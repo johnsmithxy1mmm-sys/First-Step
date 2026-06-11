@@ -47,6 +47,14 @@ def load_config(path: str | Path) -> ObjectConfig:
     if not isinstance(raw, dict):
         raise ConfigError(f"Файл «{path}» пуст или имеет неверную структуру (ожидался словарь полей).")
 
+    return validate_config(raw)
+
+
+def validate_config(raw: dict) -> ObjectConfig:
+    """Валидирует словарь полей в ObjectConfig с понятными ошибками на русском.
+
+    Используется и при загрузке YAML, и графическим приложением (форма → словарь).
+    """
     try:
         return ObjectConfig.model_validate(raw)
     except ValidationError as exc:

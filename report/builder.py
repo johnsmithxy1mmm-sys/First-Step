@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import datetime as _dt
 import re
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -25,7 +26,18 @@ from finance.format_ru import format_rub, format_pct, format_multiple, format_nu
 
 from report import charts
 
-_HERE = Path(__file__).resolve().parent
+def _resource_base() -> Path:
+    """Каталог с ресурсами отчёта (report/), рабочий и в собранном .exe.
+
+    В режиме PyInstaller данные распаковываются в sys._MEIPASS; в обычном
+    запуске берём путь относительно этого модуля.
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys._MEIPASS) / "report"  # type: ignore[attr-defined]
+    return Path(__file__).resolve().parent
+
+
+_HERE = _resource_base()
 _TEMPLATES = _HERE / "templates"
 _ASSETS = _HERE / "assets"
 
