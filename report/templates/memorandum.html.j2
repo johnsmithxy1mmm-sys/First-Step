@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>{{ obj.name }} — инвестиционный меморандум</title>
+<style>
+/* Встроенные шрифты Lora (data URI) — самодостаточный, детерминированный документ. */
+@font-face {
+  font-family: "Lora";
+  font-style: normal;
+  font-weight: 400 700;
+  src: url("data:font/ttf;base64,{{ fonts.lora }}") format("truetype");
+}
+@font-face {
+  font-family: "Lora";
+  font-style: italic;
+  font-weight: 400 700;
+  src: url("data:font/ttf;base64,{{ fonts.lora_italic }}") format("truetype");
+}
+{{ brand_css|safe }}
+</style>
+</head>
+<body>
+
+{# ── 1. Обложка ─────────────────────────────────────────────────────── #}
+<section class="cover">
+  <div class="cover-top">
+    <div class="cover-mark">А · П</div>
+    <div class="cover-confidential">Конфиденциально</div>
+  </div>
+
+  <div class="cover-center">
+    <div class="cover-rule"></div>
+    <div class="cover-type">Инвестиционный меморандум</div>
+    <div class="cover-title">{{ obj.name }}</div>
+    <div class="cover-sub">
+      <b>{{ obj.developer }}</b><br>
+      {{ obj.zone }}{% if obj.type %} · {{ obj.type }}{% endif %}{% if obj.area_str %} · {{ obj.area_str }}{% endif %}
+    </div>
+  </div>
+
+  <div class="cover-foot">
+    <div>
+      <div class="cover-sign-name">{{ advisor.name }}</div>
+      <div class="cover-sign-title">{{ advisor.title }}</div>
+    </div>
+    <div class="cover-date">{{ date_str }}</div>
+  </div>
+</section>
+
+{# ── 2. Резюме / тезис ──────────────────────────────────────────────── #}
+<section>
+  <div class="section-head">
+    <span class="section-kicker">Резюме</span>
+    <h2>Тезис и рекомендация</h2>
+    <span class="section-num">01</span>
+  </div>
+
+  <div class="thesis-grid">
+    <div>
+      <span class="stamp {{ advisor.stamp_class }}">
+        {{ advisor.stamp_label }}
+        <small>{{ advisor.recommendation }}</small>
+      </span>
+    </div>
+    <div class="thesis-text">
+      <div class="lead">{{ advisor.thesis }}</div>
+      <div class="thesis-meta">
+        <b>Сценарий выхода.</b> {{ advisor.exit_scenario }}
+      </div>
+    </div>
+  </div>
+
+  <div class="kpi-strip">
+    <div class="kpi">
+      <div class="kpi-label">IRR, базовый</div>
+      <div class="kpi-value {{ kpi.irr_class }}">{{ kpi.irr }}</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">NPV при ставке {{ kpi.discount }}</div>
+      <div class="kpi-value {{ kpi.npv_class }}">{{ kpi.npv }}</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Мультипликатор</div>
+      <div class="kpi-value">{{ kpi.moic }}</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">P(IRR &lt; 0)</div>
+      <div class="kpi-value">{{ kpi.prob_loss }}</div>
+    </div>
+  </div>
+
+  <div class="interp">
+    {{ summary.interpretation }}
+  </div>
+</section>
+
+{# ── 3. Параметры объекта ───────────────────────────────────────────── #}
+<section>
+  <div class="section-head">
+    <span class="section-kicker">Объект</span>
+    <h2>Параметры и допущения</h2>
+    <span class="section-num">02</span>
+  </div>
+
+  <table class="params">
+    {% for group in params %}
+    <tr class="group-row"><td colspan="2">{{ group.title }}</td></tr>
+    {% for row in group.rows %}
+    <tr><td>{{ row[0] }}</td><td>{{ row[1] }}</td></tr>
+    {% endfor %}
+    {% endfor %}
+  </table>
+</section>
+
+{# ── 4. Финансовая модель (DCF) ─────────────────────────────────────── #}
+<section>
+  <div class="section-head">
+    <span class="section-kicker">DCF</span>
+    <h2>Финансовая модель</h2>
+    <span class="section-num">03</span>
+  </div>
+
+  <table class="flows">
+    <thead>
+      <tr>
+        <th>Год</th><th>Выручка</th><th>OPEX</th><th>NOI</th>
+        <th>Рассрочка</th><th>Выход</th><th>Поток</th><th>Диск. поток</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for ln in dcf_rows %}
+      <tr>
+        <td>{{ ln.year }}</td>
+        <td>{{ ln.revenue }}</td>
+        <td>{{ ln.opex }}</td>
+        <td>{{ ln.noi }}</td>
+        <td class="{{ ln.installment_class }}">{{ ln.installment }}</td>
+        <td>{{ ln.exit }}</td>
+        <td class="{{ ln.net_class }}">{{ ln.net }}</td>
+        <td class="{{ ln.disc_class }}">{{ ln.disc }}</td>
+      </tr>
+      {% endfor %}
+      <tr class="total">
+        <td>NPV</td><td></td><td></td><td></td><td></td><td></td><td></td>
+        <td class="{{ dcf.npv_class }}">{{ dcf.npv }}</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="stat-row" style="margin-top:6mm">
+    <div class="stat-card"><div class="stat-label">IRR годовой</div><div class="stat-value">{{ dcf.irr }}</div></div>
+    <div class="stat-card"><div class="stat-label">Окупаемость простая</div><div class="stat-value">{{ dcf.payback }}</div></div>
+    <div class="stat-card"><div class="stat-label">Окупаемость диск.</div><div class="stat-value">{{ dcf.disc_payback }}</div></div>
+    <div class="stat-card"><div class="stat-label">Вал. доходность</div><div class="stat-value">{{ dcf.gross_yield }}</div></div>
+    <div class="stat-card"><div class="stat-label">Чист. доходность</div><div class="stat-value">{{ dcf.net_yield }}</div></div>
+    <div class="stat-card"><div class="stat-label">Чистый выход</div><div class="stat-value">{{ dcf.exit_net }}</div></div>
+  </div>
+
+  <div class="chart">{{ charts.waterfall|safe }}</div>
+  <div class="chart-caption">Водопад чистых годовых денежных потоков. Бордо — оттоки (транши рассрочки), шалфей — притоки (аренда и выход).</div>
+</section>
+
+{# ── 5. Монте-Карло ─────────────────────────────────────────────────── #}
+<section>
+  <div class="section-head">
+    <span class="section-kicker">Монте-Карло</span>
+    <h2>Распределение IRR</h2>
+    <span class="section-num">04</span>
+  </div>
+
+  <div class="chart">{{ charts.histogram|safe }}</div>
+  <div class="chart-caption">{{ mc.iterations }} итераций. Отметки P5 / P50 / P95 и целевой IRR {{ mc.target }}.</div>
+
+  <div class="stat-row">
+    <div class="stat-card"><div class="stat-label">P5 — P50 — P95</div><div class="stat-value">{{ mc.p_band }}</div></div>
+    <div class="stat-card"><div class="stat-label">P(IRR &lt; цели {{ mc.target }})</div><div class="stat-value {{ mc.below_target_class }}">{{ mc.prob_below_target }}</div></div>
+    <div class="stat-card"><div class="stat-label">P(IRR &lt; 0)</div><div class="stat-value {{ mc.below_zero_class }}">{{ mc.prob_below_zero }}</div></div>
+  </div>
+
+  <div class="interp">{{ mc.interpretation }}</div>
+</section>
+
+{# ── 6. Чувствительность ────────────────────────────────────────────── #}
+<section>
+  <div class="section-head">
+    <span class="section-kicker">Чувствительность</span>
+    <h2>Торнадо допущений</h2>
+    <span class="section-num">05</span>
+  </div>
+
+  <div class="chart">{{ charts.tornado|safe }}</div>
+  <div class="chart-caption">Размах IRR при движении каждого допущения между крайними значениями диапазона; пунктир — базовый IRR.</div>
+
+  <div class="interp">{{ sensitivity.interpretation }}</div>
+</section>
+
+{# ── 7. Структура рассрочки ─────────────────────────────────────────── #}
+<section>
+  <div class="section-head">
+    <span class="section-kicker">Рассрочка</span>
+    <h2>Структура платежей</h2>
+    <span class="section-num">06</span>
+  </div>
+
+  <div class="chart">{{ charts.installment|safe }}</div>
+  <div class="chart-caption">Транши по месяцам и накопленная доля оплаты. Поздние транши удлиняют срок работы капитала и поддерживают IRR.</div>
+
+  <table class="flows" style="margin-top:5mm">
+    <thead><tr><th>Месяц</th><th>Доля</th><th>Сумма</th><th>Накоплено</th></tr></thead>
+    <tbody>
+      {% for tr in installment_rows %}
+      <tr><td>{{ tr.month }}</td><td>{{ tr.pct }}</td><td>{{ tr.amount }}</td><td>{{ tr.cum }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+{# ── 8. Сценарий выхода ─────────────────────────────────────────────── #}
+<section>
+  <div class="section-head">
+    <span class="section-kicker">Выход</span>
+    <h2>Сценарий реализации</h2>
+    <span class="section-num">07</span>
+  </div>
+
+  <div class="lead-quote">{{ advisor.exit_scenario }}</div>
+
+  <table class="params" style="margin-top:4mm">
+    <tr class="group-row"><td colspan="2">Оценка выхода</td></tr>
+    {% for row in exit_rows %}
+    <tr><td>{{ row[0] }}</td><td>{{ row[1] }}</td></tr>
+    {% endfor %}
+  </table>
+
+  <div class="interp">{{ exit_block.interpretation }}</div>
+</section>
+
+{# ── 9. Дисклеймер ──────────────────────────────────────────────────── #}
+<section>
+  <div class="section-head">
+    <span class="section-kicker">Правовая оговорка</span>
+    <h2>Дисклеймер</h2>
+    <span class="section-num">08</span>
+  </div>
+
+  <div class="disclaimer">
+    <p>Настоящий материал подготовлен {{ advisor.name }} ({{ advisor.title }}) и носит исключительно аналитический, информационный характер. Он отражает допущения и расчёты, основанные на данных, предоставленных в конфигурации объекта, и не является индивидуальной инвестиционной рекомендацией в значении применимого законодательства.</p>
+    <p>Приведённые показатели (NPV, IRR, результаты симуляции Монте-Карло, анализ чувствительности) получены на модельных допущениях и не гарантируют будущей доходности. Фактические результаты могут существенно отличаться вследствие рыночных, правовых, налоговых и иных факторов. Стоимость недвижимого имущества может как расти, так и снижаться.</p>
+    <p>Перед принятием инвестиционного решения необходима самостоятельная проверка исходных данных и, при необходимости, привлечение независимых юридических, налоговых и оценочных консультантов. Распространение документа без согласия автора не допускается.</p>
+  </div>
+</section>
+
+</body>
+</html>

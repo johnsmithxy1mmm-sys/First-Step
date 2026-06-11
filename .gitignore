@@ -1,0 +1,13 @@
+# Результаты сборки меморандумов
+out/*.pdf
+out/*.html
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Промежуточные графики
+report/_charts_tmp/
