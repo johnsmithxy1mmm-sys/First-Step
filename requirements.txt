@@ -1,18 +1,18 @@
 # Финансовый движок
-numpy==2.3.4
+numpy>=1.26
 
 # Валидация входного YAML
-pydantic==2.12.4
-PyYAML==6.0.3
+pydantic>=2.9
+PyYAML>=6.0
 
 # Шаблон отчёта и рендер
-jinja2==3.1.6
-matplotlib==3.10.8
+jinja2>=3.1
+matplotlib>=3.8
 
 # Рендер HTML -> PDF через headless Chromium.
-# ВАЖНО: версия привязана к ревизии браузера 1194 (Chromium 141).
+# Версию фиксируем: она проверена и согласована с движком рендера.
 # После установки выполнить: playwright install chromium
 playwright==1.56.0
 
 # Тесты финансового модуля
-pytest==9.0.1
+pytest>=8.0

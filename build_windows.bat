@@ -8,6 +8,16 @@ REM ==========================================================================
 
 cd /d "%~dp0"
 
+REM Clear proxy variables for this session: a leftover SOCKS proxy makes pip
+REM fail with "Missing dependencies for SOCKS support". Direct connection is
+REM used instead. This does NOT change your system settings.
+set ALL_PROXY=
+set HTTP_PROXY=
+set HTTPS_PROXY=
+set all_proxy=
+set http_proxy=
+set https_proxy=
+
 echo.
 echo === Building the "Memorandums" application ===
 echo.
@@ -16,8 +26,8 @@ where python >nul 2>&1
 if errorlevel 1 goto nopython
 
 echo [1/3] Installing dependencies...
-python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
+if errorlevel 1 goto failed
 python -m pip install pyinstaller
 if errorlevel 1 goto failed
 
@@ -47,7 +57,9 @@ exit /b 1
 
 :failed
 echo.
-echo Build failed. See the messages above.
+echo Install/build failed. See the messages above.
+echo If you see a proxy/SOCKS or connection error, you may be behind a
+echo required proxy: run "python -m pip install pysocks" once, then retry.
 echo.
 pause
 exit /b 1
