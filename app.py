@@ -10,7 +10,6 @@
 
 from __future__ import annotations
 
-import datetime as _dt
 import threading
 import tkinter as tk
 from pathlib import Path
@@ -422,7 +421,7 @@ class App(tk.Tk):
         try:
             result = generate(data, out, log=lambda m: self.after(0, self._log, m))
             self.after(0, self._done_ok, result)
-        except (ConfigError, Exception) as e:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001  (ConfigError тоже сюда — различаем в _done_err)
             self.after(0, self._done_err, e)
 
     def _done_ok(self, result: Path):

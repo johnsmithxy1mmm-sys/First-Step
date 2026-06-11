@@ -7,28 +7,30 @@ REM ==========================================================================
 
 cd /d "%~dp0"
 
-REM Clear proxy variables for this session: a leftover SOCKS proxy makes pip
-REM fail with "Missing dependencies for SOCKS support". Does NOT change system.
-set ALL_PROXY=
-set HTTP_PROXY=
-set HTTPS_PROXY=
-set all_proxy=
-set http_proxy=
-set https_proxy=
-
 where python >nul 2>&1
 if errorlevel 1 goto nopython
 
 python -c "import playwright" >nul 2>&1
-if errorlevel 1 (
-  echo First-time setup: installing dependencies, please wait...
-  python -m pip install -r requirements.txt
-  if errorlevel 1 goto failed
-  python -m playwright install chromium
-)
+if not errorlevel 1 goto launch
 
+echo First-time setup: installing dependencies, please wait...
+REM Enable SOCKS proxy support offline (harmless if no proxy is used).
+python -m pip install --no-index --find-links vendor pysocks >nul 2>&1
+call :pipinstall "-r requirements.txt"
+if errorlevel 1 goto failed
+python -m playwright install chromium
+
+:launch
 start "" pythonw app.py
 exit /b 0
+
+REM --- pip install helper: try normally, then retry bypassing any proxy ----
+:pipinstall
+python -m pip install %~1
+if not errorlevel 1 exit /b 0
+echo     ...retrying with direct connection (no proxy)...
+python -m pip install --proxy "" %~1
+exit /b %errorlevel%
 
 :nopython
 echo.
@@ -42,8 +44,8 @@ exit /b 1
 :failed
 echo.
 echo Dependency install failed. See the messages above.
-echo If you see a proxy/SOCKS or connection error, you may be behind a
-echo required proxy: run "python -m pip install pysocks" once, then retry.
+echo If the error mentions connection or proxy, check your internet and retry.
+echo As a last resort install Python 3.12 instead of 3.14.
 echo.
 pause
 exit /b 1

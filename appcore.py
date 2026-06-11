@@ -141,9 +141,10 @@ def ensure_chromium(log: Optional[Callable[[str], None]] = None) -> bool:
         if getattr(sys, "frozen", False):
             # В собранном .exe нет «python -m playwright»: зовём node-драйвер,
             # который Playwright кладёт рядом с собой (включён в сборку).
-            from playwright._impl._driver import compute_driver_executable
+            from playwright._impl._driver import compute_driver_executable, get_driver_env
             driver = compute_driver_executable()
-            subprocess.run([*map(str, driver), "install", "chromium"], check=True)
+            subprocess.run([*map(str, driver), "install", "chromium"],
+                           check=True, env=get_driver_env())
         else:
             subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"],
                            check=True)

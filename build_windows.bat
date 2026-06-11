@@ -8,16 +8,6 @@ REM ==========================================================================
 
 cd /d "%~dp0"
 
-REM Clear proxy variables for this session: a leftover SOCKS proxy makes pip
-REM fail with "Missing dependencies for SOCKS support". Direct connection is
-REM used instead. This does NOT change your system settings.
-set ALL_PROXY=
-set HTTP_PROXY=
-set HTTPS_PROXY=
-set all_proxy=
-set http_proxy=
-set https_proxy=
-
 echo.
 echo === Building the "Memorandums" application ===
 echo.
@@ -25,19 +15,24 @@ echo.
 where python >nul 2>&1
 if errorlevel 1 goto nopython
 
-echo [1/3] Installing dependencies...
-python -m pip install -r requirements.txt
+REM Enable SOCKS proxy support offline (from bundled wheel). Harmless if a
+REM proxy is not used. Lets pip work through a configured SOCKS proxy.
+echo [1/4] Enabling proxy support (offline)...
+python -m pip install --no-index --find-links vendor pysocks >nul 2>&1
+
+echo [2/4] Installing dependencies...
+call :pipinstall "-r requirements.txt"
 if errorlevel 1 goto failed
-python -m pip install pyinstaller
+call :pipinstall "pyinstaller"
 if errorlevel 1 goto failed
 
 echo.
-echo [2/3] Building .exe (takes 1-3 minutes)...
+echo [3/4] Building .exe (takes 1-3 minutes)...
 python -m PyInstaller --noconfirm first_step.spec
 if errorlevel 1 goto failed
 
 echo.
-echo [3/3] Done. Application: dist\Memorandums\Memorandums.exe
+echo [4/4] Done. Application: dist\Memorandums\Memorandums.exe
 echo.
 echo On first PDF build the app downloads the render engine
 echo (Chromium, ~150 MB) once - internet required.
@@ -45,6 +40,14 @@ echo You can move the dist\Memorandums folder to another PC.
 echo.
 pause
 exit /b 0
+
+REM --- pip install helper: try normally, then retry bypassing any proxy ----
+:pipinstall
+python -m pip install %~1
+if not errorlevel 1 exit /b 0
+echo     ...retrying with direct connection (no proxy)...
+python -m pip install --proxy "" %~1
+exit /b %errorlevel%
 
 :nopython
 echo.
@@ -58,8 +61,8 @@ exit /b 1
 :failed
 echo.
 echo Install/build failed. See the messages above.
-echo If you see a proxy/SOCKS or connection error, you may be behind a
-echo required proxy: run "python -m pip install pysocks" once, then retry.
+echo If the error mentions connection or proxy, check your internet
+echo and try again. As a last resort install Python 3.12 instead of 3.14.
 echo.
 pause
 exit /b 1
