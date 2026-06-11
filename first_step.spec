@@ -3,7 +3,7 @@
 # Запуск (на Windows):  pyinstaller --noconfirm first_step.spec
 # Проще — двойной клик по build_windows.bat (он всё сделает сам).
 #
-# Собирается папка dist/Меморандумы/ с файлом «Меморандумы.exe».
+# Собирается папка dist/Memorandums/ с файлом Memorandums.exe.
 # Движок Chromium НЕ кладётся внутрь: при первом запуске приложение
 # скачивает его один раз (нужен интернет) — так же, как CLI-режим.
 
@@ -55,7 +55,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="Меморандумы",
+    name="Memorandums",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -71,5 +71,5 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name="Меморандумы",
+    name="Memorandums",
 )
