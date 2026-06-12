@@ -14,23 +14,16 @@ python -c "import playwright" >nul 2>&1
 if not errorlevel 1 goto launch
 
 echo First-time setup: installing dependencies, please wait...
-REM Enable SOCKS proxy support offline (harmless if no proxy is used).
 python -m pip install --no-index --find-links vendor pysocks >nul 2>&1
-call :pipinstall "-r requirements.txt"
+python -m pip install -r requirements.txt
+if errorlevel 1 echo     ...retrying with direct connection (no proxy)...
+if errorlevel 1 python -m pip install --proxy "" -r requirements.txt
 if errorlevel 1 goto failed
 python -m playwright install chromium
 
 :launch
 start "" pythonw app.py
 exit /b 0
-
-REM --- pip install helper: try normally, then retry bypassing any proxy ----
-:pipinstall
-python -m pip install %~1
-if not errorlevel 1 exit /b 0
-echo     ...retrying with direct connection (no proxy)...
-python -m pip install --proxy "" %~1
-exit /b %errorlevel%
 
 :nopython
 echo.

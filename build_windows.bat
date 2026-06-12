@@ -15,15 +15,17 @@ echo.
 where python >nul 2>&1
 if errorlevel 1 goto nopython
 
-REM Enable SOCKS proxy support offline (from bundled wheel). Harmless if a
-REM proxy is not used. Lets pip work through a configured SOCKS proxy.
 echo [1/4] Enabling proxy support (offline)...
 python -m pip install --no-index --find-links vendor pysocks >nul 2>&1
 
 echo [2/4] Installing dependencies...
-call :pipinstall "-r requirements.txt"
+python -m pip install -r requirements.txt
+if errorlevel 1 echo     ...retrying with direct connection (no proxy)...
+if errorlevel 1 python -m pip install --proxy "" -r requirements.txt
 if errorlevel 1 goto failed
-call :pipinstall "pyinstaller"
+
+python -m pip install pyinstaller
+if errorlevel 1 python -m pip install --proxy "" pyinstaller
 if errorlevel 1 goto failed
 
 echo.
@@ -40,14 +42,6 @@ echo You can move the dist\Memorandums folder to another PC.
 echo.
 pause
 exit /b 0
-
-REM --- pip install helper: try normally, then retry bypassing any proxy ----
-:pipinstall
-python -m pip install %~1
-if not errorlevel 1 exit /b 0
-echo     ...retrying with direct connection (no proxy)...
-python -m pip install --proxy "" %~1
-exit /b %errorlevel%
 
 :nopython
 echo.
