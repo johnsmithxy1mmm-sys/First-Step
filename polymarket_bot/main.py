@@ -198,6 +198,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args(argv)
 
+    # .env ищем и рядом с пакетом, и от текущей директории вверх.
+    from .config import PACKAGE_DIR
+    load_dotenv(PACKAGE_DIR / ".env")
     load_dotenv()
     cfg = BotConfig.load(args.config)
     setup_logging(cfg.runtime.log_path, args.log_level)

@@ -1,0 +1,38 @@
+# Systemd-юнит: бот работает 24/7, переживает падения и перезагрузки сервера.
+#
+# Установка (пути поправьте под себя):
+#   sudo cp polymarket_bot/deploy/polymarket-bot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now polymarket-bot      # автозапуск + старт сейчас
+#
+# Управление:
+#   systemctl status polymarket-bot                 # состояние
+#   journalctl -u polymarket-bot -f                 # живые логи
+#   sudo systemctl stop polymarket-bot              # ОСТАНОВИТЬ (только вы)
+#   sudo systemctl disable polymarket-bot           # убрать из автозапуска
+
+[Unit]
+Description=Polymarket Longshot Bot (tail mispricing barbell)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Отдельный непривилегированный пользователь (создать: sudo useradd -r -m polybot)
+User=polybot
+WorkingDirectory=/opt/First-Step
+# Секреты — из .env; файл должен принадлежать polybot с правами 600.
+EnvironmentFile=/opt/First-Step/polymarket_bot/.env
+# Для проверки без денег замените "--mode live --i-understand-the-risk" на "--mode dry-run".
+ExecStart=/opt/First-Step/.venv/bin/python -m polymarket_bot --mode live --i-understand-the-risk
+Restart=always
+RestartSec=30
+# Если бот падает 5 раз за 10 минут — остановиться и не молотить биржу.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+# Ограничения на всякий случай.
+MemoryMax=1G
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
