@@ -1,107 +1,111 @@
-"""Конфигурация бота: значения по умолчанию + JSON-файл + переопределения из CLI."""
+"""Конфигурация: config.yaml → pydantic-модели. Секреты — только из .env."""
 
 from __future__ import annotations
 
-import json
-from dataclasses import dataclass, field, fields
 from pathlib import Path
 
+import yaml
+from pydantic import BaseModel, Field, field_validator
 
-@dataclass
-class BotConfig:
-    # --- Стратегия ---
-    # Максимальная цена исхода в долларах: 0.01 = потенциал x100 при победе.
-    max_price: float = 0.01
-    # Минимальная цена: исходы за 0.000 обычно означают мёртвый рынок без стакана.
-    min_price: float = 0.001
-    # Сколько долларов вкладывать в одну ставку (базовый размер, см. stake_scaling).
-    stake_usd: float = 15.0
-    # Общий бюджет на серию ставок; бот не превысит его.
-    total_budget_usd: float = 1500.0
-    # Дневной лимит трат (0 = выключен). Защита от «слить всё за один цикл».
-    daily_budget_usd: float = 0.0
-    # Максимум ставок за один запуск (дополнительный предохранитель к бюджету).
-    max_bets: int = 100
-    # Масштабировать размер ставки по скору кандидата: 0.5x–1.5x от stake_usd.
-    stake_scaling: bool = True
+PACKAGE_DIR = Path(__file__).parent
+DEFAULT_CONFIG_PATH = PACKAGE_DIR / "config.yaml"
 
-    # --- Фильтры рынков ---
-    # Отсекаем неликвид: на пустых рынках дешёвая цена — иллюзия, купить не получится.
-    min_liquidity_usd: float = 1000.0
-    min_volume_usd: float = 5000.0
-    # Окно резолюции: слишком близкие рынки почти решены, слишком далёкие морозят деньги.
-    min_days_to_resolution: float = 1.0
+
+class ScannerConfig(BaseModel):
+    price_min: float = 0.002
+    price_max: float = 0.05
+    min_volume_24h_usd: float = 5_000.0
+    min_book_depth_usd: float = 500.0
+    book_depth_pct_from_mid: float = 0.20
+    min_days_to_resolution: float = 3.0
     max_days_to_resolution: float = 120.0
-    # Ключевые слова по вопросу рынка (без учёта регистра). Пустой include = берём всё.
-    include_keywords: list[str] = field(default_factory=list)
-    exclude_keywords: list[str] = field(default_factory=list)
-    # Не больше одной ставки на рынок, чтобы не коррелировать риски.
-    max_bets_per_market: int = 1
-    # Минимальный скор кандидата (0..1); 0 = брать всех, ранжируя по скору.
-    min_score: float = 0.0
+    # Неоднозначная резолюция: требуем источник резолюции или внятное описание правил.
+    require_resolution_clarity: bool = True
+    min_description_chars: int = 80
+    exclude_keywords: list[str] = Field(default_factory=list)
+    include_keywords: list[str] = Field(default_factory=list)
+    verify_book_depth: bool = True
+    interval_minutes: float = 20.0
+    max_candidates_per_cycle: int = 200
 
-    # --- Исполнение ---
-    # maker — свой ордер у бида (дешевле, но может не исполниться);
-    # taker — покупка по лучшему ask (дороже, но сразу).
-    entry_mode: str = "maker"
-    # Перед ставкой сверять реальный стакан CLOB (медленнее, но честнее).
-    verify_orderbook: bool = True
-    # Пауза между запросами к API, чтобы не упереться в rate limit.
-    request_delay_sec: float = 0.25
 
-    # --- Автопилот (команда auto) ---
-    # Период цикла в минутах.
-    auto_interval_min: float = 30.0
-    # Снимать неисполненные ордера старше N часов — не морозить бюджет.
-    max_order_age_hours: float = 12.0
-    # Автофиксация: когда цена позиции вырастает в N раз от входа...
-    take_profit_multiple: float = 10.0
-    # ...продать эту долю позиции (0.5 = половину; остаток «едет бесплатно»).
-    take_profit_fraction: float = 0.5
+class LLMConfig(BaseModel):
+    enabled: bool = False              # включать после калибровки остальных сигналов
+    model: str = "claude-sonnet-5"
+    max_calls_per_cycle: int = 10
+    cache_ttl_hours: float = 24.0
+    max_tokens: int = 1024
 
-    # --- Арбитраж neg-risk событий (сумма всех исходов < $1) ---
-    arb_scan: bool = True
-    # Минимальная гарантированная маржа, чтобы считать событие арбитражем.
-    arb_min_edge: float = 0.02
-    # Автоматически исполнять арбитражи (экспериментально; есть риск частичного входа).
-    arb_execute: bool = False
-    arb_stake_usd: float = 50.0
 
-    # --- Подключение ---
-    clob_host: str = "https://clob.polymarket.com"
+class EstimatorConfig(BaseModel):
+    # Порог мисспрайсинга: p_est / p_mkt ≥ min_edge_ratio при p_mkt ≤ max_p_mkt.
+    min_edge_ratio: float = 2.0
+    max_p_mkt: float = 0.05
+    base_rates_file: str = "base_rates.yaml"
+    # Вес рыночной цены как якоря в ансамбле (0.9 = почти доверяем рынку;
+    # ниже — сигналы легче перевешивают рынок, edge находить проще, но шумнее).
+    market_anchor_confidence: float = 0.85
+    llm: LLMConfig = Field(default_factory=LLMConfig)
+
+
+class PortfolioConfig(BaseModel):
+    bankroll_usd: float = 5_000.0
+    kelly_fraction: float = 0.15       # λ дробного Келли (0.1–0.25)
+    max_market_pct: float = 0.01       # ≤ 1% банка на рынок
+    max_category_pct: float = 0.10     # ≤ 10% на категорию (с учётом корреляций)
+    max_total_exposure_pct: float = 0.30
+    max_drawdown_pct: float = 0.25     # стоп всей системы
+    take_profit_multiple: float = 7.0  # частичная фиксация на 5–10x
+    take_profit_fraction: float = 0.6  # продаём 50–70%
+
+    @field_validator("kelly_fraction")
+    @classmethod
+    def _kelly_sane(cls, v: float) -> float:
+        if not 0 < v <= 0.5:
+            raise ValueError("kelly_fraction должен быть в (0, 0.5]")
+        return v
+
+
+class ExecutorConfig(BaseModel):
+    max_reprices: int = 3
+    fill_timeout_sec: float = 90.0
+    poll_interval_sec: float = 5.0
+    max_child_order_usd: float = 200.0
+
+
+class RuntimeConfig(BaseModel):
     gamma_host: str = "https://gamma-api.polymarket.com"
+    clob_host: str = "https://clob.polymarket.com"
     data_api_host: str = "https://data-api.polymarket.com"
-    chain_id: int = 137  # Polygon
-    # 0 — обычный кошелёк (EOA), 1 — аккаунт через email (Magic),
-    # 2 — аккаунт через браузерный кошелёк (прокси Polymarket).
-    signature_type: int = 0
+    chain_id: int = 137
+    db_path: str = str(PACKAGE_DIR / "data" / "ledger.sqlite")
+    log_path: str = str(PACKAGE_DIR / "data" / "bot.jsonl")
+    llm_cache_path: str = str(PACKAGE_DIR / "data" / "llm_cache.json")
+    request_timeout_sec: float = 30.0
+    max_retries: int = 4
+
+
+class BacktestConfig(BaseModel):
+    max_markets: int = 300
+    lookback_days_before_end: float = 21.0  # смотрим цену за N дней до резолюции
+
+
+class BotConfig(BaseModel):
+    scanner: ScannerConfig = Field(default_factory=ScannerConfig)
+    estimator: EstimatorConfig = Field(default_factory=EstimatorConfig)
+    portfolio: PortfolioConfig = Field(default_factory=PortfolioConfig)
+    executor: ExecutorConfig = Field(default_factory=ExecutorConfig)
+    runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
+    backtest: BacktestConfig = Field(default_factory=BacktestConfig)
 
     @classmethod
-    def load(cls, path: str | Path | None = None, **overrides) -> "BotConfig":
-        """Собирает конфиг: файл (если есть) поверх дефолтов, CLI поверх файла."""
-        data: dict = {}
-        if path is not None:
-            raw = json.loads(Path(path).read_text(encoding="utf-8"))
-            known = {f.name for f in fields(cls)}
-            unknown = set(raw) - known
-            if unknown:
-                raise ValueError(f"Неизвестные ключи в конфиге: {sorted(unknown)}")
-            data.update(raw)
-        data.update({k: v for k, v in overrides.items() if v is not None})
-        return cls(**data)
+    def load(cls, path: str | Path | None = None) -> "BotConfig":
+        path = Path(path) if path else DEFAULT_CONFIG_PATH
+        if not path.exists():
+            return cls()
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        return cls.model_validate(raw)
 
-    def validate(self) -> None:
-        if not 0 < self.max_price < 1:
-            raise ValueError("max_price должен быть между 0 и 1")
-        if self.stake_usd <= 0 or self.total_budget_usd <= 0:
-            raise ValueError("stake_usd и total_budget_usd должны быть положительными")
-        if self.stake_usd > self.total_budget_usd:
-            raise ValueError("stake_usd больше общего бюджета")
-        if self.entry_mode not in ("maker", "taker"):
-            raise ValueError("entry_mode должен быть 'maker' или 'taker'")
-        if not 0 < self.take_profit_fraction <= 1:
-            raise ValueError("take_profit_fraction должен быть в (0, 1]")
-        if self.take_profit_multiple <= 1:
-            raise ValueError("take_profit_multiple должен быть больше 1")
-        if not 0 <= self.arb_min_edge < 1:
-            raise ValueError("arb_min_edge должен быть в [0, 1)")
+    def base_rates_path(self) -> Path:
+        p = Path(self.estimator.base_rates_file)
+        return p if p.is_absolute() else PACKAGE_DIR / p

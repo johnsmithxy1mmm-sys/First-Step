@@ -1,0 +1,81 @@
+# Справочник базовых частот (base rates) для оценки хвостовых исходов.
+# Формат записи:
+#   name: идентификатор
+#   keywords_all: слова, которые ВСЕ должны встретиться в вопросе (lowercase)
+#   keywords_any: хотя бы одно из этих слов должно встретиться (пусто = не проверяем)
+#   annual_probability: вероятность, что событие случится за год (0..1)
+#   confidence: насколько доверяем этой оценке как сигналу (0..1)
+#   note: источник/обоснование
+#
+# p_est для рынка «случится ли X до даты D» = 1 - (1 - annual_probability)^(дней_до_D/365).
+# Это стартовый набор из открытых данных — расширяйте под свои категории.
+
+- name: earthquake_m8_global
+  keywords_all: [earthquake]
+  keywords_any: ["8.0", "magnitude 8", "m8"]
+  annual_probability: 0.63     # ~1 событие M8+ в год глобально (USGS: в среднем 1/год)
+  confidence: 0.5
+  note: "USGS long-term average: ~1 M8+ per year worldwide"
+
+- name: earthquake_m7_global
+  keywords_all: [earthquake]
+  keywords_any: ["7.0", "magnitude 7", "m7"]
+  annual_probability: 0.999    # ~15 событий M7+ в год глобально
+  confidence: 0.5
+  note: "USGS: ~15 M7+ per year worldwide; для конкретного региона правьте вручную"
+
+- name: hurricane_cat5_us_landfall
+  keywords_all: [hurricane]
+  keywords_any: [category 5, cat 5, landfall]
+  annual_probability: 0.25
+  confidence: 0.4
+  note: "~4 US Cat5 landfalls за ~100 лет наблюдений, с поправкой на тренд"
+
+- name: btc_drawdown_30pct_month
+  keywords_all: [bitcoin]
+  keywords_any: [crash, "-30%", drop 30, fall 30]
+  annual_probability: 0.55
+  confidence: 0.35
+  note: "Месячные просадки BTC ≥30% случались ~в 8% месяцев истории"
+
+- name: sovereign_default
+  keywords_all: [default]
+  keywords_any: [sovereign, debt, imf]
+  annual_probability: 0.03
+  confidence: 0.3
+  note: "1-3 суверенных дефолта в год на ~200 стран; для конкретной страны — вручную"
+
+- name: us_government_shutdown
+  keywords_all: [government shutdown]
+  keywords_any: []
+  annual_probability: 0.35
+  confidence: 0.45
+  note: "~7 шатдаунов за 20 лет, кластеризуются вокруг дедлайнов бюджета"
+
+- name: leader_leaves_office_early
+  keywords_all: []
+  keywords_any: [resign, impeach, "removed from office", "step down"]
+  annual_probability: 0.04
+  confidence: 0.3
+  note: "Досрочный уход главы государства/CEO — редкое событие, ~2-5%/год"
+
+- name: new_country_conflict
+  keywords_all: []
+  keywords_any: [invade, invasion, "declare war", "military strike", missile strike]
+  annual_probability: 0.05
+  confidence: 0.25
+  note: "Новый межгосударственный вооружённый конфликт по паре стран — грубая оценка"
+
+- name: pandemic_declaration
+  keywords_all: []
+  keywords_any: [pandemic, "public health emergency of international concern", pheic]
+  annual_probability: 0.10
+  confidence: 0.3
+  note: "PHEIC объявлялись ~7 раз за 15 лет"
+
+- name: volcano_vei5
+  keywords_all: [volcano]
+  keywords_any: [erupt, eruption]
+  annual_probability: 0.5
+  confidence: 0.35
+  note: "VEI5+ извержения ~раз в 2 года глобально; для конкретного вулкана — вручную"

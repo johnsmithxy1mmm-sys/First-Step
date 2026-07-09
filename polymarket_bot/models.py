@@ -1,0 +1,242 @@
+"""Pydantic-модели данных: рынки, кандидаты, сигналы, оценки, планы сделок."""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+def _json_list(value: Any) -> list:
+    """Gamma отдаёт outcomes/outcomePrices/clobTokenIds строками с JSON внутри."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def _num(raw: dict, *keys: str) -> float:
+    for key in keys:
+        value = raw.get(key)
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return 0.0
+
+
+def _parse_dt(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+class Market(BaseModel):
+    """Один бинарный рынок Polymarket (Yes/No) c контекстом события."""
+
+    model_config = ConfigDict(frozen=False)
+
+    id: str
+    question: str
+    slug: str = ""
+    description: str = ""
+    category: str = ""
+    outcomes: list[str] = Field(default_factory=list)
+    outcome_prices: list[float] = Field(default_factory=list)
+    clob_token_ids: list[str] = Field(default_factory=list)
+    liquidity_usd: float = 0.0
+    volume_usd: float = 0.0
+    volume_24h_usd: float = 0.0
+    one_day_price_change: float = 0.0
+    best_bid: float = 0.0
+    best_ask: float = 0.0
+    end_date: datetime | None = None
+    neg_risk: bool = False
+    enable_order_book: bool = True
+    tick_size: float = 0.001
+    min_order_size: float = 5.0
+    resolution_source: str = ""
+    closed: bool = False
+    # Контекст события (группы рынков) — нужен кросс-рыночной когерентности.
+    event_id: str = ""
+    event_title: str = ""
+    event_neg_risk: bool = False
+
+    @classmethod
+    def from_gamma(cls, raw: dict, event: dict | None = None) -> "Market | None":
+        outcomes = [str(o) for o in _json_list(raw.get("outcomes"))]
+        prices_raw = _json_list(raw.get("outcomePrices"))
+        token_ids = [str(t) for t in _json_list(raw.get("clobTokenIds"))]
+        try:
+            prices = [float(p) for p in prices_raw]
+        except (TypeError, ValueError):
+            return None
+        if not (len(outcomes) == len(prices) == len(token_ids)) or not outcomes:
+            return None
+        event = event or {}
+        return cls(
+            id=str(raw.get("id", "")),
+            question=raw.get("question") or "",
+            slug=raw.get("slug") or "",
+            description=raw.get("description") or "",
+            category=raw.get("category") or "",
+            outcomes=outcomes,
+            outcome_prices=prices,
+            clob_token_ids=token_ids,
+            liquidity_usd=_num(raw, "liquidityNum", "liquidity"),
+            volume_usd=_num(raw, "volumeNum", "volume"),
+            volume_24h_usd=_num(raw, "volume24hr", "volume24hrClob"),
+            one_day_price_change=_num(raw, "oneDayPriceChange"),
+            best_bid=_num(raw, "bestBid"),
+            best_ask=_num(raw, "bestAsk"),
+            end_date=_parse_dt(raw.get("endDate")),
+            neg_risk=bool(raw.get("negRisk", False)),
+            enable_order_book=bool(raw.get("enableOrderBook", True)),
+            tick_size=_num(raw, "orderPriceMinTickSize") or 0.001,
+            min_order_size=_num(raw, "orderMinSize") or 5.0,
+            resolution_source=raw.get("resolutionSource") or "",
+            closed=bool(raw.get("closed", False)),
+            event_id=str(event.get("id", "")),
+            event_title=event.get("title") or "",
+            event_neg_risk=bool(event.get("negRisk", False)),
+        )
+
+    def days_to_resolution(self, now: datetime | None = None) -> float | None:
+        if self.end_date is None:
+            return None
+        now = now or datetime.now(timezone.utc)
+        return (self.end_date - now).total_seconds() / 86400.0
+
+    def resolved_winner_index(self) -> int | None:
+        """Для закрытых рынков: индекс победившего исхода по финальным ценам."""
+        if not self.closed or not self.outcome_prices:
+            return None
+        best = max(self.outcome_prices)
+        if best < 0.95:  # резолюция неоднозначна / рынок отменён
+            return None
+        return self.outcome_prices.index(best)
+
+
+class BookLevel(BaseModel):
+    price: float
+    size: float
+
+
+class OrderBook(BaseModel):
+    bids: list[BookLevel] = Field(default_factory=list)
+    asks: list[BookLevel] = Field(default_factory=list)
+
+    @property
+    def best_bid(self) -> float:
+        return max((l.price for l in self.bids if l.size > 0), default=0.0)
+
+    @property
+    def best_ask(self) -> float:
+        return min((l.price for l in self.asks if l.size > 0), default=0.0)
+
+    @property
+    def mid(self) -> float:
+        bid, ask = self.best_bid, self.best_ask
+        if bid > 0 and ask > 0:
+            return (bid + ask) / 2
+        return bid or ask
+
+    def bid_depth_usd_within(self, pct_from_mid: float) -> float:
+        """Долларовая глубина бидов не дальше pct от mid — поддержка нашей стороны."""
+        mid = self.mid
+        if mid <= 0:
+            return 0.0
+        floor_price = mid * (1.0 - pct_from_mid)
+        return sum(l.price * l.size for l in self.bids if l.price >= floor_price)
+
+
+class Candidate(BaseModel):
+    """Дешёвый исход, прошедший фильтры первого уровня."""
+
+    market: Market
+    outcome_index: int
+    token_id: str
+    p_mkt: float                      # рыночная цена = имплайд-вероятность
+    book: OrderBook | None = None
+
+    @property
+    def outcome(self) -> str:
+        return self.market.outcomes[self.outcome_index]
+
+    @property
+    def payout_multiple(self) -> float:
+        return 1.0 / self.p_mkt if self.p_mkt > 0 else 0.0
+
+
+class Signal(BaseModel):
+    """Результат одного источника оценки вероятности."""
+
+    name: str
+    p_est: float | None = None        # None = сигнал воздержался
+    confidence: float = 0.0           # 0..1, используется как вес в ансамбле
+    rationale: str = ""
+
+
+class Estimate(BaseModel):
+    """Итоговая оценка кандидата ансамблем сигналов."""
+
+    candidate: Candidate
+    p_mkt: float
+    p_est: float
+    signals: list[Signal] = Field(default_factory=list)
+
+    @property
+    def edge_ratio(self) -> float:
+        return self.p_est / self.p_mkt if self.p_mkt > 0 else 0.0
+
+    def signals_dump(self) -> str:
+        return json.dumps(
+            [s.model_dump() for s in self.signals], ensure_ascii=False, default=str
+        )
+
+
+class TradePlan(BaseModel):
+    """Сделка, одобренная портфельным модулем."""
+
+    estimate: Estimate
+    category: str
+    size_usd: float
+    limit_price_cap: float            # выше этой цены edge исчезает — не платить больше
+
+    @property
+    def token_id(self) -> str:
+        return self.estimate.candidate.token_id
+
+
+class ExecutionResult(BaseModel):
+    status: str                       # filled | resting | skipped | canceled | failed
+    filled_size: float = 0.0
+    avg_price: float = 0.0
+    order_ids: list[str] = Field(default_factory=list)
+    detail: str = ""
+
+
+class Position(BaseModel):
+    token_id: str
+    market_id: str
+    question: str
+    outcome: str
+    category: str
+    size: float
+    avg_price: float
+
+    @property
+    def cost_usd(self) -> float:
+        return self.size * self.avg_price

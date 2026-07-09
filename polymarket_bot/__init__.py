@@ -1,7 +1,10 @@
-"""Polymarket longshot bot — автономные мелкие ставки на дешёвые исходы.
+"""Polymarket longshot bot — барбелл на мисспрайсинге хвостовых исходов.
 
-Скоринг кандидатов, maker-вход, автофиксация прибыли, арбитраж neg-risk
-событий, автопилот с уведомлениями в Telegram.
+Сканер мисспрайсинга: покупает лонгшот только когда собственная оценка
+вероятности существенно выше рыночной цены (p_est / p_mkt >= порога).
+Модули: scanner -> estimator (base rates, когерентность, LLM, momentum)
+-> portfolio (fractional Kelly + лимиты) -> executor (maker-лимитки)
+-> ledger (sqlite, атрибуция PnL) -> monitor (rich + Telegram).
 """
 
-__version__ = "0.2.0"
+__version__ = "1.0.0"
