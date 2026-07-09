@@ -16,3 +16,8 @@ report/_charts_tmp/
 build/
 dist/
 *.manifest
+
+# Polymarket-бот: история ставок и локальный конфиг с личными настройками
+polymarket_bot/data/
+polymarket_bot/config.json
+.env
