@@ -13,15 +13,19 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
 
 from . import backtest as backtest_mod
+from .arbitrage import ArbitrageScanner
 from .clob import ClobReader, Trader
 from .config import BotConfig
+from .crossmarket import CrossMarketScanner
 from .estimator import Estimator
 from .executor import Executor
 from .gamma import GammaClient
 from .ledger import Ledger
 from .logging_setup import setup_logging
-from .models import Estimate
+from .marketmaker import MarketMaker
+from .models import Estimate, Market
 from .monitor import Dashboard, alert
+from .niche import NicheWatcher
 from .portfolio import Portfolio
 from .scanner import Scanner
 
@@ -42,8 +46,21 @@ class Bot:
         self.executor = Executor(cfg, self.ledger, self.clob, self.trader, mode)
         self.dashboard = Dashboard()
         self.errors: list[str] = []
+        # Дополнительные стратегии (карта территории: №1 арбитраж, №3 MM,
+        # №2 кросс-платформенные алерты, №5 нишевые вотчлисты).
+        self.arb = ArbitrageScanner(cfg, self.ledger, self.clob, self.trader, mode)
+        self.mm = MarketMaker(cfg, self.ledger, self.clob, self.trader, mode)
+        self.cross = CrossMarketScanner(cfg)
+        self.niche = NicheWatcher(cfg, self.ledger)
+        # Кэш активных рынков: обновляется основным циклом, быстрые стратегии
+        # берут метаданные отсюда, а точные цены — из живых стаканов CLOB.
+        self.markets_cache: list[Market] = []
 
     def close(self) -> None:
+        try:
+            self.mm.shutdown()   # снять все котировки
+        except Exception:
+            log.exception("mm shutdown")
         self.ledger.close()
 
     # --- один торговый цикл ---
@@ -56,9 +73,15 @@ class Bot:
 
         try:
             markets = self.gamma.fetch_active_markets()
+            self.markets_cache = markets
         except Exception as exc:
             self._error(f"gamma: {exc}")
             return
+
+        try:
+            self.niche.cycle(markets)  # №5: алерты о новых рынках в нишах
+        except Exception as exc:
+            self._error(f"niche: {exc}")
 
         # Марки открытых позиций (нужны для equity/drawdown/выходов).
         positions = self.ledger.open_positions(self.mode)
@@ -178,6 +201,44 @@ class Bot:
         self.errors.append(text)
         log.error(text)
 
+    # --- джобы дополнительных стратегий (свои интервалы, изолированные ошибки) ---
+
+    def arb_job(self) -> None:
+        """№1: neg-risk корзины. Цены проверяются по живым стаканам."""
+        if not self.markets_cache:
+            return
+        try:
+            found = self.arb.cycle(self.markets_cache)
+            for a in found[:3]:
+                alert(f"АРБИТРАЖ {a.side}-корзина «{a.event_title[:60]}»: "
+                      f"+{a.profit_pct * 100:.1f}% на комплект, "
+                      f"глубина {a.max_sets_by_depth()} комплектов"
+                      + ("" if self.cfg.arbitrage.execute else " (execute выключен)"))
+        except Exception:
+            log.exception("arb job")
+
+    def mm_job(self) -> None:
+        """№3: маркет-мейкинг. Не котирует в observe-only (kill-switch общий)."""
+        if not self.markets_cache:
+            return
+        try:
+            if self.portfolio.observe_only():
+                self.mm.shutdown()
+                return
+            self.mm.cycle(self.markets_cache)
+        except Exception:
+            log.exception("mm job")
+
+    def cross_job(self) -> None:
+        """№2: расхождения с внешними площадками — только алерты."""
+        if not self.markets_cache:
+            return
+        try:
+            for d in self.cross.cycle(self.markets_cache):
+                alert(d.describe())
+        except Exception:
+            log.exception("crossmarket job")
+
 
 def est_to_plan(est: Estimate, category: str):
     from .models import TradePlan
@@ -221,6 +282,9 @@ def main(argv: list[str] | None = None) -> None:
     if args.once:
         try:
             bot.cycle()
+            bot.arb_job()
+            bot.mm_job()
+            bot.cross_job()
         finally:
             bot.close()
         return
@@ -238,6 +302,18 @@ def main(argv: list[str] | None = None) -> None:
     scheduler.add_job(bot.cycle, "interval",
                       minutes=cfg.scanner.interval_minutes,
                       max_instances=1, coalesce=True)
+    if cfg.arbitrage.enabled:
+        scheduler.add_job(bot.arb_job, "interval",
+                          seconds=cfg.arbitrage.interval_sec,
+                          max_instances=1, coalesce=True)
+    if cfg.market_maker.enabled:
+        scheduler.add_job(bot.mm_job, "interval",
+                          seconds=cfg.market_maker.interval_sec,
+                          max_instances=1, coalesce=True)
+    if cfg.crossmarket.enabled:
+        scheduler.add_job(bot.cross_job, "interval",
+                          minutes=cfg.crossmarket.interval_min,
+                          max_instances=1, coalesce=True)
     scheduler.start()
     bot.cycle()  # первый цикл сразу
 

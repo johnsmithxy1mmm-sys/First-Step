@@ -228,6 +228,21 @@ class ExecutionResult(BaseModel):
     detail: str = ""
 
 
+def simple_estimate(market: Market, outcome_index: int, price: float) -> Estimate:
+    """Минимальная оценка для сделок не-лонгшот стратегий (арбитраж, MM)."""
+    return Estimate(
+        candidate=Candidate(
+            market=market,
+            outcome_index=outcome_index,
+            token_id=market.clob_token_ids[outcome_index],
+            p_mkt=price,
+        ),
+        p_mkt=price,
+        p_est=price,
+        signals=[],
+    )
+
+
 class Position(BaseModel):
     token_id: str
     market_id: str

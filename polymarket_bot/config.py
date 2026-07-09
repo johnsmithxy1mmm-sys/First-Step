@@ -73,6 +73,68 @@ class ExecutorConfig(BaseModel):
     max_child_order_usd: float = 200.0
 
 
+class ArbitrageConfig(BaseModel):
+    """Стратегия №1: структурный арбитраж neg-risk корзин (YES и NO)."""
+    enabled: bool = True
+    execute: bool = False              # обнаружение+алерт по умолчанию; ордера — явно
+    interval_sec: float = 60.0
+    min_profit_pct: float = 0.015      # минимум 1.5% на комплект (покрывает риск ноги)
+    prefilter_tolerance: float = 0.01  # порог отбора по ценам Gamma (грубее реального)
+    max_stake_usd: float = 300.0
+    min_sets: int = 5
+    max_legs: int = 20
+    max_events_per_cycle: int = 10
+    min_leg_volume_24h_usd: float = 500.0
+
+
+class MarketMakerConfig(BaseModel):
+    """Стратегия №3: маркет-мейкинг + liquidity rewards — база денежного потока."""
+    enabled: bool = False              # включать осознанно: требует капитала на котировки
+    interval_sec: float = 45.0
+    max_markets: int = 8
+    price_lo: float = 0.10             # средние рынки, не хвосты
+    price_hi: float = 0.90
+    min_volume_24h_usd: float = 20_000.0
+    min_days_to_resolution: float = 2.0
+    half_spread: float = 0.01          # полуспред котировки
+    quote_size_usd: float = 50.0       # долларов на каждую сторону каждого рынка
+    inventory_cap_usd: float = 150.0   # кэп перекоса Yes/No на рынок
+    guard_price_move: float = 0.03     # mid сдвинулся сильнее — снять котировки
+    guard_cooldown_cycles: int = 3
+    guard_volume_ratio: float = 0.5    # 24h-объём > 50% всего оборота = новостной шок
+
+
+class CrossMarketConfig(BaseModel):
+    """Стратегия №2: расхождения с другими площадками (алерты, без автоторговли)."""
+    enabled: bool = True
+    interval_min: float = 15.0
+    min_divergence: float = 0.04       # от 4 п.п.
+    min_similarity: float = 0.65       # порог совпадения заголовков (Жаккар)
+    min_volume_24h_usd: float = 10_000.0
+    max_alerts_per_cycle: int = 10
+
+
+class Watchlist(BaseModel):
+    name: str
+    keywords: list[str] = Field(default_factory=list)
+
+
+class NicheConfig(BaseModel):
+    """Стратегия №5: мгновенные алерты о новых рынках в ваших нишах."""
+    enabled: bool = True
+    watchlists: list[Watchlist] = Field(default_factory=lambda: [
+        Watchlist(name="post-soviet", keywords=[
+            "russia", "ukraine", "belarus", "kazakhstan", "armenia", "azerbaijan",
+            "georgia", "moldova", "putin", "zelensky", "lukashenko", "kremlin",
+            "donbas", "crimea", "baltic", "latvia", "lithuania", "estonia",
+        ]),
+        Watchlist(name="crypto", keywords=[
+            "bitcoin", "btc", "ethereum", "eth", "solana", "crypto", "stablecoin",
+            "binance", "coinbase", "tether", "sec etf", "halving", "defi",
+        ]),
+    ])
+
+
 class RuntimeConfig(BaseModel):
     gamma_host: str = "https://gamma-api.polymarket.com"
     clob_host: str = "https://clob.polymarket.com"
@@ -95,6 +157,10 @@ class BotConfig(BaseModel):
     estimator: EstimatorConfig = Field(default_factory=EstimatorConfig)
     portfolio: PortfolioConfig = Field(default_factory=PortfolioConfig)
     executor: ExecutorConfig = Field(default_factory=ExecutorConfig)
+    arbitrage: ArbitrageConfig = Field(default_factory=ArbitrageConfig)
+    market_maker: MarketMakerConfig = Field(default_factory=MarketMakerConfig)
+    crossmarket: CrossMarketConfig = Field(default_factory=CrossMarketConfig)
+    niche: NicheConfig = Field(default_factory=NicheConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     backtest: BacktestConfig = Field(default_factory=BacktestConfig)
 

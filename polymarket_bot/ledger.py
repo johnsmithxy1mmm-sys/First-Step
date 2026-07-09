@@ -32,7 +32,12 @@ CREATE TABLE IF NOT EXISTS trades (
     usd REAL NOT NULL,
     order_id TEXT,
     status TEXT,
+    strategy TEXT DEFAULT 'longshot', -- longshot | arb | mm
     snapshot TEXT                     -- JSON: p_mkt, p_est, edge, signals, book
+);
+CREATE TABLE IF NOT EXISTS seen_markets (
+    market_id TEXT PRIMARY KEY,
+    ts TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS estimates (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -84,7 +89,8 @@ class Ledger:
 
     def record_trade(self, *, mode: str, estimate: Estimate, category: str,
                      side: str, price: float, size: float,
-                     order_id: str | None, status: str) -> None:
+                     order_id: str | None, status: str,
+                     strategy: str = "longshot") -> None:
         c = estimate.candidate
         snapshot = {
             "p_mkt": estimate.p_mkt,
@@ -95,11 +101,11 @@ class Ledger:
         }
         self._conn.execute(
             "INSERT INTO trades (ts, mode, market_id, event_id, question, outcome, "
-            "category, token_id, side, price, size, usd, order_id, status, snapshot) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "category, token_id, side, price, size, usd, order_id, status, strategy, snapshot) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (_now(), mode, c.market.id, c.market.event_id, c.market.question,
              c.outcome, category, c.token_id, side, price, size,
-             round(price * size, 6), order_id, status,
+             round(price * size, 6), order_id, status, strategy,
              json.dumps(snapshot, ensure_ascii=False, default=str)),
         )
         self._conn.commit()
@@ -120,6 +126,16 @@ class Ledger:
             "INSERT OR REPLACE INTO resolutions (token_id, market_id, ts, won, payout_per_share) "
             "VALUES (?,?,?,?,?)",
             (token_id, market_id, _now(), int(won), 1.0 if won else 0.0),
+        )
+        self._conn.commit()
+
+    def seen_market_ids(self) -> set[str]:
+        return {r["market_id"] for r in self._conn.execute("SELECT market_id FROM seen_markets")}
+
+    def mark_markets_seen(self, market_ids: list[str]) -> None:
+        self._conn.executemany(
+            "INSERT OR IGNORE INTO seen_markets (market_id, ts) VALUES (?, ?)",
+            [(mid, _now()) for mid in market_ids],
         )
         self._conn.commit()
 

@@ -45,6 +45,60 @@ executor:
   poll_interval_sec: 5
   max_child_order_usd: 200    # дробление крупных заявок
 
+# Стратегия №1: структурный арбитраж neg-risk корзин.
+# Почти безрисковый, но capacity микроскопический; окна выедаются быстрыми ботами.
+arbitrage:
+  enabled: true
+  execute: false            # true = ставить ордера; false = только находить и алертить
+  interval_sec: 60
+  min_profit_pct: 0.015     # покрывает риск неисполнения ноги
+  prefilter_tolerance: 0.01
+  max_stake_usd: 300
+  min_sets: 5
+  max_legs: 20
+  max_events_per_cycle: 10
+  min_leg_volume_24h_usd: 500
+
+# Стратегия №3: маркет-мейкинг — единственная, где типичный месяц плюс.
+# База денежного потока портфеля. Включать осознанно: держит капитал в котировках.
+market_maker:
+  enabled: false
+  interval_sec: 45
+  max_markets: 8
+  price_lo: 0.10            # котируем средние рынки, не хвосты
+  price_hi: 0.90
+  min_volume_24h_usd: 20000
+  min_days_to_resolution: 2
+  half_spread: 0.01
+  quote_size_usd: 50
+  inventory_cap_usd: 150
+  guard_price_move: 0.03    # защита от adverse selection: снять котировки при шоке
+  guard_cooldown_cycles: 3
+  guard_volume_ratio: 0.5
+
+# Стратегия №2: кросс-платформенные расхождения (Kalshi). Только алерты:
+# правила резолюции площадок сверяет человек.
+crossmarket:
+  enabled: true
+  interval_min: 15
+  min_divergence: 0.04      # от 4 п.п.
+  min_similarity: 0.65
+  min_volume_24h_usd: 10000
+  max_alerts_per_cycle: 10
+
+# Стратегия №5: информационный edge в нише — мгновенные алерты о новых рынках.
+# Вотчлисты редактируйте под свои домены (дефолт: постсоветская геополитика + крипто).
+niche:
+  enabled: true
+  watchlists:
+    - name: post-soviet
+      keywords: [russia, ukraine, belarus, kazakhstan, armenia, azerbaijan,
+                 georgia, moldova, putin, zelensky, lukashenko, kremlin,
+                 donbas, crimea, baltic, latvia, lithuania, estonia]
+    - name: crypto
+      keywords: [bitcoin, btc, ethereum, eth, solana, crypto, stablecoin,
+                 binance, coinbase, tether, sec etf, halving, defi]
+
 runtime:
   gamma_host: https://gamma-api.polymarket.com
   clob_host: https://clob.polymarket.com
