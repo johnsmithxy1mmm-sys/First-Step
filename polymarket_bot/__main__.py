@@ -1,8 +1,10 @@
 """CLI бота: python -m polymarket_bot <команда>.
 
 Команды:
-  scan       — найти дешёвые исходы и показать таблицу кандидатов
-  run        — разместить ставки (по умолчанию dry-run; реальные ордера с --live)
+  scan       — найти и отскорить дешёвые исходы, показать таблицу кандидатов
+  run        — один торговый цикл (по умолчанию dry-run; реальные ордера с --live)
+  auto       — АВТОПИЛОТ: торговые циклы по расписанию, без участия человека
+  arb        — сканер арбитражей neg-risk событий (сумма исходов < $1)
   history    — история ставок бота
   positions  — текущие позиции и PnL кошелька (data-api Polymarket)
 """
@@ -13,14 +15,19 @@ import argparse
 import os
 import sys
 import time
+from datetime import datetime, timezone
+from pathlib import Path
 
 import requests
 
-from . import clob
+from . import autopilot, clob
+from .arb import find_arbs
 from .config import BotConfig
-from .gamma import iter_active_markets
+from .gamma import iter_active_events, iter_active_markets
 from .storage import BetLog
-from .strategy import Candidate, find_candidates, plan_bets
+from .strategy import find_candidates
+
+AUTO_LOG_PATH = Path(__file__).parent / "data" / "auto.log"
 
 
 def _add_common(parser: argparse.ArgumentParser) -> None:
@@ -40,115 +47,105 @@ def _load_config(args: argparse.Namespace) -> BotConfig:
     return cfg
 
 
-def _collect_candidates(cfg: BotConfig, log: BetLog) -> list[Candidate]:
-    print("Сканирую активные рынки Polymarket (это может занять минуту-две)...")
-    markets = list(iter_active_markets(cfg))
-    print(f"Рынков получено: {len(markets)}")
-    candidates = find_candidates(markets, cfg, skip_token_ids=log.live_token_ids())
-    print(f"Кандидатов после фильтров (цена ≤ {cfg.max_price:g}): {len(candidates)}")
-    return candidates
-
-
-def _print_table(rows: list[Candidate], limit: int = 50) -> None:
-    if not rows:
-        print("Ничего не найдено. Попробуйте ослабить фильтры (--max-price, min_liquidity_usd).")
-        return
-    print(f"{'ЦЕНА':>7} {'ИКСЫ':>6} {'ЛИКВ.$':>10} {'ДО КОНЦА':>9}  ИСХОД / ВОПРОС")
-    for c in rows[:limit]:
-        days = "-"
-        if c.end_date is not None:
-            from datetime import datetime, timezone
-            days = f"{(c.end_date - datetime.now(timezone.utc)).days}д"
-        print(f"{c.price:>7.3f} {c.payout_multiple:>5.0f}x {c.liquidity_usd:>10,.0f} {days:>9}  "
-              f"[{c.outcome}] {c.question[:80]}")
-    if len(rows) > limit:
-        print(f"... и ещё {len(rows) - limit}")
+def _make_trader(cfg: BotConfig, live: bool, yes: bool, what: str) -> clob.Trader | None:
+    if not live:
+        print("\n=== DRY-RUN: ордера НЕ размещаются. Для реальной торговли добавьте --live ===\n")
+        return None
+    if not yes:
+        answer = input(f"РЕАЛЬНЫЕ деньги: {what}. Продолжить? [yes/N] ")
+        if answer.strip().lower() not in ("y", "yes"):
+            sys.exit("Отменено.")
+    return clob.Trader(cfg)
 
 
 def cmd_scan(args: argparse.Namespace) -> None:
     cfg = _load_config(args)
     log = BetLog()
-    candidates = _collect_candidates(cfg, log)
-    _print_table(candidates)
+    print("Сканирую активные рынки Polymarket (это может занять минуту-две)...")
+    markets = list(iter_active_markets(cfg))
+    print(f"Рынков получено: {len(markets)}")
+    candidates = find_candidates(markets, cfg, skip_token_ids=log.live_token_ids())
+    print(f"Кандидатов после фильтров (цена ≤ {cfg.max_price:g}): {len(candidates)}\n")
+    if not candidates:
+        print("Ничего не найдено. Попробуйте ослабить фильтры (--max-price, min_liquidity_usd).")
+        return
+    print(f"{'SCORE':>5} {'ЦЕНА':>7} {'ИКСЫ':>6} {'ЛИКВ.$':>10} {'ДО КОНЦА':>9}  ИСХОД / ВОПРОС")
+    for c in candidates[:50]:
+        days = "-"
+        if c.end_date is not None:
+            days = f"{(c.end_date - datetime.now(timezone.utc)).days}д"
+        print(f"{c.score:>5.2f} {c.price:>7.3f} {c.payout_multiple:>5.0f}x "
+              f"{c.liquidity_usd:>10,.0f} {days:>9}  [{c.outcome}] {c.question[:75]}")
+    if len(candidates) > 50:
+        print(f"... и ещё {len(candidates) - 50}")
 
 
 def cmd_run(args: argparse.Namespace) -> None:
     cfg = _load_config(args)
     log = BetLog()
+    budget = autopilot.remaining_budget(cfg, log)
+    trader = _make_trader(
+        cfg, args.live, args.yes,
+        f"до {cfg.max_bets} ордеров на сумму до ${min(budget, cfg.total_budget_usd):,.0f}",
+    )
+    autopilot.run_cycle(cfg, log, trader)
 
-    remaining = cfg.total_budget_usd - log.spent_usd()
-    if remaining < cfg.stake_usd:
-        sys.exit(f"Бюджет исчерпан: потрачено {log.spent_usd():.2f} из {cfg.total_budget_usd:.2f}.")
-    cfg.total_budget_usd = remaining
 
-    candidates = plan_bets(_collect_candidates(cfg, log), cfg)
-    if not candidates:
-        return
+def cmd_auto(args: argparse.Namespace) -> None:
+    cfg = _load_config(args)
+    log = BetLog()
+    trader = _make_trader(
+        cfg, args.live, args.yes,
+        f"автопилот каждые {cfg.auto_interval_min:g} мин, общий бюджет "
+        f"${cfg.total_budget_usd:,.0f}"
+        + (f", дневной ${cfg.daily_budget_usd:,.0f}" if cfg.daily_budget_usd else ""),
+    )
 
-    trader = None
-    if args.live:
-        if not args.yes:
-            total = min(len(candidates) * cfg.stake_usd, cfg.total_budget_usd)
-            answer = input(f"РЕАЛЬНЫЕ ставки: до {len(candidates)} ордеров, "
-                           f"до ${total:,.0f}. Продолжить? [yes/N] ")
-            if answer.strip().lower() not in ("y", "yes"):
-                sys.exit("Отменено.")
-        trader = clob.Trader(cfg)
-    else:
-        print("\n=== DRY-RUN: ордера НЕ размещаются. Для реальной торговли добавьте --live ===\n")
-
-    session = requests.Session()
-    placed = skipped = 0
-    spent = shares_total = 0.0
-    for c in candidates:
-        if spent + cfg.stake_usd > cfg.total_budget_usd:
+    cycle = 0
+    while True:
+        cycle += 1
+        started = datetime.now(timezone.utc)
+        print(f"\n{'=' * 70}\nЦикл #{cycle} — {started.isoformat(timespec='seconds')}\n{'=' * 70}")
+        try:
+            report = autopilot.run_cycle(cfg, log, trader)
+            _append_auto_log(started, report)
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            # Автопилот не умирает: фиксируем и ждём следующего цикла.
+            print(f"Цикл #{cycle} упал: {exc}")
+        if args.once:
+            break
+        try:
+            print(f"Сон {cfg.auto_interval_min:g} мин (Ctrl+C — остановить)...")
+            time.sleep(cfg.auto_interval_min * 60)
+        except KeyboardInterrupt:
+            print("\nОстановлено пользователем.")
             break
 
-        price = c.price
-        if cfg.verify_orderbook:
-            quote = clob.get_best_ask(cfg, c.token_id, session)
-            time.sleep(cfg.request_delay_sec)
-            if quote is None or quote.best_ask > cfg.max_price:
-                skipped += 1
-                continue  # в реальном стакане дешёвой цены нет
-            price = quote.best_ask
 
-        price = clob.round_to_tick(price, c.tick_size)
-        if not cfg.min_price <= price <= cfg.max_price:
-            skipped += 1
-            continue
-        size = clob.shares_for_stake(cfg.stake_usd, price, c.min_order_size)
-        if size <= 0:
-            skipped += 1
-            continue
+def _append_auto_log(started: datetime, report: autopilot.CycleReport) -> None:
+    AUTO_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with AUTO_LOG_PATH.open("a", encoding="utf-8") as fh:
+        fh.write(f"\n--- {started.isoformat(timespec='seconds')} ---\n")
+        fh.write("\n".join(report.lines) + "\n")
 
-        if trader is not None:
-            try:
-                resp = trader.buy_limit(c, price, size)
-            except Exception as exc:  # не роняем всю серию из-за одного рынка
-                print(f"  ОШИБКА [{c.outcome}] {c.question[:60]}: {exc}")
-                skipped += 1
-                continue
-            order_id = (resp or {}).get("orderID")
-            status = (resp or {}).get("status", "unknown")
-            log.record(candidate=c, price=price, size=size, live=True,
-                       order_id=order_id, status=status)
-        else:
-            log.record(candidate=c, price=price, size=size, live=False, status="dry-run")
 
-        placed += 1
-        spent += price * size
-        shares_total += size
-        mult = 1 / price if price else 0
-        print(f"  {'ОРДЕР' if trader else 'ПЛАН '} {price:.3f} x {size:,.0f} шт = "
-              f"${price * size:,.2f} (до {mult:,.0f}x) [{c.outcome}] {c.question[:70]}")
-
-    mode = "размещено ордеров" if trader else "запланировано (dry-run)"
-    print(f"\nИтого {mode}: {placed}, пропущено: {skipped}, задействовано: ${spent:,.2f}")
-    if placed:
-        avg_payout = shares_total / placed  # акция платит $1 при победе
-        print(f"Средний выигрыш одной победившей ставки: ~${avg_payout:,.0f} "
-              f"(окупает ~{avg_payout / cfg.stake_usd:,.0f} сгоревших ставок).")
+def cmd_arb(args: argparse.Namespace) -> None:
+    cfg = _load_config(args)
+    print("Сканирую neg-risk события (сумма всех исходов < $1 = безрисковая прибыль)...")
+    events = list(iter_active_events(cfg))
+    print(f"Событий получено: {len(events)}")
+    arbs = find_arbs(events, cfg)
+    if not arbs:
+        print(f"Арбитражей с маржой ≥ {cfg.arb_min_edge * 100:.0f}% сейчас нет — это нормально, "
+              f"они живут минуты. Держите сканер в цикле auto.")
+        return
+    for a in arbs:
+        print(f"\n«{a.title}»: комплект из {len(a.legs)} исходов за ${a.sum_asks:.3f} "
+              f"→ +{a.edge * 100:.1f}% гарантированно")
+        for leg in a.legs:
+            print(f"    {leg.ask:>6.3f}  {leg.question[:70]}")
 
 
 def cmd_history(args: argparse.Namespace) -> None:
@@ -158,12 +155,15 @@ def cmd_history(args: argparse.Namespace) -> None:
         print("Ставок ещё не было.")
         return
     live = [b for b in bets if b.get("live")]
-    print(f"Всего записей: {len(bets)} (реальных: {len(live)}, dry-run: {len(bets) - len(live)})")
-    print(f"Потрачено реально: ${log.spent_usd():,.2f}")
+    sells = [b for b in bets if b.get("side") == "SELL"]
+    print(f"Всего записей: {len(bets)} (реальных: {len(live)}, dry-run: {len(bets) - len(live)}, "
+          f"продаж: {len(sells)})")
+    print(f"Потрачено реально: ${log.spent_usd():,.2f} (сегодня: ${log.spent_today_usd():,.2f})")
     for b in bets[-30:]:
         tag = "LIVE" if b.get("live") else "dry "
-        print(f"  {b['ts']} [{tag}] {b['price']:.3f} x {b['size']:,.0f} = ${b['usd']:,.2f} "
-              f"[{b['outcome']}] {b['question'][:60]} ({b['status']})")
+        side = b.get("side", "BUY")
+        print(f"  {b['ts']} [{tag}] {side} {b['price']:.3f} x {b['size']:,.0f} = ${b['usd']:,.2f} "
+              f"[{b['outcome']}] {b['question'][:55]} ({b['status']})")
 
 
 def cmd_positions(args: argparse.Namespace) -> None:
@@ -171,10 +171,7 @@ def cmd_positions(args: argparse.Namespace) -> None:
     if not address:
         sys.exit("Укажите адрес: --address 0x... или переменную POLYMARKET_FUNDER.")
     cfg = _load_config(args)
-    resp = requests.get(f"{cfg.data_api_host}/positions",
-                        params={"user": address, "limit": 500}, timeout=30)
-    resp.raise_for_status()
-    positions = resp.json()
+    positions = autopilot.fetch_positions(cfg, address, requests.Session())
     if not positions:
         print("Открытых позиций нет.")
         return
@@ -196,15 +193,26 @@ def main(argv: list[str] | None = None) -> None:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_scan = sub.add_parser("scan", help="показать кандидатов без ставок")
+    p_scan = sub.add_parser("scan", help="показать кандидатов со скорами, без ставок")
     _add_common(p_scan)
     p_scan.set_defaults(func=cmd_scan)
 
-    p_run = sub.add_parser("run", help="разместить ставки (dry-run по умолчанию)")
+    p_run = sub.add_parser("run", help="один торговый цикл (dry-run по умолчанию)")
     _add_common(p_run)
     p_run.add_argument("--live", action="store_true", help="реальные ордера вместо dry-run")
     p_run.add_argument("--yes", action="store_true", help="не спрашивать подтверждение в --live")
     p_run.set_defaults(func=cmd_run)
+
+    p_auto = sub.add_parser("auto", help="автопилот: циклы по расписанию")
+    _add_common(p_auto)
+    p_auto.add_argument("--live", action="store_true", help="реальные ордера вместо dry-run")
+    p_auto.add_argument("--yes", action="store_true", help="не спрашивать подтверждение в --live")
+    p_auto.add_argument("--once", action="store_true", help="один цикл и выход (для cron)")
+    p_auto.set_defaults(func=cmd_auto)
+
+    p_arb = sub.add_parser("arb", help="сканер арбитражей neg-risk событий")
+    _add_common(p_arb)
+    p_arb.set_defaults(func=cmd_arb)
 
     p_hist = sub.add_parser("history", help="история ставок бота")
     p_hist.set_defaults(func=cmd_history)

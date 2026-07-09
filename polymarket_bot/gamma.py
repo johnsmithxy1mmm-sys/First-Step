@@ -40,6 +40,47 @@ def iter_active_markets(cfg: BotConfig, session: requests.Session | None = None)
         time.sleep(cfg.request_delay_sec)
 
 
+def iter_active_events(cfg: BotConfig, session: requests.Session | None = None) -> Iterator[dict]:
+    """Постранично отдаёт активные события (группы рынков) — нужны для арбитража."""
+    session = session or requests.Session()
+    offset = 0
+    for _ in range(MAX_PAGES):
+        resp = session.get(
+            f"{cfg.gamma_host}/events",
+            params={
+                "active": "true",
+                "closed": "false",
+                "limit": PAGE_SIZE,
+                "offset": offset,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        batch = resp.json()
+        if not batch:
+            return
+        yield from batch
+        if len(batch) < PAGE_SIZE:
+            return
+        offset += PAGE_SIZE
+        time.sleep(cfg.request_delay_sec)
+
+
+def market_by_token(cfg: BotConfig, token_id: str,
+                    session: requests.Session | None = None) -> dict | None:
+    """Находит рынок по ID токена CLOB (нужно при продаже позиции: тик, neg-risk)."""
+    session = session or requests.Session()
+    resp = session.get(
+        f"{cfg.gamma_host}/markets",
+        params={"clob_token_ids": token_id},
+        timeout=30,
+    )
+    if resp.status_code != 200:
+        return None
+    markets = resp.json()
+    return markets[0] if markets else None
+
+
 def parse_json_list(value) -> list:
     """Gamma отдаёт outcomes/outcomePrices/clobTokenIds строками с JSON внутри."""
     if value is None:
