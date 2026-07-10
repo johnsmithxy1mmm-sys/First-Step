@@ -80,3 +80,29 @@ def test_niche_crypto_watchlist(cfg, ledger):
     with mock.patch("polymarket_bot.niche.alert"):
         hits = watcher.cycle([btc])
     assert hits[0][0] == "crypto"
+
+
+def test_niche_matches_whole_words_only(cfg, ledger):
+    """Баг из живого прогона: 'eth' ловил 'Hegseth' как подстроку."""
+    watcher = NicheWatcher(cfg, ledger)
+    hegseth = make_market(
+        id="h1", question="Will Pete Hegseth win the 2028 US Presidential Election?")
+    eth = make_market(id="h2", question="Will ETH close above $10k this year?")
+    with mock.patch("polymarket_bot.niche.alert"):
+        hits = watcher.cycle([hegseth, eth])
+    assert [(name, m.id) for name, m in hits] == [("crypto", "h2")]
+
+
+def test_niche_survives_market_without_end_date(cfg, ledger):
+    """Баг из живого прогона: рынок без даты ронял цикл, пометка «увиден» терялась."""
+    watcher = NicheWatcher(cfg, ledger)
+    dateless = make_market(id="d1", question="Will Ukraine join the EU?",
+                           end_date=None)
+    with mock.patch("polymarket_bot.niche.alert"):
+        hits = watcher.cycle([dateless])
+    assert [(name, m.id) for name, m in hits] == [("post-soviet", "d1")]
+    assert "d1" in ledger.seen_market_ids()   # рынок помечен несмотря ни на что
+    # Повторный цикл — тишина, дублей нет.
+    with mock.patch("polymarket_bot.niche.alert") as alert_mock:
+        assert watcher.cycle([dateless]) == []
+    alert_mock.assert_not_called()
