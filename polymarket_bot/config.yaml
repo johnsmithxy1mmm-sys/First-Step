@@ -59,22 +59,74 @@ arbitrage:
   max_events_per_cycle: 10
   min_leg_volume_24h_usd: 500
 
-# Стратегия №3: маркет-мейкинг — единственная, где типичный месяц плюс.
-# База денежного потока портфеля. Включать осознанно: держит капитал в котировках.
+# ЯДРО (80% капитала): маркет-мейкинг + liquidity rewards farming.
+# Три потока дохода: спред + maker rebate + дневной rewards-пул.
 market_maker:
-  enabled: false
-  interval_sec: 45
-  max_markets: 8
-  price_lo: 0.10            # котируем средние рынки, не хвосты
-  price_hi: 0.90
-  min_volume_24h_usd: 20000
-  min_days_to_resolution: 2
+  enabled: false            # включать после Фазы 1-3 (dry-run -> paper)
+  interval_sec: 30
+  max_markets: 5
+  min_volume_24h_usd: 50000
+  min_days_to_resolution: 30
+  require_rewards_program: true
+  max_daily_midpoint_move: 0.05
   half_spread: 0.01
-  quote_size_usd: 50
-  inventory_cap_usd: 150
-  guard_price_move: 0.03    # защита от adverse selection: снять котировки при шоке
+  quote_size_usd: 10
+  inventory_skew_k: 0.5     # главный механизм риска: сдвиг fair против инвентаря
+  requote_threshold_ticks: 2  # гистерезис: не жечь rate limit и rewards-сэмплинг
+  requote_timer_sec: 120
+  guard_price_move: 0.03    # adverse selection: снять котировки при шоке
   guard_cooldown_cycles: 3
   guard_volume_ratio: 0.5
+
+# Риск-фреймворк: абсолютные лимиты, kill-switch (halt до ручного рестарта).
+risk:
+  max_position_per_market_usd: 50
+  max_global_exposure_usd: 300
+  max_daily_loss_usd: 25
+  max_drawdown_pct: 0.15
+  min_edge_after_fees: 0.01
+  reconcile_interval_sec: 60
+  ws_staleness_kill_sec: 10
+
+# Fee Structure V2 (март 2026): maker платит 0 и получает rebate.
+# ПРОВЕРЯЙТЕ актуальность на docs.polymarket.com (Фаза 0).
+fees:
+  taker:
+    crypto: 0.07
+    sports: 0.03
+    finance: 0.04
+    politics: 0.04
+    tech: 0.04
+    economics: 0.05
+    culture: 0.05
+    weather: 0.05
+    geopolitics: 0.0
+    other: 0.04
+  maker_rebate_frac: 0.35
+
+# WS-стаканы: авто-reconnect, heartbeat, gap-detect (>10с -> снять котировки).
+ws:
+  enabled: true
+  url: wss://ws-subscriptions-clob.polymarket.com/ws/market
+  ping_interval_sec: 10
+
+ratelimit:
+  orders_per_sec: 20
+  orders_burst: 100
+  reads_per_sec: 30
+  reads_burst: 100
+
+# САТЕЛЛИТ (20%): T-10s TA на 5-мин BTC up/down. По умолчанию ВЫКЛЮЧЕН.
+satellite:
+  enabled: false
+  slug_template: "btc-updown-5m-{ts}"
+  window_sec: 300
+  entry_from_sec: 30
+  entry_to_sec: 10
+  edge_threshold: 0.05
+  kelly_fraction: 0.25      # quarter-Kelly
+  max_bet_usd: 10
+  candles_url: "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=30"
 
 # Стратегия №2: кросс-платформенные расхождения (Kalshi). Только алерты:
 # правила резолюции площадок сверяет человек.

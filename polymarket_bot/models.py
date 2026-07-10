@@ -34,6 +34,11 @@ def _num(raw: dict, *keys: str) -> float:
     return 0.0
 
 
+def _normalize_spread(value: float) -> float:
+    """Gamma отдаёт rewardsMaxSpread в центах (3.5) — приводим к вероятности."""
+    return value / 100.0 if value > 1.0 else value
+
+
 def _parse_dt(value: Any) -> datetime | None:
     if not value:
         return None
@@ -69,6 +74,9 @@ class Market(BaseModel):
     min_order_size: float = 5.0
     resolution_source: str = ""
     closed: bool = False
+    # Liquidity Rewards Program: параметры отдаёт Gamma — не хардкодим.
+    rewards_min_size: float = 0.0     # минимальный размер котировки для rewards
+    rewards_max_spread: float = 0.0   # макс. отклонение от midpoint (в вероятности)
     # Контекст события (группы рынков) — нужен кросс-рыночной когерентности.
     event_id: str = ""
     event_title: str = ""
@@ -108,10 +116,16 @@ class Market(BaseModel):
             min_order_size=_num(raw, "orderMinSize") or 5.0,
             resolution_source=raw.get("resolutionSource") or "",
             closed=bool(raw.get("closed", False)),
+            rewards_min_size=_num(raw, "rewardsMinSize"),
+            rewards_max_spread=_normalize_spread(_num(raw, "rewardsMaxSpread")),
             event_id=str(event.get("id", "")),
             event_title=event.get("title") or "",
             event_neg_risk=bool(event.get("negRisk", False)),
         )
+
+    @property
+    def in_rewards_program(self) -> bool:
+        return self.rewards_min_size > 0 and self.rewards_max_spread > 0
 
     def days_to_resolution(self, now: datetime | None = None) -> float | None:
         if self.end_date is None:

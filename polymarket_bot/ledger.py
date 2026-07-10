@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -77,10 +78,14 @@ class Ledger:
     def __init__(self, db_path: str | Path):
         path = Path(db_path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(path))
+        # check_same_thread=False + лок: в леджер пишут и основной цикл,
+        # и websocket-поток fastlane (мгновенные входы/выходы).
+        self._conn = sqlite3.connect(str(path), check_same_thread=False, timeout=30)
         self._conn.row_factory = sqlite3.Row
-        self._conn.executescript(SCHEMA)
-        self._conn.commit()
+        self._lock = threading.RLock()
+        with self._lock:
+            self._conn.executescript(SCHEMA)
+            self._conn.commit()
 
     def close(self) -> None:
         self._conn.close()
@@ -238,6 +243,44 @@ class Ledger:
                 payout = remaining * (1.0 if slot["won"] else 0.0)
                 pnl += payout - avg * remaining                    # реализовано резолюцией
         return pnl
+
+    def first_bank_equity_since(self, ts_iso: str) -> float | None:
+        """Первый снапшот equity после отметки времени (для дневного стопа)."""
+        row = self._conn.execute(
+            "SELECT equity FROM bank WHERE ts >= ? ORDER BY id LIMIT 1", (ts_iso,)
+        ).fetchone()
+        return float(row["equity"]) if row else None
+
+    def realized_pnl_by_strategy(self, mode: str) -> dict[str, float]:
+        """Реализованный PnL по стратегиям (для аллокации и атрибуции)."""
+        rows = self._conn.execute(
+            "SELECT t.token_id, t.side, t.size, t.usd, t.strategy, r.won "
+            "FROM trades t LEFT JOIN resolutions r ON r.token_id = t.token_id "
+            "WHERE t.mode = ? AND t.status != 'failed' ORDER BY t.id", (mode,)
+        ).fetchall()
+        per_token: dict[str, dict] = defaultdict(
+            lambda: {"buy_size": 0.0, "buy_usd": 0.0, "sell_usd": 0.0,
+                     "sell_size": 0.0, "won": None, "strategy": "longshot"})
+        for r in rows:
+            slot = per_token[r["token_id"]]
+            slot["strategy"] = r["strategy"] or slot["strategy"]
+            if r["side"] == "BUY":
+                slot["buy_size"] += r["size"]
+                slot["buy_usd"] += r["usd"]
+            else:
+                slot["sell_size"] += r["size"]
+                slot["sell_usd"] += r["usd"]
+            if r["won"] is not None:
+                slot["won"] = bool(r["won"])
+        out: dict[str, float] = defaultdict(float)
+        for slot in per_token.values():
+            avg = slot["buy_usd"] / slot["buy_size"] if slot["buy_size"] > 0 else 0.0
+            pnl = slot["sell_usd"] - avg * slot["sell_size"]
+            if slot["won"] is not None:
+                remaining = max(slot["buy_size"] - slot["sell_size"], 0.0)
+                pnl += remaining * (1.0 if slot["won"] else 0.0) - avg * remaining
+            out[slot["strategy"]] += pnl
+        return dict(out)
 
     def high_water_mark(self) -> float:
         row = self._conn.execute("SELECT MAX(hwm) AS hwm FROM bank").fetchone()

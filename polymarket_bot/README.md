@@ -6,10 +6,21 @@ Production-grade автономный бот для Polymarket: базовая �
 
 | # | Стратегия | Модуль | Режим по умолчанию |
 |---|---|---|---|
-| 1 | Структурный арбитраж neg-risk корзин (YES и NO) | `arbitrage.py` | детекция + алерт (`execute: false`) |
+| **ЯДРО** | **MM + liquidity rewards farming** (microprice, inventory skew, requote-гистерезис, rewards-диапазон из Gamma, fee-aware спред) | `marketmaker.py` + `scorer.py` | выключен — включать после фаз dry-run → paper |
+| сателлит | T-10s TA на 5-мин BTC up/down (детерминированные слаги, quarter-Kelly, FOK) | `satellite.py` | **выключен** (`satellite.enabled: false`) |
+| 1 | Структурный арбитраж neg-risk корзин | `arbitrage.py` | детекция + алерт (наивный sum-to-one по REST задокументированно выеден — исполнение не рекомендовано) |
 | 2 | Кросс-платформенные расхождения (Kalshi) | `crossmarket.py` | только алерты — правила резолюции сверяет человек |
-| 3 | Маркет-мейкинг + liquidity rewards, guard от adverse selection | `marketmaker.py` | выключен (`enabled: false`) — включать осознанно |
-| 5 | Нишевые вотчлисты (постсоветская геополитика, крипто) | `niche.py` | мгновенные алерты о новых рынках с правилами резолюции |
+| 5 | Нишевые вотчлисты + лонгшот-барбелл | `niche.py`, `scanner.py`+`estimator/` | алерты; лонгшоты в dry-run |
+
+Инфраструктура (мастер-промпт 2026): `ws_feed.py` — WS-стаканы с reconnect/
+heartbeat/gap-detect; `risk.py` — kill-switch (дневной стоп, просадка от HWM,
+WS-disconnect >10с, reconcile-рассинхрон каждые 60с → bulk-cancel + halt);
+`fees.py` — Fee Structure V2 по категориям (maker rebate, конфигурируемо);
+`ratelimit.py` — token bucket; `replay.py` — запись стаканов + бэктест-реплей.
+
+**Порядок фаз: `--mode dry-run` → `--mode paper` (≥7 дней) → `--mode live`
+(только вручную). Фаза 0: `python -m polymarket_bot.phase0_smoke` на вашей
+машине — сверка живого API (эндпоинты, rewards-поля, версия SDK) с config.yaml.**
 
 Все стратегии работают в одном процессе на своих интервалах, пишут в общий
 леджер (колонка `strategy` — раздельная атрибуция PnL) и подчиняются общему

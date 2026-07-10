@@ -1,117 +1,167 @@
-"""Маркет-мейкер: котировки, guard от adverse selection, инвентарь, dry-run."""
+"""MM-ядро: microprice, skew, гистерезис, rewards-диапазон, guard, paper-филлы."""
 
 from unittest import mock
 
 import pytest
 
 from polymarket_bot.marketmaker import MarketMaker
-from polymarket_bot.models import BookLevel, OrderBook, simple_estimate
+from polymarket_bot.models import simple_estimate
+from polymarket_bot.ws_feed import TopOfBook
 
 from .conftest import make_market
 
 
-def mid_market(**overrides):
+def mm_market(**overrides):
     defaults = dict(
-        id="mm1", question="Will the Fed cut rates in September?",
+        id="mm1", question="Will the Democrats win the Senate midterms?",
         outcome_prices=[0.45, 0.55],
         clob_token_ids=["mm1-yes", "mm1-no"],
-        volume_24h_usd=50_000, volume_usd=1_000_000,
+        volume_24h_usd=100_000, volume_usd=5_000_000,
+        rewards_min_size=20.0, rewards_max_spread=0.03,
+        end_date=None,
     )
     defaults.update(overrides)
+    from datetime import datetime, timedelta, timezone
+    if defaults.get("end_date") is None:
+        defaults["end_date"] = datetime.now(timezone.utc) + timedelta(days=90)
     return make_market(**defaults)
 
 
-def book(bid=0.43, ask=0.47) -> OrderBook:
-    return OrderBook(bids=[BookLevel(price=bid, size=5000)],
-                     asks=[BookLevel(price=ask, size=5000)])
+def top(bid=0.43, ask=0.47, bid_size=1000.0, ask_size=1000.0) -> TopOfBook:
+    return TopOfBook(bid=bid, bid_size=bid_size, ask=ask, ask_size=ask_size, ts=1.0)
 
 
-def make_mm(cfg, ledger, trader=None) -> MarketMaker:
+def make_mm(cfg, ledger, mode="dry-run", tops=None) -> MarketMaker:
     cfg.market_maker.enabled = True
     clob = mock.Mock()
-    clob.order_book.return_value = book()
-    return MarketMaker(cfg, ledger, clob, trader,
-                       "live" if trader else "dry-run")
+    clob.order_book.return_value = None
+    source = (lambda t: tops.get(t)) if tops is not None else None
+    return MarketMaker(cfg, ledger, clob, None, mode, top_source=source)
 
 
-def test_selects_liquid_mid_markets_only(cfg, ledger):
+# --- fair value и котировки ---
+
+def test_microprice_weighs_by_sizes():
+    t = top(bid=0.40, ask=0.50, bid_size=3000, ask_size=1000)
+    # Тяжёлый бид тянет microprice вверх: (0.40*1000 + 0.50*3000) / 4000 = 0.475
+    assert t.microprice == pytest.approx(0.475)
+
+
+def test_quote_symmetric_within_rewards_band(cfg, ledger):
     mm = make_mm(cfg, ledger)
-    tail = mid_market(id="t", outcome_prices=[0.02, 0.98])
-    illiquid = mid_market(id="i", volume_24h_usd=100)
-    good = mid_market()
-    selected = mm.select_markets([tail, illiquid, good])
-    assert [m.id for m in selected] == ["mm1"]
-
-
-def test_quote_symmetric_and_non_crossing(cfg, ledger):
-    mm = make_mm(cfg, ledger)
-    quote = mm.compute_quote(mid_market(), book(bid=0.43, ask=0.47))  # mid 0.45
+    m = mm_market()
+    quote = mm.compute_quote(m, top())  # microprice = mid = 0.45
     assert quote is not None
-    assert quote.yes_bid == pytest.approx(0.44)          # mid - 0.01
-    assert quote.no_bid == pytest.approx(1 - 0.46)       # 1 - (mid + 0.01)
-    assert quote.captured_spread == pytest.approx(0.02)  # прибыль пары = полный спред
-    assert quote.yes_bid < 0.47                          # не пересекаем ask
+    assert quote.yes_bid == pytest.approx(0.44)
+    assert quote.implied_yes_ask == pytest.approx(0.46)
+    # Полуспред внутри reward-диапазона (0.03 * 0.9).
+    assert quote.captured_spread / 2 <= m.rewards_max_spread * 0.9 + 1e-9
+    # Размер не меньше rewards_min_size (иначе не засчитается).
+    assert quote.size >= m.rewards_min_size
 
 
-def test_no_quote_when_spread_too_tight(cfg, ledger):
+def test_quote_respects_fee_breakeven(cfg, ledger):
+    # Категория geopolitics: taker fee 0 -> rebate 0 -> полуспред >= min_edge/2.
+    cfg.risk.min_edge_after_fees = 0.02
+    cfg.market_maker.half_spread = 0.001
     mm = make_mm(cfg, ledger)
-    # Книжный спред 0.002 < наш полуспред 0.01: зарабатывать нечего.
-    assert mm.compute_quote(mid_market(), book(bid=0.449, ask=0.451)) is None
+    m = mm_market(question="Will NATO invoke Article 5 over the invasion?")
+    quote = mm.compute_quote(m, top())
+    assert quote is not None
+    assert quote.captured_spread >= 0.02 - 1e-9
 
 
-def test_guard_on_price_jump(cfg, ledger):
+def test_inventory_skew_shifts_both_quotes_down(cfg, ledger):
     mm = make_mm(cfg, ledger)
-    m = mid_market()
-    assert not mm.guard_blocks(m, book(bid=0.43, ask=0.47))   # первый замер
-    assert mm.guard_blocks(m, book(bid=0.48, ask=0.52))       # mid +0.05 >= 0.03
-    # Cooldown держится заданное число циклов.
-    for _ in range(cfg.market_maker.guard_cooldown_cycles):
-        assert mm.guard_blocks(m, book(bid=0.48, ask=0.52))
-    assert not mm.guard_blocks(m, book(bid=0.48, ask=0.52))
-
-
-def test_guard_on_volume_spike(cfg, ledger):
-    mm = make_mm(cfg, ledger)
-    shocked = mid_market(volume_24h_usd=600_000, volume_usd=1_000_000)  # 60% за сутки
-    assert mm.guard_blocks(shocked, book())
-
-
-def test_inventory_cap_disables_heavy_side(cfg, ledger):
-    cfg.market_maker.inventory_cap_usd = 100.0
-    mm = make_mm(cfg, ledger)
-    m = mid_market()
-    assert mm.sides_allowed(m) == (True, True)
-    # Накопили Yes на $150 (> кэпа): бид на Yes выключается, No остаётся.
+    m = mm_market()
+    base = mm.compute_quote(m, top())
+    # Накопили длинный Yes на весь лимит -> fair сдвигается вниз.
     ledger.record_trade(mode="dry-run", estimate=simple_estimate(m, 0, 0.45),
-                        category="mm", side="BUY", price=0.45, size=333.4,
+                        category="mm", side="BUY",
+                        price=0.45, size=cfg.risk.max_position_per_market_usd / 0.45,
+                        order_id=None, status="filled", strategy="mm")
+    skewed = mm.compute_quote(m, top())
+    assert skewed is not None
+    assert skewed.yes_bid < base.yes_bid          # бид ниже
+    assert skewed.implied_yes_ask < base.implied_yes_ask  # ask агрессивнее
+
+
+def test_requote_hysteresis(cfg, ledger):
+    cfg.market_maker.requote_timer_sec = 9999
+    mm = make_mm(cfg, ledger)
+    m = mm_market()
+    assert mm.needs_requote(m, top())             # котировки ещё нет
+    quote = mm.compute_quote(m, top())
+    mm._quotes[m.id] = quote
+    # Fair сдвинулся меньше 2 тиков — НЕ переставляем (гистерезис).
+    assert not mm.needs_requote(m, top(bid=0.431, ask=0.471))
+    # Сдвиг больше порога — переставляем.
+    assert mm.needs_requote(m, top(bid=0.45, ask=0.49))
+
+
+def test_sides_disabled_at_position_cap(cfg, ledger):
+    mm = make_mm(cfg, ledger)
+    m = mm_market()
+    assert mm.sides_allowed(m) == (True, True)
+    ledger.record_trade(mode="dry-run", estimate=simple_estimate(m, 0, 0.45),
+                        category="mm", side="BUY",
+                        price=0.45, size=(cfg.risk.max_position_per_market_usd + 10) / 0.45,
                         order_id=None, status="filled", strategy="mm")
     quote_yes, quote_no = mm.sides_allowed(m)
     assert not quote_yes and quote_no
 
 
-def test_dry_run_places_no_orders(cfg, ledger):
+def test_guard_on_midpoint_jump(cfg, ledger):
     mm = make_mm(cfg, ledger)
-    quotes = mm.cycle([mid_market()])
+    m = mm_market()
+    assert not mm.guard_blocks(m, top(bid=0.43, ask=0.47))
+    assert mm.guard_blocks(m, top(bid=0.48, ask=0.52))     # скачок >= 0.03
+    for _ in range(cfg.market_maker.guard_cooldown_cycles):
+        assert mm.guard_blocks(m, top(bid=0.48, ask=0.52))  # cooldown
+    assert not mm.guard_blocks(m, top(bid=0.48, ask=0.52))
+
+
+def test_extreme_midpoint_requires_two_sided_or_exit(cfg, ledger):
+    tops = {"mm1-yes": top(bid=0.94, ask=0.96), "mm1-no": top(bid=0.04, ask=0.06)}
+    mm = make_mm(cfg, ledger, tops=tops)
+    m = mm_market(outcome_prices=[0.95, 0.05], one_day_price_change=0.0)
+    # Перекошенный инвентарь: разрешена одна сторона -> при mid>0.90 покидаем рынок.
+    ledger.record_trade(mode="dry-run", estimate=simple_estimate(m, 0, 0.95),
+                        category="mm", side="BUY",
+                        price=0.95, size=(cfg.risk.max_position_per_market_usd + 10) / 0.95,
+                        order_id=None, status="filled", strategy="mm")
+    with mock.patch.object(mm._scorer, "top_markets", return_value=[m]), \
+         mock.patch.object(mm._scorer, "eligible", return_value=True):
+        quotes = mm.cycle([m])
+    assert quotes == []
+    assert m.id not in mm._quotes
+
+
+# --- paper-режим ---
+
+def test_paper_fill_when_market_trades_through(cfg, ledger):
+    tops = {"mm1-yes": top(bid=0.43, ask=0.47), "mm1-no": top(bid=0.53, ask=0.57)}
+    mm = make_mm(cfg, ledger, mode="paper", tops=tops)
+    m = mm_market()
+    quote = mm.compute_quote(m, tops["mm1-yes"])
+    mm._quotes[m.id] = quote
+
+    mm._paper_fills()                             # ask 0.47 > бид 0.44 — нет филла
+    assert ledger.open_positions("paper") == []
+
+    tops["mm1-yes"] = top(bid=0.42, ask=0.44)     # рынок проторговался в наш бид
+    mm._paper_fills()
+    positions = ledger.open_positions("paper")
+    assert len(positions) == 1
+    assert positions[0].avg_price == pytest.approx(quote.yes_bid)
+
+
+def test_dry_run_never_places_orders(cfg, ledger):
+    tops = {"mm1-yes": top(), "mm1-no": top(bid=0.53, ask=0.57)}
+    mm = make_mm(cfg, ledger, tops=tops)
+    m = mm_market()
+    with mock.patch.object(mm._scorer, "top_markets", return_value=[m]), \
+         mock.patch.object(mm._scorer, "eligible", return_value=True):
+        quotes = mm.cycle([m])
     assert len(quotes) == 1
-    assert mm._orders == {}                       # ордеров нет — только лог
-
-
-def test_live_cancel_replace_and_fill_sync(cfg, ledger):
-    trader = mock.Mock()
-    trader.buy_limit.side_effect = [{"orderID": f"o{i}"} for i in range(10)]
-    trader.order_status.return_value = {"status": "live", "size_matched": 40.0}
-    mm = make_mm(cfg, ledger, trader=trader)
-    m = mid_market()
-
-    mm.cycle([m])
-    assert trader.buy_limit.call_count == 2       # Yes-бид + No-бид
-    assert len(mm._orders[m.id]) == 2
-
-    mm.cycle([m])                                 # второй цикл: sync fills + cancel-replace
-    assert trader.cancel.call_count == 2          # старые котировки сняты
-    fills = [p for p in ledger.open_positions("live")]
-    assert len(fills) == 2                        # частичные исполнения записаны
-    assert all(p.size == pytest.approx(40.0) for p in fills)
-
-    mm.shutdown()
-    assert trader.cancel.call_count == 4          # свежие котировки тоже сняты
+    assert mm._orders == {}                       # намерения логируются, ордеров нет

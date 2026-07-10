@@ -87,37 +87,62 @@ class Trader:
             raise SystemExit("POLYMARKET_PRIVATE_KEY не задан (см. .env.example)")
         funder = os.environ.get("POLYMARKET_FUNDER")
         signature_type = int(os.environ.get("POLYMARKET_SIGNATURE_TYPE", "0"))
-        if signature_type in (1, 2) and not funder:
-            raise SystemExit("Для signature_type 1/2 требуется POLYMARKET_FUNDER")
+        if signature_type in (1, 2, 3) and not funder:
+            raise SystemExit("Для signature_type 1/2/3 требуется POLYMARKET_FUNDER")
 
-        kwargs: dict = dict(key=private_key, chain_id=cfg.runtime.chain_id,
-                            signature_type=signature_type)
-        if funder:
-            kwargs["funder"] = funder
-        self._client = ClobClient(cfg.runtime.clob_host, **kwargs)
-        self._client.set_api_creds(self._client.create_or_derive_api_creds())
+        def build(sig_type: int):
+            kwargs: dict = dict(key=private_key, chain_id=cfg.runtime.chain_id,
+                                signature_type=sig_type)
+            if funder:
+                kwargs["funder"] = funder
+            client = ClobClient(cfg.runtime.clob_host, **kwargs)
+            client.set_api_creds(client.create_or_derive_api_creds())
+            return client
+
+        # Известный баг: sigtype 3 (deposit wallets / POLY_1271) в SDK может
+        # работать некорректно — при падении откатываемся на sigtype 2.
+        try:
+            self._client = build(signature_type)
+        except Exception as exc:
+            if signature_type == 3:
+                log.warning("signature_type=3 упал (%s) — fallback на 2 (proxy)", exc)
+                signature_type = 2
+                self._client = build(signature_type)
+            else:
+                raise
+        self.signature_type = signature_type
+        log.info("Trader: режим подписи signature_type=%d, funder=%s",
+                 signature_type, (funder or "-")[:12])
         self._data_api = cfg.runtime.data_api_host
         self._funder = funder
 
     def _limit_order(self, side, token_id: str, price: float, size: float,
-                     neg_risk: bool) -> dict:
+                     neg_risk: bool, order_type: str = "GTC") -> dict:
         from py_clob_client.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
 
         args = OrderArgs(price=price, size=size, side=side, token_id=token_id)
         options = PartialCreateOrderOptions(neg_risk=True) if neg_risk else None
         signed = self._client.create_order(args, options)
-        return self._client.post_order(signed, OrderType.GTC) or {}
+        # Маркет-ордеров на платформе нет: агрессивные ноги — FOK/IOC-лимитки.
+        ot = getattr(OrderType, order_type, OrderType.GTC)
+        return self._client.post_order(signed, ot) or {}
 
-    def buy_limit(self, token_id: str, price: float, size: float, neg_risk: bool = False) -> dict:
+    def buy_limit(self, token_id: str, price: float, size: float,
+                  neg_risk: bool = False, order_type: str = "GTC") -> dict:
         from py_clob_client.order_builder.constants import BUY
-        return self._limit_order(BUY, token_id, price, size, neg_risk)
+        return self._limit_order(BUY, token_id, price, size, neg_risk, order_type)
 
-    def sell_limit(self, token_id: str, price: float, size: float, neg_risk: bool = False) -> dict:
+    def sell_limit(self, token_id: str, price: float, size: float,
+                   neg_risk: bool = False, order_type: str = "GTC") -> dict:
         from py_clob_client.order_builder.constants import SELL
-        return self._limit_order(SELL, token_id, price, size, neg_risk)
+        return self._limit_order(SELL, token_id, price, size, neg_risk, order_type)
 
     def cancel(self, order_id: str) -> None:
         self._client.cancel(order_id)
+
+    def cancel_all(self) -> None:
+        """Bulk-cancel всех ордеров (аварийное действие kill-switch)."""
+        self._client.cancel_all()
 
     def order_status(self, order_id: str) -> dict:
         """{'status': 'LIVE'|'MATCHED'|'CANCELED'..., 'size_matched': float}."""

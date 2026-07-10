@@ -8,6 +8,7 @@ import os
 import signal
 import sys
 import threading
+from pathlib import Path
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
@@ -27,7 +28,10 @@ from .models import Estimate, Market
 from .monitor import Dashboard, alert
 from .niche import NicheWatcher
 from .portfolio import Portfolio
+from .risk import KillSwitch
+from .satellite import BTC5mSatellite
 from .scanner import Scanner
+from .ws_feed import WSFeed
 
 log = logging.getLogger(__name__)
 
@@ -46,21 +50,45 @@ class Bot:
         self.executor = Executor(cfg, self.ledger, self.clob, self.trader, mode)
         self.dashboard = Dashboard()
         self.errors: list[str] = []
-        # Дополнительные стратегии (карта территории: №1 арбитраж, №3 MM,
-        # №2 кросс-платформенные алерты, №5 нишевые вотчлисты).
+        # WS-фид стаканов: «мгновенно» для MM и выходов; gap-detect → kill-switch.
+        self.ws: WSFeed | None = None
+        if cfg.ws.enabled:
+            self.ws = WSFeed(cfg.ws.url,
+                             on_disconnect=self._on_ws_disconnect,
+                             staleness_kill_sec=cfg.risk.ws_staleness_kill_sec,
+                             ping_interval_sec=cfg.ws.ping_interval_sec)
+        # Стратегии: MM-ядро, арбитраж-алерты, кросс-платформа, ниши, сателлит.
         self.arb = ArbitrageScanner(cfg, self.ledger, self.clob, self.trader, mode)
-        self.mm = MarketMaker(cfg, self.ledger, self.clob, self.trader, mode)
+        self.mm = MarketMaker(cfg, self.ledger, self.clob, self.trader, mode,
+                              top_source=(self.ws.top if self.ws else None))
         self.cross = CrossMarketScanner(cfg)
         self.niche = NicheWatcher(cfg, self.ledger)
+        self.satellite = BTC5mSatellite(cfg, self.ledger, self.clob, self.trader, mode)
+        # Kill-switch: bulk-cancel + halt. Восстановление стейта — reconcile.
+        self.killswitch = KillSwitch(cfg, self.ledger, mode,
+                                     cancel_all=self._cancel_everything, alert=alert)
         # Кэш активных рынков: обновляется основным циклом, быстрые стратегии
-        # берут метаданные отсюда, а точные цены — из живых стаканов CLOB.
+        # берут метаданные отсюда, а точные цены — из WS/живых стаканов.
         self.markets_cache: list[Market] = []
+
+    def _cancel_everything(self) -> None:
+        self.mm.shutdown()
+        if self.trader is not None:
+            try:
+                self.trader.cancel_all()
+            except Exception:
+                log.exception("cancel_all")
+
+    def _on_ws_disconnect(self, gap_sec: float) -> None:
+        self.killswitch.on_ws_disconnect(gap_sec)
 
     def close(self) -> None:
         try:
-            self.mm.shutdown()   # снять все котировки
+            self._cancel_everything()   # снять все котировки
         except Exception:
-            log.exception("mm shutdown")
+            log.exception("shutdown cancel")
+        if self.ws is not None:
+            self.ws.stop()
         self.ledger.close()
 
     # --- один торговый цикл ---
@@ -218,16 +246,67 @@ class Bot:
             log.exception("arb job")
 
     def mm_job(self) -> None:
-        """№3: маркет-мейкинг. Не котирует в observe-only (kill-switch общий)."""
+        """Ядро: маркет-мейкинг. Блокируется kill-switch'ем и observe-only."""
         if not self.markets_cache:
             return
         try:
-            if self.portfolio.observe_only():
+            if self.ws is not None and self.ws.healthy:
+                self.killswitch.on_ws_recovered()
+            if not self.killswitch.trading_allowed or self.portfolio.observe_only():
                 self.mm.shutdown()
                 return
-            self.mm.cycle(self.markets_cache)
+            quotes = self.mm.cycle(self.markets_cache)
+            # WS-подписка на токены котируемых рынков + открытых позиций.
+            if self.ws is not None:
+                tokens: set[str] = set()
+                for q in quotes:
+                    tokens.update(q.market.clob_token_ids[:2])
+                for p in self.ledger.open_positions(self.mode):
+                    tokens.add(p.token_id)
+                if tokens:
+                    self.ws.watch(tokens)
         except Exception:
             log.exception("mm job")
+
+    def satellite_job(self) -> None:
+        """Сателлит btc_5m_ta (выключен по умолчанию)."""
+        try:
+            if self.killswitch.trading_allowed:
+                self.satellite.cycle()
+        except Exception:
+            log.exception("satellite job")
+
+    def risk_job(self) -> None:
+        """Проверки kill-switch: дневной стоп, просадка, reconcile с биржей."""
+        try:
+            equity = self.portfolio.equity()
+            self.killswitch.check_daily_loss(equity)
+            self.killswitch.check_drawdown(
+                equity, max(self.ledger.high_water_mark(),
+                            self.cfg.portfolio.bankroll_usd))
+            if self.trader is not None:
+                exchange_ids = {str(o.get("id") or o.get("orderID") or "")
+                                for o in self.trader.open_orders()}
+                exchange_ids.discard("")
+                self.killswitch.reconcile(self.mm.local_order_ids(), exchange_ids)
+        except Exception:
+            log.exception("risk job")
+
+    def digest_job(self) -> None:
+        """Telegram-дайджест: PnL, инвентарь, атрибуция по стратегиям."""
+        try:
+            equity = self.portfolio.equity()
+            positions = self.ledger.open_positions(self.mode)
+            pnl = self.ledger.realized_pnl_by_strategy(self.mode)
+            pnl_lines = "\n".join(f"  {k}: {v:+,.2f}" for k, v in pnl.items()) or "  —"
+            alert(f"Дайджест [{self.mode}]\n"
+                  f"Equity: ${equity:,.2f} | просадка {self.portfolio.drawdown() * 100:.1f}%\n"
+                  f"Открытых позиций: {len(positions)} "
+                  f"(${sum(p.cost_usd for p in positions):,.2f})\n"
+                  f"Реализованный PnL по стратегиям:\n{pnl_lines}\n"
+                  f"Kill-switch: {'HALT: ' + self.killswitch.reason if self.killswitch.halted else 'норма'}")
+        except Exception:
+            log.exception("digest job")
 
     def cross_job(self) -> None:
         """№2: расхождения с внешними площадками — только алерты."""
@@ -250,10 +329,16 @@ def main(argv: list[str] | None = None) -> None:
         prog="polymarket_bot",
         description="Барбелл на мисспрайсинге хвостовых исходов Polymarket",
     )
-    parser.add_argument("--mode", choices=("dry-run", "live", "backtest"),
-                        default="dry-run")
+    parser.add_argument("--mode",
+                        choices=("dry-run", "paper", "live", "backtest",
+                                 "record-books", "replay"),
+                        default="dry-run",
+                        help="dry-run -> paper -> live (переход только вручную); "
+                             "backtest/record-books/replay — офлайн-фазы")
     parser.add_argument("--config", default=None, help="путь к config.yaml")
     parser.add_argument("--once", action="store_true", help="один цикл и выход")
+    parser.add_argument("--minutes", type=float, default=2880,
+                        help="длительность record-books (по умолчанию 48ч)")
     parser.add_argument("--i-understand-the-risk", action="store_true",
                         dest="risk_ack", help="обязательный флаг для --mode live")
     parser.add_argument("--log-level", default="INFO")
@@ -271,6 +356,21 @@ def main(argv: list[str] | None = None) -> None:
         backtest_mod.print_report(report, cfg)
         return
 
+    snaps_db = str(Path(cfg.runtime.db_path).parent / "book_snaps.sqlite")
+    if args.mode == "record-books":
+        from .replay import BookRecorder
+        n = BookRecorder(cfg, snaps_db).record(minutes=args.minutes)
+        log.info("записано снапшотов: %d -> %s", n, snaps_db)
+        return
+    if args.mode == "replay":
+        from . import replay as replay_mod
+        ledger = Ledger(cfg.runtime.db_path)
+        try:
+            replay_mod.print_report(replay_mod.replay(cfg, snaps_db, ledger))
+        finally:
+            ledger.close()
+        return
+
     if args.mode == "live":
         if not args.risk_ack:
             sys.exit("live-режим требует явного флага --i-understand-the-risk")
@@ -279,12 +379,15 @@ def main(argv: list[str] | None = None) -> None:
         log.warning("LIVE-РЕЖИМ: реальные деньги.")
 
     bot = Bot(cfg, args.mode)
+    if bot.ws is not None and not args.once:
+        bot.ws.start()
     if args.once:
         try:
             bot.cycle()
             bot.arb_job()
             bot.mm_job()
             bot.cross_job()
+            bot.risk_job()
         finally:
             bot.close()
         return
@@ -314,6 +417,14 @@ def main(argv: list[str] | None = None) -> None:
         scheduler.add_job(bot.cross_job, "interval",
                           minutes=cfg.crossmarket.interval_min,
                           max_instances=1, coalesce=True)
+    if cfg.satellite.enabled:
+        scheduler.add_job(bot.satellite_job, "interval", seconds=5,
+                          max_instances=1, coalesce=True)
+    scheduler.add_job(bot.risk_job, "interval",
+                      seconds=cfg.risk.reconcile_interval_sec,
+                      max_instances=1, coalesce=True)
+    scheduler.add_job(bot.digest_job, "interval", hours=6,
+                      max_instances=1, coalesce=True)
     scheduler.start()
     bot.cycle()  # первый цикл сразу
 

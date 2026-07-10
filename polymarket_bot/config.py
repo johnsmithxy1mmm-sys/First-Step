@@ -88,20 +88,75 @@ class ArbitrageConfig(BaseModel):
 
 
 class MarketMakerConfig(BaseModel):
-    """Стратегия №3: маркет-мейкинг + liquidity rewards — база денежного потока."""
+    """Ядро (80% капитала): маркет-мейкинг + liquidity rewards farming."""
     enabled: bool = False              # включать осознанно: требует капитала на котировки
-    interval_sec: float = 45.0
-    max_markets: int = 8
-    price_lo: float = 0.10             # средние рынки, не хвосты
-    price_hi: float = 0.90
-    min_volume_24h_usd: float = 20_000.0
-    min_days_to_resolution: float = 2.0
-    half_spread: float = 0.01          # полуспред котировки
-    quote_size_usd: float = 50.0       # долларов на каждую сторону каждого рынка
-    inventory_cap_usd: float = 150.0   # кэп перекоса Yes/No на рынок
-    guard_price_move: float = 0.03     # mid сдвинулся сильнее — снять котировки
+    interval_sec: float = 30.0
+    max_markets: int = 5
+    # Отбор рынков (скоринг-модуль): объём, горизонт, rewards, стабильность.
+    min_volume_24h_usd: float = 50_000.0
+    min_days_to_resolution: float = 30.0
+    require_rewards_program: bool = True
+    max_daily_midpoint_move: float = 0.05   # реализованная волатильность midpoint
+    # Котирование.
+    half_spread: float = 0.01
+    quote_size_usd: float = 10.0
+    inventory_skew_k: float = 0.5      # сдвиг fair против инвентаря
+    # Requote-гистерезис: лишний churn ест rate limit и rewards-сэмплинг.
+    requote_threshold_ticks: float = 2.0
+    requote_timer_sec: float = 120.0
+    # Adverse selection guard.
+    guard_price_move: float = 0.03
     guard_cooldown_cycles: int = 3
-    guard_volume_ratio: float = 0.5    # 24h-объём > 50% всего оборота = новостной шок
+    guard_volume_ratio: float = 0.5
+
+
+class RiskLimitsConfig(BaseModel):
+    """Абсолютные лимиты риск-фреймворка (жёсткие требования мастер-промпта)."""
+    max_position_per_market_usd: float = 50.0
+    max_global_exposure_usd: float = 300.0
+    max_daily_loss_usd: float = 25.0        # дневной стоп → halt до ручного рестарта
+    max_drawdown_pct: float = 0.15          # от high-water mark → полный halt
+    min_edge_after_fees: float = 0.01
+    reconcile_interval_sec: float = 60.0
+    ws_staleness_kill_sec: float = 10.0
+
+
+class FeesConfig(BaseModel):
+    """Fee Structure V2 (март 2026). Проверяйте актуальность на docs.polymarket.com."""
+    taker: dict[str, float] = Field(default_factory=lambda: {
+        "crypto": 0.07, "sports": 0.03, "finance": 0.04, "politics": 0.04,
+        "tech": 0.04, "economics": 0.05, "culture": 0.05, "weather": 0.05,
+        "geopolitics": 0.0, "other": 0.04,
+    })
+    maker_rebate_frac: float = 0.35    # rebate 20-50% от taker fee; середина
+
+
+class WSConfig(BaseModel):
+    enabled: bool = True
+    url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+    ping_interval_sec: float = 10.0
+
+
+class RateLimitConfig(BaseModel):
+    """Собственный token-bucket даже при повышенных лимитах V2."""
+    orders_per_sec: float = 20.0
+    orders_burst: float = 100.0
+    reads_per_sec: float = 30.0
+    reads_burst: float = 100.0
+
+
+class SatelliteConfig(BaseModel):
+    """Сателлит (20%): T-10s TA на 5-мин BTC up/down. По умолчанию ВЫКЛЮЧЕН."""
+    enabled: bool = False
+    slug_template: str = "btc-updown-5m-{ts}"
+    window_sec: int = 300
+    entry_from_sec: float = 30.0       # входим за 10-30 сек до закрытия окна
+    entry_to_sec: float = 10.0
+    edge_threshold: float = 0.05       # P(model) - implied - fee > порога
+    kelly_fraction: float = 0.25       # quarter-Kelly
+    max_bet_usd: float = 10.0
+    candles_url: str = ("https://api.binance.com/api/v3/klines"
+                        "?symbol=BTCUSDT&interval=1m&limit=30")
 
 
 class CrossMarketConfig(BaseModel):
@@ -159,6 +214,11 @@ class BotConfig(BaseModel):
     executor: ExecutorConfig = Field(default_factory=ExecutorConfig)
     arbitrage: ArbitrageConfig = Field(default_factory=ArbitrageConfig)
     market_maker: MarketMakerConfig = Field(default_factory=MarketMakerConfig)
+    risk: RiskLimitsConfig = Field(default_factory=RiskLimitsConfig)
+    fees: FeesConfig = Field(default_factory=FeesConfig)
+    ws: WSConfig = Field(default_factory=WSConfig)
+    ratelimit: RateLimitConfig = Field(default_factory=RateLimitConfig)
+    satellite: SatelliteConfig = Field(default_factory=SatelliteConfig)
     crossmarket: CrossMarketConfig = Field(default_factory=CrossMarketConfig)
     niche: NicheConfig = Field(default_factory=NicheConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
