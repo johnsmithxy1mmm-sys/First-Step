@@ -1,6 +1,5 @@
-# Результаты сборки меморандумов
-out/*.pdf
-out/*.html
+# Секреты — НИКОГДА не коммитить
+.env
 
 # Python
 __pycache__/
@@ -9,15 +8,6 @@ __pycache__/
 .venv/
 venv/
 
-# Промежуточные графики
-report/_charts_tmp/
-
-# Артефакты сборки .exe (PyInstaller)
-build/
-dist/
-*.manifest
-
-# Polymarket-бот: история ставок и локальный конфиг с личными настройками
+# Состояние бота: журнал сделок, снапшоты стаканов, кэш LLM, логи, локальный конфиг
 polymarket_bot/data/
 polymarket_bot/config.json
-.env

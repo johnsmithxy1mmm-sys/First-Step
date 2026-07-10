@@ -20,11 +20,11 @@ Wants=network-online.target
 Type=simple
 # Отдельный непривилегированный пользователь (создать: sudo useradd -r -m polybot)
 User=polybot
-WorkingDirectory=/opt/First-Step
+WorkingDirectory=/opt/Polymarket-Mint-Bot
 # Секреты — из .env; файл должен принадлежать polybot с правами 600.
-EnvironmentFile=/opt/First-Step/polymarket_bot/.env
+EnvironmentFile=/opt/Polymarket-Mint-Bot/polymarket_bot/.env
 # Для проверки без денег замените "--mode live --i-understand-the-risk" на "--mode dry-run".
-ExecStart=/opt/First-Step/.venv/bin/python -m polymarket_bot --mode live --i-understand-the-risk
+ExecStart=/opt/Polymarket-Mint-Bot/.venv/bin/python -m polymarket_bot --mode live --i-understand-the-risk
 Restart=always
 RestartSec=30
 # Если бот падает 5 раз за 10 минут — остановиться и не молотить биржу.
