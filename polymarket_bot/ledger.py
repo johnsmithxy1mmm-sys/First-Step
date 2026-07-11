@@ -59,6 +59,17 @@ CREATE TABLE IF NOT EXISTS resolutions (
     won INTEGER NOT NULL,             -- 1 = исход выиграл, акция платит $1
     payout_per_share REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS markouts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_id INTEGER NOT NULL,
+    token_id TEXT NOT NULL,
+    horizon_sec INTEGER NOT NULL,
+    fill_price REAL NOT NULL,
+    mark_price REAL NOT NULL,
+    markout REAL NOT NULL,            -- mark - fill; для покупки >0 = цена ушла за нами
+    ts TEXT NOT NULL,
+    UNIQUE (trade_id, horizon_sec)
+);
 CREATE TABLE IF NOT EXISTS bank (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts TEXT NOT NULL,
@@ -281,6 +292,66 @@ class Ledger:
                 pnl += remaining * (1.0 if slot["won"] else 0.0) - avg * remaining
             out[slot["strategy"]] += pnl
         return dict(out)
+
+    # --- markout-аналитика: куда ушла цена после наших филлов ---
+
+    def fills_needing_markout(self, mode: str, horizon_sec: int,
+                              max_age_sec: float = 172_800,
+                              limit: int = 20) -> list[dict]:
+        """Исполненные покупки, которым пора замерить markout на горизонте."""
+        now = datetime.now(timezone.utc)
+        rows = self._conn.execute(
+            "SELECT t.id, t.token_id, t.price, t.ts FROM trades t "
+            "WHERE t.mode = ? AND t.side = 'BUY' "
+            "AND t.status IN ('filled', 'paper-filled') "
+            "AND NOT EXISTS (SELECT 1 FROM markouts m "
+            "                WHERE m.trade_id = t.id AND m.horizon_sec = ?) "
+            "ORDER BY t.id", (mode, horizon_sec)).fetchall()
+        out: list[dict] = []
+        for r in rows:
+            age = (now - datetime.fromisoformat(r["ts"])).total_seconds()
+            if horizon_sec <= age <= max_age_sec:
+                out.append(dict(r))
+                if len(out) >= limit:
+                    break
+        return out
+
+    def record_markout(self, trade_id: int, token_id: str, horizon_sec: int,
+                       fill_price: float, mark_price: float) -> None:
+        self._conn.execute(
+            "INSERT OR IGNORE INTO markouts "
+            "(trade_id, token_id, horizon_sec, fill_price, mark_price, markout, ts) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (trade_id, token_id, horizon_sec, fill_price, mark_price,
+             mark_price - fill_price, _now()))
+        self._conn.commit()
+
+    def markout_stats(self, mode: str) -> list[dict]:
+        """Средний markout по (стратегия, горизонт): главный тест качества филлов.
+
+        Для покупки markout < 0 означает adverse selection: цена после нашего
+        филла систематически падает — нас переезжают информированные.
+        """
+        rows = self._conn.execute(
+            "SELECT t.strategy, m.horizon_sec, COUNT(*) AS n, "
+            "AVG(m.markout) AS avg_markout, "
+            "AVG(m.markout / m.fill_price) AS avg_markout_pct, "
+            "SUM(CASE WHEN m.markout >= 0 THEN 1 ELSE 0 END) AS favorable "
+            "FROM markouts m JOIN trades t ON t.id = m.trade_id "
+            "WHERE t.mode = ? "
+            "GROUP BY t.strategy, m.horizon_sec "
+            "ORDER BY t.strategy, m.horizon_sec", (mode,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def bank_series(self) -> list[dict]:
+        return [dict(r) for r in self._conn.execute(
+            "SELECT ts, equity, hwm FROM bank ORDER BY id")]
+
+    def estimates_summary(self) -> dict:
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS total, SUM(qualifies) AS qualifying, "
+            "AVG(edge_ratio) AS avg_edge FROM estimates").fetchone()
+        return dict(row)
 
     def high_water_mark(self) -> float:
         row = self._conn.execute("SELECT MAX(hwm) AS hwm FROM bank").fetchone()

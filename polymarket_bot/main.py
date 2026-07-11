@@ -292,6 +292,29 @@ class Bot:
         except Exception:
             log.exception("risk job")
 
+    MARKOUT_HORIZONS_SEC = (60, 600)
+
+    def markout_job(self) -> None:
+        """Замер markout: где цена через 1 и 10 минут после каждого филла."""
+        try:
+            for horizon in self.MARKOUT_HORIZONS_SEC:
+                for fill in self.ledger.fills_needing_markout(self.mode, horizon):
+                    mid = None
+                    if self.ws is not None:
+                        top = self.ws.top(fill["token_id"])
+                        if top is not None and top.mid > 0:
+                            mid = top.mid
+                    if mid is None:
+                        book = self.clob.order_book(fill["token_id"])
+                        if book is not None and book.mid > 0:
+                            mid = book.mid
+                    if mid:
+                        self.ledger.record_markout(
+                            fill["id"], fill["token_id"], horizon,
+                            fill["price"], mid)
+        except Exception:
+            log.exception("markout job")
+
     def digest_job(self) -> None:
         """Telegram-дайджест: PnL, инвентарь, атрибуция по стратегиям."""
         try:
@@ -331,12 +354,15 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("--mode",
                         choices=("dry-run", "paper", "live", "backtest",
-                                 "record-books", "replay"),
+                                 "record-books", "replay", "report"),
                         default="dry-run",
                         help="dry-run -> paper -> live (переход только вручную); "
                              "backtest/record-books/replay — офлайн-фазы")
     parser.add_argument("--config", default=None, help="путь к config.yaml")
     parser.add_argument("--once", action="store_true", help="один цикл и выход")
+    parser.add_argument("--report-mode", default="paper",
+                        choices=("dry-run", "paper", "live"),
+                        help="чьи данные показывать в --mode report")
     parser.add_argument("--minutes", type=float, default=2880,
                         help="длительность record-books (по умолчанию 48ч)")
     parser.add_argument("--i-understand-the-risk", action="store_true",
@@ -354,6 +380,16 @@ def main(argv: list[str] | None = None) -> None:
     if args.mode == "backtest":
         report = backtest_mod.run_backtest(cfg)
         backtest_mod.print_report(report, cfg)
+        return
+
+    if args.mode == "report":
+        from .analytics import compute_report, print_report
+        ledger = Ledger(cfg.runtime.db_path)
+        try:
+            # Отчёт по тому режиму, в котором копились данные (paper по умолчанию).
+            print_report(compute_report(ledger, args.report_mode))
+        finally:
+            ledger.close()
         return
 
     snaps_db = str(Path(cfg.runtime.db_path).parent / "book_snaps.sqlite")
@@ -388,6 +424,7 @@ def main(argv: list[str] | None = None) -> None:
             bot.mm_job()
             bot.cross_job()
             bot.risk_job()
+            bot.markout_job()
         finally:
             bot.close()
         return
@@ -424,6 +461,8 @@ def main(argv: list[str] | None = None) -> None:
                       seconds=cfg.risk.reconcile_interval_sec,
                       max_instances=1, coalesce=True)
     scheduler.add_job(bot.digest_job, "interval", hours=6,
+                      max_instances=1, coalesce=True)
+    scheduler.add_job(bot.markout_job, "interval", seconds=30,
                       max_instances=1, coalesce=True)
     scheduler.start()
     bot.cycle()  # первый цикл сразу
