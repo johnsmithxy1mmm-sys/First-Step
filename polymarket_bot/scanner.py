@@ -64,6 +64,30 @@ class Scanner:
         out.sort(key=lambda c: c.market.volume_24h_usd, reverse=True)
         return out[: s.max_candidates_per_cycle]
 
+    def reject_reason(self, m, now=None) -> str | None:
+        """None = у рынка есть дешёвый исход-кандидат; иначе причина отсева (диагностика)."""
+        from datetime import datetime, timezone
+        s = self._cfg.scanner
+        now = now or datetime.now(timezone.utc)
+        if m.closed or not m.enable_order_book:
+            return "нет стакана / закрыт"
+        if m.volume_24h_usd < s.min_volume_24h_usd:
+            return f"объём 24h < ${s.min_volume_24h_usd:,.0f}"
+        days = m.days_to_resolution(now)
+        if days is None or not s.min_days_to_resolution <= days <= s.max_days_to_resolution:
+            return "вне окна резолюции"
+        q = m.question.lower()
+        if s.include_keywords and not any(k.lower() in q for k in s.include_keywords):
+            return "не подходит по include_keywords"
+        if any(k.lower() in q for k in s.exclude_keywords):
+            return "отсечён exclude_keywords"
+        if s.require_resolution_clarity and not m.resolution_source \
+                and len(m.description.strip()) < s.min_description_chars:
+            return "мутные правила резолюции"
+        if not any(s.price_min <= p <= s.price_max for p in m.outcome_prices):
+            return f"нет исхода в цене [{s.price_min}, {s.price_max}]"
+        return None
+
     def verify_depth(self, candidates: list[Candidate]) -> list[Candidate]:
         """Второй уровень: реальная глубина книги на нашей стороне."""
         s = self._cfg.scanner

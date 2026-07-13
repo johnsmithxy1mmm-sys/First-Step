@@ -366,7 +366,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("--mode",
                         choices=("dry-run", "paper", "live", "backtest",
-                                 "record-books", "replay", "report"),
+                                 "record-books", "replay", "report", "diagnose"),
                         default="dry-run",
                         help="dry-run -> paper -> live (переход только вручную); "
                              "backtest/record-books/replay — офлайн-фазы")
@@ -392,6 +392,11 @@ def main(argv: list[str] | None = None) -> None:
     if args.mode == "backtest":
         report = backtest_mod.run_backtest(cfg)
         backtest_mod.print_report(report, cfg)
+        return
+
+    if args.mode == "diagnose":
+        from .diagnose import run_diagnose
+        run_diagnose(cfg)
         return
 
     if args.mode == "report":

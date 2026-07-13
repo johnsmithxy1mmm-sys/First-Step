@@ -47,30 +47,31 @@ class MarketScorer:
         text = market.description.lower()
         return any(marker in text for marker in SUBJECTIVE_RESOLUTION_MARKERS)
 
-    def eligible(self, m: Market, now: datetime | None = None) -> bool:
+    def reject_reason(self, m: Market, now: datetime | None = None) -> str | None:
+        """None = рынок пригоден для MM; иначе строка-причина отсева (для диагностики)."""
         c = self._cfg
         if m.closed or not m.enable_order_book or len(m.clob_token_ids) < 2:
-            return False
+            return "нет стакана / закрыт"
         if m.volume_24h_usd < c.min_volume_24h_usd:
-            return False
+            return f"объём 24h < ${c.min_volume_24h_usd:,.0f}"
         days = m.days_to_resolution(now or datetime.now(timezone.utc))
         if days is None or days < c.min_days_to_resolution:
-            return False
+            return f"до резолюции < {c.min_days_to_resolution:.0f} дн."
         if c.require_rewards_program and not m.in_rewards_program:
-            return False
-        # Стабильность вероятности: дневное движение midpoint ниже порога.
+            return "не в rewards-программе"
         if abs(m.one_day_price_change) > c.max_daily_midpoint_move:
-            return False
-        # Спред достаточен: >= 2x минимального тика (иначе зарабатывать нечего).
+            return "волатилен (движение midpoint > порога)"
         if m.best_bid > 0 and m.best_ask > 0 \
                 and (m.best_ask - m.best_bid) < 2 * m.tick_size:
-            return False
+            return "спред < 2 тиков"
         if not m.resolution_source and len(m.description.strip()) < 80:
-            return False
+            return "мутные правила резолюции"
         if self.uma_risk(m):
-            log.debug("scorer: %s исключён (UMA-риск: субъективная резолюция)", m.id)
-            return False
-        return True
+            return "UMA-риск (субъективная резолюция)"
+        return None
+
+    def eligible(self, m: Market, now: datetime | None = None) -> bool:
+        return self.reject_reason(m, now) is None
 
     def score(self, m: Market, book: OrderBook | None) -> float:
         """rewards-привлекательность / конкуренция мейкеров возле midpoint."""
