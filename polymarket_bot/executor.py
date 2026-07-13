@@ -52,7 +52,7 @@ class Executor:
 
     # --- вход ---
 
-    def execute(self, plan: TradePlan) -> ExecutionResult:
+    def execute(self, plan: TradePlan, strategy: str = "longshot") -> ExecutionResult:
         if self.already_entered(plan.token_id):
             return ExecutionResult(status="skipped", detail="already entered (idempotency)")
 
@@ -89,6 +89,7 @@ class Executor:
             side="BUY", price=avg_price, size=filled_size,
             order_id=order_ids[0] if order_ids else None,
             status="filled" if self._trader else "sim-filled",
+            strategy=strategy,
         )
         return ExecutionResult(status="filled", filled_size=filled_size,
                                avg_price=avg_price, order_ids=order_ids)

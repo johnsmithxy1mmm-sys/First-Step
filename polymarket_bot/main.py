@@ -20,6 +20,7 @@ from .config import BotConfig
 from .crossmarket import CrossMarketScanner
 from .estimator import Estimator
 from .executor import Executor
+from .fade import FadeStrategy
 from .gamma import GammaClient
 from .ledger import Ledger
 from .logging_setup import setup_logging
@@ -49,6 +50,7 @@ class Bot:
         self.portfolio = Portfolio(cfg, self.ledger, mode)
         self.trader = Trader(cfg) if mode == "live" else None
         self.executor = Executor(cfg, self.ledger, self.clob, self.trader, mode)
+        self.fade = FadeStrategy(cfg, self.ledger, self.portfolio, self.executor, mode)
         self.dashboard = Dashboard()
         self.errors: list[str] = []
         # WS-фид стаканов: «мгновенно» для MM и выходов; gap-detect → kill-switch.
@@ -139,6 +141,7 @@ class Bot:
 
             if not observe_only:
                 self._enter_positions(qualifying)
+                self.fade.cycle(estimates)
                 self._exit_positions(marks)
         except Exception as exc:
             self._error(f"cycle: {exc}")

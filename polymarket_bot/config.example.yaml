@@ -172,6 +172,16 @@ smart_money:
   tail_max_price: 0.10       # вход дешевле — метка [ХВОСТ]
   only_niche_or_tail: false  # true = алертить только про нишу/хвост
 
+# Фейдинг переоценённых хвостов: покупаем NO, когда YES-хвост переоценён
+# (прибыльная сторона favorite-longshot bias). Плюсово в среднем, но с
+# редким крупным убытком — держится жёсткими кэпами портфеля.
+fade:
+  enabled: false
+  bias_discount: 0.30       # хвост считаем переоценённым минимум на 30%
+  fade_max_price: 0.10      # фейдим только YES-хвосты дешевле этой цены
+  min_tail_price: 0.005
+  min_edge_after_fees: 0.005
+
 runtime:
   gamma_host: https://gamma-api.polymarket.com
   clob_host: https://clob.polymarket.com

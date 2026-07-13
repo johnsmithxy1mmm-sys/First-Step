@@ -76,6 +76,23 @@ class ExecutorConfig(BaseModel):
     max_child_order_usd: float = 200.0
 
 
+class FadeConfig(BaseModel):
+    """Фейдинг переоценённых хвостов: покупаем NO, когда YES-хвост переоценён.
+
+    Прибыльная сторона favorite-longshot bias: толпа раздувает цену дешёвых
+    исходов, мы систематически снимаем этот перекос, покупая NO. Плюсово в
+    среднем (bias реален), но каждая ставка асимметрична — редкий крупный
+    убыток при срабатывании хвоста, поэтому жёсткие кэпы и диверсификация.
+    """
+    enabled: bool = False
+    # Систематическая поправка: хвост считаем переоценённым минимум на эту долю
+    # (0.30 = "дешёвые исходы в среднем на 30% дороже честной цены").
+    bias_discount: float = 0.30
+    fade_max_price: float = 0.10       # фейдим только хвосты дешевле этой цены YES
+    min_tail_price: float = 0.005      # ниже — неликвид/шум
+    min_edge_after_fees: float = 0.005  # минимум 0.5% чистого edge на NO-стороне
+
+
 class ArbitrageConfig(BaseModel):
     """Стратегия №1: структурный арбитраж neg-risk корзин (YES и NO)."""
     enabled: bool = True
@@ -244,6 +261,7 @@ class BotConfig(BaseModel):
     portfolio: PortfolioConfig = Field(default_factory=PortfolioConfig)
     executor: ExecutorConfig = Field(default_factory=ExecutorConfig)
     arbitrage: ArbitrageConfig = Field(default_factory=ArbitrageConfig)
+    fade: FadeConfig = Field(default_factory=FadeConfig)
     market_maker: MarketMakerConfig = Field(default_factory=MarketMakerConfig)
     risk: RiskLimitsConfig = Field(default_factory=RiskLimitsConfig)
     fees: FeesConfig = Field(default_factory=FeesConfig)

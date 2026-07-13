@@ -102,22 +102,22 @@ class Portfolio:
 
     # --- сайзинг ---
 
-    def size_trade(self, estimate: Estimate) -> TradePlan | None:
-        cfg = self._cfg
-        c = estimate.candidate
-        bankroll = self._cfg.bankroll_usd
-        category = classify_category(c.market.question, c.market.category)
+    def size_usd(self, category: str, p_est: float, p_mkt: float,
+                 min_order_notional: float = 1.0) -> float | None:
+        """Размер позиции по Kelly со всеми кэпами; None = места нет.
 
-        f_star = kelly_fraction(estimate.p_est, estimate.p_mkt)
+        Единый сайзинг для лонгшотов и фейда: kelly от edge, кэп на рынок,
+        на категорию (с матрицей корреляций) и на суммарную экспозицию.
+        """
+        cfg = self._cfg
+        bankroll = cfg.bankroll_usd
+
+        f_star = kelly_fraction(p_est, p_mkt)
         if f_star <= 0:
             return None
         size = cfg.kelly_fraction * f_star * bankroll
-
-        # Жёсткий кэп на рынок.
         size = min(size, cfg.max_market_pct * bankroll)
 
-        # Кэп на категорию с учётом корреляций: эффективная экспозиция категории
-        # включает долю коррелированных категорий.
         exposure = self._ledger.exposure_by_category(self._mode)
         effective = exposure.get(category, 0.0) + sum(
             correlation(category, other) * usd
@@ -125,31 +125,30 @@ class Portfolio:
         )
         cat_room = cfg.max_category_pct * bankroll - effective
         if cat_room <= 0:
-            log.info("skip %s: категория %s заполнена (eff=%.0f)", c.market.id, category, effective)
             return None
         size = min(size, cat_room)
 
-        # Кэп на суммарную экспозицию.
         total_room = cfg.max_total_exposure_pct * bankroll - self._ledger.total_exposure(self._mode)
         if total_room <= 0:
             return None
         size = min(size, total_room)
 
-        # Минимальный размер ордера биржи.
-        min_usd = c.market.min_order_size * estimate.p_mkt
-        if size < max(min_usd, 1.0):
+        if size < max(min_order_notional, 1.0):
             return None
+        return round(size, 2)
 
+    def size_trade(self, estimate: Estimate) -> TradePlan | None:
+        c = estimate.candidate
+        category = classify_category(c.market.question, c.market.category)
+        size = self.size_usd(category, estimate.p_est, estimate.p_mkt,
+                             c.market.min_order_size * estimate.p_mkt)
+        if size is None:
+            return None
         # Выше этой цены edge падает ниже порога — executor не должен платить больше.
         min_edge = max(estimate.edge_ratio / 2, 1.2)  # запас: половина найденного edge
         price_cap = min(estimate.p_est / min_edge, 0.99)
-
-        return TradePlan(
-            estimate=estimate,
-            category=category,
-            size_usd=round(size, 2),
-            limit_price_cap=price_cap,
-        )
+        return TradePlan(estimate=estimate, category=category,
+                         size_usd=size, limit_price_cap=price_cap)
 
     # --- выходы ---
 
