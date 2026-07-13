@@ -150,6 +150,16 @@ niche:
     - name: crypto
       keywords: [bitcoin, btc, ethereum, eth, solana, crypto, stablecoin,
                  binance, coinbase, tether, sec etf, halving, defi]
+    - name: ai
+      keywords: [ai, openai, chatgpt, gpt, anthropic, claude, gemini, deepmind,
+                 agi, llm, grok, xai, nvidia, sora, artificial intelligence,
+                 large language model]
+    - name: football-eu
+      keywords: [champions league, premier league, la liga, serie a, bundesliga,
+                 ligue 1, europa league, uefa, ballon, real madrid, barcelona,
+                 man city, manchester city, manchester united, man united,
+                 liverpool, arsenal, chelsea, tottenham, bayern, dortmund,
+                 psg, juventus, inter milan, ac milan, napoli, atletico madrid]
 
 runtime:
   gamma_host: https://gamma-api.polymarket.com

@@ -82,6 +82,25 @@ def test_niche_crypto_watchlist(cfg, ledger):
     assert hits[0][0] == "crypto"
 
 
+def test_niche_ai_and_football_watchlists(cfg, ledger):
+    watcher = NicheWatcher(cfg, ledger)
+    markets = [
+        make_market(id="a1", question="Will OpenAI release GPT-6 by 2027?"),
+        make_market(id="a2", question="Will any AI achieve AGI before 2030?"),
+        make_market(id="f1", question="Will Real Madrid win the Champions League?"),
+        make_market(id="f2", question="Will Arsenal finish top of the Premier League?"),
+        make_market(id="u1", question="Will Ukraine join the EU by 2030?"),
+    ]
+    with mock.patch("polymarket_bot.niche.alert"):
+        hits = {m.id: name for name, m in watcher.cycle(markets)}
+    assert hits["a1"] == "ai"
+    assert hits["a2"] == "ai"
+    assert hits["f1"] == "football-eu"
+    assert hits["f2"] == "football-eu"
+    # "Ukraine" содержит буквы "ai", но границы слов + порядок дают post-soviet.
+    assert hits["u1"] == "post-soviet"
+
+
 def test_niche_matches_whole_words_only(cfg, ledger):
     """Баг из живого прогона: 'eth' ловил 'Hegseth' как подстроку."""
     watcher = NicheWatcher(cfg, ledger)
