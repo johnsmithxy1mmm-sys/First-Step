@@ -202,6 +202,21 @@ class NicheConfig(BaseModel):
     ])
 
 
+class SmartMoneyConfig(BaseModel):
+    """Трекер «умных денег»: алерты, когда сильные кошельки заходят в рынок.
+
+    Использует публичный Data API Polymarket (/positions по адресу).
+    watch_wallets — адреса, за которыми следим (сильные игроки, которых вы
+    нашли на leaderboard'е polymarket.com). Пусто = трекер молчит.
+    """
+    enabled: bool = False
+    interval_min: float = 10.0
+    watch_wallets: list[str] = Field(default_factory=list)
+    min_position_usd: float = 50.0     # игнорируем пыль
+    tail_max_price: float = 0.10       # вход дешевле — помечаем как хвостовой
+    only_niche_or_tail: bool = False   # true = алертить лишь про нишу/хвост
+
+
 class RuntimeConfig(BaseModel):
     gamma_host: str = "https://gamma-api.polymarket.com"
     clob_host: str = "https://clob.polymarket.com"
@@ -233,6 +248,7 @@ class BotConfig(BaseModel):
     satellite: SatelliteConfig = Field(default_factory=SatelliteConfig)
     crossmarket: CrossMarketConfig = Field(default_factory=CrossMarketConfig)
     niche: NicheConfig = Field(default_factory=NicheConfig)
+    smart_money: SmartMoneyConfig = Field(default_factory=SmartMoneyConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     backtest: BacktestConfig = Field(default_factory=BacktestConfig)
 

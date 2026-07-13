@@ -40,12 +40,16 @@ class NicheWatcher:
                 re.compile(rf"(?<![a-z0-9])(?:{joined})(?![a-z0-9])"),
             ))
 
-    def _match(self, market: Market) -> str | None:
-        text = f"{market.question} {market.event_title}".lower()
+    def classify(self, text: str) -> str | None:
+        """Имя ниши для произвольного текста (нужно и трекеру умных денег)."""
+        low = text.lower()
         for name, pattern in self._patterns:
-            if pattern.search(text):
+            if pattern.search(low):
                 return name
         return None
+
+    def _match(self, market: Market) -> str | None:
+        return self.classify(f"{market.question} {market.event_title}")
 
     def _alert_market(self, name: str, m: Market) -> None:
         days = m.days_to_resolution()

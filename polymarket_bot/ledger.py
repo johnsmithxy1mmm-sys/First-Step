@@ -40,6 +40,10 @@ CREATE TABLE IF NOT EXISTS seen_markets (
     market_id TEXT PRIMARY KEY,
     ts TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS smart_money_seen (
+    key TEXT PRIMARY KEY,             -- wallet:asset — позиция, о которой уже алертили
+    ts TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS estimates (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts TEXT NOT NULL,
@@ -153,6 +157,15 @@ class Ledger:
             "INSERT OR IGNORE INTO seen_markets (market_id, ts) VALUES (?, ?)",
             [(mid, _now()) for mid in market_ids],
         )
+        self._conn.commit()
+
+    def smart_money_seen_keys(self) -> set[str]:
+        return {r["key"] for r in self._conn.execute("SELECT key FROM smart_money_seen")}
+
+    def mark_smart_money_seen(self, keys: list[str]) -> None:
+        self._conn.executemany(
+            "INSERT OR IGNORE INTO smart_money_seen (key, ts) VALUES (?, ?)",
+            [(k, _now()) for k in keys])
         self._conn.commit()
 
     def snapshot_bank(self, cash: float, exposure: float) -> None:

@@ -31,6 +31,7 @@ from .portfolio import Portfolio
 from .risk import KillSwitch
 from .satellite import BTC5mSatellite
 from .scanner import Scanner
+from .smartmoney import SmartMoneyTracker
 from .ws_feed import WSFeed
 
 log = logging.getLogger(__name__)
@@ -63,6 +64,7 @@ class Bot:
                               top_source=(self.ws.top if self.ws else None))
         self.cross = CrossMarketScanner(cfg)
         self.niche = NicheWatcher(cfg, self.ledger)
+        self.smart_money = SmartMoneyTracker(cfg, self.ledger, self.niche)
         self.satellite = BTC5mSatellite(cfg, self.ledger, self.clob, self.trader, mode)
         # Kill-switch: bulk-cancel + halt. Восстановление стейта — reconcile.
         self.killswitch = KillSwitch(cfg, self.ledger, mode,
@@ -276,6 +278,13 @@ class Bot:
         except Exception:
             log.exception("satellite job")
 
+    def smart_money_job(self) -> None:
+        """№5: алерты, когда сильные кошельки заходят в рынок."""
+        try:
+            self.smart_money.cycle()
+        except Exception:
+            log.exception("smart-money job")
+
     def risk_job(self) -> None:
         """Проверки kill-switch: дневной стоп, просадка, reconcile с биржей."""
         try:
@@ -423,6 +432,7 @@ def main(argv: list[str] | None = None) -> None:
             bot.arb_job()
             bot.mm_job()
             bot.cross_job()
+            bot.smart_money_job()
             bot.risk_job()
             bot.markout_job()
         finally:
@@ -453,6 +463,10 @@ def main(argv: list[str] | None = None) -> None:
     if cfg.crossmarket.enabled:
         scheduler.add_job(bot.cross_job, "interval",
                           minutes=cfg.crossmarket.interval_min,
+                          max_instances=1, coalesce=True)
+    if cfg.smart_money.enabled:
+        scheduler.add_job(bot.smart_money_job, "interval",
+                          minutes=cfg.smart_money.interval_min,
                           max_instances=1, coalesce=True)
     if cfg.satellite.enabled:
         scheduler.add_job(bot.satellite_job, "interval", seconds=5,
