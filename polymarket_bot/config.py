@@ -78,7 +78,8 @@ class ArbitrageConfig(BaseModel):
     enabled: bool = True
     execute: bool = False              # обнаружение+алерт по умолчанию; ордера — явно
     interval_sec: float = 60.0
-    min_profit_pct: float = 0.015      # минимум 1.5% на комплект (покрывает риск ноги)
+    min_profit_pct: float = 0.015      # минимум 1.5% ЧИСТОГО edge (после комиссий)
+    suspicious_gross_edge: float = 0.05  # gross выше -> вероятно неполная корзина, не исполнять
     prefilter_tolerance: float = 0.01  # порог отбора по ценам Gamma (грубее реального)
     max_stake_usd: float = 300.0
     min_sets: int = 5

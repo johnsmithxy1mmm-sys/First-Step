@@ -51,7 +51,8 @@ arbitrage:
   enabled: true
   execute: false            # true = ставить ордера; false = только находить и алертить
   interval_sec: 60
-  min_profit_pct: 0.015     # покрывает риск неисполнения ноги
+  min_profit_pct: 0.015     # минимум 1.5% ЧИСТОГО edge (после комиссий)
+  suspicious_gross_edge: 0.05  # gross выше -> вероятно неполная корзина, не исполнять
   prefilter_tolerance: 0.01
   max_stake_usd: 300
   min_sets: 5

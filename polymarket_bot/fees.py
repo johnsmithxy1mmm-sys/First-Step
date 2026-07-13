@@ -27,7 +27,8 @@ class FeeModel:
 
     def fee_key(self, category: str, gamma_category: str = "") -> str:
         g = gamma_category.lower()
-        for key in self._cfg.taker:
+        # От длинных ключей к коротким: иначе "geopolitics" ложно матчит "politics".
+        for key in sorted(self._cfg.taker, key=len, reverse=True):
             if key != "other" and key in g:
                 return key
         return _CATEGORY_TO_FEE_KEY.get(category, "other")

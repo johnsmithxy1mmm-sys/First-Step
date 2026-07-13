@@ -240,10 +240,13 @@ class Bot:
         try:
             found = self.arb.cycle(self.markets_cache)
             for a in found[:3]:
+                warn = " ⚠️ подозрительно: проверьте полноту корзины" if a.suspect else ""
+                will_execute = self.cfg.arbitrage.execute and not a.suspect
+                note = "" if will_execute else " (execute выключен)"
                 alert(f"АРБИТРАЖ {a.side}-корзина «{a.event_title[:60]}»: "
-                      f"+{a.profit_pct * 100:.1f}% на комплект, "
-                      f"глубина {a.max_sets_by_depth()} комплектов"
-                      + ("" if self.cfg.arbitrage.execute else " (execute выключен)"))
+                      f"NET после комиссий +{a.net_profit_pct * 100:.2f}% "
+                      f"(gross +{a.profit_pct * 100:.1f}%), "
+                      f"глубина {a.max_sets_by_depth()} комплектов{warn}{note}")
         except Exception:
             log.exception("arb job")
 
