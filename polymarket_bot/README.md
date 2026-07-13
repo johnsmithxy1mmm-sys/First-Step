@@ -98,6 +98,12 @@ python -m polymarket_bot --mode live --i-understand-the-risk
 Все параметры стратегии — в `config.yaml` (фильтры сканера, порог edge,
 λ Келли, кэпы, тейк-профит, интервал цикла). Секреты — только в `.env`.
 
+`config.yaml` — ваш личный конфиг, он **вне git** (обновления кода его не
+трогают). В репозитории лежит шаблон `config.example.yaml`. Если своего
+`config.yaml` нет, бот берёт параметры из шаблона; чтобы настроить под себя:
+`cp polymarket_bot/config.example.yaml polymarket_bot/config.yaml` и правьте
+копию.
+
 ## Что происходит в одном цикле
 
 1. **scanner** — все активные рынки из Gamma; фильтры: цена в [0.002, 0.05],

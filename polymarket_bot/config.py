@@ -8,7 +8,10 @@ import yaml
 from pydantic import BaseModel, Field, field_validator
 
 PACKAGE_DIR = Path(__file__).parent
+# config.yaml — личный конфиг пользователя (вне git). config.example.yaml —
+# шаблон в репозитории; используется, если своего config.yaml ещё нет.
 DEFAULT_CONFIG_PATH = PACKAGE_DIR / "config.yaml"
+EXAMPLE_CONFIG_PATH = PACKAGE_DIR / "config.example.yaml"
 
 
 class ScannerConfig(BaseModel):
@@ -255,10 +258,17 @@ class BotConfig(BaseModel):
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> "BotConfig":
-        path = Path(path) if path else DEFAULT_CONFIG_PATH
-        if not path.exists():
+        if path is not None:
+            chosen = Path(path)
+        elif DEFAULT_CONFIG_PATH.exists():
+            chosen = DEFAULT_CONFIG_PATH          # личный конфиг пользователя
+        elif EXAMPLE_CONFIG_PATH.exists():
+            chosen = EXAMPLE_CONFIG_PATH          # свежий клон без своего config.yaml
+        else:
             return cls()
-        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        if not chosen.exists():
+            return cls()
+        raw = yaml.safe_load(chosen.read_text(encoding="utf-8")) or {}
         return cls.model_validate(raw)
 
     def base_rates_path(self) -> Path:
