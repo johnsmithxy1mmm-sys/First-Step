@@ -1,120 +1,118 @@
-# Карта территории: стратегии и их реализация в боте
+# Map of the territory: strategies and how the bot implements them
 
-Общий паттерн, который стоит принять: **доходность и «гарантированность»
-обратно пропорциональны везде**. №1 почти безрисковый, но микроскопический
-по объёму; №5 может дать иксы, но это уже не система, а ставка на
-собственную экспертизу.
+A general pattern worth accepting: **yield and "guaranteedness" are inversely
+proportional everywhere**. #1 is nearly risk-free but microscopic in volume;
+#5 can deliver multi-x but is no longer a system — it is a bet on your own
+expertise.
 
-**Рекомендуемый портфель:** №3 как база денежного потока + №1/№2
-оппортунистически + маленькая доля №5 в своей нише. Это не финансовый
-совет, а карта территории — решение по аллокации за вами.
-
----
-
-## №1. Структурный арбитраж внутри Polymarket (negRisk)
-
-В мульти-исходных рынках (выборы, номинации) сумма цен всех кандидатов
-иногда отклоняется от $1 — покупка корзины даёт математически
-гарантированную прибыль независимо от исхода. Чистейший edge на платформе,
-но окна живут секунды-минуты и выедаются ботами: нужен websocket, скорость
-и готовый капитал на кошельке. Доходность единиц-десятков процентов годовых
-при почти нулевом риске, но capacity ограничен жёстко.
-
-**Реализация:** `arbitrage.py` — обе стороны окна: YES-корзина (Σask < 1,
-выплата $1) и NO-корзина (Σbid(Yes) > 1 ⟺ Σask(No) < n−1, выплата $(n−1)).
-Префильтр по ценам Gamma → верификация по живым стаканам → сайзинг минимумом
-по глубине ног и `max_stake_usd`. Секция `arbitrage:` в config.yaml;
-`execute: false` по умолчанию (детекция + алерт), интервал 60 сек.
-
-**Честное ограничение:** это REST-поллинг, «медленный охотник» — он
-подбирает то, что осталось после websocket-ботов. Порог `min_profit_pct`
-(1.5%) закладывает риск неисполнения ноги.
-
-## №2. Кросс-платформенный арбитраж
-
-Один и тот же исход на Polymarket, Kalshi, Betfair котируется с
-расхождениями в 2–10 п.п., особенно в моменты новостей. Риски не рыночные,
-а операционные: разные критерии резолюции (главный убийца — «одинаковое»
-событие резолвится по-разному), юрисдикции, заморозка капитала на
-нескольких площадках.
-
-**Реализация:** `crossmarket.py` — сопоставление заголовков (Жаккар по
-значимым словам, порог 0.65) Polymarket ↔ Kalshi (публичный REST без
-авторизации), алерт при расхождении ≥ 4 п.п. **Автоторговли нет намеренно**:
-сверку правил резолюции двух площадок делает человек — каждый алерт
-заканчивается напоминанием об этом. Другие площадки (Betfair и т.п.)
-подключаются реализацией протокола `ExternalVenue`.
-
-## №3. Маркет-мейкинг + liquidity rewards
-
-Самая «скучная» и самая воспроизводимая стратегия: котируешь двусторонне
-ликвидные рынки, собираешь спред и программу вознаграждений. Основной риск —
-adverse selection перед новостями. Единственная стратегия из списка, где
-типичный месяц — плюс, а не минус. **База денежного потока портфеля.**
-
-**Реализация:** `marketmaker.py` — двусторонняя котировка двумя покупками
-(бид на Yes по mid−s/2 + бид на No по 1−(mid+s/2); исполнились обе стороны →
-Yes+No = $1 к выкупу, прибыль = спред). Cancel-replace цикл каждые 45 сек,
-фиксация частичных исполнений в леджер. Защита от adverse selection —
-автоматическое снятие котировок: guard по движению mid (≥3 п.п. → cooldown),
-guard по всплеску объёма (суточный > 50% всего оборота), кэп перекоса
-инвентаря (перекошенная сторона отключается). Kill-switch общий с остальным
-ботом. `market_maker.enabled: false` по умолчанию — включать осознанно,
-стратегия держит капитал в котировках.
-
-## №4. Резолюционный edge (rules lawyering)
-
-Торговля расхождения между заголовком рынка и буквой правил UMA-резолюции.
-Не масштабируется, но и не выедается ботами.
-
-**Реализация:** принципиально ручная стратегия — автоматизировать чтение
-правил «лучше толпы» нельзя честно. Поддержка в коде: (а) нишевые алерты №5
-включают полный текст правил резолюции и источник — расхождение заголовка
-и буквы видно в момент появления рынка; (б) LLM-сигнал лонгшот-стратегии
-получает описание правил в промпт; (в) сканер отбрасывает рынки без
-источника резолюции и внятного описания — то, чем ловят других, не должно
-ловить нас.
-
-## №5. Информационный edge в нише
-
-Исторически все громкие частные плюсы на Polymarket — люди, знавшие узкий
-домен глубже толпы (французский трейдер на выборах США заказывал собственные
-опросы). Рабочий вариант — постсоветская геополитика и крипто, где
-первоисточники читаются быстрее западной толпы.
-
-**Реализация:** `niche.py` — вотчлисты (`niche.watchlists` в config.yaml,
-дефолт: post-soviet + crypto). Модуль убирает задержку между «появился рынок
-в нише» и «я его увидел»: мгновенный Telegram-алерт о каждом новом рынке
-с ценой, объёмом, сроком и полными правилами резолюции. Дальше решает
-человек. Дедупликация через таблицу `seen_markets` в леджере.
-
-## Вне prediction-рынков: funding rate arbitrage (carry)
-
-Лонг спот / шорт перп при положительном фандинге — исторически 5–15% годовых
-в USDC с ограниченным риском, но с рисками биржи и проскальзывания фандинга
-в минус.
-
-**Не реализовано в этом боте** — осознанно: другие площадки (CEX), другой
-риск-профиль, другие ключи. Смешивать это с Polymarket-ботом в одном
-процессе — плохая архитектура; если делать, то отдельным сервисом.
+**Recommended portfolio:** #3 as the cash-flow base + #1/#2 opportunistically
++ a small share of #5 in your niche. This is not financial advice, just a map
+of the territory — the allocation decision is yours.
 
 ---
 
-## Как включить портфельный режим
+## #1. Structural arbitrage within Polymarket (negRisk)
+
+In multi-outcome markets (elections, nominations) the sum of all candidate
+prices sometimes deviates from $1 — buying the basket yields a mathematically
+guaranteed profit regardless of the outcome. The purest edge on the platform,
+but windows live seconds to minutes and are eaten by bots: you need a
+websocket, speed and capital ready on the wallet. Returns of single-to-tens of
+percent per year at near-zero risk, but capacity is hard-limited.
+
+**Implementation:** `arbitrage.py` — both sides of the window: YES basket
+(Σask < 1, pays $1) and NO basket (Σbid(Yes) > 1 ⟺ Σask(No) < n−1, pays $(n−1)).
+Prefilter on Gamma prices → verification against live order books → sizing by
+the minimum of leg depth and `max_stake_usd`. The `arbitrage:` section in
+config.yaml; `execute: false` by default (detect + alert), 60-second interval.
+
+**Honest limit:** this is REST polling, the "slow hunter" — it picks up what is
+left after the websocket bots. The `min_profit_pct` threshold (1.5%) budgets
+for the risk of a leg not filling.
+
+## #2. Cross-platform arbitrage
+
+The same outcome on Polymarket, Kalshi, Betfair is quoted with 2–10 pp gaps,
+especially at news moments. The risks are not market but operational: different
+resolution criteria (the main killer — an "identical" event resolves
+differently), jurisdictions, capital locked across several venues.
+
+**Implementation:** `crossmarket.py` — title matching (Jaccard over meaningful
+words, threshold 0.65) Polymarket ↔ Kalshi (public REST, no auth), alert on a
+gap >= 4 pp. **Auto-trading is deliberately absent**: a human reconciles the
+two venues' resolution rules — every alert ends with a reminder to do so. Other
+venues (Betfair etc.) plug in via the `ExternalVenue` protocol implementation.
+
+## #3. Market making + liquidity rewards
+
+The most "boring" and most reproducible strategy: quote two-sided liquid
+markets, collect the spread and the rewards program. The main risk is adverse
+selection ahead of news. The only strategy on this list where a typical month
+is a plus, not a minus. **The portfolio's cash-flow base.**
+
+**Implementation:** `marketmaker.py` — a two-sided quote via two buys (bid on
+Yes at mid−s/2 + bid on No at 1−(mid+s/2); if both sides fill → Yes+No = $1 at
+redemption, profit = spread). A cancel-replace cycle every 45 sec, partial
+fills recorded to the ledger. Adverse-selection protection — automatic quote
+pulling: a guard on mid movement (>=3 pp → cooldown), a guard on a volume spike
+(daily > 50% of total turnover), an inventory-skew cap (the skewed side is
+disabled). The kill-switch is shared with the rest of the bot.
+`market_maker.enabled: false` by default — enable deliberately, the strategy
+holds capital in quotes.
+
+## #4. Resolution edge (rules lawyering)
+
+Trading the gap between the market headline and the letter of the UMA
+resolution rules. Does not scale, but is not eaten by bots either.
+
+**Implementation:** a fundamentally manual strategy — you cannot honestly
+automate reading rules "better than the crowd". Support in the code: (a) the
+niche alerts of #5 include the full resolution-rules text and source — a gap
+between headline and letter is visible the moment the market appears; (b) the
+LLM signal of the longshot strategy receives the rules description in the
+prompt; (c) the scanner drops markets without a resolution source and a clear
+description — what catches others must not catch us.
+
+## #5. Informational edge in a niche
+
+Historically every loud private win on Polymarket came from people who knew a
+narrow domain deeper than the crowd (a French trader on the US elections
+commissioned his own polls). A workable angle is post-Soviet geopolitics and
+crypto, where primary sources read faster than the Western crowd.
+
+**Implementation:** `niche.py` — watchlists (`niche.watchlists` in config.yaml,
+default: post-soviet + crypto). The module removes the lag between "a market
+appeared in my niche" and "I saw it": an instant Telegram alert on every new
+market with price, volume, horizon and the full resolution rules. From there a
+human decides. Deduplication via the `seen_markets` table in the ledger.
+
+## Outside prediction markets: funding rate arbitrage (carry)
+
+Long spot / short perp under positive funding — historically 5–15% per year in
+USDC with limited risk, but with exchange risk and the risk of funding slipping
+negative.
+
+**Not implemented in this bot** — deliberately: different venues (CEX), a
+different risk profile, different keys. Mixing this with the Polymarket bot in
+one process is poor architecture; if you do it, do it as a separate service.
+
+---
+
+## How to turn on portfolio mode
 
 ```yaml
 # config.yaml
 market_maker:
-  enabled: true        # №3 — база (сначала обкатать в dry-run!)
+  enabled: true        # #3 — the base (break it in on dry-run first!)
 arbitrage:
   enabled: true
-  execute: true        # №1 — оппортунистически
+  execute: true        # #1 — opportunistically
 crossmarket:
-  enabled: true        # №2 — алерты, торгуете руками
+  enabled: true        # #2 — alerts, you trade by hand
 niche:
-  enabled: true        # №5 — алерты в вашей нише
+  enabled: true        # #5 — alerts in your niche
 ```
 
-Все стратегии живут в одном процессе на своих интервалах, пишут в общий
-леджер с колонкой `strategy` (атрибуция PnL раздельная) и подчиняются общему
-kill-switch по просадке.
+All strategies live in one process on their own intervals, write to a shared
+ledger with a `strategy` column (separate PnL attribution) and obey a shared
+drawdown kill-switch.

@@ -1,161 +1,158 @@
 # Polymarket Multi-Strategy Bot
 
-Production-grade автономный бот для Polymarket: базовая стратегия —
-**«барбелл на мисспрайсинге хвостовых исходов»**, плюс портфель
-дополнительных стратегий (см. [STRATEGIES.md](STRATEGIES.md)):
+A production-grade autonomous bot for Polymarket: the base strategy is a
+**"barbell on the mispricing of tail outcomes"**, plus a portfolio of
+additional strategies (see [STRATEGIES.md](STRATEGIES.md)):
 
-| # | Стратегия | Модуль | Режим по умолчанию |
+| # | Strategy | Module | Default mode |
 |---|---|---|---|
-| **ЯДРО** | **MM + liquidity rewards farming** (microprice, inventory skew, requote-гистерезис, rewards-диапазон из Gamma, fee-aware спред) | `marketmaker.py` + `scorer.py` | выключен — включать после фаз dry-run → paper |
-| сателлит | T-10s TA на 5-мин BTC up/down (детерминированные слаги, quarter-Kelly, FOK) | `satellite.py` | **выключен** (`satellite.enabled: false`) |
-| 1 | Структурный арбитраж neg-risk корзин | `arbitrage.py` | детекция + алерт (наивный sum-to-one по REST задокументированно выеден — исполнение не рекомендовано) |
-| 2 | Кросс-платформенные расхождения (Kalshi) | `crossmarket.py` | только алерты — правила резолюции сверяет человек |
-| 5 | Нишевые вотчлисты + лонгшот-барбелл | `niche.py`, `scanner.py`+`estimator/` | алерты; лонгшоты в dry-run |
+| **CORE** | **MM + liquidity rewards farming** (microprice, inventory skew, requote hysteresis, rewards band from Gamma, fee-aware spread) | `marketmaker.py` + `scorer.py` | off — enable after the dry-run → paper phases |
+| satellite | T-10s TA on 5-min BTC up/down (deterministic slugs, quarter-Kelly, FOK) | `satellite.py` | **off** (`satellite.enabled: false`) |
+| 1 | Structural arbitrage of neg-risk baskets | `arbitrage.py` | detect + alert (the naive sum-to-one over REST is documented as eaten — execution not recommended) |
+| 2 | Cross-platform divergences (Kalshi) | `crossmarket.py` | alerts only — a human reconciles the resolution rules |
+| 5 | Niche watchlists + longshot barbell | `niche.py`, `scanner.py`+`estimator/` | alerts; longshots in dry-run |
 
-Инфраструктура (мастер-промпт 2026): `ws_feed.py` — WS-стаканы с reconnect/
-heartbeat/gap-detect; `risk.py` — kill-switch (дневной стоп, просадка от HWM,
-WS-disconnect >10с, reconcile-рассинхрон каждые 60с → bulk-cancel + halt);
-`fees.py` — Fee Structure V2 по категориям (maker rebate, конфигурируемо);
-`ratelimit.py` — token bucket; `replay.py` — запись стаканов + бэктест-реплей.
+Infrastructure (master prompt 2026): `ws_feed.py` — WS order books with
+reconnect/heartbeat/gap-detect; `risk.py` — kill-switch (daily stop, drawdown
+from HWM, WS disconnect >10s, reconcile desync every 60s → bulk-cancel + halt);
+`fees.py` — Fee Structure V2 per category (maker rebate, configurable);
+`ratelimit.py` — token bucket; `replay.py` — book recording + backtest replay.
 
-**Порядок фаз: `--mode dry-run` → `--mode paper` (≥7 дней) → `--mode live`
-(только вручную). Фаза 0: `python -m polymarket_bot.phase0_smoke` на вашей
-машине — сверка живого API (эндпоинты, rewards-поля, версия SDK) с config.yaml.**
+**Phase order: `--mode dry-run` → `--mode paper` (>=7 days) → `--mode live`
+(manual only). Phase 0: `python -m polymarket_bot.phase0_smoke` on your
+machine — reconciles the live API (endpoints, rewards fields, SDK version) with config.yaml.**
 
-Все стратегии работают в одном процессе на своих интервалах, пишут в общий
-леджер (колонка `strategy` — раздельная атрибуция PnL) и подчиняются общему
-kill-switch. Рекомендуемый портфель и честные ограничения каждой стратегии —
-в STRATEGIES.md.
+All strategies run in one process on their own intervals, write to a shared
+ledger (the `strategy` column gives separate PnL attribution) and obey a shared
+kill-switch. The recommended portfolio and each strategy's honest limits are in
+STRATEGIES.md.
 
-## Философия стратегии
+## Strategy philosophy
 
-Наивная стратегия «купить сотни контрактов по $0.005–0.03 и ждать иксов»
-имеет **отрицательное EV** из-за favorite-longshot bias: дешёвые исходы на
-prediction-рынках систематически переоценены. Поэтому бот **не покупает
-хвосты вслепую** — это сканер мисспрайсинга. Лонгшот покупается только
-когда собственная оценка вероятности `p_est` существенно выше рыночной
-цены `p_mkt`: по умолчанию `p_est / p_mkt ≥ 2.0` при `p_mkt ≤ 0.05`.
+The naive "buy hundreds of contracts at $0.005–0.03 and wait for multi-x"
+strategy has **negative EV** because of favorite-longshot bias: cheap outcomes
+on prediction markets are systematically overpriced. So the bot **does not buy
+tails blindly** — it is a mispricing scanner. A longshot is bought only when
+the bot's own probability estimate `p_est` is materially above the market price
+`p_mkt`: by default `p_est / p_mkt >= 2.0` at `p_mkt <= 0.05`.
 
-## Архитектура
+## Architecture
 
 ```
-gamma.py ──┐                     ┌── base_rates.py  (исторические частоты, YAML)
-           ▼                     ├── coherence.py   (кросс-рыночная логика, приоритет №1)
-      scanner.py ──► estimator/ ─┼── llm.py         (Claude, structured JSON, кэш)
-   (фильтры L1+L2)   (ансамбль)  └── momentum.py    (информированный поток)
+gamma.py ──┐                     ┌── base_rates.py  (historical frequencies, YAML)
+           ▼                     ├── coherence.py   (cross-market logic, priority #1)
+      scanner.py ──► estimator/ ─┼── llm.py         (Claude, structured JSON, cache)
+   (L1+L2 filters)   (ensemble)  └── momentum.py    (informed flow)
                          │
                          ▼
-                   portfolio.py  (fractional Kelly, кэпы 1%/10%/30%, kill-switch 25%)
+                   portfolio.py  (fractional Kelly, 1%/10%/30% caps, kill-switch 25%)
                          │
                          ▼
-                   executor.py   (только maker-лимитки, репрайсинг, идемпотентность)
+                   executor.py   (maker limit orders only, repricing, idempotency)
                          │
                          ▼
-                    ledger.py    (sqlite: снапшоты сделок, Brier, атрибуция PnL)
+                    ledger.py    (sqlite: trade snapshots, Brier, PnL attribution)
                          │
                          ▼
-                    monitor.py   (rich-дашборд + Telegram)   ◄── main.py (оркестратор)
+                    monitor.py   (rich dashboard + Telegram)   ◄── main.py (orchestrator)
 ```
 
-### Сигналы оценщика
+### Estimator signals
 
-| Сигнал | Что делает | Доверие |
+| Signal | What it does | Confidence |
 |---|---|---|
-| **coherence** | Логические связки: neg-risk корзины (Σp ≠ 1) и календарные цепочки (P(до ранней даты) ≤ P(до поздней)). Несогласованность = структурный edge | 0.7–0.9 |
-| **base_rates** | Исторические частоты из `base_rates.yaml`: p = 1−(1−годовая)^(дней/365). Справочник расширяемый | из YAML (0.25–0.5) |
-| **llm** | Claude (`claude-sonnet-5`, structured JSON через официальный SDK) оценивает p_est по вопросу и правилам резолюции. Кэш 24 ч, лимит вызовов за цикл | ≤ 0.7 |
-| **momentum** | Рост цены хвоста при всплеске объёма = информированный поток | 0.15–0.4 |
+| **coherence** | Logical links: neg-risk baskets (sum(p) != 1) and calendar chains (P(by earlier date) <= P(by later date)). Inconsistency = structural edge | 0.7–0.9 |
+| **base_rates** | Historical frequencies from `base_rates.yaml`: p = 1−(1−annual)^(days/365). Extensible reference | from YAML (0.25–0.5) |
+| **llm** | Claude (`claude-sonnet-5`, structured JSON via the official SDK) estimates p_est from the question and resolution rules. 24h cache, per-cycle call limit | <= 0.7 |
+| **momentum** | A tail price rise on a volume spike = informed flow | 0.15–0.4 |
 
-**Ансамбль** — взвешенное геометрическое среднее с confidence-весами.
-Рыночная цена всегда участвует как якорь с весом
-`market_anchor_confidence` (0.85): чтобы ансамбль дал edge ≥ 2, сигнал с
-доверием 0.5 должен расходиться с рынком в ~2^((0.85+0.5)/0.5) ≈ 6.5 раз.
-Это осознанный консерватизм против longshot bias; ослабляйте якорь после
-калибровки бэктестом.
+The **ensemble** is a confidence-weighted geometric mean. The market price
+always participates as an anchor with weight `market_anchor_confidence` (0.85):
+for the ensemble to yield edge >= 2, a signal with confidence 0.5 must diverge
+from the market by ~2^((0.85+0.5)/0.5) ≈ 6.5x. This is deliberate conservatism
+against longshot bias; loosen the anchor after calibrating with a backtest.
 
-## Установка
+## Installation
 
 ```bash
 pip install -r polymarket_bot/requirements.txt
-cp polymarket_bot/.env.example polymarket_bot/.env   # заполнить; .env в .gitignore
+cp polymarket_bot/.env.example polymarket_bot/.env   # fill it in; .env is in .gitignore
 ```
 
-## Порядок работы (важно!)
+## Workflow (important!)
 
 ```bash
-# 1. Бэктест на закрытых рынках: калибровка p_est до единого живого доллара
+# 1. Backtest on closed markets: calibrate p_est before a single live dollar
 python -m polymarket_bot --mode backtest
 
-# 2. Dry-run (ДЕФОЛТ): всё по-настоящему, кроме денег. Ордера виртуальные,
-#    PnL считается по реальным резолюциям. Обязательный этап до live.
-python -m polymarket_bot                     # циклы по расписанию
-python -m polymarket_bot --once              # один цикл (удобно для cron)
+# 2. Dry-run (DEFAULT): everything for real except the money. Orders are
+#    virtual, PnL is computed on real resolutions. A mandatory stage before live.
+python -m polymarket_bot                     # scheduled cycles
+python -m polymarket_bot --once              # one cycle (handy for cron)
 
-# 3. Live — реальные деньги, только после недель успешного dry-run
+# 3. Live — real money, only after weeks of successful dry-run
 python -m polymarket_bot --mode live --i-understand-the-risk
 ```
 
-Все параметры стратегии — в `config.yaml` (фильтры сканера, порог edge,
-λ Келли, кэпы, тейк-профит, интервал цикла). Секреты — только в `.env`.
+All strategy parameters are in `config.yaml` (scanner filters, edge threshold,
+Kelly λ, caps, take-profit, cycle interval). Secrets go only in `.env`.
 
-`config.yaml` — ваш личный конфиг, он **вне git** (обновления кода его не
-трогают). В репозитории лежит шаблон `config.example.yaml`. Если своего
-`config.yaml` нет, бот берёт параметры из шаблона; чтобы настроить под себя:
-`cp polymarket_bot/config.example.yaml polymarket_bot/config.yaml` и правьте
-копию.
+`config.yaml` is your personal config, kept **outside git** (code updates don't
+touch it). The repo ships a template `config.example.yaml`. If you have no
+`config.yaml` of your own, the bot reads parameters from the template; to
+customize: `cp polymarket_bot/config.example.yaml polymarket_bot/config.yaml`
+and edit the copy.
 
-## Что происходит в одном цикле
+## What happens in one cycle
 
-1. **scanner** — все активные рынки из Gamma; фильтры: цена в [0.002, 0.05],
-   объём 24h ≥ $5k, глубина бидов ≥ $500 в пределах 20% от mid, резолюция
-   через 3–120 дней, однозначные правила резолюции (источник или внятное
-   описание).
-2. **estimator** — ансамбль сигналов даёт p_est; каждая оценка со всеми
-   вкладами сигналов пишется в леджер.
-3. **portfolio** — fractional Kelly (λ=0.15) с жёсткими кэпами: ≤1% банка
-   на рынок, ≤10% на категорию (с экспертной матрицей корреляций:
-   геополитика↔экономика 0.5 и т.д.), ≤30% суммарно. Просадка ≥25% →
-   **kill-switch**: observe-only + алерт.
-4. **executor** — только лимитные maker-ордера: бид чуть выше best bid
-   (никогда не пересекая ask), таймаут, до 3 репрайсов, отмена если цена
-   ушла выше порога edge. Крупные заявки дробятся по $200. Идемпотентность:
-   перед ордером локальный стейт сверяется с фактическими позициями API;
-   при недоступности сверки ордер **не** отправляется (fail-safe).
-5. **выходы** — позиция выросла в ≥7 раз → продажа 60%, остаток — бесплатный
-   лотерейный билет. Резолюции фиксируются в леджере автоматически.
-6. **monitor** — rich-дашборд (банк, просадка, позиции, топ-кандидаты,
-   ошибки) + Telegram-алерты о входах/выходах/резолюциях/kill-switch.
+1. **scanner** — all active markets from Gamma; filters: price in [0.002, 0.05],
+   24h volume >= $5k, bid depth >= $500 within 20% of mid, resolution in
+   3–120 days, unambiguous resolution rules (a source or a clear description).
+2. **estimator** — the signal ensemble gives p_est; every estimate with all
+   signal contributions is written to the ledger.
+3. **portfolio** — fractional Kelly (λ=0.15) with hard caps: <=1% of bankroll
+   per market, <=10% per category (with an expert correlation matrix:
+   geopolitics↔economy 0.5 etc.), <=30% total. Drawdown >=25% →
+   **kill-switch**: observe-only + alert.
+4. **executor** — maker limit orders only: bid just above best bid (never
+   crossing ask), a timeout, up to 3 reprices, cancel if price moved above the
+   edge threshold. Large orders are split into $200 children. Idempotency:
+   before an order, local state is reconciled with the API's actual positions;
+   if the reconcile is unavailable, the order is **not** sent (fail-safe).
+5. **exits** — a position that rose >=7x → sell 60%, the remainder is a free
+   lottery ticket. Resolutions are recorded in the ledger automatically.
+6. **monitor** — rich dashboard (bank, drawdown, positions, top candidates,
+   errors) + Telegram alerts on entries/exits/resolutions/kill-switch.
 
-## Аналитика леджера
+## Ledger analytics
 
-`ledger.metrics()`: hit rate, средний реализованный множитель, ROI,
-**Brier score модели против Brier рынка** (главный тест: обыгрываем ли мы
-цену), атрибуция PnL по сигналам — какой источник edge реально работает.
-Каждая сделка хранит полный снапшот (p_mkt, p_est, вклады сигналов, книга
-на момент входа).
+`ledger.metrics()`: hit rate, average realized multiple, ROI, **model Brier
+score vs market Brier** (the key test: do we beat the price), PnL attribution
+by signal — which edge source actually works. Every trade stores a full
+snapshot (p_mkt, p_est, signal contributions, the book at entry time).
 
-## Бэктест: методика и честные ограничения
+## Backtest: method and honest limits
 
-Закрытые рынки Gamma + история цен CLOB (`/prices-history`): цена
-сэмплируется за `lookback_days_before_end` (21 день) до резолюции — это
-«вход бота». Отчёт: Brier рынка vs модели, таблица калибровки по бакетам
-цены, симулированный ROI стратегии. Ограничения: вход по сэмплированной
-цене оптимистичен, momentum и LLM в бэктесте не участвуют (нет исторических
-дельт; у LLM — утечка будущего знания).
+Closed Gamma markets + CLOB price history (`/prices-history`): the price is
+sampled `lookback_days_before_end` (21 days) before resolution — the bot's
+"entry". Report: market vs model Brier, a bucketed calibration table, and
+simulated strategy ROI. Limits: entry at the sampled price is optimistic;
+momentum and LLM do not participate in the backtest (no historical deltas; the
+LLM would leak future knowledge).
 
-## ⚠️ Риски
+## ⚠️ Risks
 
-- Live-режим требует явного `--i-understand-the-risk`. Ставьте только то,
-  что готовы полностью потерять.
-- Dry-run fill-модель оптимистична (maker-бид считается исполненным);
-  реальный fill-rate ниже — закладывайте это в оценку результатов.
-- Приватный ключ используется только официальным `py-clob-client` для
-  подписи ордеров и читается исключительно из `.env`.
-- Юрисдикционные ограничения Polymarket — ваша ответственность.
+- Live mode requires an explicit `--i-understand-the-risk`. Bet only what you
+  are ready to lose entirely.
+- The dry-run fill model is optimistic (the maker bid is treated as filled);
+  the real fill-rate is lower — factor that into your reading of the results.
+- The private key is used only by the official `py-clob-client` to sign orders
+  and is read exclusively from `.env`.
+- Polymarket's jurisdictional restrictions are your responsibility.
 
-## Тесты
+## Tests
 
 ```bash
-pytest polymarket_bot/tests/ -q     # 46 офлайн-тестов: edge-фильтр, Келли,
-                                    # когерентность, идемпотентность, леджер
+pytest polymarket_bot/tests/ -q     # offline tests: edge filter, Kelly,
+                                    # coherence, idempotency, ledger, fade, MM, ...
 ```

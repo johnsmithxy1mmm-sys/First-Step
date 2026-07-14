@@ -1,15 +1,15 @@
-# Systemd-юнит: бот работает 24/7, переживает падения и перезагрузки сервера.
+# Systemd unit: the bot runs 24/7 and survives crashes and server reboots.
 #
-# Установка (пути поправьте под себя):
+# Install (adjust the paths for yourself):
 #   sudo cp polymarket_bot/deploy/polymarket-bot.service /etc/systemd/system/
 #   sudo systemctl daemon-reload
-#   sudo systemctl enable --now polymarket-bot      # автозапуск + старт сейчас
+#   sudo systemctl enable --now polymarket-bot      # autostart + start now
 #
-# Управление:
-#   systemctl status polymarket-bot                 # состояние
-#   journalctl -u polymarket-bot -f                 # живые логи
-#   sudo systemctl stop polymarket-bot              # ОСТАНОВИТЬ (только вы)
-#   sudo systemctl disable polymarket-bot           # убрать из автозапуска
+# Management:
+#   systemctl status polymarket-bot                 # status
+#   journalctl -u polymarket-bot -f                 # live logs
+#   sudo systemctl stop polymarket-bot              # STOP (only you)
+#   sudo systemctl disable polymarket-bot           # remove from autostart
 
 [Unit]
 Description=Polymarket Longshot Bot (tail mispricing barbell)
@@ -18,19 +18,19 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# Отдельный непривилегированный пользователь (создать: sudo useradd -r -m polybot)
+# A separate unprivileged user (create: sudo useradd -r -m polybot)
 User=polybot
 WorkingDirectory=/opt/Polymarket-Mint-Bot
-# Секреты — из .env; файл должен принадлежать polybot с правами 600.
+# Secrets from .env; the file must be owned by polybot with mode 600.
 EnvironmentFile=/opt/Polymarket-Mint-Bot/polymarket_bot/.env
-# Для проверки без денег замените "--mode live --i-understand-the-risk" на "--mode dry-run".
+# To test without money, replace "--mode live --i-understand-the-risk" with "--mode dry-run".
 ExecStart=/opt/Polymarket-Mint-Bot/.venv/bin/python -m polymarket_bot --mode live --i-understand-the-risk
 Restart=always
 RestartSec=30
-# Если бот падает 5 раз за 10 минут — остановиться и не молотить биржу.
+# If the bot crashes 5 times in 10 minutes — stop and do not hammer the exchange.
 StartLimitIntervalSec=600
 StartLimitBurst=5
-# Ограничения на всякий случай.
+# Limits just in case.
 MemoryMax=1G
 NoNewPrivileges=true
 
