@@ -39,6 +39,7 @@ from .config import BotConfig
 from .fees import FeeModel
 from .ledger import Ledger
 from .models import Market, simple_estimate
+from .monitor import alert
 from .portfolio import classify_category
 from .scorer import MarketScorer
 from .ws_feed import TopOfBook
@@ -221,6 +222,11 @@ class MarketMaker:
             category="mm", side="BUY", price=price, size=size,
             order_id=order_id, status=status, strategy="mm",
         )
+        side = (market.outcomes[outcome_index]
+                if outcome_index < len(market.outcomes)
+                else ("Yes" if outcome_index == 0 else "No"))
+        alert(f"MM fill [{self._mode}] {side} {price:.3f} x {size:,.0f} "
+              f"= ${price * size:,.2f} — {market.question[:60]}")
 
     def _sync_live_fills(self) -> None:
         if self._trader is None:

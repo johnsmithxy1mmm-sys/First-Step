@@ -150,10 +150,13 @@ def test_paper_fill_when_market_trades_through(cfg, ledger):
     assert ledger.open_positions("paper") == []
 
     tops["mm1-yes"] = top(bid=0.42, ask=0.44)     # market traded into our bid
-    mm._paper_fills()
+    with mock.patch("polymarket_bot.marketmaker.alert") as a:
+        mm._paper_fills()
     positions = ledger.open_positions("paper")
     assert len(positions) == 1
     assert positions[0].avg_price == pytest.approx(quote.yes_bid)
+    a.assert_called_once()                        # fill is announced to Telegram
+    assert "MM fill" in a.call_args[0][0]
 
 
 def test_dry_run_never_places_orders(cfg, ledger):
