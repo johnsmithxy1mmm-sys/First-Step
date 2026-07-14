@@ -1,17 +1,17 @@
-"""Фаза 0 — разведка API. Запускать НА ВАШЕЙ МАШИНЕ (не в CI-песочнице):
+"""Phase 0 — API recon. Run ON YOUR MACHINE (not in the CI sandbox):
 
     python -m polymarket_bot.phase0_smoke
 
-Проверяет пять фактов о живой платформе и печатает вердикт по каждому:
-  1. Gamma: рынки отдаются, поля rewards (rewardsMinSize/rewardsMaxSpread) на месте.
-  2. CLOB REST: стакан читается.
-  3. CLOB WS: подписка работает, приходят book/price_change.
-  4. Версия py-clob-client и поддержка V2 (наличие OrderType.FOK и т.п.).
-  5. Данные о комиссиях/категориях в Gamma (сверьте с config.yaml fees:).
+Checks five facts about the live platform and prints a verdict for each:
+  1. Gamma: markets are returned, rewards fields (rewardsMinSize/rewardsMaxSpread) present.
+  2. CLOB REST: the order book reads.
+  3. CLOB WS: subscription works, book/price_change arrive.
+  4. py-clob-client version and V2 support (presence of OrderType.FOK etc.).
+  5. Fee/category data in Gamma (cross-check with config.yaml fees:).
 
-Если реальные эндпоинты/схемы отличаются от конфига — правьте config.yaml
-(runtime: hosts, fees:) и сообщите, что изменилось. Код бота платформенно-
-зависимые вещи читает из конфига, не из констант.
+If the real endpoints/schemas differ from the config — edit config.yaml
+(runtime: hosts, fees:) and report what changed. The bot reads
+platform-dependent things from the config, not from constants.
 """
 
 from __future__ import annotations
@@ -30,20 +30,20 @@ def check_gamma(cfg: BotConfig) -> dict | None:
                             params={"active": "true", "closed": "false",
                                     "limit": 5}, max_retries=2)
     markets = resp.json()
-    assert isinstance(markets, list) and markets, "Gamma вернул пусто"
+    assert isinstance(markets, list) and markets, "Gamma returned empty"
     m = markets[0]
     rewards_fields = [k for k in m if "reward" in k.lower()]
-    print(f"[OK] Gamma: {len(markets)} рынков; пример: {m.get('question', '')[:60]}")
-    print(f"     rewards-поля: {rewards_fields or 'НЕ НАЙДЕНЫ — проверьте схему!'}")
+    print(f"[OK] Gamma: {len(markets)} markets; example: {m.get('question', '')[:60]}")
+    print(f"     rewards fields: {rewards_fields or 'NOT FOUND — check the schema!'}")
     fee_fields = [k for k in m if "fee" in k.lower()]
-    print(f"     fee-поля: {fee_fields or 'нет (комиссии берём из config.yaml)'}")
+    print(f"     fee fields: {fee_fields or 'none (fees come from config.yaml)'}")
     return m
 
 
 def check_clob_book(cfg: BotConfig, market: dict) -> str | None:
     token_ids = json.loads(market.get("clobTokenIds") or "[]")
     if not token_ids:
-        print("[SKIP] CLOB book: у рынка нет clobTokenIds")
+        print("[SKIP] CLOB book: market has no clobTokenIds")
         return None
     client = make_client(20)
     resp = get_with_backoff(client, f"{cfg.runtime.clob_host}/book",
@@ -62,7 +62,7 @@ async def check_ws(cfg: BotConfig, token_id: str) -> None:
         raw = await asyncio.wait_for(ws.recv(), timeout=15)
         payload = json.loads(raw)
         first = payload[0] if isinstance(payload, list) else payload
-        print(f"[OK] CLOB WS: первое сообщение event_type={first.get('event_type')}")
+        print(f"[OK] CLOB WS: first message event_type={first.get('event_type')}")
 
 
 def check_sdk() -> None:
@@ -73,14 +73,14 @@ def check_sdk() -> None:
         version = getattr(py_clob_client, "__version__", "?")
         print(f"[OK] py-clob-client {version}; OrderType.FOK: {fok}")
         if not fok:
-            print("     ВНИМАНИЕ: FOK не найден — обновите SDK до V2-совместимого")
+            print("     WARNING: FOK not found — update the SDK to a V2-compatible one")
     except ImportError:
-        print("[FAIL] py-clob-client не установлен")
+        print("[FAIL] py-clob-client is not installed")
 
 
 def main() -> None:
     cfg = BotConfig.load()
-    print("=== Фаза 0: разведка API Polymarket ===")
+    print("=== Phase 0: Polymarket API recon ===")
     failures = 0
     market = None
     token = None
@@ -103,8 +103,8 @@ def main() -> None:
             failures += 1
             print(f"[FAIL] ws: {exc}")
     check_sdk()
-    print("\nИтог:", "ВСЁ ОК — можно запускать Фазу 1 (dry-run)"
-          if failures == 0 else f"{failures} проверок упало — правьте config.yaml")
+    print("\nResult:", "ALL OK — you can run Phase 1 (dry-run)"
+          if failures == 0 else f"{failures} checks failed — edit config.yaml")
     sys.exit(1 if failures else 0)
 
 

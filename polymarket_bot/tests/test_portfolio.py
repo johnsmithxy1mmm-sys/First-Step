@@ -1,4 +1,4 @@
-"""Портфель: Келли, кэпы, kill-switch, правило выхода."""
+"""Portfolio: Kelly, caps, kill-switch, exit rule."""
 
 import pytest
 
@@ -12,7 +12,7 @@ from .conftest import make_candidate
 
 def make_estimate(p_mkt=0.01, p_est=0.03, **overrides):
     c = make_candidate(outcome_prices=[p_mkt, 1 - p_mkt], **overrides)
-    # Один сигнал с гигантским весом задаёт p_est точно.
+    # One signal with a huge weight sets p_est exactly.
     return combine(c, [Signal(name="s", p_est=p_est, confidence=1e9)], 1e-9)
 
 
@@ -23,12 +23,12 @@ def record_buy(ledger, est, category, usd):
                         order_id=None, status="sim-filled")
 
 
-# --- Келли ---
+# --- Kelly ---
 
 def test_kelly_formula():
     # p=0.03, price=0.01: f* = 0.02/0.99
     assert kelly_fraction(0.03, 0.01) == pytest.approx(0.02 / 0.99)
-    assert kelly_fraction(0.005, 0.01) == 0.0  # отрицательный edge
+    assert kelly_fraction(0.005, 0.01) == 0.0  # negative edge
     assert kelly_fraction(0.5, 0.0) == 0.0
 
 
@@ -49,21 +49,21 @@ def test_no_plan_when_no_edge(cfg, ledger):
     assert p.size_trade(make_estimate(p_mkt=0.02, p_est=0.02)) is None
 
 
-# --- кэпы категории и общей экспозиции ---
+# --- category and total exposure caps ---
 
 def test_category_cap_blocks_after_fill(cfg, ledger):
     p = Portfolio(cfg, ledger, "dry-run")
     cat_cap = cfg.portfolio.max_category_pct * cfg.portfolio.bankroll_usd  # $500
     est_old = make_estimate(p_mkt=0.01, p_est=0.05)
-    record_buy(ledger, est_old, "nature", cat_cap)  # категория заполнена
+    record_buy(ledger, est_old, "nature", cat_cap)  # category is full
 
-    est_new = make_estimate(p_mkt=0.01, p_est=0.05)  # тот же землетрясенческий вопрос
+    est_new = make_estimate(p_mkt=0.01, p_est=0.05)  # the same earthquake question
     assert p.size_trade(est_new) is None
 
 
 def test_correlated_category_reduces_room(cfg, ledger):
     p = Portfolio(cfg, ledger, "dry-run")
-    # Геополитика заполнена: экономика (rho=0.5) получает вдвое меньший запас.
+    # Geopolitics is full: economy (rho=0.5) gets half the room.
     record_buy(ledger, make_estimate(), "geopolitics",
                cfg.portfolio.max_category_pct * cfg.portfolio.bankroll_usd)
     est = make_estimate(
@@ -78,7 +78,7 @@ def test_correlated_category_reduces_room(cfg, ledger):
 
 
 def test_total_exposure_cap(cfg, ledger):
-    cfg.portfolio.max_total_exposure_pct = 0.001  # $5 на всё
+    cfg.portfolio.max_total_exposure_pct = 0.001  # $5 for everything
     p = Portfolio(cfg, ledger, "dry-run")
     record_buy(ledger, make_estimate(), "sports", 5.0)
     assert p.size_trade(make_estimate(p_mkt=0.01, p_est=0.05)) is None
@@ -90,14 +90,14 @@ def test_drawdown_kill_switch(cfg, ledger):
     p = Portfolio(cfg, ledger, "dry-run")
     assert not p.observe_only()
 
-    # Покупка на $1000, резолюция в ноль: банк 5000 -> 4000 (просадка 20%).
+    # A $1000 buy resolving to zero: bank 5000 -> 4000 (20% drawdown).
     est = make_estimate(p_mkt=0.01, p_est=0.05)
     record_buy(ledger, est, "nature", 1000.0)
     ledger.record_resolution(est.candidate.token_id, est.candidate.market.id, won=False)
     assert p.drawdown() == pytest.approx(0.20, abs=0.01)
     assert not p.observe_only()  # 20% < 25%
 
-    # Ещё -500: просадка 30% >= 25% -> стоп.
+    # Another -500: drawdown 30% >= 25% -> stop.
     est2 = make_estimate(p_mkt=0.01, p_est=0.05, id="m2",
                          clob_token_ids=["tok2-yes", "tok2-no"])
     record_buy(ledger, est2, "nature", 500.0)
@@ -105,7 +105,7 @@ def test_drawdown_kill_switch(cfg, ledger):
     assert p.observe_only()
 
 
-# --- выход ---
+# --- exit ---
 
 def test_exit_rule_takes_partial_profit(cfg, ledger):
     p = Portfolio(cfg, ledger, "dry-run")
@@ -115,11 +115,11 @@ def test_exit_rule_takes_partial_profit(cfg, ledger):
     plan = p.exit_plan(pos, current_price=0.08)               # 8x >= 7x
     assert plan is not None
     size, min_price = plan
-    assert size == 600                                        # 60% позиции
+    assert size == 600                                        # 60% of the position
     assert min_price == pytest.approx(0.01 * 7 * 0.8)
 
 
-# --- классификатор категорий ---
+# --- category classifier ---
 
 def test_classify_category():
     assert classify_category("Will bitcoin hit $500k?") == "crypto"

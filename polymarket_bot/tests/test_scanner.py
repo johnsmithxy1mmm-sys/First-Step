@@ -1,4 +1,4 @@
-"""Сканер: фильтры первого уровня и проверка глубины книги."""
+"""Scanner: first-level filters and book-depth check."""
 
 from datetime import datetime, timedelta, timezone
 from unittest import mock
@@ -40,10 +40,10 @@ def test_rejects_bad_resolution_window(cfg):
 def test_rejects_ambiguous_resolution(cfg):
     ambiguous = make_market(resolution_source="", description="short")
     assert scan1(cfg, ambiguous) == []
-    # Внятное описание без источника — допустимо.
+    # A clear description without a source is acceptable.
     described = make_market(resolution_source="")
     assert len(scan1(cfg, described)) == 1
-    # Флаг можно выключить.
+    # The flag can be turned off.
     cfg.scanner.require_resolution_clarity = False
     assert len(scan1(cfg, ambiguous)) == 1
 
@@ -71,7 +71,7 @@ def test_depth_filter(cfg):
 
     thin = make_book()
     thin.bids = [lvl.model_copy(update={"size": 10}) for lvl in thin.bids]
-    clob.order_book.return_value = thin  # ~$0.1 глубины — меньше $500
+    clob.order_book.return_value = thin  # ~$0.1 depth — less than $500
     assert scanner.verify_depth(candidates) == []
 
     clob.order_book.return_value = None

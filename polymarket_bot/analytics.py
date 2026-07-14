@@ -1,10 +1,10 @@
-"""Аналитический отчёт: всё, что бот накопил в леджере, — одной командой.
+"""Analytics report: everything the bot accumulated in the ledger, one command.
 
     python -m polymarket_bot --mode report
 
-Секции: банк и просадка, PnL по стратегиям, лонгшот-метрики (hit rate, ROI,
-Brier модели против рынка), сводка оценок, markout-анализ филлов (главный
-тест качества исполнения MM), открытые позиции.
+Sections: bank and drawdown, PnL by strategy, longshot metrics (hit rate, ROI,
+model Brier vs market), estimate summary, fill markout analysis (the key test
+of MM execution quality), open positions.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from .ledger import Ledger
 
 
 def compute_report(ledger: Ledger, mode: str) -> dict:
-    """Собирает все метрики в один словарь (тестируется без rich)."""
+    """Gathers all metrics into one dict (testable without rich)."""
     bank = ledger.bank_series()
     equity_start = bank[0]["equity"] if bank else None
     equity_now = bank[-1]["equity"] if bank else None
@@ -48,19 +48,19 @@ def print_report(report: dict) -> None:
     mode = report["mode"]
 
     eq_start, eq_now = report["equity_start"], report["equity_now"]
-    bank_line = "снапшотов банка ещё нет — запустите бота хотя бы на один цикл"
+    bank_line = "no bank snapshots yet — run the bot for at least one cycle"
     if eq_now is not None:
         delta = eq_now - eq_start
         bank_line = (f"Equity: ${eq_start:,.2f} -> ${eq_now:,.2f} ({delta:+,.2f}) | "
                      f"HWM ${report['hwm']:,.2f} | "
-                     f"макс. просадка {report['max_drawdown_pct'] * 100:.1f}% | "
-                     f"точек: {report['bank_points']}")
-    c.print(Panel(bank_line, title=f"Отчёт PolyBot — режим {mode}"))
+                     f"max drawdown {report['max_drawdown_pct'] * 100:.1f}% | "
+                     f"points: {report['bank_points']}")
+    c.print(Panel(bank_line, title=f"PolyBot report — mode {mode}"))
 
     pnl = report["pnl_by_strategy"]
     if pnl:
-        t = Table(title="Реализованный PnL по стратегиям")
-        t.add_column("Стратегия")
+        t = Table(title="Realized PnL by strategy")
+        t.add_column("Strategy")
         t.add_column("PnL, $", justify="right")
         for name, value in sorted(pnl.items()):
             t.add_row(name, f"{value:+,.2f}")
@@ -68,58 +68,58 @@ def print_report(report: dict) -> None:
 
     ls = report["longshot"]
     if ls["resolved_trades"]:
-        t = Table(title="Лонгшоты: разрешившиеся сделки")
-        for col in ("Сделок", "Hit rate", "Средний множитель", "ROI",
-                    "Brier модели", "Brier рынка"):
+        t = Table(title="Longshots: resolved trades")
+        for col in ("Trades", "Hit rate", "Avg multiple", "ROI",
+                    "Model Brier", "Market Brier"):
             t.add_column(col, justify="right")
         better = ls["brier_model"] is not None and ls["brier_market"] is not None \
             and ls["brier_model"] < ls["brier_market"]
         t.add_row(
             str(ls["resolved_trades"]), f"{ls['hit_rate']:.1%}",
             f"{ls['avg_win_multiple']:.1f}x", f"{ls['roi']:+.1%}",
-            f"{ls['brier_model']:.5f}" + (" (лучше рынка)" if better else ""),
+            f"{ls['brier_model']:.5f}" + (" (better than market)" if better else ""),
             f"{ls['brier_market']:.5f}")
         c.print(t)
         attribution = ls.get("signal_pnl_attribution") or {}
         if attribution:
-            t = Table(title="Атрибуция PnL по сигналам")
-            t.add_column("Сигнал")
+            t = Table(title="PnL attribution by signal")
+            t.add_column("Signal")
             t.add_column("PnL, $", justify="right")
             for name, value in sorted(attribution.items(), key=lambda x: -x[1]):
                 t.add_row(name, f"{value:+,.2f}")
             c.print(t)
     else:
-        c.print("[dim]Разрешившихся лонгшот-сделок пока нет — hit rate и Brier "
-                "появятся после первых резолюций.[/dim]")
+        c.print("[dim]No resolved longshot trades yet — hit rate and Brier "
+                "will appear after the first resolutions.[/dim]")
 
     est = report["estimates"]
     if est.get("total"):
-        c.print(f"Оценок записано: {est['total']} | прошло порог edge: "
-                f"{est['qualifying'] or 0} | средний edge: {est['avg_edge']:.2f}")
+        c.print(f"Estimates recorded: {est['total']} | passed edge threshold: "
+                f"{est['qualifying'] or 0} | avg edge: {est['avg_edge']:.2f}")
 
     markouts = report["markouts"]
     if markouts:
-        t = Table(title="Markout-анализ филлов (тест adverse selection)")
-        for col in ("Стратегия", "Горизонт", "Филлов", "Средний markout",
-                    "в % от цены", "В нашу сторону"):
+        t = Table(title="Fill markout analysis (adverse-selection test)")
+        for col in ("Strategy", "Horizon", "Fills", "Avg markout",
+                    "% of price", "In our favor"):
             t.add_column(col, justify="right")
         for m in markouts:
             t.add_row(
-                m["strategy"], f"+{m['horizon_sec']}с", str(m["n"]),
+                m["strategy"], f"+{m['horizon_sec']}s", str(m["n"]),
                 f"{m['avg_markout']:+.4f}", f"{m['avg_markout_pct'] * 100:+.1f}%",
                 f"{m['favorable']}/{m['n']}")
         c.print(t)
-        c.print("[dim]markout < 0 на покупках = после нашего филла цена падает: "
-                "нас переезжают информированные — ужесточайте guard или ширьте "
-                "спред. markout ~ 0 и стабильный = можно сужать спред.[/dim]")
+        c.print("[dim]markout < 0 on buys = price falls after our fill: the "
+                "informed are running us over — tighten the guard or widen the "
+                "spread. markout ~ 0 and stable = you can narrow the spread.[/dim]")
     else:
-        c.print("[dim]Markout-данных пока нет: они копятся автоматически через "
-                "1 и 10 минут после каждого филла (нужен работающий бот).[/dim]")
+        c.print("[dim]No markout data yet: it accumulates automatically 1 and "
+                "10 minutes after each fill (needs a running bot).[/dim]")
 
     positions = report["positions"]
     if positions:
-        t = Table(title=f"Открытые позиции ({len(positions)})")
-        for col in ("Категория", "Исход / Вопрос", "Размер", "Вход", "Кост, $"):
+        t = Table(title=f"Open positions ({len(positions)})")
+        for col in ("Category", "Outcome / Question", "Size", "Entry", "Cost, $"):
             t.add_column(col)
         for p in sorted(positions, key=lambda p: p.cost_usd, reverse=True)[:25]:
             t.add_row(p.category, f"[{p.outcome}] {p.question[:55]}",

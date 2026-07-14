@@ -1,4 +1,4 @@
-"""Общие фикстуры: фабрики рынков/кандидатов, конфиг с временной БД."""
+"""Shared fixtures: market/candidate factories, config with a temp DB."""
 
 from __future__ import annotations
 

@@ -1,9 +1,9 @@
-"""Ансамбль: взвешенное геометрическое среднее сигналов с confidence-весами.
+"""Ensemble: confidence-weighted geometric mean of signals.
 
-Рыночная цена всегда участвует как якорный сигнал с весом
-market_anchor_confidence — чтобы перевесить рынок, сигналы должны быть
-одновременно уверенными и расходиться с ценой. Это защита от
-favorite-longshot bias: по умолчанию мы верим рынку.
+The market price always participates as an anchor signal with weight
+market_anchor_confidence — to outweigh the market, signals must be both
+confident and diverge from the price. This guards against favorite-longshot
+bias: by default we trust the market.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ def combine(candidate: Candidate, signals: list[Signal],
         name="market",
         p_est=candidate.p_mkt,
         confidence=market_anchor_confidence,
-        rationale="рыночная цена как байесовский якорь",
+        rationale="market price as a Bayesian anchor",
     )
     active = [anchor] + [s for s in signals if s.p_est is not None and s.confidence > 0]
 

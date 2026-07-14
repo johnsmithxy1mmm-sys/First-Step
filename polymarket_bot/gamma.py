@@ -1,4 +1,4 @@
-"""Gamma Markets API: метаданные рынков и событий."""
+"""Gamma Markets API: market and event metadata."""
 
 from __future__ import annotations
 
@@ -41,7 +41,7 @@ class GammaClient:
             offset += PAGE_SIZE
 
     def fetch_active_markets(self) -> list[Market]:
-        """Активные рынки через /events — контекст события нужен когерентности."""
+        """Active markets via /events — event context is needed for coherence."""
         markets: list[Market] = []
         seen: set[str] = set()
         for event in self._paginate("/events", {"active": "true", "closed": "false"}):
@@ -50,11 +50,11 @@ class GammaClient:
                 if market is not None and market.id not in seen:
                     seen.add(market.id)
                     markets.append(market)
-        log.info("gamma: активных рынков %d", len(markets))
+        log.info("gamma: active markets %d", len(markets))
         return markets
 
     def fetch_closed_markets(self, max_markets: int) -> list[Market]:
-        """Закрытые рынки для бэктеста калибровки."""
+        """Closed markets for calibration backtests."""
         markets: list[Market] = []
         for raw in self._paginate("/markets", {"closed": "true", "order": "endDate", "ascending": "false"}):
             market = Market.from_gamma(raw)
@@ -63,5 +63,5 @@ class GammaClient:
             markets.append(market)
             if len(markets) >= max_markets:
                 break
-        log.info("gamma: закрытых рынков для бэктеста %d", len(markets))
+        log.info("gamma: closed markets for backtest %d", len(markets))
         return markets

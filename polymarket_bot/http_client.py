@@ -1,4 +1,4 @@
-"""HTTP-обвязка: httpx с экспоненциальным бэкоффом и джиттером."""
+"""HTTP wrapper: httpx with exponential backoff and jitter."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ def get_with_backoff(
     max_retries: int = 4,
     base_delay: float = 1.0,
 ) -> httpx.Response:
-    """GET с ретраями на сетевые ошибки и 429/5xx. Бросает после исчерпания попыток."""
+    """GET retrying network errors and 429/5xx. Raises once retries are exhausted."""
     last_exc: Exception | None = None
     for attempt in range(max_retries + 1):
         try:
@@ -39,7 +39,7 @@ def get_with_backoff(
             retry_after = resp.headers.get("retry-after")
             delay = float(retry_after) if retry_after else None
         except httpx.HTTPStatusError:
-            raise  # не-ретраебельный 4xx
+            raise  # non-retryable 4xx
         except httpx.HTTPError as exc:
             last_exc = exc
             delay = None

@@ -1,10 +1,10 @@
-"""Polymarket longshot bot — барбелл на мисспрайсинге хвостовых исходов.
+"""Polymarket longshot bot — a barbell on the mispricing of tail outcomes.
 
-Сканер мисспрайсинга: покупает лонгшот только когда собственная оценка
-вероятности существенно выше рыночной цены (p_est / p_mkt >= порога).
-Модули: scanner -> estimator (base rates, когерентность, LLM, momentum)
--> portfolio (fractional Kelly + лимиты) -> executor (maker-лимитки)
--> ledger (sqlite, атрибуция PnL) -> monitor (rich + Telegram).
+Mispricing scanner: buys a longshot only when its own probability estimate is
+materially above the market price (p_est / p_mkt >= threshold).
+Modules: scanner -> estimator (base rates, coherence, LLM, momentum)
+-> portfolio (fractional Kelly + limits) -> executor (maker limit orders)
+-> ledger (sqlite, PnL attribution) -> monitor (rich + Telegram).
 """
 
 __version__ = "1.0.0"

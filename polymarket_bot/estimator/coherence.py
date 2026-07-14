@@ -1,17 +1,17 @@
-"""Кросс-рыночная когерентность — приоритет №1 среди сигналов.
+"""Cross-market coherence — priority #1 among signals.
 
-Логические связки между рынками дают структурный edge, не зависящий от
-чьих-либо мнений:
+Logical links between markets give a structural edge independent of anyone's
+opinions:
 
-1. Neg-risk корзины. В событии с взаимоисключающими исходами (выборы и т.п.)
-   сумма цен Yes всех рынков обязана быть ~1. Если S = Σp ≠ 1, каждая цена
-   систематически смещена: честная вероятность кандидата ≈ p_mkt / S.
-   При S < 1 корзина в сумме недооценена — чистейший edge.
+1. Neg-risk baskets. In an event with mutually exclusive outcomes (elections
+   etc.) the sum of Yes prices across markets must be ~1. If S = sum(p) != 1,
+   every price is systematically skewed: the candidate's fair probability is
+   ~ p_mkt / S. When S < 1 the basket is collectively underpriced — pure edge.
 
-2. Календарные цепочки. «Событие до 31 марта» логически влечёт «до 30 июня»,
-   значит P(до ранней даты) ≤ P(до поздней). Если рынок с поздней датой стоит
-   ДЕШЕВЛЕ раннего — нарушение монотонности: поздний недооценён минимум до
-   цены раннего.
+2. Calendar chains. "Event by March 31" logically implies "by June 30", so
+   P(by earlier date) <= P(by later date). If the market with the later date
+   is CHEAPER than the earlier one — a monotonicity violation: the later one
+   is underpriced at least to the earlier one's price.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from ..models import Candidate, Market, Signal
 
 log = logging.getLogger(__name__)
 
-# Порог, ниже которого расхождение суммы корзины считаем шумом спреда.
+# Threshold below which a basket-sum deviation is treated as spread noise.
 BASKET_TOLERANCE = 0.02
 
 _DATE_NOISE = re.compile(
@@ -36,7 +36,7 @@ _DATE_NOISE = re.compile(
 
 
 def normalize_question(question: str) -> str:
-    """Убирает даты/числа: «X by March 31?» и «X by June 30?» дают один ключ."""
+    """Strips dates/numbers: "X by March 31?" and "X by June 30?" give one key."""
     stripped = _DATE_NOISE.sub(" ", question.lower())
     return " ".join(stripped.split())
 
@@ -45,7 +45,7 @@ class CoherenceSignal:
     name = "coherence"
 
     def __init__(self, markets: list[Market]):
-        # Корзины neg-risk событий: сумма Yes-цен по событию.
+        # Baskets of neg-risk events: sum of Yes prices per event.
         self._basket_sum: dict[str, float] = {}
         self._basket_size: dict[str, int] = {}
         by_event: dict[str, list[Market]] = defaultdict(list)
@@ -57,7 +57,7 @@ class CoherenceSignal:
                 self._basket_sum[event_id] = sum(m.outcome_prices[0] for m in group)
                 self._basket_size[event_id] = len(group)
 
-        # Календарные цепочки: рынки с одинаковым нормализованным вопросом.
+        # Calendar chains: markets with the same normalized question.
         self._chains: dict[str, list[Market]] = defaultdict(list)
         for m in markets:
             if m.end_date is not None and m.outcome_prices:
@@ -73,14 +73,14 @@ class CoherenceSignal:
         if s is None or s <= 0 or abs(s - 1.0) <= BASKET_TOLERANCE:
             return None
         p_fair = min(candidate.p_mkt / s, 0.999)
-        # Недооценённая корзина (S < 1) — структурный арбитраж, доверие максимальное.
+        # An underpriced basket (S < 1) is structural arbitrage, max confidence.
         confidence = 0.9 if s < 1.0 else 0.7
         return Signal(
             name=self.name,
             p_est=p_fair,
             confidence=confidence,
-            rationale=f"neg-risk basket «{candidate.market.event_title[:50]}»: "
-                      f"Σp={s:.3f} по {self._basket_size[candidate.market.event_id]} исходам "
+            rationale=f"neg-risk basket {candidate.market.event_title[:50]}: "
+                      f"sum(p)={s:.3f} over {self._basket_size[candidate.market.event_id]} outcomes "
                       f"-> fair={p_fair:.4f}",
         )
 
@@ -91,7 +91,7 @@ class CoherenceSignal:
         chain = self._chains.get(normalize_question(m.question), [])
         if len(chain) < 2 or m.end_date is None:
             return None
-        # Максимальная Yes-цена среди рынков той же цепочки с БОЛЕЕ РАННИМ дедлайном.
+        # Max Yes price among same-chain markets with an EARLIER deadline.
         earlier_max = max(
             (o.outcome_prices[0] for o in chain
              if o.id != m.id and o.end_date is not None and o.end_date < m.end_date),
@@ -99,12 +99,12 @@ class CoherenceSignal:
         )
         if earlier_max is None or earlier_max <= candidate.p_mkt + BASKET_TOLERANCE:
             return None
-        # Нарушение монотонности: наш (поздний) обязан стоить >= раннего.
+        # Monotonicity violation: ours (later) must cost >= the earlier one.
         return Signal(
             name=self.name,
             p_est=min(earlier_max, 0.999),
             confidence=0.85,
-            rationale=f"calendar chain: более ранний дедлайн торгуется по {earlier_max:.3f}, "
-                      f"наш (позже, {m.end_date.date()}) по {candidate.p_mkt:.3f} — "
-                      f"нарушение P(early) <= P(late)",
+            rationale=f"calendar chain: earlier deadline trades at {earlier_max:.3f}, "
+                      f"ours (later, {m.end_date.date()}) at {candidate.p_mkt:.3f} — "
+                      f"violates P(early) <= P(late)",
         )

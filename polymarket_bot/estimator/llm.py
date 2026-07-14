@@ -1,13 +1,13 @@
-"""LLM-сигнал: оценка вероятности хвостового исхода моделью Claude.
+"""LLM signal: a Claude model probability estimate for a tail outcome.
 
-Модель получает вопрос рынка, правила резолюции, цену и срок — и возвращает
-структурированный JSON (p_est, confidence, rationale) через официальный SDK
-(client.messages.parse + pydantic-схема). Ответы кэшируются на сутки,
-частота вызовов ограничена per-cycle лимитом.
+The model receives the market question, resolution rules, price and horizon —
+and returns structured JSON (p_est, confidence, rationale) via the official
+SDK (client.messages.parse + a pydantic schema). Responses are cached for a
+day; call frequency is bounded by a per-cycle limit.
 
-Внешний новостной фон подключается через NewsProvider: по умолчанию он пуст
-(модель опирается на собственные знания), но интерфейс позволяет подать
-заголовки из любого источника.
+External news context plugs in via NewsProvider: empty by default (the model
+relies on its own knowledge), but the interface lets you feed headlines from
+any source.
 """
 
 from __future__ import annotations
@@ -37,15 +37,15 @@ class NullNewsProvider:
 
 
 class LLMEstimate(BaseModel):
-    """Схема структурированного ответа модели."""
+    """Structured-response schema for the model."""
 
     p_est: float = Field(ge=0.0, le=1.0,
-                         description="Оценка вероятности исхода Yes, 0..1")
-    direction: str = Field(description="'higher' если рынок недооценивает, "
-                                       "'lower' если переоценивает, 'fair' если цена честная")
+                         description="Estimated probability of the Yes outcome, 0..1")
+    direction: str = Field(description="'higher' if the market underprices, "
+                                       "'lower' if it overprices, 'fair' if the price is right")
     confidence: float = Field(ge=0.0, le=1.0,
-                              description="Уверенность в оценке, 0..1")
-    rationale: str = Field(description="Краткое обоснование, 1-3 предложения")
+                              description="Confidence in the estimate, 0..1")
+    rationale: str = Field(description="Brief justification, 1-3 sentences")
 
 
 SYSTEM_PROMPT = (
@@ -119,10 +119,10 @@ class LLMSignal:
         p_est = float(result["p_est"])
         confidence = float(result["confidence"])
         if result.get("direction") == "fair":
-            confidence *= 0.5  # честная цена = слабый сигнал, почти воздержание
+            confidence *= 0.5  # fair price = weak signal, almost an abstention
         return Signal(
             name=self.name, p_est=p_est,
-            confidence=min(confidence, 0.7),  # LLM не перевешивает структурные сигналы
+            confidence=min(confidence, 0.7),  # LLM does not outweigh structural signals
             rationale=str(result.get("rationale", ""))[:300],
         )
 

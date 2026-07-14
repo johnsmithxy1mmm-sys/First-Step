@@ -1,15 +1,15 @@
-"""Комиссии Fee Structure V2 (март 2026): taker fees по категориям, maker rebate.
+"""Fee Structure V2 (March 2026): per-category taker fees, maker rebate.
 
-Maker платит 0 и получает rebate 20-50% от taker fees — вся экономика бота
-строится на maker-стороне. Ставки читаются из config.yaml (fees:), НЕ
-хардкодятся в логике: при изменении структуры комиссий правится конфиг.
+The maker pays 0 and earns a 20-50% rebate on taker fees — the whole bot
+economy is built on the maker side. Rates are read from config.yaml (fees:),
+NOT hardcoded in logic: if the fee structure changes, edit the config.
 """
 
 from __future__ import annotations
 
 from .config import FeesConfig
 
-# Маппинг наших категорий портфеля на категории fee-таблицы.
+# Mapping of our portfolio categories to the fee-table categories.
 _CATEGORY_TO_FEE_KEY = {
     "crypto": "crypto",
     "sports": "sports",
@@ -27,7 +27,7 @@ class FeeModel:
 
     def fee_key(self, category: str, gamma_category: str = "") -> str:
         g = gamma_category.lower()
-        # От длинных ключей к коротким: иначе "geopolitics" ложно матчит "politics".
+        # Longest keys first: otherwise "geopolitics" falsely matches "politics".
         for key in sorted(self._cfg.taker, key=len, reverse=True):
             if key != "other" and key in g:
                 return key
@@ -38,19 +38,19 @@ class FeeModel:
         return self._cfg.taker.get(key, self._cfg.taker.get("other", 0.04))
 
     def maker_rebate(self, category: str, gamma_category: str = "") -> float:
-        """Rebate мейкеру как доля от taker fee этой категории."""
+        """Maker rebate as a fraction of this category taker fee."""
         return self.taker_fee(category, gamma_category) * self._cfg.maker_rebate_frac
 
     def net_taker_edge(self, gross_edge: float, category: str,
                        gamma_category: str = "") -> float:
-        """Edge агрессивной (taker) ноги после комиссии."""
+        """Edge of the aggressive (taker) leg after the fee."""
         return gross_edge - self.taker_fee(category, gamma_category)
 
     def mm_min_half_spread(self, category: str, gamma_category: str = "",
                            min_edge_after_fees: float = 0.01) -> float:
-        """Минимальный полуспред котировки, чтобы пара bid+ask была прибыльна.
+        """Minimum quote half-spread for a bid+ask pair to be profitable.
 
-        Прибыль пары = полный спред + rebate обеих сторон; требуем
+        Pair profit = full spread + rebate on both sides; require
         >= min_edge_after_fees. Maker fee = 0.
         """
         rebate = self.maker_rebate(category, gamma_category)

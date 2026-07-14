@@ -1,4 +1,4 @@
-"""Скоринг рынков для MM и сателлит btc_5m_ta."""
+"""Market scoring for MM and the btc_5m_ta satellite."""
 
 from datetime import datetime, timedelta, timezone
 from unittest import mock
@@ -26,7 +26,7 @@ def mm_market(**overrides):
     return make_market(**defaults)
 
 
-# --- скоринг ---
+# --- scoring ---
 
 def test_scorer_accepts_good_mm_market(cfg):
     assert MarketScorer(cfg).eligible(mm_market())
@@ -34,12 +34,12 @@ def test_scorer_accepts_good_mm_market(cfg):
 
 def test_scorer_filters(cfg):
     s = MarketScorer(cfg)
-    assert not s.eligible(mm_market(volume_24h_usd=10_000))          # объём
+    assert not s.eligible(mm_market(volume_24h_usd=10_000))          # volume
     near = datetime.now(timezone.utc) + timedelta(days=5)
-    assert not s.eligible(mm_market(end_date=near))                  # < 30 дней
-    assert not s.eligible(mm_market(rewards_min_size=0))             # вне rewards
-    assert not s.eligible(mm_market(one_day_price_change=0.10))      # волатилен
-    assert not s.eligible(mm_market(best_bid=0.449, best_ask=0.450)) # спред < 2 тиков
+    assert not s.eligible(mm_market(end_date=near))                  # < 30 days
+    assert not s.eligible(mm_market(rewards_min_size=0))             # not in rewards
+    assert not s.eligible(mm_market(one_day_price_change=0.10))      # volatile
+    assert not s.eligible(mm_market(best_bid=0.449, best_ask=0.450)) # spread < 2 ticks
 
 
 def test_scorer_flags_subjective_resolution(cfg):
@@ -58,7 +58,7 @@ def test_scorer_prefers_sports_over_crypto(cfg):
     assert s.score(sports, None) > s.score(crypto, None)
 
 
-# --- сателлит: детерминированные слаги и тайминг ---
+# --- satellite: deterministic slugs and timing ---
 
 def test_slug_deterministic_and_ts_multiple_of_300():
     now = 1_750_000_123.0
@@ -79,17 +79,17 @@ def test_ta_p_up_direction():
     p_up_bear, conf_bear = ta_p_up(down)
     assert p_up_bull > 0.6 and conf_bull > 0
     assert p_up_bear < 0.4 and conf_bear > 0
-    assert ta_p_up([]) == (0.5, 0.0)                     # мало данных — воздержание
+    assert ta_p_up([]) == (0.5, 0.0)                     # too little data — abstain
 
 
 def test_satellite_edge_accounts_for_crypto_fee(cfg, ledger):
     sat = BTC5mSatellite(cfg, ledger, clob=mock.Mock(), trader=None, mode="paper")
-    # p_up 0.60 против implied 0.50: сырой edge 0.10, но fee crypto 0.07
-    # оставляет 0.03 < порога 0.05 -> входа нет.
+    # p_up 0.60 vs implied 0.50: raw edge 0.10, but crypto fee 0.07
+    # leaves 0.03 < threshold 0.05 -> no entry.
     assert sat.decide(p_up=0.60, implied_up=0.50) is None
-    # p_up 0.65: edge после fee 0.08 >= 0.05 -> вход в UP.
+    # p_up 0.65: edge after fee 0.08 >= 0.05 -> enter UP.
     assert sat.decide(p_up=0.65, implied_up=0.50) == (0, 0.65)
-    # Зеркально для DOWN.
+    # Mirror for DOWN.
     assert sat.decide(p_up=0.35, implied_up=0.50) == (1, 0.65)
 
 
@@ -112,7 +112,7 @@ def test_satellite_trades_once_per_window(cfg, ledger):
     clob = mock.Mock()
     sat = BTC5mSatellite(cfg, ledger, clob=clob, trader=None, mode="paper")
     window = window_ts(1_750_000_000.0)
-    now = window + 300 - 15.0                            # T-15s: внутри окна входа
+    now = window + 300 - 15.0                            # T-15s: inside the entry window
 
     candles = [Candle(open=100 + i, high=101 + i, low=99 + i, close=100.9 + i)
                for i in range(12)]
@@ -128,7 +128,7 @@ def test_satellite_trades_once_per_window(cfg, ledger):
     with mock.patch.object(sat, "fetch_candles", return_value=candles), \
          mock.patch.object(sat, "fetch_market", return_value=market):
         sat.cycle(now=now)
-        sat.cycle(now=now + 2)                           # то же окно — не дублируем
+        sat.cycle(now=now + 2)                           # same window — no duplicate
     trades = ledger.open_positions("paper")
     assert len(trades) == 1
     assert trades[0].size > 0

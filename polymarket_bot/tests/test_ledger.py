@@ -1,4 +1,4 @@
-"""Леджер: позиции, PnL, метрики калибровки, атрибуция по сигналам."""
+"""Ledger: positions, PnL, calibration metrics, signal attribution."""
 
 import pytest
 
@@ -34,26 +34,26 @@ def test_positions_and_exposure(ledger):
 
 def test_sell_reduces_position_and_realizes_pnl(ledger):
     est = make_estimate()
-    buy(ledger, est, 100.0)  # 10 000 шт по 0.01
+    buy(ledger, est, 100.0)  # 10,000 sh at 0.01
     ledger.record_trade(mode="dry-run", estimate=est, category="nature", side="SELL",
                         price=0.08, size=6000, order_id=None, status="sim-filled")
     positions = ledger.open_positions("dry-run")
     assert positions[0].size == pytest.approx(4000)
-    # Продали 6000 по 0.08 (вход 0.01): реализовано (0.08-0.01)*6000 = 420.
+    # Sold 6000 at 0.08 (entry 0.01): realized (0.08-0.01)*6000 = 420.
     assert ledger.realized_pnl("dry-run") == pytest.approx(420.0)
 
 
 def test_resolution_win_and_loss_pnl(ledger):
     est_win = make_estimate()
     est_loss = make_estimate(id="m2", clob_token_ids=["t2-yes", "t2-no"])
-    buy(ledger, est_win, 100.0)   # 10 000 шт
-    buy(ledger, est_loss, 50.0)   # 5 000 шт
+    buy(ledger, est_win, 100.0)   # 10,000 sh
+    buy(ledger, est_loss, 50.0)   # 5,000 sh
     ledger.record_resolution(est_win.candidate.token_id, "m1", won=True)
     ledger.record_resolution(est_loss.candidate.token_id, "m2", won=False)
 
-    # Выигрыш: 10 000*$1 - 100 = 9 900; проигрыш: -50.
+    # Win: 10,000*$1 - 100 = 9,900; loss: -50.
     assert ledger.realized_pnl("dry-run") == pytest.approx(9900.0 - 50.0)
-    assert ledger.open_positions("dry-run") == []  # обе позиции закрыты
+    assert ledger.open_positions("dry-run") == []  # both positions closed
 
 
 def test_metrics_hit_rate_brier_and_attribution(ledger):
@@ -69,12 +69,12 @@ def test_metrics_hit_rate_brier_and_attribution(ledger):
     m = ledger.metrics("dry-run")
     assert m["resolved_trades"] == 2
     assert m["hit_rate"] == pytest.approx(0.5)
-    assert m["avg_win_multiple"] == pytest.approx(100.0)   # выигрыш по 0.01
+    assert m["avg_win_multiple"] == pytest.approx(100.0)   # win at 0.01
     assert m["invested_usd"] == pytest.approx(200.0)
     assert m["payout_usd"] == pytest.approx(10_000.0)
     assert m["roi"] == pytest.approx((10_000 - 200) / 200)
     assert m["brier_model"] is not None and m["brier_market"] is not None
-    # Атрибуция: выигрышный PnL приписан когерентности, проигрышный — моментуму.
+    # Attribution: winning PnL assigned to coherence, losing to momentum.
     attribution = m["signal_pnl_attribution"]
     assert attribution["coherence"] == pytest.approx(9900.0)
     assert attribution["momentum"] == pytest.approx(-100.0)
@@ -93,5 +93,5 @@ def test_idempotency_helper(ledger):
     assert not ledger.has_position_or_open_buy(est.candidate.token_id, "dry-run")
     buy(ledger, est, 10.0)
     assert ledger.has_position_or_open_buy(est.candidate.token_id, "dry-run")
-    # Другой режим — отдельный стейт.
+    # A different mode — separate state.
     assert not ledger.has_position_or_open_buy(est.candidate.token_id, "live")

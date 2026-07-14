@@ -1,12 +1,12 @@
-"""Сателлит (20% капитала, по умолчанию ВЫКЛЮЧЕН): T-10s TA на 5-мин BTC.
+"""Satellite (20% of capital, DISABLED by default): T-10s TA on 5-min BTC.
 
-НЕ латентный арбитраж (выеден sub-100ms HFT и подавлен динамическими taker
-fees). Вместо этого: технический скоринг направления за 10-30 сек до
-закрытия окна; вход только при P(model) − implied − taker_fee > edge_threshold.
+NOT latency arbitrage (eaten by sub-100ms HFT and suppressed by dynamic taker
+fees). Instead: a technical directional score 10-30 sec before the window
+closes; enter only when P(model) - implied - taker_fee > edge_threshold.
 
-Слаги детерминированы: btc-updown-5m-{unix_ts}, ts кратен 300 — рынок
-вычисляется по часам, а не ищется. Сайзинг: quarter-Kelly с жёстким кэпом.
-Вход агрессивной ногой (FOK): маркет-ордеров на платформе нет.
+Slugs are deterministic: btc-updown-5m-{unix_ts}, ts a multiple of 300 — the
+market is computed from the clock, not searched. Sizing: quarter-Kelly with a
+hard cap. Entry with an aggressive leg (FOK): no market orders on the platform.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ log = logging.getLogger(__name__)
 
 
 def window_ts(now: float, window_sec: int = 300) -> int:
-    """Начало текущего 5-минутного окна (unix ts, кратен 300)."""
+    """Start of the current 5-minute window (unix ts, multiple of 300)."""
     return int(now // window_sec) * window_sec
 
 
@@ -51,30 +51,30 @@ class Candle(BaseModel):
 
 
 def ta_p_up(candles: list[Candle]) -> tuple[float, float]:
-    """Вероятность закрытия окна вверх по минутным свечам. -> (p_up, confidence).
+    """Probability the window closes up, from minute candles. -> (p_up, confidence).
 
-    Прозрачные компоненты: momentum последних минут, положение цены
-    относительно короткой EMA, доля бычьих свечей. Логистическое смешение.
+    Transparent components: recent-minute momentum, price position relative to
+    a short EMA, share of bullish candles. Logistic blend.
     """
     if len(candles) < 6:
         return 0.5, 0.0
     closes = [c.close for c in candles]
     last = closes[-1]
 
-    # Momentum: доходность за 3 и за 1 минуту, нормированная волатильностью.
+    # Momentum: 3-minute and 1-minute returns, normalized by volatility.
     rets = [closes[i] / closes[i - 1] - 1.0 for i in range(1, len(closes))]
     vol = max((sum(r * r for r in rets) / len(rets)) ** 0.5, 1e-6)
     mom3 = (last / closes[-4] - 1.0) / (vol * math.sqrt(3))
     mom1 = rets[-1] / vol
 
-    # EMA(5): положение цены относительно локального тренда.
+    # EMA(5): price position relative to the local trend.
     ema = closes[0]
     alpha = 2 / (5 + 1)
     for price in closes[1:]:
         ema = alpha * price + (1 - alpha) * ema
     ema_dev = (last - ema) / max(ema * vol, 1e-9)
 
-    # Доля бычьих минут из последних шести.
+    # Share of bullish minutes out of the last six.
     bull_frac = sum(1 for c in candles[-6:] if c.close > c.open) / 6.0
 
     z = 0.5 * mom1 + 0.7 * mom3 + 0.4 * ema_dev + 1.2 * (bull_frac - 0.5)
@@ -102,7 +102,7 @@ class BTC5mSatellite:
         try:
             resp = get_with_backoff(self._http, self._cfg.candles_url, max_retries=1)
         except httpx.HTTPError as exc:
-            log.warning("satellite: свечи недоступны: %s", exc)
+            log.warning("satellite: candles unavailable: %s", exc)
             return []
         out = []
         for k in resp.json() or []:
@@ -125,7 +125,7 @@ class BTC5mSatellite:
         return Market.from_gamma(markets[0]) if markets else None
 
     def decide(self, p_up: float, implied_up: float) -> tuple[int, float] | None:
-        """(outcome_index, p_model) для входа или None. Edge считается ПОСЛЕ fee."""
+        """(outcome_index, p_model) to enter, or None. Edge is computed AFTER fee."""
         fee = self._fees.taker_fee("crypto")
         edge_up = p_up - implied_up - fee
         edge_down = (1.0 - p_up) - (1.0 - implied_up) - fee
@@ -158,7 +158,7 @@ class BTC5mSatellite:
         slug = market_slug(now, self._cfg.slug_template, self._cfg.window_sec)
         market = self.fetch_market(slug)
         if market is None or len(market.clob_token_ids) < 2:
-            log.debug("satellite: рынок %s не найден", slug)
+            log.debug("satellite: market %s not found", slug)
             return
 
         book = self._clob.order_book(market.clob_token_ids[0])
@@ -188,7 +188,7 @@ class BTC5mSatellite:
                                               order_type="FOK")
                 order_id = (resp or {}).get("orderID")
             except Exception as exc:
-                log.error("satellite: FOK не исполнился: %s", exc)
+                log.error("satellite: FOK did not fill: %s", exc)
                 return
         self._ledger.record_trade(
             mode=self._mode, estimate=simple_estimate(market, idx, price),
@@ -197,5 +197,5 @@ class BTC5mSatellite:
             status="filled" if self._trader else f"{self._mode}-filled",
             strategy="btc_5m",
         )
-        log.info("satellite: вход %s p_model=%.3f implied=%.3f %.3f x %.0f (%s)",
+        log.info("satellite: entry %s p_model=%.3f implied=%.3f %.3f x %.0f (%s)",
                  "UP" if idx == 0 else "DOWN", p_model, implied_up, price, size, slug)

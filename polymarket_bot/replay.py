@@ -1,10 +1,10 @@
-"""Фаза 2 — бэктест MM: запись стаканов в SQLite и реплей логики котирования.
+"""Phase 2 — MM backtest: record order books to SQLite and replay quoting logic.
 
-Запись: снапшоты топа книги выбранных рынков каждые N секунд (>= 48 часов
-для осмысленного отчёта). Реплей: прогон котировочной логики MarketMaker по
-записи с paper-моделью филлов. Отчёт: fill rate, реализованный спред,
-инвентарь, оценка rewards-времени (доля снапшотов с котировкой в reward-
-диапазоне).
+Recording: top-of-book snapshots of selected markets every N seconds (>= 48
+hours for a meaningful report). Replay: run the MarketMaker quoting logic over
+the recording with a paper fill model. Report: fill rate, captured spread,
+inventory, an estimate of rewards time (share of snapshots with a quote in the
+reward band).
 """
 
 from __future__ import annotations
@@ -61,14 +61,14 @@ class BookRecorder:
                  for m in markets if scorer.eligible(m)}
         selected = scorer.top_markets(markets, books)
         if not selected:
-            log.warning("recorder: нет пригодных рынков")
+            log.warning("recorder: no eligible markets")
             return 0
         for m in selected:
             self._conn.execute(
                 "INSERT OR REPLACE INTO snap_markets (market_id, payload) VALUES (?,?)",
                 (m.id, m.model_dump_json()))
         self._conn.commit()
-        log.info("recorder: пишем %d рынков каждые %.0fс, %.0f минут",
+        log.info("recorder: writing %d markets every %.0fs, %.0f minutes",
                  len(selected), interval_sec, minutes)
 
         deadline = time.time() + minutes * 60
@@ -109,14 +109,14 @@ class ReplayReport:
 
 
 def replay(cfg: BotConfig, db_path: str | Path, ledger) -> ReplayReport:
-    """Реплей MM-логики по записанным стаканам (paper-модель филлов)."""
+    """Replay MM logic over recorded order books (paper fill model)."""
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     markets: dict[str, Market] = {}
     for row in conn.execute("SELECT market_id, payload FROM snap_markets"):
         markets[row["market_id"]] = Market.model_validate_json(row["payload"])
     if not markets:
-        log.error("replay: в записи нет рынков — сначала --record-books")
+        log.error("replay: no markets in the recording — run --record-books first")
         return ReplayReport()
 
     tops: dict[str, TopOfBook] = {}
@@ -136,7 +136,7 @@ def replay(cfg: BotConfig, db_path: str | Path, ledger) -> ReplayReport:
             ask=row["ask"] or 0, ask_size=row["ask_size"] or 0, ts=row["ts"])
         if current_ts is None:
             current_ts = row["ts"]
-        if row["ts"] > current_ts:            # новый момент времени → цикл MM
+        if row["ts"] > current_ts:            # a new point in time -> MM cycle
             report.snapshots += 1
             quotes = mm.cycle(market_list)
             report.quotes_posted += len(quotes)
@@ -149,28 +149,28 @@ def replay(cfg: BotConfig, db_path: str | Path, ledger) -> ReplayReport:
     for p in ledger.open_positions("paper"):
         report.fills += 1
         report.inventory_by_market[p.question[:40]] = round(p.cost_usd, 2)
-    # Реализованный спред: пары Yes+No в инвентаре = $1 к выкупу.
+    # Captured spread: Yes+No pairs in inventory = $1 at redemption.
     report.spread_captured_usd = ledger.realized_pnl_by_strategy("paper").get("mm", 0.0)
     return report
 
 
 class _NullClob:
-    def order_book(self, token_id: str):  # реплей работает только от снапшотов
+    def order_book(self, token_id: str):  # replay works only from snapshots
         return None
 
 
 def print_report(report: ReplayReport) -> None:
     console = Console()
-    t = Table(title="Бэктест MM (реплей записанных стаканов)")
-    t.add_column("Метрика")
-    t.add_column("Значение")
-    t.add_row("Моментов времени", str(report.snapshots))
-    t.add_row("Котировок выставлено", str(report.quotes_posted))
-    t.add_row("Виртуальных филлов", str(report.fills))
+    t = Table(title="MM backtest (replay of recorded books)")
+    t.add_column("Metric")
+    t.add_column("Value")
+    t.add_row("Time points", str(report.snapshots))
+    t.add_row("Quotes posted", str(report.quotes_posted))
+    t.add_row("Virtual fills", str(report.fills))
     t.add_row("Fill rate", f"{report.fill_rate:.1%}")
-    t.add_row("Снапшотов в reward-диапазоне", str(report.reward_eligible_snaps))
+    t.add_row("Snapshots in reward band", str(report.reward_eligible_snaps))
     console.print(t)
     if report.inventory_by_market:
-        console.print("Инвентарь:", report.inventory_by_market)
-    console.print("[dim]Модель филлов оптимистична (проторговка сквозь цену); "
-                  "для решения о live нужна Фаза 3 (paper на живом потоке).[/dim]")
+        console.print("Inventory:", report.inventory_by_market)
+    console.print("[dim]The fill model is optimistic (trade-through); a live "
+                  "decision needs Phase 3 (paper on the live stream).[/dim]")

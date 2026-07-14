@@ -1,4 +1,4 @@
-"""Оценщик вероятностей: ансамбль сигналов поверх кандидатов сканера."""
+"""Probability estimator: an ensemble of signals over scanner candidates."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ class Estimator:
 
     def estimate_all(self, candidates: list[Candidate],
                      all_markets: list[Market]) -> list[Estimate]:
-        """Оценивает кандидатов; сортирует по убыванию edge."""
+        """Estimates candidates; sorts by descending edge."""
         coherence = CoherenceSignal(all_markets)
         self._llm.start_cycle()
 
@@ -32,14 +32,14 @@ class Estimator:
         for c in candidates:
             signals = []
             for producer in (
-                lambda: coherence.evaluate(c),          # приоритет №1
+                lambda: coherence.evaluate(c),          # priority #1
                 lambda: self._base_rates.evaluate(c),
                 lambda: self._momentum.evaluate(c),
                 lambda: self._llm.evaluate(c),
             ):
                 try:
                     signal = producer()
-                except Exception as exc:  # один сигнал не роняет оценку
+                except Exception as exc:  # one signal must not break the estimate
                     log.warning("signal error on %s: %s", c.market.id, exc)
                     signal = None
                 if signal is not None:
@@ -56,7 +56,7 @@ class Estimator:
         return estimates
 
     def qualifies(self, estimate: Estimate) -> bool:
-        """Порог мисспрайсинга: edge ≥ 2.0 при p_mkt ≤ 0.05 (настраивается)."""
+        """Mispricing threshold: edge >= 2.0 at p_mkt <= 0.05 (configurable)."""
         e = self._cfg.estimator
         return (estimate.p_mkt <= e.max_p_mkt
                 and estimate.edge_ratio >= e.min_edge_ratio)

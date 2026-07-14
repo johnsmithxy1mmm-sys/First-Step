@@ -1,6 +1,6 @@
-"""Token-bucket rate limiter: даже с повышенными лимитами V2 бот обязан
-самоограничиваться — Cloudflare-очередь при превышении хуже локального
-ожидания."""
+"""Token-bucket rate limiter: even with the raised V2 limits the bot must
+self-throttle — a Cloudflare queue on overshoot is worse than waiting
+locally."""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ class TokenBucket:
             return False
 
     def acquire(self, tokens: float = 1.0, timeout: float = 30.0) -> bool:
-        """Блокирующее ожидание токенов (с таймаутом)."""
+        """Blocking wait for tokens (with a timeout)."""
         deadline = time.monotonic() + timeout
         while True:
             with self._lock:

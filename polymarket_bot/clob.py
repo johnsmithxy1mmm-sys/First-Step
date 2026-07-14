@@ -1,4 +1,4 @@
-"""CLOB Polymarket: чтение стакана, история цен, торговый клиент."""
+"""Polymarket CLOB: order-book reads, price history, trading client."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ log = logging.getLogger(__name__)
 
 
 class ClobReader:
-    """Read-only доступ к CLOB: стакан, статусы ордеров не требуют подписи."""
+    """Read-only CLOB access: book and order status need no signature."""
 
     def __init__(self, cfg: BotConfig, client: httpx.Client | None = None):
         self._cfg = cfg
@@ -47,7 +47,7 @@ class ClobReader:
         return book if (book.bids or book.asks) else None
 
     def price_history(self, token_id: str, start_ts: int, end_ts: int) -> list[tuple[int, float]]:
-        """История цен токена (для бэктеста): [(unix_ts, price), ...]."""
+        """Token price history (for backtests): [(unix_ts, price), ...]."""
         try:
             resp = get_with_backoff(
                 self._client,
@@ -74,21 +74,21 @@ def round_to_tick(price: float, tick: float) -> float:
 
 
 class Trader:
-    """Подписанные операции через официальный py-clob-client. Только для live."""
+    """Signed operations via the official py-clob-client. Live only."""
 
     def __init__(self, cfg: BotConfig):
         try:
             from py_clob_client.client import ClobClient
         except ImportError as exc:  # pragma: no cover
-            raise SystemExit("pip install py-clob-client для live-режима") from exc
+            raise SystemExit("pip install py-clob-client for live mode") from exc
 
         private_key = os.environ.get("POLYMARKET_PRIVATE_KEY")
         if not private_key:
-            raise SystemExit("POLYMARKET_PRIVATE_KEY не задан (см. .env.example)")
+            raise SystemExit("POLYMARKET_PRIVATE_KEY not set (see .env.example)")
         funder = os.environ.get("POLYMARKET_FUNDER")
         signature_type = int(os.environ.get("POLYMARKET_SIGNATURE_TYPE", "0"))
         if signature_type in (1, 2, 3) and not funder:
-            raise SystemExit("Для signature_type 1/2/3 требуется POLYMARKET_FUNDER")
+            raise SystemExit("signature_type 1/2/3 requires POLYMARKET_FUNDER")
 
         def build(sig_type: int):
             kwargs: dict = dict(key=private_key, chain_id=cfg.runtime.chain_id,
@@ -99,19 +99,19 @@ class Trader:
             client.set_api_creds(client.create_or_derive_api_creds())
             return client
 
-        # Известный баг: sigtype 3 (deposit wallets / POLY_1271) в SDK может
-        # работать некорректно — при падении откатываемся на sigtype 2.
+        # Known bug: sigtype 3 (deposit wallets / POLY_1271) may misbehave in
+        # the SDK — on failure we fall back to sigtype 2.
         try:
             self._client = build(signature_type)
         except Exception as exc:
             if signature_type == 3:
-                log.warning("signature_type=3 упал (%s) — fallback на 2 (proxy)", exc)
+                log.warning("signature_type=3 failed (%s) — falling back to 2 (proxy)", exc)
                 signature_type = 2
                 self._client = build(signature_type)
             else:
                 raise
         self.signature_type = signature_type
-        log.info("Trader: режим подписи signature_type=%d, funder=%s",
+        log.info("Trader: signature mode signature_type=%d, funder=%s",
                  signature_type, (funder or "-")[:12])
         self._data_api = cfg.runtime.data_api_host
         self._funder = funder
@@ -123,7 +123,7 @@ class Trader:
         args = OrderArgs(price=price, size=size, side=side, token_id=token_id)
         options = PartialCreateOrderOptions(neg_risk=True) if neg_risk else None
         signed = self._client.create_order(args, options)
-        # Маркет-ордеров на платформе нет: агрессивные ноги — FOK/IOC-лимитки.
+        # No market orders on the platform: aggressive legs are FOK/IOC limits.
         ot = getattr(OrderType, order_type, OrderType.GTC)
         return self._client.post_order(signed, ot) or {}
 
@@ -141,7 +141,7 @@ class Trader:
         self._client.cancel(order_id)
 
     def cancel_all(self) -> None:
-        """Bulk-cancel всех ордеров (аварийное действие kill-switch)."""
+        """Bulk-cancel all orders (emergency kill-switch action)."""
         self._client.cancel_all()
 
     def order_status(self, order_id: str) -> dict:
@@ -156,7 +156,7 @@ class Trader:
         return self._client.get_orders() or []
 
     def api_positions(self) -> list[dict]:
-        """Фактические позиции кошелька из data-api (для сверки идемпотентности)."""
+        """Actual wallet positions from data-api (for idempotency reconcile)."""
         if not self._funder:
             return []
         client = make_client(15.0)

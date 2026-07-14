@@ -1,4 +1,4 @@
-"""MM-ядро: microprice, skew, гистерезис, rewards-диапазон, guard, paper-филлы."""
+"""MM core: microprice, skew, hysteresis, rewards band, guard, paper fills."""
 
 from unittest import mock
 
@@ -39,11 +39,11 @@ def make_mm(cfg, ledger, mode="dry-run", tops=None) -> MarketMaker:
     return MarketMaker(cfg, ledger, clob, None, mode, top_source=source)
 
 
-# --- fair value и котировки ---
+# --- fair value and quotes ---
 
 def test_microprice_weighs_by_sizes():
     t = top(bid=0.40, ask=0.50, bid_size=3000, ask_size=1000)
-    # Тяжёлый бид тянет microprice вверх: (0.40*1000 + 0.50*3000) / 4000 = 0.475
+    # A heavy bid pulls the microprice up: (0.40*1000 + 0.50*3000) / 4000 = 0.475
     assert t.microprice == pytest.approx(0.475)
 
 
@@ -54,14 +54,14 @@ def test_quote_symmetric_within_rewards_band(cfg, ledger):
     assert quote is not None
     assert quote.yes_bid == pytest.approx(0.44)
     assert quote.implied_yes_ask == pytest.approx(0.46)
-    # Полуспред внутри reward-диапазона (0.03 * 0.9).
+    # Half-spread inside the reward band (0.03 * 0.9).
     assert quote.captured_spread / 2 <= m.rewards_max_spread * 0.9 + 1e-9
-    # Размер не меньше rewards_min_size (иначе не засчитается).
+    # Size not below rewards_min_size (otherwise it will not count).
     assert quote.size >= m.rewards_min_size
 
 
 def test_quote_respects_fee_breakeven(cfg, ledger):
-    # Категория geopolitics: taker fee 0 -> rebate 0 -> полуспред >= min_edge/2.
+    # Category geopolitics: taker fee 0 -> rebate 0 -> half-spread >= min_edge/2.
     cfg.risk.min_edge_after_fees = 0.02
     cfg.market_maker.half_spread = 0.001
     mm = make_mm(cfg, ledger)
@@ -75,27 +75,27 @@ def test_inventory_skew_shifts_both_quotes_down(cfg, ledger):
     mm = make_mm(cfg, ledger)
     m = mm_market()
     base = mm.compute_quote(m, top())
-    # Накопили длинный Yes на весь лимит -> fair сдвигается вниз.
+    # Accumulated long Yes up to the limit -> fair shifts down.
     ledger.record_trade(mode="dry-run", estimate=simple_estimate(m, 0, 0.45),
                         category="mm", side="BUY",
                         price=0.45, size=cfg.risk.max_position_per_market_usd / 0.45,
                         order_id=None, status="filled", strategy="mm")
     skewed = mm.compute_quote(m, top())
     assert skewed is not None
-    assert skewed.yes_bid < base.yes_bid          # бид ниже
-    assert skewed.implied_yes_ask < base.implied_yes_ask  # ask агрессивнее
+    assert skewed.yes_bid < base.yes_bid          # bid lower
+    assert skewed.implied_yes_ask < base.implied_yes_ask  # ask more aggressive
 
 
 def test_requote_hysteresis(cfg, ledger):
     cfg.market_maker.requote_timer_sec = 9999
     mm = make_mm(cfg, ledger)
     m = mm_market()
-    assert mm.needs_requote(m, top())             # котировки ещё нет
+    assert mm.needs_requote(m, top())             # no quote yet
     quote = mm.compute_quote(m, top())
     mm._quotes[m.id] = quote
-    # Fair сдвинулся меньше 2 тиков — НЕ переставляем (гистерезис).
+    # Fair moved less than 2 ticks — do NOT reprice (hysteresis).
     assert not mm.needs_requote(m, top(bid=0.431, ask=0.471))
-    # Сдвиг больше порога — переставляем.
+    # Move exceeds threshold — reprice.
     assert mm.needs_requote(m, top(bid=0.45, ask=0.49))
 
 
@@ -115,7 +115,7 @@ def test_guard_on_midpoint_jump(cfg, ledger):
     mm = make_mm(cfg, ledger)
     m = mm_market()
     assert not mm.guard_blocks(m, top(bid=0.43, ask=0.47))
-    assert mm.guard_blocks(m, top(bid=0.48, ask=0.52))     # скачок >= 0.03
+    assert mm.guard_blocks(m, top(bid=0.48, ask=0.52))     # jump >= 0.03
     for _ in range(cfg.market_maker.guard_cooldown_cycles):
         assert mm.guard_blocks(m, top(bid=0.48, ask=0.52))  # cooldown
     assert not mm.guard_blocks(m, top(bid=0.48, ask=0.52))
@@ -125,7 +125,7 @@ def test_extreme_midpoint_requires_two_sided_or_exit(cfg, ledger):
     tops = {"mm1-yes": top(bid=0.94, ask=0.96), "mm1-no": top(bid=0.04, ask=0.06)}
     mm = make_mm(cfg, ledger, tops=tops)
     m = mm_market(outcome_prices=[0.95, 0.05], one_day_price_change=0.0)
-    # Перекошенный инвентарь: разрешена одна сторона -> при mid>0.90 покидаем рынок.
+    # Skewed inventory: one side allowed -> at mid>0.90 leave the market.
     ledger.record_trade(mode="dry-run", estimate=simple_estimate(m, 0, 0.95),
                         category="mm", side="BUY",
                         price=0.95, size=(cfg.risk.max_position_per_market_usd + 10) / 0.95,
@@ -137,7 +137,7 @@ def test_extreme_midpoint_requires_two_sided_or_exit(cfg, ledger):
     assert m.id not in mm._quotes
 
 
-# --- paper-режим ---
+# --- paper mode ---
 
 def test_paper_fill_when_market_trades_through(cfg, ledger):
     tops = {"mm1-yes": top(bid=0.43, ask=0.47), "mm1-no": top(bid=0.53, ask=0.57)}
@@ -146,10 +146,10 @@ def test_paper_fill_when_market_trades_through(cfg, ledger):
     quote = mm.compute_quote(m, tops["mm1-yes"])
     mm._quotes[m.id] = quote
 
-    mm._paper_fills()                             # ask 0.47 > бид 0.44 — нет филла
+    mm._paper_fills()                             # ask 0.47 > bid 0.44 — no fill
     assert ledger.open_positions("paper") == []
 
-    tops["mm1-yes"] = top(bid=0.42, ask=0.44)     # рынок проторговался в наш бид
+    tops["mm1-yes"] = top(bid=0.42, ask=0.44)     # market traded into our bid
     mm._paper_fills()
     positions = ledger.open_positions("paper")
     assert len(positions) == 1
@@ -164,4 +164,4 @@ def test_dry_run_never_places_orders(cfg, ledger):
          mock.patch.object(mm._scorer, "eligible", return_value=True):
         quotes = mm.cycle([m])
     assert len(quotes) == 1
-    assert mm._orders == {}                       # намерения логируются, ордеров нет
+    assert mm._orders == {}                       # intentions logged, no orders

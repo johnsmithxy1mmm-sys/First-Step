@@ -1,4 +1,4 @@
-"""Оценщик: ансамбль, edge-фильтр, когерентность, base rates, momentum."""
+"""Estimator: ensemble, edge filter, coherence, base rates, momentum."""
 
 import math
 from datetime import datetime, timedelta, timezone
@@ -16,13 +16,13 @@ from polymarket_bot.models import Signal
 from .conftest import make_candidate, make_market
 
 
-# --- ансамбль ---
+# --- ensemble ---
 
 def test_ensemble_geometric_mean_math():
     c = make_candidate()  # p_mkt = 0.01
     signals = [Signal(name="s1", p_est=0.04, confidence=0.5)]
     est = combine(c, signals, market_anchor_confidence=0.5)
-    # Равные веса: geo-mean(0.01, 0.04) = sqrt(0.01*0.04) = 0.02
+    # Equal weights: geo-mean(0.01, 0.04) = sqrt(0.01*0.04) = 0.02
     assert est.p_est == pytest.approx(math.sqrt(0.01 * 0.04), rel=1e-6)
     assert est.edge_ratio == pytest.approx(2.0, rel=1e-6)
 
@@ -39,7 +39,7 @@ def test_ensemble_ignores_abstaining_signals():
     assert est.edge_ratio == pytest.approx(1.0)
 
 
-# --- edge-фильтр ---
+# --- edge filter ---
 
 def test_edge_filter_threshold(cfg):
     estimator = Estimator(cfg)
@@ -57,7 +57,7 @@ def test_edge_filter_rejects_expensive_market(cfg):
     assert not estimator.qualifies(est)
 
 
-# --- когерентность ---
+# --- coherence ---
 
 def _negrisk_market(mid: str, yes_price: float, event_id: str = "ev1"):
     return make_market(
@@ -68,7 +68,7 @@ def _negrisk_market(mid: str, yes_price: float, event_id: str = "ev1"):
 
 
 def test_negrisk_basket_underpriced_rescales_up():
-    # Сумма Yes = 0.90 < 1: каждый исход недооценён, fair = p / 0.9.
+    # Sum of Yes = 0.90 < 1: every outcome underpriced, fair = p / 0.9.
     markets = [_negrisk_market("a", 0.02), _negrisk_market("b", 0.38),
                _negrisk_market("c", 0.50)]
     signal = CoherenceSignal(markets).evaluate(
@@ -80,7 +80,7 @@ def test_negrisk_basket_underpriced_rescales_up():
 
 def test_negrisk_basket_fair_sum_is_silent():
     markets = [_negrisk_market("a", 0.02), _negrisk_market("b", 0.48),
-               _negrisk_market("c", 0.50)]  # сумма 1.00
+               _negrisk_market("c", 0.50)]  # sum 1.00
     assert CoherenceSignal(markets).evaluate(make_candidate(market=markets[0])) is None
 
 
@@ -96,10 +96,10 @@ def test_calendar_chain_violation_detected():
     assert normalize_question(early.question) == normalize_question(late.question)
 
     signal = CoherenceSignal([early, late]).evaluate(make_candidate(market=late))
-    assert signal is not None            # поздний дешевле раннего — нарушение
+    assert signal is not None            # later cheaper than earlier — violation
     assert signal.p_est == pytest.approx(0.05)
 
-    # Ранний рынок нарушения не имеет (нет более ранних дороже него).
+    # The earlier market has no violation (no earlier one pricier than it).
     assert CoherenceSignal([early, late]).evaluate(make_candidate(market=early)) is None
 
 
@@ -108,7 +108,7 @@ def test_calendar_chain_violation_detected():
 def test_probability_before_transform():
     assert probability_before(0.5, 365) == pytest.approx(0.5)
     assert probability_before(0.5, 0) == 0.0
-    # Полгода при годовой 0.5: 1 - 0.5^0.5 ~ 0.2929
+    # Half a year at annual 0.5: 1 - 0.5^0.5 ~ 0.2929
     assert probability_before(0.5, 182.5) == pytest.approx(1 - 0.5**0.5, rel=1e-3)
 
 
@@ -119,14 +119,14 @@ def test_base_rates_signal_matches_keywords():
     signal = BaseRatesSignal([entry]).evaluate(make_candidate())
     assert signal is not None
     assert 0 < signal.p_est < 0.63
-    # No-сторона не оценивается базовыми частотами.
+    # The No side is not estimated by base rates.
     assert BaseRatesSignal([entry]).evaluate(make_candidate(outcome_index=1)) is None
 
 
 # --- momentum ---
 
 def test_momentum_fires_on_price_rise_with_volume():
-    c = make_candidate(one_day_price_change=0.01)  # +100% к цене 0.01
+    c = make_candidate(one_day_price_change=0.01)  # +100% on a 0.01 price
     signal = MomentumSignal().evaluate(c)
     assert signal is not None
     assert signal.p_est > c.p_mkt
@@ -137,12 +137,12 @@ def test_momentum_silent_on_decline_or_flat():
     assert MomentumSignal().evaluate(make_candidate(one_day_price_change=0.0)) is None
 
 
-# --- интеграция estimator ---
+# --- estimator integration ---
 
 def test_estimator_full_pass(cfg):
     estimator = Estimator(cfg)
     markets = [_negrisk_market("a", 0.02), _negrisk_market("b", 0.28),
-               _negrisk_market("c", 0.40)]  # сумма 0.70 — сильный сигнал корзины
+               _negrisk_market("c", 0.40)]  # sum 0.70 — strong basket signal
     candidates = [make_candidate(market=markets[0])]
     estimates = estimator.estimate_all(candidates, markets)
     assert len(estimates) == 1

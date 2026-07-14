@@ -1,4 +1,4 @@
-"""Арбитраж neg-risk корзин: детекция, комиссии (net edge), suspect, сайзинг."""
+"""Neg-risk basket arbitrage: detection, fees (net edge), suspect, sizing."""
 
 from unittest import mock
 
@@ -36,7 +36,7 @@ def make_scanner(cfg, ledger, books: dict, trader=None) -> ArbitrageScanner:
                             "live" if trader else "dry-run")
 
 
-# --- чистая математика комиссий (без сети) ---
+# --- pure fee math (no network) ---
 
 def test_fee_math_net_below_gross():
     leg = lambda ask: ArbLeg(market=make_market(), outcome_index=0,
@@ -46,13 +46,13 @@ def test_fee_math_net_below_gross():
     assert arb.cost_per_set == pytest.approx(0.98)
     assert arb.profit_pct == pytest.approx(0.02 / 0.98)     # gross +2%
     assert arb.fee_per_set == pytest.approx(0.03 * 0.98)
-    # Ровно сценарий ЧМ: +2% gross, но 3% комиссии -> чистый УБЫТОК.
+    # Exactly the World Cup scenario: +2% gross, but 3% fees -> net LOSS.
     assert arb.net_profit_per_set == pytest.approx(0.02 - 0.0294)
     assert arb.net_profit_pct < 0
 
 
 def test_marginal_arb_rejected_after_fees(cfg, ledger):
-    """+2% gross на спорт-корзине (fee 3%) — после комиссий не сделка."""
+    """+2% gross on a sports basket (fee 3%) — not a trade after fees."""
     group = negrisk_group([0.32, 0.33, 0.31], category="sports")   # ~0.98
     books = {}
     for i, ask in enumerate([0.33, 0.33, 0.32]):
@@ -63,29 +63,29 @@ def test_marginal_arb_rejected_after_fees(cfg, ledger):
 
 def test_prefilter_catches_skewed_baskets(cfg, ledger):
     scanner = make_scanner(cfg, ledger, {})
-    cheap = negrisk_group([0.20, 0.30, 0.40])        # сумма 0.90 — подозрительно
-    fair = negrisk_group([0.30, 0.30, 0.40], "ev2")  # сумма 1.00 — норм
+    cheap = negrisk_group([0.20, 0.30, 0.40])        # sum 0.90 — suspect
+    fair = negrisk_group([0.30, 0.30, 0.40], "ev2")  # sum 1.00 — fine
     groups = scanner.prefilter_events(cheap + fair)
     assert len(groups) == 1
     assert groups[0][0].event_id == "ev1"
 
 
 def test_yes_basket_detected_with_net_and_suspect(cfg, ledger):
-    group = negrisk_group([0.20, 0.30, 0.40])        # категория other -> fee 0.04
+    group = negrisk_group([0.20, 0.30, 0.40])        # category other -> fee 0.04
     books = {}
-    for i, ask in enumerate([0.21, 0.31, 0.41]):     # сумма ask = 0.93, gross 7.5%
+    for i, ask in enumerate([0.21, 0.31, 0.41]):     # sum ask = 0.93, gross 7.5%
         books[f"m{i}-yes"] = book(ask)
         books[f"m{i}-no"] = book(1 - ask + 0.02)
     arb = make_scanner(cfg, ledger, books).verify(group)
     assert arb is not None and arb.side == "YES"
     assert arb.cost_per_set == pytest.approx(0.93)
     assert arb.profit_pct == pytest.approx(0.07 / 0.93, rel=1e-6)      # gross
-    assert arb.net_profit_pct < arb.profit_pct                        # комиссии учтены
-    assert arb.suspect                                                # 7.5% > 5% -> подозрительно
+    assert arb.net_profit_pct < arb.profit_pct                        # fees accounted
+    assert arb.suspect                                                # 7.5% > 5% -> suspect
 
 
 def test_no_basket_detected_fee_free_category(cfg, ledger):
-    # Geopolitics: taker fee 0, поэтому NO-корзина выживает после комиссий.
+    # Geopolitics: taker fee 0, so the NO basket survives after fees.
     group = negrisk_group([0.30, 0.40, 0.40], category="geopolitics")
     books = {}
     for i, yes_ask in enumerate([0.32, 0.42, 0.42]):
@@ -107,7 +107,7 @@ def test_fair_books_no_arb(cfg, ledger):
 
 
 def test_min_profit_threshold(cfg, ledger):
-    cfg.arbitrage.min_profit_pct = 0.10              # требуем 10% чистыми
+    cfg.arbitrage.min_profit_pct = 0.10              # require 10% net
     group = negrisk_group([0.20, 0.30, 0.40], category="geopolitics")
     books = {}
     for i, ask in enumerate([0.21, 0.31, 0.41]):     # net 7.5% < 10%
@@ -126,24 +126,24 @@ def test_suspect_basket_not_executed(cfg, ledger):
     scanner = make_scanner(cfg, ledger, books)
     arb = scanner.verify(group)
     assert arb is not None and arb.suspect
-    assert scanner.execute(arb) == 0.0               # подозрительную не исполняем
+    assert scanner.execute(arb) == 0.0               # do not execute a suspect one
     assert ledger.open_positions("dry-run") == []
 
 
 def test_sizing_limited_by_depth_and_stake(cfg, ledger):
     cfg.arbitrage.execute = True
     cfg.arbitrage.max_stake_usd = 30.0
-    # Скромный реальный edge (3.1% gross, geopolitics fee 0) — не suspect, исполняется.
+    # Modest real edge (3.1% gross, geopolitics fee 0) — not suspect, executes.
     group = negrisk_group([0.31, 0.32, 0.33], category="geopolitics")
     books = {}
-    for i, ask in enumerate([0.32, 0.32, 0.33]):     # сумма 0.97
+    for i, ask in enumerate([0.32, 0.32, 0.33]):     # sum 0.97
         books[f"m{i}-yes"] = book(ask, depth=40)
         books[f"m{i}-no"] = book(0.95)
     scanner = make_scanner(cfg, ledger, books)
     arb = scanner.verify(group)
     assert arb is not None and not arb.suspect
     spent = scanner.execute(arb)
-    sets = int(30 // 0.97)                            # stake-кэп 30/0.97 = 30 < глубины 40
+    sets = int(30 // 0.97)                            # stake cap 30/0.97 = 30 < depth 40
     assert spent == pytest.approx(sets * 0.97, rel=1e-6)
     trades = ledger.open_positions("dry-run")
     assert len(trades) == 3 and all(t.size == sets for t in trades)
@@ -154,7 +154,7 @@ def test_execute_skips_tiny_windows(cfg, ledger):
     group = negrisk_group([0.20, 0.30, 0.40], category="geopolitics")
     books = {}
     for i, ask in enumerate([0.21, 0.31, 0.41]):
-        books[f"m{i}-yes"] = book(ask, depth=3)      # глубина 3 < min_sets 5
+        books[f"m{i}-yes"] = book(ask, depth=3)      # depth 3 < min_sets 5
         books[f"m{i}-no"] = book(0.95)
     scanner = make_scanner(cfg, ledger, books)
     arb = scanner.verify(group)

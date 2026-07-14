@@ -1,12 +1,12 @@
-"""WS-стаканы: авто-reconnect, heartbeat, gap-detect.
+"""WS order books: auto-reconnect, heartbeat, gap-detect.
 
-Websocket-поток CLOB — механизм «мгновенно»: изменения топа книги приходят
-за миллисекунды вместо REST-поллинга. На каждом обновлении дёргается
-callback (MM-репрайс, мгновенные выходы). При потере потока дольше
-staleness_kill_sec вызывается on_disconnect — kill-switch снимает котировки:
-торговать вслепую нельзя.
+The CLOB websocket stream is the "instant" mechanism: top-of-book changes
+arrive in milliseconds instead of REST polling. Each update fires a callback
+(MM reprice, instant exits). If the stream is lost for longer than
+staleness_kill_sec, on_disconnect is called — the kill-switch pulls quotes:
+trading blind is not allowed.
 
-Логика разбора сообщений вынесена в BookStore — тестируется без сети.
+Message-parsing logic lives in BookStore — testable without a network.
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ class TopOfBook(BaseModel):
 
     @property
     def microprice(self) -> float:
-        """Микроцена: mid, взвешенный объёмами сторон — честнее для fair value."""
+        """Microprice: mid weighted by side sizes — fairer for fair value."""
         total = self.bid_size + self.ask_size
         if self.bid > 0 and self.ask > 0 and total > 0:
             return (self.bid * self.ask_size + self.ask * self.bid_size) / total
@@ -46,7 +46,7 @@ class TopOfBook(BaseModel):
 
 
 class BookStore:
-    """L2-книги по токенам из WS-сообщений CLOB (event_type: book / price_change)."""
+    """L2 books per token from CLOB WS messages (event_type: book / price_change)."""
 
     def __init__(self) -> None:
         self._bids: dict[str, dict[float, float]] = {}
@@ -54,7 +54,7 @@ class BookStore:
         self._lock = threading.Lock()
 
     def handle(self, msg: dict) -> str | None:
-        """Обрабатывает одно сообщение; возвращает token_id, если книга изменилась."""
+        """Handles one message; returns token_id if the book changed."""
         token = str(msg.get("asset_id") or msg.get("market") or "")
         if not token:
             return None
@@ -111,7 +111,7 @@ class BookStore:
 
 
 class WSFeed(threading.Thread):
-    """Поток websocket-подписки на стаканы выбранных токенов."""
+    """Websocket subscription thread for the order books of selected tokens."""
 
     daemon = True
 
@@ -133,7 +133,7 @@ class WSFeed(threading.Thread):
         self._last_msg_ts = 0.0
         self._outage_reported = False
 
-    # --- публичный интерфейс ---
+    # --- public interface ---
 
     def watch(self, tokens: set[str]) -> None:
         tokens = set(tokens)
@@ -152,13 +152,13 @@ class WSFeed(threading.Thread):
         self._stop.set()
         self._resubscribe.set()
 
-    # --- цикл потока ---
+    # --- thread loop ---
 
-    def run(self) -> None:  # pragma: no cover — сетевой цикл, логика в BookStore
+    def run(self) -> None:  # pragma: no cover — network loop, logic is in BookStore
         try:
             import websockets  # noqa: F401
         except ImportError:
-            log.error("ws_feed: пакет websockets не установлен — поток выключен")
+            log.error("ws_feed: the websockets package is not installed — feed disabled")
             return
         backoff = 1.0
         while not self._stop.is_set():
@@ -169,7 +169,7 @@ class WSFeed(threading.Thread):
                 asyncio.run(self._session())
                 backoff = 1.0
             except Exception as exc:
-                log.warning("ws_feed: %s — reconnect через %.0fс", exc, backoff)
+                log.warning("ws_feed: %s — reconnect in %.0fs", exc, backoff)
                 self._check_outage()
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 30.0)
@@ -182,7 +182,7 @@ class WSFeed(threading.Thread):
         async with websockets.connect(self._url, ping_interval=self._ping_interval,
                                       close_timeout=5) as ws:
             await ws.send(json.dumps({"type": "market", "assets_ids": tokens}))
-            log.info("ws_feed: подписка на %d токенов", len(tokens))
+            log.info("ws_feed: subscribed to %d tokens", len(tokens))
             self._last_msg_ts = time.time()
             self._outage_reported = False
             while not self._stop.is_set() and not self._resubscribe.is_set():
@@ -214,11 +214,11 @@ class WSFeed(threading.Thread):
                         log.exception("ws_feed: on_update callback")
 
     def _check_outage(self) -> None:
-        """Gap-detect: поток мёртв дольше порога — сообщаем kill-switch один раз."""
+        """Gap-detect: stream dead beyond threshold — notify kill-switch once."""
         gap = time.time() - self._last_msg_ts if self._last_msg_ts else 0.0
         if gap >= self._staleness and not self._outage_reported:
             self._outage_reported = True
-            log.error("ws_feed: нет данных %.0fс — котировки должны быть сняты", gap)
+            log.error("ws_feed: no data for %.0fs — quotes must be pulled", gap)
             if self._on_disconnect is not None:
                 try:
                     self._on_disconnect(gap)

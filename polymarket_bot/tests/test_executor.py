@@ -1,4 +1,4 @@
-"""Исполнитель: идемпотентность, maker-цены, edge-cap, дробление, dry-run fill."""
+"""Executor: idempotency, maker prices, edge cap, child-splitting, dry-run fill."""
 
 from unittest import mock
 
@@ -24,14 +24,14 @@ def make_executor(cfg, ledger, book=None, trader=None) -> Executor:
     return Executor(cfg, ledger, clob, trader, "dry-run" if trader is None else "live")
 
 
-# --- dry-run исполнение ---
+# --- dry-run execution ---
 
 def test_dry_run_fills_at_maker_price_and_records(cfg, ledger):
     ex = make_executor(cfg, ledger, book=make_book(best_bid=0.009, best_ask=0.012))
     plan = make_plan(size_usd=50.0, cap=0.02)
     result = ex.execute(plan)
     assert result.status == "filled"
-    # ask (0.012) <= cap (0.02): встаём на тик ниже ask.
+    # ask (0.012) <= cap (0.02): sit one tick below ask.
     assert result.avg_price == pytest.approx(0.011)
     positions = ledger.open_positions("dry-run")
     assert len(positions) == 1
@@ -39,18 +39,18 @@ def test_dry_run_fills_at_maker_price_and_records(cfg, ledger):
 
 
 def test_maker_price_never_crosses_ask(cfg, ledger):
-    book = make_book(best_bid=0.010, best_ask=0.011)  # спред в один тик
+    book = make_book(best_bid=0.010, best_ask=0.011)  # one-tick spread
     ex = make_executor(cfg, ledger, book=book)
     result = ex.execute(make_plan(cap=0.05))
     assert result.status == "filled"
-    assert result.avg_price <= book.best_ask - 0.001 + 1e-9  # maker, не taker
+    assert result.avg_price <= book.best_ask - 0.001 + 1e-9  # maker, not taker
 
 
 def test_edge_cap_limits_price(cfg, ledger):
-    # Книга дорогая: bid 0.030, ask 0.035, а edge исчезает выше 0.02.
+    # Expensive book: bid 0.030, ask 0.035, edge vanishes above 0.02.
     ex = make_executor(cfg, ledger, book=make_book(best_bid=0.030, best_ask=0.035))
     result = ex.execute(make_plan(cap=0.02))
-    # Цена зажата кэпом 0.02 — бид ниже рынка, честный resting-ордер.
+    # Price clamped by the 0.02 cap — bid below market, an honest resting order.
     assert result.status == "filled"
     assert result.avg_price <= 0.02 + 1e-9
 
@@ -62,11 +62,11 @@ def test_order_splitting_into_children(cfg, ledger):
     ex = Executor(cfg, ledger, clob, None, "dry-run")
     result = ex.execute(make_plan(size_usd=50.0))
     assert result.status == "filled"
-    # 50 / 20 -> 3 ребёнка -> 3 запроса книги (по одному на ребёнка).
+    # 50 / 20 -> 3 children -> 3 book requests (one per child).
     assert clob.order_book.call_count == 3
 
 
-# --- идемпотентность ---
+# --- idempotency ---
 
 def test_idempotency_skips_existing_position(cfg, ledger):
     ex = make_executor(cfg, ledger)
@@ -75,7 +75,7 @@ def test_idempotency_skips_existing_position(cfg, ledger):
     second = ex.execute(plan)
     assert second.status == "skipped"
     assert "idempotency" in second.detail
-    assert len(ledger.open_positions("dry-run")) == 1  # дубля нет
+    assert len(ledger.open_positions("dry-run")) == 1  # no duplicate
 
 
 def test_idempotency_checks_api_positions_in_live(cfg, ledger):
@@ -91,11 +91,11 @@ def test_reconcile_failure_is_fail_safe(cfg, ledger):
     trader = mock.Mock()
     trader.api_positions.side_effect = RuntimeError("api down")
     ex = make_executor(cfg, ledger, trader=trader)
-    # Сверка не удалась -> считаем, что позиция есть, ордер не шлём.
+    # Reconcile failed -> assume a position exists, do not send an order.
     assert ex.execute(make_plan()).status == "skipped"
 
 
-# --- live-путь с моками ---
+# --- live path with mocks ---
 
 def test_live_reprices_then_gives_up(cfg, ledger):
     cfg.executor.max_reprices = 2
@@ -130,7 +130,7 @@ def test_live_partial_fill_recorded(cfg, ledger):
     assert result.filled_size == 1000.0
 
 
-# --- take-profit продажа ---
+# --- take-profit sell ---
 
 def test_execute_sell_respects_min_price(cfg, ledger):
     ex = make_executor(cfg, ledger, book=make_book(best_bid=0.05, best_ask=0.06))

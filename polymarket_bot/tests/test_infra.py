@@ -1,4 +1,4 @@
-"""Инфраструктура мастер-промпта: fees, rate limiter, WS BookStore, kill-switch."""
+"""Master-prompt infrastructure: fees, rate limiter, WS BookStore, kill-switch."""
 
 import time
 from unittest import mock
@@ -11,7 +11,7 @@ from polymarket_bot.risk import KillSwitch
 from polymarket_bot.ws_feed import BookStore
 
 
-# --- комиссии V2 ---
+# --- V2 fees ---
 
 def test_taker_fees_by_category(cfg):
     fees = FeeModel(cfg.fees)
@@ -20,23 +20,23 @@ def test_taker_fees_by_category(cfg):
     assert fees.taker_fee("geopolitics") == 0.0
     assert fees.taker_fee("elections") == pytest.approx(0.04)   # politics
     assert fees.taker_fee("nature") == pytest.approx(0.05)      # weather
-    # Категория Gamma имеет приоритет над нашим классификатором.
+    # The Gamma category takes priority over our classifier.
     assert fees.taker_fee("other", gamma_category="Sports") == pytest.approx(0.03)
 
 
 def test_maker_rebate_and_net_edge(cfg):
     fees = FeeModel(cfg.fees)
     assert fees.maker_rebate("crypto") == pytest.approx(0.07 * 0.35)
-    # Агрессивная нога на крипте теряет 7 п.п. edge.
+    # The aggressive leg on crypto loses 7 pp of edge.
     assert fees.net_taker_edge(0.10, "crypto") == pytest.approx(0.03)
 
 
 def test_mm_min_half_spread(cfg):
     fees = FeeModel(cfg.fees)
-    # geopolitics: rebate 0 -> полуспред = min_edge / 2.
+    # geopolitics: rebate 0 -> half-spread = min_edge / 2.
     assert fees.mm_min_half_spread("geopolitics", min_edge_after_fees=0.02) \
         == pytest.approx(0.01)
-    # sports: rebate 2*0.03*0.35=0.021 покрывает min_edge 0.01 -> порог 0.
+    # sports: rebate 2*0.03*0.35=0.021 covers min_edge 0.01 -> threshold 0.
     assert fees.mm_min_half_spread("sports", min_edge_after_fees=0.01) == 0.0
 
 
@@ -44,9 +44,9 @@ def test_mm_min_half_spread(cfg):
 
 def test_token_bucket_burst_and_refill():
     bucket = TokenBucket(rate_per_sec=100.0, burst=5.0)
-    assert all(bucket.try_acquire() for _ in range(5))   # burst съеден
+    assert all(bucket.try_acquire() for _ in range(5))   # burst consumed
     assert not bucket.try_acquire()
-    time.sleep(0.03)                                     # ~3 токена восстановились
+    time.sleep(0.03)                                     # ~3 tokens refilled
     assert bucket.try_acquire()
 
 
@@ -54,7 +54,7 @@ def test_token_bucket_acquire_blocks_until_refill():
     bucket = TokenBucket(rate_per_sec=50.0, burst=1.0)
     assert bucket.acquire()
     start = time.monotonic()
-    assert bucket.acquire(timeout=1.0)                   # ждёт ~20мс
+    assert bucket.acquire(timeout=1.0)                   # waits ~20ms
     assert time.monotonic() - start >= 0.01
 
 
@@ -84,8 +84,8 @@ def test_bookstore_price_change_updates_levels():
                               {"price": "0.46", "side": "SELL", "size": "0"},
                               {"price": "0.47", "side": "SELL", "size": "40"}]})
     top = store.top("tok")
-    assert top.bid == pytest.approx(0.45)   # новый лучший бид
-    assert top.ask == pytest.approx(0.47)   # 0.46 снят (size 0)
+    assert top.bid == pytest.approx(0.45)   # new best bid
+    assert top.ask == pytest.approx(0.47)   # 0.46 removed (size 0)
 
 
 def test_bookstore_ignores_garbage():
@@ -105,8 +105,8 @@ def make_ks(cfg, ledger, mode="paper"):
 
 def test_killswitch_daily_loss_halts(cfg, ledger):
     ks, cancel, alert = make_ks(cfg, ledger)
-    ledger.snapshot_bank(cash=5000, exposure=0)          # старт дня: equity 5000
-    ks.check_daily_loss(equity_now=4990)                 # -10 < лимита 25
+    ledger.snapshot_bank(cash=5000, exposure=0)          # day start: equity 5000
+    ks.check_daily_loss(equity_now=4990)                 # -10 < limit 25
     assert ks.trading_allowed
     ks.check_daily_loss(equity_now=4970)                 # -30 >= 25 -> halt
     assert ks.halted and not ks.trading_allowed
@@ -124,9 +124,9 @@ def test_killswitch_ws_pause_and_resume(cfg, ledger):
     ks, cancel, _ = make_ks(cfg, ledger)
     ks.on_ws_disconnect(12.0)
     assert ks.paused and not ks.halted
-    cancel.assert_called_once()                          # котировки сняты
+    cancel.assert_called_once()                          # quotes pulled
     ks.on_ws_recovered()
-    assert ks.trading_allowed                            # авто-возврат
+    assert ks.trading_allowed                            # auto-resume
 
 
 def test_killswitch_reconcile_mismatch_halts(cfg, ledger):
@@ -140,4 +140,4 @@ def test_killswitch_global_exposure_gate(cfg, ledger):
     ks, _, _ = make_ks(cfg, ledger)
     assert not ks.check_global_exposure(cfg.risk.max_global_exposure_usd - 1)
     assert ks.check_global_exposure(cfg.risk.max_global_exposure_usd)
-    assert not ks.halted                                 # гейт, не авария
+    assert not ks.halted                                 # a gate, not an emergency

@@ -1,17 +1,17 @@
-"""Бэктест на закрытых рынках: калибровка p_est до единого живого доллара.
+"""Backtest on closed markets: calibrate p_est before a single live dollar.
 
-Методика:
-  1. Берём закрытые рынки из Gamma с однозначной резолюцией (цена ~0/1).
-  2. Для каждого сэмплируем цену за lookback_days_before_end дней до конца
-     через CLOB /prices-history — это «цена входа», которую видел бы бот.
-  3. Прогоняем офлайн-сигналы (base rates + когерентность по сэмплированным
-     ценам события); LLM в бэктесте выключен по умолчанию (стоимость + утечка
-     будущего знания из обучающих данных).
-  4. Считаем: Brier рынка vs Brier модели, таблицу калибровки по бакетам,
-     симулированный PnL стратегии «покупать всё с edge ≥ порога».
+Method:
+  1. Take closed Gamma markets with unambiguous resolution (price ~0/1).
+  2. For each, sample the price lookback_days_before_end days before the end
+     via CLOB /prices-history — the "entry price" the bot would have seen.
+  3. Run the offline signals (base rates + coherence over the sampled event
+     prices); LLM is off by default in backtest (cost + future-knowledge leak
+     from training data).
+  4. Compute: market Brier vs model Brier, a bucketed calibration table, and
+     simulated PnL of a "buy everything with edge >= threshold" strategy.
 
-Ограничения (честно): momentum в бэктесте недоступен (нет суточных дельт
-прошлого), fill-модель оптимистична (вход по сэмплированной цене).
+Limits (honestly): momentum is unavailable in backtest (no past daily deltas),
+the fill model is optimistic (entry at the sampled price).
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ log = logging.getLogger(__name__)
 @dataclass
 class BacktestRow:
     market: Market
-    p_entry: float          # цена за lookback дней до резолюции
+    p_entry: float          # price lookback days before resolution
     p_est: float
     won: bool
     signals: list[str] = field(default_factory=list)
@@ -56,7 +56,7 @@ class BacktestReport:
         return total / len(self.rows)
 
     def buckets(self) -> list[tuple[str, int, float, float]]:
-        """[(диапазон, n, средняя цена, фактическая частота побед)]."""
+        """[(range, n, avg price, actual win frequency)]."""
         edges = [0.0, 0.01, 0.02, 0.03, 0.05, 0.10, 1.0]
         grouped: dict[int, list[BacktestRow]] = defaultdict(list)
         for r in self.rows:
@@ -104,7 +104,7 @@ def run_backtest(cfg: BotConfig, gamma: GammaClient | None = None,
         if winner is None or m.end_date is None or not m.clob_token_ids:
             continue
         end_ts = int(m.end_date.timestamp())
-        token = m.clob_token_ids[0]  # Yes-сторона
+        token = m.clob_token_ids[0]  # Yes side
         history = clob.price_history(token, end_ts - lookback_sec - 86400,
                                      end_ts - lookback_sec + 86400)
         if not history:
@@ -132,31 +132,31 @@ def run_backtest(cfg: BotConfig, gamma: GammaClient | None = None,
 def print_report(report: BacktestReport, cfg: BotConfig) -> None:
     console = Console()
     n = len(report.rows)
-    console.print(f"\n[bold]Бэктест: {n} хвостовых исходов с историей цен[/bold]")
+    console.print(f"\n[bold]Backtest: {n} tail outcomes with price history[/bold]")
     if not n:
-        console.print("Недостаточно данных: увеличьте backtest.max_markets "
-                      "или ослабьте фильтры сканера.")
+        console.print("Not enough data: raise backtest.max_markets "
+                      "or relax the scanner filters.")
         return
 
     brier_mkt = report.brier(use_model=False)
     brier_model = report.brier(use_model=True)
-    console.print(f"Brier рынка:  {brier_mkt:.5f}")
-    console.print(f"Brier модели: {brier_model:.5f} "
-                  f"({'лучше' if brier_model < brier_mkt else 'ХУЖЕ'} рынка)")
+    console.print(f"Market Brier: {brier_mkt:.5f}")
+    console.print(f"Model Brier:  {brier_model:.5f} "
+                  f"({'better' if brier_model < brier_mkt else 'WORSE'} than market)")
 
-    t = Table(title="Калибровка по бакетам цены входа")
-    for col in ("Диапазон p", "N", "Средняя цена", "Фактическая частота", "Bias"):
+    t = Table(title="Calibration by entry-price bucket")
+    for col in ("p range", "N", "Avg price", "Actual frequency", "Bias"):
         t.add_column(col)
     for rng, count, avg_p, freq in report.buckets():
-        bias = "переоценён" if avg_p > freq else "недооценён"
+        bias = "overpriced" if avg_p > freq else "underpriced"
         t.add_row(rng, str(count), f"{avg_p:.4f}", f"{freq:.4f}", bias)
     console.print(t)
 
     sim = report.strategy_pnl(cfg.estimator.min_edge_ratio)
     console.print(
-        f"\nСимуляция стратегии (edge >= {cfg.estimator.min_edge_ratio:g}, $100/сделка): "
-        f"{sim['trades']} сделок, {sim['wins']} побед, "
+        f"\nStrategy simulation (edge >= {cfg.estimator.min_edge_ratio:g}, $100/trade): "
+        f"{sim['trades']} trades, {sim['wins']} wins, "
         f"ROI = {sim['roi'] * 100:+.1f}%"
     )
-    console.print("[dim]Оговорки: вход по сэмплированной цене (оптимистично), "
-                  "momentum/LLM в бэктесте не участвуют.[/dim]")
+    console.print("[dim]Caveats: entry at the sampled price (optimistic), "
+                  "momentum/LLM do not participate in the backtest.[/dim]")

@@ -1,10 +1,10 @@
-"""Сигнал base rates: исторические частоты событий из YAML-справочника.
+"""Base-rates signal: historical event frequencies from a YAML reference.
 
-p_est для рынка «случится ли X до даты D»:
-    p = 1 - (1 - annual_probability) ^ (дней_до_D / 365)
-— вероятность хотя бы одного события пуассоновского типа за остаток срока.
-Применяется только к Yes-стороне: базовая частота описывает наступление
-события, а не его отсутствие.
+p_est for a market "will X happen by date D":
+    p = 1 - (1 - annual_probability) ^ (days_to_D / 365)
+— the probability of at least one Poisson-type event over the remaining term.
+Applies only to the Yes side: a base rate describes the event occurring, not
+its absence.
 """
 
 from __future__ import annotations
@@ -40,14 +40,14 @@ class BaseRateEntry(BaseModel):
 
 def load_base_rates(path: Path) -> list[BaseRateEntry]:
     if not path.exists():
-        log.warning("base rates: файл %s не найден, сигнал отключён", path)
+        log.warning("base rates: file %s not found, signal disabled", path)
         return []
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or []
     return [BaseRateEntry.model_validate(item) for item in raw]
 
 
 def probability_before(annual_probability: float, days_left: float) -> float:
-    """P(хотя бы одно событие за days_left) при годовой частоте annual_probability."""
+    """P(at least one event within days_left) given annual_probability."""
     if days_left <= 0:
         return 0.0
     p = 1.0 - (1.0 - min(annual_probability, 0.999999)) ** (days_left / 365.0)
@@ -62,7 +62,7 @@ class BaseRatesSignal:
 
     def evaluate(self, candidate: Candidate, now: datetime | None = None) -> Signal | None:
         if candidate.outcome_index != 0:
-            return None  # базовые частоты сформулированы для Yes-стороны
+            return None  # base rates are phrased for the Yes side
         days = candidate.market.days_to_resolution(now or datetime.now(timezone.utc))
         if days is None:
             return None

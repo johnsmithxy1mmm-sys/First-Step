@@ -1,4 +1,4 @@
-"""Structured logging: JSONL-файл + читаемая консоль (rich)."""
+"""Structured logging: JSONL file + readable console (rich)."""
 
 from __future__ import annotations
 
@@ -39,6 +39,6 @@ def setup_logging(log_path: str, level: str = "INFO") -> None:
     file_handler.setLevel(logging.DEBUG)
     root.addHandler(file_handler)
 
-    # Шумные библиотеки — только предупреждения.
+    # Noisy libraries — warnings only.
     for noisy in ("httpx", "httpcore", "urllib3", "apscheduler"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
