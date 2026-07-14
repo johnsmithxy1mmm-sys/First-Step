@@ -1,14 +1,14 @@
-# Параметры стратегии «барбелл на мисспрайсинге хвостовых исходов».
-# Секретов здесь нет и быть не должно — ключи только в .env.
+# Parameters for the "barbell on the mispricing of tail outcomes" strategy.
+# No secrets here, ever — keys go only in .env.
 
 scanner:
-  price_min: 0.002            # ниже — мёртвые рынки, купить нереально
-  price_max: 0.05             # хвост: имплайд-вероятность ≤ 5%
+  price_min: 0.002            # below this — dead markets, impossible to buy
+  price_max: 0.05             # tail: implied probability <= 5%
   min_volume_24h_usd: 5000
-  min_book_depth_usd: 500     # глубина бидов в пределах 20% от mid
+  min_book_depth_usd: 500     # bid depth within 20% of mid
   book_depth_pct_from_mid: 0.20
-  min_days_to_resolution: 3   # короче — катализатору нет времени
-  max_days_to_resolution: 120 # длиннее — заморозка капитала убивает IRR
+  min_days_to_resolution: 3   # shorter — no time for a catalyst
+  max_days_to_resolution: 120 # longer — capital lock-up kills IRR
   require_resolution_clarity: true
   min_description_chars: 80
   exclude_keywords: []
@@ -18,12 +18,12 @@ scanner:
   max_candidates_per_cycle: 200
 
 estimator:
-  min_edge_ratio: 2.0         # p_est / p_mkt ≥ 2 — иначе не сделка
+  min_edge_ratio: 2.0         # p_est / p_mkt >= 2 — otherwise no trade
   max_p_mkt: 0.05
   base_rates_file: base_rates.yaml
   market_anchor_confidence: 0.85
   llm:
-    enabled: false            # включать после калибровки base rates + когерентности
+    enabled: false            # enable after calibrating base rates + coherence
     model: claude-sonnet-5
     max_calls_per_cycle: 10
     cache_ttl_hours: 24
@@ -31,28 +31,28 @@ estimator:
 
 portfolio:
   bankroll_usd: 5000
-  kelly_fraction: 0.15        # λ дробного Келли
-  max_market_pct: 0.01        # ≤ 1% банка на рынок
-  max_category_pct: 0.10      # ≤ 10% на категорию (с учётом корреляций)
+  kelly_fraction: 0.15        # lambda of fractional Kelly
+  max_market_pct: 0.01        # <= 1% of bankroll per market
+  max_category_pct: 0.10      # <= 10% per category (accounting for correlations)
   max_total_exposure_pct: 0.30
-  max_drawdown_pct: 0.25      # просадка ≥ 25% → observe-only + алерт
-  take_profit_multiple: 7.0   # частичная фиксация при росте в N раз
+  max_drawdown_pct: 0.25      # drawdown >= 25% -> observe-only + alert
+  take_profit_multiple: 7.0   # partial take on an N-x rise
   take_profit_fraction: 0.6
 
 executor:
   max_reprices: 3
   fill_timeout_sec: 90
   poll_interval_sec: 5
-  max_child_order_usd: 200    # дробление крупных заявок
+  max_child_order_usd: 200    # split large orders
 
-# Стратегия №1: структурный арбитраж neg-risk корзин.
-# Почти безрисковый, но capacity микроскопический; окна выедаются быстрыми ботами.
+# Strategy #1: structural arbitrage of neg-risk baskets.
+# Nearly risk-free, but capacity is microscopic; windows are eaten by fast bots.
 arbitrage:
   enabled: true
-  execute: false            # true = ставить ордера; false = только находить и алертить
+  execute: false            # true = place orders; false = only find and alert
   interval_sec: 60
-  min_profit_pct: 0.015     # минимум 1.5% ЧИСТОГО edge (после комиссий)
-  suspicious_gross_edge: 0.05  # gross выше -> вероятно неполная корзина, не исполнять
+  min_profit_pct: 0.015     # at least 1.5% NET edge (after fees)
+  suspicious_gross_edge: 0.05  # gross above this -> likely incomplete basket, do not execute
   prefilter_tolerance: 0.01
   max_stake_usd: 300
   min_sets: 5
@@ -60,10 +60,10 @@ arbitrage:
   max_events_per_cycle: 10
   min_leg_volume_24h_usd: 500
 
-# ЯДРО (80% капитала): маркет-мейкинг + liquidity rewards farming.
-# Три потока дохода: спред + maker rebate + дневной rewards-пул.
+# CORE (80% of capital): market making + liquidity rewards farming.
+# Three income streams: spread + maker rebate + daily rewards pool.
 market_maker:
-  enabled: false            # включать после Фазы 1-3 (dry-run -> paper)
+  enabled: false            # enable after Phases 1-3 (dry-run -> paper)
   interval_sec: 30
   max_markets: 5
   min_volume_24h_usd: 50000
@@ -72,14 +72,14 @@ market_maker:
   max_daily_midpoint_move: 0.05
   half_spread: 0.01
   quote_size_usd: 10
-  inventory_skew_k: 0.5     # главный механизм риска: сдвиг fair против инвентаря
-  requote_threshold_ticks: 2  # гистерезис: не жечь rate limit и rewards-сэмплинг
+  inventory_skew_k: 0.5     # main risk mechanism: shift fair against inventory
+  requote_threshold_ticks: 2  # hysteresis: do not burn rate limit or rewards sampling
   requote_timer_sec: 120
-  guard_price_move: 0.03    # adverse selection: снять котировки при шоке
+  guard_price_move: 0.03    # adverse selection: pull quotes on a shock
   guard_cooldown_cycles: 3
   guard_volume_ratio: 0.5
 
-# Риск-фреймворк: абсолютные лимиты, kill-switch (halt до ручного рестарта).
+# Risk framework: absolute limits, kill-switch (halt until manual restart).
 risk:
   max_position_per_market_usd: 50
   max_global_exposure_usd: 300
@@ -89,8 +89,8 @@ risk:
   reconcile_interval_sec: 60
   ws_staleness_kill_sec: 10
 
-# Fee Structure V2 (март 2026): maker платит 0 и получает rebate.
-# ПРОВЕРЯЙТЕ актуальность на docs.polymarket.com (Фаза 0).
+# Fee Structure V2 (March 2026): maker pays 0 and earns a rebate.
+# VERIFY it is current at docs.polymarket.com (Phase 0).
 fees:
   taker:
     crypto: 0.07
@@ -105,7 +105,7 @@ fees:
     other: 0.04
   maker_rebate_frac: 0.35
 
-# WS-стаканы: авто-reconnect, heartbeat, gap-detect (>10с -> снять котировки).
+# WS order books: auto-reconnect, heartbeat, gap-detect (>10s -> pull quotes).
 ws:
   enabled: true
   url: wss://ws-subscriptions-clob.polymarket.com/ws/market
@@ -117,7 +117,7 @@ ratelimit:
   reads_per_sec: 30
   reads_burst: 100
 
-# САТЕЛЛИТ (20%): T-10s TA на 5-мин BTC up/down. По умолчанию ВЫКЛЮЧЕН.
+# SATELLITE (20%): T-10s TA on 5-min BTC up/down. DISABLED by default.
 satellite:
   enabled: false
   slug_template: "btc-updown-5m-{ts}"
@@ -129,18 +129,18 @@ satellite:
   max_bet_usd: 10
   candles_url: "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=30"
 
-# Стратегия №2: кросс-платформенные расхождения (Kalshi). Только алерты:
-# правила резолюции площадок сверяет человек.
+# Strategy #2: cross-platform divergences (Kalshi). Alerts only:
+# a human reconciles the venues' resolution rules.
 crossmarket:
   enabled: true
   interval_min: 15
-  min_divergence: 0.04      # от 4 п.п.
+  min_divergence: 0.04      # from 4 pp
   min_similarity: 0.65
   min_volume_24h_usd: 10000
   max_alerts_per_cycle: 10
 
-# Стратегия №5: информационный edge в нише — мгновенные алерты о новых рынках.
-# Вотчлисты редактируйте под свои домены (дефолт: постсоветская геополитика + крипто).
+# Strategy #5: informational edge in a niche — instant alerts on new markets.
+# Edit the watchlists for your own domains (default: post-Soviet geopolitics + crypto).
 niche:
   enabled: true
   watchlists:
@@ -162,26 +162,26 @@ niche:
                  liverpool, arsenal, chelsea, tottenham, bayern, dortmund,
                  psg, juventus, inter milan, ac milan, napoli, atletico madrid]
 
-# Трекер «умных денег»: алерты, когда сильные кошельки заходят в рынок.
-# Адреса берите с polymarket.com/leaderboard (стабильно прибыльные игроки).
+# Smart-money tracker: alerts when strong wallets enter a market.
+# Take addresses from polymarket.com/leaderboard (consistently profitable players).
 smart_money:
   enabled: false
   interval_min: 10
-  watch_wallets: []          # ["0x...", "0x..."] — кого отслеживать
+  watch_wallets: []          # ["0x...", "0x..."] — who to follow
   min_position_usd: 50
-  tail_max_price: 0.10       # вход дешевле — метка [ХВОСТ]
-  only_niche_or_tail: false  # true = алертить только про нишу/хвост
+  tail_max_price: 0.10       # entry cheaper than this — [TAIL] tag
+  only_niche_or_tail: false  # true = alert only on niche/tail
 
-# Фейдинг переоценённых хвостов: покупаем NO, когда YES-хвост переоценён
-# (прибыльная сторона favorite-longshot bias). Плюсово в среднем, но с
-# редким крупным убытком — держится жёсткими кэпами портфеля.
+# Fading overpriced tails: buy NO when the YES tail is overpriced
+# (the profitable side of favorite-longshot bias). Positive on average, but
+# with a rare large loss — held in check by the portfolio's hard caps.
 fade:
   enabled: false
-  bias_discount: 0.30       # хвост считаем переоценённым минимум на 30%
-  fade_max_price: 0.10      # фейдим только YES-хвосты дешевле этой цены
+  bias_discount: 0.30       # treat the tail as overpriced by at least 30%
+  fade_max_price: 0.10      # fade only YES tails cheaper than this price
   min_tail_price: 0.005
   min_edge_after_fees: 0.005
-  longshot_veto_ratio: 2.0  # p_est ≥ 2× рынка -> настоящий лонгшот, не фейдим
+  longshot_veto_ratio: 2.0  # p_est >= 2x market -> a real longshot, do not fade
 
 runtime:
   gamma_host: https://gamma-api.polymarket.com
