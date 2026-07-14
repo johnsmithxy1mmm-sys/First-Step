@@ -103,7 +103,24 @@ class Ledger:
             self._conn.commit()
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
+
+    # --- locked DB access (single sqlite connection shared across threads) ---
+
+    def _query(self, sql: str, params: tuple = ()) -> list:
+        with self._lock:
+            return self._conn.execute(sql, params).fetchall()
+
+    def _execute(self, sql: str, params: tuple = ()) -> None:
+        with self._lock:
+            self._conn.execute(sql, params)
+            self._conn.commit()
+
+    def _executemany(self, sql: str, seq) -> None:
+        with self._lock:
+            self._conn.executemany(sql, seq)
+            self._conn.commit()
 
     # --- writes ---
 
@@ -119,7 +136,7 @@ class Ledger:
             "signals": [s.model_dump() for s in estimate.signals],
             "book": c.book.model_dump() if c.book else None,
         }
-        self._conn.execute(
+        self._execute(
             "INSERT INTO trades (ts, mode, market_id, event_id, question, outcome, "
             "category, token_id, side, price, size, usd, order_id, status, strategy, snapshot) "
             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -128,63 +145,56 @@ class Ledger:
              round(price * size, 6), order_id, status, strategy,
              json.dumps(snapshot, ensure_ascii=False, default=str)),
         )
-        self._conn.commit()
 
     def record_estimate(self, estimate: Estimate, qualifies: bool) -> None:
         c = estimate.candidate
-        self._conn.execute(
+        self._execute(
             "INSERT INTO estimates (ts, market_id, token_id, question, p_mkt, p_est, "
             "edge_ratio, qualifies, signals) VALUES (?,?,?,?,?,?,?,?,?)",
             (_now(), c.market.id, c.token_id, c.market.question,
              estimate.p_mkt, estimate.p_est, estimate.edge_ratio,
              int(qualifies), estimate.signals_dump()),
         )
-        self._conn.commit()
 
     def record_resolution(self, token_id: str, market_id: str, won: bool) -> None:
-        self._conn.execute(
+        self._execute(
             "INSERT OR REPLACE INTO resolutions (token_id, market_id, ts, won, payout_per_share) "
             "VALUES (?,?,?,?,?)",
             (token_id, market_id, _now(), int(won), 1.0 if won else 0.0),
         )
-        self._conn.commit()
 
     def seen_market_ids(self) -> set[str]:
-        return {r["market_id"] for r in self._conn.execute("SELECT market_id FROM seen_markets")}
+        return {r["market_id"] for r in self._query("SELECT market_id FROM seen_markets")}
 
     def mark_markets_seen(self, market_ids: list[str]) -> None:
-        self._conn.executemany(
+        self._executemany(
             "INSERT OR IGNORE INTO seen_markets (market_id, ts) VALUES (?, ?)",
             [(mid, _now()) for mid in market_ids],
         )
-        self._conn.commit()
 
     def smart_money_seen_keys(self) -> set[str]:
-        return {r["key"] for r in self._conn.execute("SELECT key FROM smart_money_seen")}
+        return {r["key"] for r in self._query("SELECT key FROM smart_money_seen")}
 
     def mark_smart_money_seen(self, keys: list[str]) -> None:
-        self._conn.executemany(
+        self._executemany(
             "INSERT OR IGNORE INTO smart_money_seen (key, ts) VALUES (?, ?)",
             [(k, _now()) for k in keys])
-        self._conn.commit()
 
     def snapshot_bank(self, cash: float, exposure: float) -> None:
         equity = cash + exposure
         hwm = max(self.high_water_mark(), equity)
-        self._conn.execute(
+        self._execute(
             "INSERT INTO bank (ts, cash, exposure, equity, hwm) VALUES (?,?,?,?,?)",
             (_now(), cash, exposure, equity, hwm),
         )
-        self._conn.commit()
 
     # --- positions and exposure ---
 
     def open_positions(self, mode: str) -> list[Position]:
         """Open positions = buys - sells - resolutions (per token)."""
-        rows = self._conn.execute(
-            "SELECT * FROM trades WHERE mode = ? AND status != 'failed' ORDER BY id", (mode,)
-        ).fetchall()
-        resolved = {r["token_id"] for r in self._conn.execute("SELECT token_id FROM resolutions")}
+        rows = self._query(
+            "SELECT * FROM trades WHERE mode = ? AND status != 'failed' ORDER BY id", (mode,))
+        resolved = {r["token_id"] for r in self._query("SELECT token_id FROM resolutions")}
 
         agg: dict[str, dict] = {}
         for r in rows:
@@ -227,22 +237,20 @@ class Ledger:
 
     def has_position_or_open_buy(self, token_id: str, mode: str) -> bool:
         """Idempotency: do not duplicate an entry for a token."""
-        row = self._conn.execute(
+        row = self._query(
             "SELECT COUNT(*) AS n FROM trades WHERE mode = ? AND token_id = ? "
             "AND side = 'BUY' AND status != 'failed' AND status != 'canceled'",
-            (mode, token_id),
-        ).fetchone()
+            (mode, token_id))[0]
         return row["n"] > 0
 
     # --- PnL and metrics ---
 
     def realized_pnl(self, mode: str) -> float:
         """PnL from closed events: resolutions + sells against entry cost."""
-        rows = self._conn.execute(
+        rows = self._query(
             "SELECT t.token_id, t.side, t.price, t.size, t.usd, r.won "
             "FROM trades t LEFT JOIN resolutions r ON r.token_id = t.token_id "
-            "WHERE t.mode = ? AND t.status != 'failed' ORDER BY t.id", (mode,)
-        ).fetchall()
+            "WHERE t.mode = ? AND t.status != 'failed' ORDER BY t.id", (mode,))
 
         per_token: dict[str, dict] = defaultdict(
             lambda: {"buy_size": 0.0, "buy_usd": 0.0, "sell_usd": 0.0,
@@ -270,18 +278,16 @@ class Ledger:
 
     def first_bank_equity_since(self, ts_iso: str) -> float | None:
         """First equity snapshot after a timestamp (for the daily stop)."""
-        row = self._conn.execute(
-            "SELECT equity FROM bank WHERE ts >= ? ORDER BY id LIMIT 1", (ts_iso,)
-        ).fetchone()
-        return float(row["equity"]) if row else None
+        rows = self._query(
+            "SELECT equity FROM bank WHERE ts >= ? ORDER BY id LIMIT 1", (ts_iso,))
+        return float(rows[0]["equity"]) if rows else None
 
     def realized_pnl_by_strategy(self, mode: str) -> dict[str, float]:
         """Realized PnL by strategy (for allocation and attribution)."""
-        rows = self._conn.execute(
+        rows = self._query(
             "SELECT t.token_id, t.side, t.size, t.usd, t.strategy, r.won "
             "FROM trades t LEFT JOIN resolutions r ON r.token_id = t.token_id "
-            "WHERE t.mode = ? AND t.status != 'failed' ORDER BY t.id", (mode,)
-        ).fetchall()
+            "WHERE t.mode = ? AND t.status != 'failed' ORDER BY t.id", (mode,))
         per_token: dict[str, dict] = defaultdict(
             lambda: {"buy_size": 0.0, "buy_usd": 0.0, "sell_usd": 0.0,
                      "sell_size": 0.0, "won": None, "strategy": "longshot"})
@@ -313,13 +319,13 @@ class Ledger:
                               limit: int = 20) -> list[dict]:
         """Filled buys due for a markout measurement at the horizon."""
         now = datetime.now(timezone.utc)
-        rows = self._conn.execute(
+        rows = self._query(
             "SELECT t.id, t.token_id, t.price, t.ts FROM trades t "
             "WHERE t.mode = ? AND t.side = 'BUY' "
             "AND t.status IN ('filled', 'paper-filled') "
             "AND NOT EXISTS (SELECT 1 FROM markouts m "
             "                WHERE m.trade_id = t.id AND m.horizon_sec = ?) "
-            "ORDER BY t.id", (mode, horizon_sec)).fetchall()
+            "ORDER BY t.id", (mode, horizon_sec))
         out: list[dict] = []
         for r in rows:
             age = (now - datetime.fromisoformat(r["ts"])).total_seconds()
@@ -331,13 +337,12 @@ class Ledger:
 
     def record_markout(self, trade_id: int, token_id: str, horizon_sec: int,
                        fill_price: float, mark_price: float) -> None:
-        self._conn.execute(
+        self._execute(
             "INSERT OR IGNORE INTO markouts "
             "(trade_id, token_id, horizon_sec, fill_price, mark_price, markout, ts) "
             "VALUES (?,?,?,?,?,?,?)",
             (trade_id, token_id, horizon_sec, fill_price, mark_price,
              mark_price - fill_price, _now()))
-        self._conn.commit()
 
     def markout_stats(self, mode: str) -> list[dict]:
         """Average markout by (strategy, horizon): the key fill-quality test.
@@ -345,7 +350,7 @@ class Ledger:
         For a buy, markout < 0 means adverse selection: price after our fill
         systematically drops — the informed are running us over.
         """
-        rows = self._conn.execute(
+        rows = self._query(
             "SELECT t.strategy, m.horizon_sec, COUNT(*) AS n, "
             "AVG(m.markout) AS avg_markout, "
             "AVG(m.markout / m.fill_price) AS avg_markout_pct, "
@@ -353,30 +358,29 @@ class Ledger:
             "FROM markouts m JOIN trades t ON t.id = m.trade_id "
             "WHERE t.mode = ? "
             "GROUP BY t.strategy, m.horizon_sec "
-            "ORDER BY t.strategy, m.horizon_sec", (mode,)).fetchall()
+            "ORDER BY t.strategy, m.horizon_sec", (mode,))
         return [dict(r) for r in rows]
 
     def bank_series(self) -> list[dict]:
-        return [dict(r) for r in self._conn.execute(
+        return [dict(r) for r in self._query(
             "SELECT ts, equity, hwm FROM bank ORDER BY id")]
 
     def estimates_summary(self) -> dict:
-        row = self._conn.execute(
+        row = self._query(
             "SELECT COUNT(*) AS total, SUM(qualifies) AS qualifying, "
-            "AVG(edge_ratio) AS avg_edge FROM estimates").fetchone()
+            "AVG(edge_ratio) AS avg_edge FROM estimates")[0]
         return dict(row)
 
     def high_water_mark(self) -> float:
-        row = self._conn.execute("SELECT MAX(hwm) AS hwm FROM bank").fetchone()
+        row = self._query("SELECT MAX(hwm) AS hwm FROM bank")[0]
         return float(row["hwm"] or 0.0)
 
     def metrics(self, mode: str) -> dict:
         """Hit rate, average multiple, Brier for p_est/p_mkt, ROI, PnL attribution."""
-        rows = self._conn.execute(
+        rows = self._query(
             "SELECT t.token_id, t.price, t.size, t.usd, t.snapshot, r.won "
             "FROM trades t JOIN resolutions r ON r.token_id = t.token_id "
-            "WHERE t.mode = ? AND t.side = 'BUY' AND t.status != 'failed'", (mode,)
-        ).fetchall()
+            "WHERE t.mode = ? AND t.side = 'BUY' AND t.status != 'failed'", (mode,))
 
         n = len(rows)
         wins = sum(1 for r in rows if r["won"])
