@@ -1,17 +1,17 @@
-"""Трекер «умных денег» (уровень 2, №5): следим за сильными кошельками.
+"""Smart-money tracker (level 2, #5): follow strong wallets.
 
-Исторически громкие частные плюсы на Polymarket — люди, знавшие домен глубже
-толпы. Их сделки видны публично: Data API отдаёт позиции любого адреса. Модуль
-следит за списком таких кошельков и алертит, когда они **впервые** заходят в
-рынок — с пометкой, если это хвостовой исход (дёшево, потенциал иксов) или
-рынок из вашей ниши.
+Historically loud private winners on Polymarket are people who knew a domain
+deeper than the crowd. Their trades are public: the Data API returns any
+address's positions. This module watches a list of such wallets and alerts
+when they enter a market for the **first** time — flagging it if it's a tail
+outcome (cheap, multi-x potential) or a market in your niche.
 
-Только алерты, без автоторговли: копировать вслепую нельзя (разный размер
-банка, разное время входа), но знать, куда зашли сильные, — сильный сигнал
-для ручного решения и для лонгшот-оценщика.
+Alerts only, no auto-trading: blind copying is unwise (different bankroll,
+different entry timing), but knowing where the strong players went is a
+powerful input for a manual decision and for the longshot estimator.
 
-Где взять адреса: leaderboard на polymarket.com/leaderboard — скопируйте
-адреса стабильно прибыльных игроков в smart_money.watch_wallets.
+Where to get addresses: the leaderboard at polymarket.com/leaderboard — copy
+the addresses of consistently profitable players into smart_money.watch_wallets.
 """
 
 from __future__ import annotations
@@ -50,7 +50,7 @@ class WalletPosition(BaseModel):
 
 
 def parse_positions(wallet: str, raw: list) -> list[WalletPosition]:
-    """Дефенсивный разбор ответа Data API /positions (форма может отличаться)."""
+    """Defensive parse of the Data API /positions response (shape may vary)."""
     out: list[WalletPosition] = []
     for p in raw or []:
         if not isinstance(p, dict):
@@ -100,18 +100,18 @@ class SmartMoneyTracker:
     def _describe(self, pos: WalletPosition, niche: str | None) -> str:
         tags = []
         if self._is_tail(pos):
-            tags.append("ХВОСТ")
+            tags.append("TAIL")
         if niche:
-            tags.append(f"ниша:{niche}")
+            tags.append(f"niche:{niche}")
         tag_str = f" [{', '.join(tags)}]" if tags else ""
-        return (f"🐋 УМНЫЕ ДЕНЬГИ{tag_str}\n"
-                f"Кошелёк {pos.wallet[:10]}… зашёл: {pos.title[:80]}\n"
-                f"Исход [{pos.outcome}] по {pos.avg_price:.3f} | "
-                f"${pos.usd:,.0f} | PnL кошелька по позиции ${pos.cash_pnl:,.0f}\n"
+        return (f"🐋 SMART MONEY{tag_str}\n"
+                f"Wallet {pos.wallet[:10]}… entered: {pos.title[:80]}\n"
+                f"Outcome [{pos.outcome}] at {pos.avg_price:.3f} | "
+                f"${pos.usd:,.0f} | wallet PnL on this position ${pos.cash_pnl:,.0f}\n"
                 f"https://polymarket.com/profile/{pos.wallet}")
 
     def cycle(self) -> list[WalletPosition]:
-        """Проверяет отслеживаемые кошельки, алертит про новые позиции."""
+        """Checks the watched wallets, alerts on new positions."""
         if not self._cfg.enabled or not self._cfg.watch_wallets:
             return []
         seen = self._ledger.smart_money_seen_keys()
@@ -122,7 +122,7 @@ class SmartMoneyTracker:
             for pos in self.fetch_positions(wallet):
                 if pos.key in seen or pos.usd < self._cfg.min_position_usd:
                     continue
-                fresh_keys.append(pos.key)   # помечаем виденной независимо от алерта
+                fresh_keys.append(pos.key)   # mark seen regardless of alerting
                 niche = self._niche.classify(pos.title)
                 if self._cfg.only_niche_or_tail and not (niche or self._is_tail(pos)):
                     continue

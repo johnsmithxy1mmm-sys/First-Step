@@ -1,13 +1,13 @@
-"""Стратегия №2: кросс-платформенный сканер расхождений (Polymarket vs Kalshi).
+"""Strategy #2: cross-platform divergence scanner (Polymarket vs Kalshi).
 
-Один и тот же исход на разных площадках котируется с расхождениями в
-2-10 п.п., особенно в новостные моменты. Модуль ТОЛЬКО находит и алертит —
-автоторговли нет намеренно: главный риск не рыночный, а операционный
-(«одинаковое» событие резолвится по-разному из-за отличий в правилах),
-и сверить правила резолюции может только человек.
+The same outcome is quoted with 2-10 pp gaps across venues, especially at
+news moments. This module ONLY finds and alerts — auto-trading is
+deliberately absent: the main risk is not market but operational (an
+"identical" event resolves differently due to rule differences), and only a
+human can reconcile the resolution rules.
 
-Kalshi выбран первым внешним venue: публичный REST без авторизации.
-Другие площадки (Betfair и т.п.) подключаются реализацией ExternalVenue.
+Kalshi is the first external venue: public REST, no auth. Other venues
+(Betfair etc.) plug in via an ExternalVenue implementation.
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ def title_tokens(title: str) -> frozenset[str]:
 
 
 def similarity(a: str, b: str) -> float:
-    """Жаккар по значимым словам заголовков."""
+    """Jaccard over the meaningful words of the titles."""
     ta, tb = title_tokens(a), title_tokens(b)
     if not ta or not tb:
         return 0.0
@@ -47,7 +47,7 @@ def similarity(a: str, b: str) -> float:
 class VenueMarket(BaseModel):
     venue: str
     title: str
-    yes_price: float            # mid вероятности Yes, 0..1
+    yes_price: float            # mid of Yes probability, 0..1
     url: str = ""
 
 
@@ -57,7 +57,7 @@ class ExternalVenue(Protocol):
 
 
 class KalshiVenue:
-    """Публичные рыночные данные Kalshi (без авторизации)."""
+    """Public Kalshi market data (no auth)."""
 
     name = "kalshi"
     HOST = "https://api.elections.kalshi.com/trade-api/v2"
@@ -94,7 +94,7 @@ class KalshiVenue:
             cursor = data.get("cursor")
             if not cursor:
                 break
-        log.info("kalshi: рынков получено %d", len(out))
+        log.info("kalshi: fetched %d markets", len(out))
         return out
 
 
@@ -111,12 +111,12 @@ class Divergence(BaseModel):
 
     def describe(self) -> str:
         cheaper = "Polymarket" if self.poly_price < self.venue_price else self.venue_market.venue
-        return (f"РАСХОЖДЕНИЕ {self.gap * 100:.1f} п.п. (дешевле на {cheaper}, "
+        return (f"DIVERGENCE {self.gap * 100:.1f} pp (cheaper on {cheaper}, "
                 f"sim={self.similarity:.2f}):\n"
                 f"  Polymarket {self.poly_price:.3f}: {self.poly_market.question[:80]}\n"
                 f"  {self.venue_market.venue} {self.venue_price:.3f}: "
                 f"{self.venue_market.title[:80]}\n"
-                f"  ПРОВЕРЬТЕ ПРАВИЛА РЕЗОЛЮЦИИ ОБЕИХ ПЛОЩАДОК ПЕРЕД ВХОДОМ")
+                f"  CHECK BOTH VENUES' RESOLUTION RULES BEFORE ENTERING")
 
 
 class CrossMarketScanner:

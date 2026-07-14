@@ -1,4 +1,4 @@
-"""Мониторинг: rich-дашборд в терминале + Telegram-алерты (опционально)."""
+"""Monitoring: rich terminal dashboard + optional Telegram alerts."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ log = logging.getLogger(__name__)
 
 
 def alert(text: str) -> bool:
-    """Telegram-алерт; тихо выключен, если не заданы TELEGRAM_* переменные."""
+    """Telegram alert; silently disabled if TELEGRAM_* vars are unset."""
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
@@ -52,8 +52,8 @@ class Dashboard:
         ))
 
         if positions:
-            t = Table(title=f"Открытые позиции ({len(positions)})")
-            for col in ("Категория", "Исход / Вопрос", "Размер", "Вход", "Сейчас", "x"):
+            t = Table(title=f"Open positions ({len(positions)})")
+            for col in ("Category", "Outcome / Question", "Size", "Entry", "Now", "x"):
                 t.add_column(col)
             for p in sorted(positions, key=lambda p: p.cost_usd, reverse=True)[:20]:
                 mark = marks.get(p.token_id, 0.0)
@@ -65,8 +65,8 @@ class Dashboard:
             c.print(t)
 
         if top_estimates:
-            t = Table(title="Топ кандидатов по edge")
-            for col in ("edge", "p_mkt", "p_est", "Сигналы", "Вопрос"):
+            t = Table(title="Top candidates by edge")
+            for col in ("edge", "p_mkt", "p_est", "Signals", "Question"):
                 t.add_column(col)
             for e in top_estimates[:10]:
                 signal_names = ",".join(s.name for s in e.signals if s.name != "market")
@@ -75,4 +75,4 @@ class Dashboard:
             c.print(t)
 
         if errors:
-            c.print(Panel("\n".join(errors[-8:]), title="[red]Ошибки цикла[/red]"))
+            c.print(Panel("\n".join(errors[-8:]), title="[red]Cycle errors[/red]"))

@@ -1,4 +1,4 @@
-"""Трекер умных денег: разбор позиций, детекция новых, дедуп, метки хвост/ниша."""
+"""Smart-money tracker: position parsing, new detection, dedup, tail/niche tags."""
 
 from unittest import mock
 
@@ -29,7 +29,7 @@ def test_parse_positions_tolerates_garbage():
     parsed = parse_positions("0xA", [
         raw_pos(), "not-a-dict", {}, raw_pos(asset="", title="no asset"),
         raw_pos(asset="tok2", avgPrice="bad")])
-    assert [p.asset for p in parsed] == ["tok1"]     # только валидная запись
+    assert [p.asset for p in parsed] == ["tok1"]     # only the valid record
     assert parsed[0].usd == pytest.approx(50.0)
 
 
@@ -39,14 +39,14 @@ def test_alerts_new_position_once(cfg, ledger):
     with mock.patch("polymarket_bot.smartmoney.alert") as a:
         first = tracker.cycle()
     assert len(first) == 1 and a.called
-    # Повторный цикл — позиция уже виденная, тишина.
+    # Second cycle — the position is already seen, silence.
     with mock.patch("polymarket_bot.smartmoney.alert") as a:
         assert tracker.cycle() == []
         a.assert_not_called()
 
 
 def test_ignores_dust(cfg, ledger):
-    tiny = raw_pos(size=100, avgPrice=0.001)          # $0.10 < порога $50
+    tiny = raw_pos(size=100, avgPrice=0.001)          # $0.10 < $50 threshold
     tracker = make_tracker(cfg, ledger, positions={"0xWHALE": [tiny]})
     with mock.patch("polymarket_bot.smartmoney.alert"):
         assert tracker.cycle() == []
@@ -55,7 +55,7 @@ def test_ignores_dust(cfg, ledger):
 def test_tail_and_niche_tags(cfg, ledger):
     positions = {"0xWHALE": [
         raw_pos(asset="t-tail", title="Will Russia capture Sumy?",
-                avgPrice=0.04, size=5000),             # $200: хвост + ниша post-soviet
+                avgPrice=0.04, size=5000),             # $200: tail + post-soviet niche
         raw_pos(asset="t-mid", title="Will the Chiefs win?", avgPrice=0.55),
     ]}
     tracker = make_tracker(cfg, ledger, positions=positions)
@@ -63,21 +63,21 @@ def test_tail_and_niche_tags(cfg, ledger):
         alerted = tracker.cycle()
     assert len(alerted) == 2
     texts = " ".join(call.args[0] for call in a.call_args_list)
-    assert "ХВОСТ" in texts and "ниша:post-soviet" in texts
+    assert "TAIL" in texts and "niche:post-soviet" in texts
 
 
 def test_only_niche_or_tail_filter(cfg, ledger):
     cfg.smart_money.only_niche_or_tail = True
     positions = {"0xWHALE": [
-        raw_pos(asset="t-tail", title="Random market", avgPrice=0.03, size=5000),  # $150 хвост
-        raw_pos(asset="t-niche", title="Will OpenAI release GPT-6?", avgPrice=0.60),  # ниша ai
-        raw_pos(asset="t-skip", title="Boring midprice market", avgPrice=0.55),       # ни то ни другое
+        raw_pos(asset="t-tail", title="Random market", avgPrice=0.03, size=5000),  # $150 tail
+        raw_pos(asset="t-niche", title="Will OpenAI release GPT-6?", avgPrice=0.60),  # ai niche
+        raw_pos(asset="t-skip", title="Boring midprice market", avgPrice=0.55),       # neither
     ]}
     tracker = make_tracker(cfg, ledger, positions=positions)
     with mock.patch("polymarket_bot.smartmoney.alert"):
         alerted = tracker.cycle()
-    assert {p.asset for p in alerted} == {"t-tail", "t-niche"}   # midprice отсеян
-    # Но все три помечены виденными — дублей не будет.
+    assert {p.asset for p in alerted} == {"t-tail", "t-niche"}   # midprice dropped
+    # But all three are marked seen — no duplicates later.
     assert len(ledger.smart_money_seen_keys()) == 3
 
 

@@ -1,22 +1,21 @@
-"""Стратегия: фейдинг переоценённых хвостов (прибыльная сторона longshot-bias).
+"""Strategy: fading overpriced tails (the profitable side of longshot bias).
 
-Дешёвые исходы на prediction-рынках систематически ПЕРЕоценены (толпа любит
-покупать «лотерейные билеты»). Наивная покупка таких хвостов минусова — а
-вот обратная сторона плюсовая: покупать NO, когда YES-хвост стоит дороже
-честной цены.
+Cheap outcomes on prediction markets are systematically OVERpriced (the crowd
+loves buying "lottery tickets"). Naively buying such tails is negative-EV — the
+opposite side is positive: buy NO when the YES tail costs more than fair.
 
-Механика на бинарном рынке [Yes, No], цены [p, 1-p]:
-  - хвост Yes переоценён: p_mkt > честной вероятности;
-  - тогда No недооценён: 1-p_mkt < 1 - p_fair;
-  - покупаем No по ~(1-p_mkt), при резолюции получаем $1.
+Mechanics on a binary market [Yes, No], prices [p, 1-p]:
+  - the Yes tail is overpriced: p_mkt > fair probability;
+  - then No is underpriced: 1-p_mkt < 1 - p_fair;
+  - buy No near ~(1-p_mkt); at resolution it pays $1.
 
-Честная вероятность Yes: min(оценка ансамбля, p_mkt·(1-bias_discount)) —
-берём меньшее из «что говорит оценщик» и «систематическая поправка на bias».
-Даже без активного сигнала bias_discount делает хвост фейдабельным.
+Fair Yes probability: min(ensemble estimate, p_mkt*(1-bias_discount)) — the
+lower of "what the estimator says" and "the systematic bias correction". Even
+with no active signal, bias_discount alone makes the tail fadeable.
 
-Переиспользует оценщик, портфельные лимиты (Kelly + кэпы) и исполнитель.
-Только maker-лимитки (fee 0). Идемпотентность — на стороне executor.
-Позиции держатся до резолюции (выигрыш маленький и частый).
+Reuses the estimator, portfolio limits (Kelly + caps) and the executor.
+Maker-only limit orders (fee ~0). Idempotency is handled by the executor.
+Positions are held to resolution (the win is small and frequent).
 """
 
 from __future__ import annotations
@@ -41,37 +40,45 @@ class FadeStrategy:
         self._executor = executor
         self._mode = mode
 
+    def reject_reason(self, estimate: Estimate) -> str | None:
+        """None = the tail is fadeable; else the reject reason (for diagnostics).
+
+        Covers the pre-sizing filters only; the portfolio cap is applied later
+        in plan() where the bankroll/exposure state is available.
+        """
+        cfg = self._cfg
+        c = estimate.candidate
+        p_mkt_yes = estimate.p_mkt
+        if not cfg.min_tail_price <= p_mkt_yes <= cfg.fade_max_price:
+            return f"tail price outside [{cfg.min_tail_price}, {cfg.fade_max_price}]"
+        if c.outcome_index not in (0, 1) or len(c.market.clob_token_ids) < 2:
+            return "not a binary market"
+        # If the estimator sees a REAL longshot (p_est >= ratio * p_mkt, the same
+        # threshold the longshot strategy BUYS Yes on), don't fade our own signal.
+        if estimate.p_est >= p_mkt_yes * cfg.longshot_veto_ratio:
+            return "estimator sees a real longshot"
+        p_fair_yes = min(estimate.p_est, p_mkt_yes * (1.0 - cfg.bias_discount))
+        edge = (1.0 - p_fair_yes) - (1.0 - p_mkt_yes)   # = p_mkt_yes - p_fair_yes
+        if edge < cfg.min_edge_after_fees:
+            return "edge below min after fees"
+        return None
+
     def plan(self, estimate: Estimate) -> TradePlan | None:
-        """Строит план покупки NO для переоценённого YES-хвоста (или None)."""
+        """Builds a NO-buy plan for an overpriced YES tail (or None)."""
+        if self.reject_reason(estimate) is not None:
+            return None
+
         cfg = self._cfg
         c = estimate.candidate
         market = c.market
         p_mkt_yes = estimate.p_mkt
 
-        if not cfg.min_tail_price <= p_mkt_yes <= cfg.fade_max_price:
-            return None
-        if c.outcome_index not in (0, 1) or len(market.clob_token_ids) < 2:
-            return None
-        # Вето только на НАСТОЯЩИЙ лонгшот: p_est ≥ ratio × p_mkt (тот же порог,
-        # по которому лонгшот ПОКУПАЕТ YES) — тогда не фейдим против своего же
-        # сигнала. Лёгкий дрейф p_est выше рынка — шум якоря (0.85), а тезис
-        # фейда держится на СИСТЕМАТИЧЕСКОМ смещении, не на пер-рынок оценке.
-        if estimate.p_est >= p_mkt_yes * cfg.longshot_veto_ratio:
-            return None
-
-        # Честная вероятность Yes с поправкой на систематический bias.
+        # Fair Yes probability with the systematic bias correction.
         p_fair_yes = min(estimate.p_est, p_mkt_yes * (1.0 - cfg.bias_discount))
         p_fair_no = 1.0 - p_fair_yes
-        entry_no = 1.0 - p_mkt_yes                    # рыночная цена No
+        entry_no = 1.0 - p_mkt_yes                    # market price of No
         no_index = 1 - c.outcome_index
         no_token = market.clob_token_ids[no_index]
-
-        # Edge на No-стороне. Фейд ставится maker-лимиткой (fee ~0, возможен
-        # rebate), поэтому комиссию не вычитаем; min_edge_after_fees — буфер
-        # под проскальзывание и неполный fill.
-        edge = p_fair_no - entry_no                   # = p_mkt_yes - p_fair_yes
-        if edge < cfg.min_edge_after_fees:
-            return None
 
         category = classify_category(market.question, market.category)
         size = self._portfolio.size_usd(category, p_fair_no, entry_no,
@@ -79,19 +86,19 @@ class FadeStrategy:
         if size is None:
             return None
 
-        # Синтетическая оценка No-стороны для сайзинга/леджера.
+        # Synthetic No-side estimate for sizing / ledger.
         no_est = Estimate(
             candidate=Candidate(market=market, outcome_index=no_index,
                                 token_id=no_token, p_mkt=entry_no),
             p_mkt=entry_no, p_est=p_fair_no, signals=estimate.signals,
         )
-        # Не платить за No выше, чем остаётся минимальный edge.
+        # Don't pay more for No than leaves the minimum edge.
         price_cap = min(p_fair_no - cfg.min_edge_after_fees, 0.99)
         return TradePlan(estimate=no_est, category=category,
                          size_usd=size, limit_price_cap=price_cap)
 
     def cycle(self, estimates: list[Estimate]) -> int:
-        """Фейдит переоценённые хвосты среди оценённых кандидатов. -> входов."""
+        """Fades overpriced tails among the scored candidates. -> entries."""
         if not self._cfg.enabled:
             return 0
         entered = 0
@@ -103,10 +110,10 @@ class FadeStrategy:
             if result.status == "filled":
                 entered += 1
                 m = plan.estimate.candidate.market
-                log.info("ФЕЙД No %.3f x %.0f = $%.2f (честн. Yes %.3f vs рынок %.3f) [%s]",
+                log.info("FADE No %.3f x %.0f = $%.2f (fair Yes %.3f vs market %.3f) [%s]",
                          result.avg_price, result.filled_size,
                          result.avg_price * result.filled_size,
                          1 - plan.estimate.p_est, est.p_mkt, m.question[:50])
         if entered:
-            log.info("фейдов за цикл: %d", entered)
+            log.info("fades this cycle: %d", entered)
         return entered

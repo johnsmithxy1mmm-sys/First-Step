@@ -1,8 +1,8 @@
-"""Сканер: фильтры первого уровня поверх всех активных рынков.
+"""Scanner: first-level filters over all active markets.
 
-Задача сканера — не найти сделку, а быстро отсечь то, что сделкой быть
-не может: неликвид, рынки без стакана, мутные правила резолюции, неудобные
-горизонты. Оценкой вероятности занимается estimator.
+The scanner's job is not to find a trade but to quickly drop what cannot be
+one: illiquid markets, markets with no book, murky resolution rules,
+awkward horizons. Probability estimation is the estimator's job.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ class Scanner:
 
     def first_level_filter(self, markets: list[Market],
                            now: datetime | None = None) -> list[Candidate]:
-        """Фильтры, не требующие похода в стакан."""
+        """Filters that do not require hitting the order book."""
         s = self._cfg.scanner
         now = now or datetime.now(timezone.utc)
         out: list[Candidate] = []
@@ -44,8 +44,8 @@ class Scanner:
             if any(k.lower() in q for k in s.exclude_keywords):
                 continue
 
-            # Неоднозначные правила резолюции — источник «правильно угадал,
-            # но рынок зарезолвили не так». Требуем источник или внятное описание.
+            # Ambiguous resolution rules are a source of "guessed right but the
+            # market resolved otherwise". Require a source or a clear description.
             if s.require_resolution_clarity and not m.resolution_source:
                 if len(m.description.strip()) < s.min_description_chars:
                     continue
@@ -60,36 +60,36 @@ class Scanner:
                     token_id=m.clob_token_ids[idx], p_mkt=price,
                 ))
 
-        # Самые ликвидные — первыми: на них реалистичнее исполниться.
+        # Most liquid first: more realistic to actually fill on them.
         out.sort(key=lambda c: c.market.volume_24h_usd, reverse=True)
         return out[: s.max_candidates_per_cycle]
 
     def reject_reason(self, m, now=None) -> str | None:
-        """None = у рынка есть дешёвый исход-кандидат; иначе причина отсева (диагностика)."""
+        """None = market has a cheap outcome candidate; else the reject reason (diagnostics)."""
         from datetime import datetime, timezone
         s = self._cfg.scanner
         now = now or datetime.now(timezone.utc)
         if m.closed or not m.enable_order_book:
-            return "нет стакана / закрыт"
+            return "no book / closed"
         if m.volume_24h_usd < s.min_volume_24h_usd:
-            return f"объём 24h < ${s.min_volume_24h_usd:,.0f}"
+            return f"24h volume < ${s.min_volume_24h_usd:,.0f}"
         days = m.days_to_resolution(now)
         if days is None or not s.min_days_to_resolution <= days <= s.max_days_to_resolution:
-            return "вне окна резолюции"
+            return "outside resolution window"
         q = m.question.lower()
         if s.include_keywords and not any(k.lower() in q for k in s.include_keywords):
-            return "не подходит по include_keywords"
+            return "excluded by include_keywords"
         if any(k.lower() in q for k in s.exclude_keywords):
-            return "отсечён exclude_keywords"
+            return "excluded by exclude_keywords"
         if s.require_resolution_clarity and not m.resolution_source \
                 and len(m.description.strip()) < s.min_description_chars:
-            return "мутные правила резолюции"
+            return "unclear resolution rules"
         if not any(s.price_min <= p <= s.price_max for p in m.outcome_prices):
-            return f"нет исхода в цене [{s.price_min}, {s.price_max}]"
+            return f"no outcome priced in [{s.price_min}, {s.price_max}]"
         return None
 
     def verify_depth(self, candidates: list[Candidate]) -> list[Candidate]:
-        """Второй уровень: реальная глубина книги на нашей стороне."""
+        """Second level: real book depth on our side."""
         s = self._cfg.scanner
         if not s.verify_book_depth or self._clob is None:
             return candidates
@@ -103,11 +103,11 @@ class Scanner:
                 continue
             c.book = book
             verified.append(c)
-        log.info("scanner: %d кандидатов после проверки глубины (%d до)",
+        log.info("scanner: %d candidates after depth check (%d before)",
                  len(verified), len(candidates))
         return verified
 
     def scan(self, markets: list[Market]) -> list[Candidate]:
         candidates = self.first_level_filter(markets)
-        log.info("scanner: %d кандидатов после фильтров 1-го уровня", len(candidates))
+        log.info("scanner: %d candidates after first-level filters", len(candidates))
         return self.verify_depth(candidates)

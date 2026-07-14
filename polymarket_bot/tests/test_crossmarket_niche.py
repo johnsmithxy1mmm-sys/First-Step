@@ -1,4 +1,4 @@
-"""Кросс-платформенный сканер и нишевые вотчлисты."""
+"""Cross-platform scanner and niche watchlists."""
 
 from unittest import mock
 
@@ -38,7 +38,7 @@ def test_divergence_detected_above_threshold(cfg):
     found = scanner.cycle([poly])
     assert len(found) == 1
     assert found[0].gap == pytest.approx(0.08)
-    assert "ПРАВИЛА РЕЗОЛЮЦИИ" in found[0].describe()
+    assert "RESOLUTION RULES" in found[0].describe()
 
 
 def test_small_gap_or_weak_match_ignored(cfg):
@@ -48,7 +48,7 @@ def test_small_gap_or_weak_match_ignored(cfg):
     )
     small_gap = VenueMarket(venue="kalshi",
                             title="Fed cuts interest rates in September 2026",
-                            yes_price=0.32)                      # 2 п.п. < 4
+                            yes_price=0.32)                      # 2 pp < 4
     unrelated = VenueMarket(venue="kalshi",
                             title="Will it snow in Miami?", yes_price=0.90)
     assert make_cross(cfg, [small_gap]).cycle([poly]) == []
@@ -66,9 +66,9 @@ def test_niche_alerts_once_per_market(cfg, ledger):
         hits = watcher.cycle([ukraine, boring])
     assert [(name, m.id) for name, m in hits] == [("post-soviet", "n1")]
     alert_mock.assert_called_once()
-    assert "Правила:" in alert_mock.call_args[0][0]   # rules lawyering: правила в алерте
+    assert "Rules:" in alert_mock.call_args[0][0]   # rules lawyering: rules in the alert
 
-    # Повторный цикл: рынок уже виден, алерта нет.
+    # Second cycle: market already seen, no alert.
     with mock.patch("polymarket_bot.niche.alert") as alert_mock:
         assert watcher.cycle([ukraine, boring]) == []
     alert_mock.assert_not_called()
@@ -97,12 +97,12 @@ def test_niche_ai_and_football_watchlists(cfg, ledger):
     assert hits["a2"] == "ai"
     assert hits["f1"] == "football-eu"
     assert hits["f2"] == "football-eu"
-    # "Ukraine" содержит буквы "ai", но границы слов + порядок дают post-soviet.
+    # "Ukraine" contains the letters "ai", but word boundaries + order give post-soviet.
     assert hits["u1"] == "post-soviet"
 
 
 def test_niche_matches_whole_words_only(cfg, ledger):
-    """Баг из живого прогона: 'eth' ловил 'Hegseth' как подстроку."""
+    """Bug from a live run: 'eth' matched 'Hegseth' as a substring."""
     watcher = NicheWatcher(cfg, ledger)
     hegseth = make_market(
         id="h1", question="Will Pete Hegseth win the 2028 US Presidential Election?")
@@ -113,15 +113,15 @@ def test_niche_matches_whole_words_only(cfg, ledger):
 
 
 def test_niche_survives_market_without_end_date(cfg, ledger):
-    """Баг из живого прогона: рынок без даты ронял цикл, пометка «увиден» терялась."""
+    """Bug from a live run: a market with no date crashed the cycle, losing the "seen" mark."""
     watcher = NicheWatcher(cfg, ledger)
     dateless = make_market(id="d1", question="Will Ukraine join the EU?",
                            end_date=None)
     with mock.patch("polymarket_bot.niche.alert"):
         hits = watcher.cycle([dateless])
     assert [(name, m.id) for name, m in hits] == [("post-soviet", "d1")]
-    assert "d1" in ledger.seen_market_ids()   # рынок помечен несмотря ни на что
-    # Повторный цикл — тишина, дублей нет.
+    assert "d1" in ledger.seen_market_ids()   # market marked no matter what
+    # Second cycle — silence, no duplicates.
     with mock.patch("polymarket_bot.niche.alert") as alert_mock:
         assert watcher.cycle([dateless]) == []
     alert_mock.assert_not_called()
