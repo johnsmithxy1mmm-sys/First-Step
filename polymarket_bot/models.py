@@ -1,4 +1,4 @@
-"""Pydantic-модели данных: рынки, кандидаты, сигналы, оценки, планы сделок."""
+"""Pydantic data models: markets, candidates, signals, estimates, trade plans."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 def _json_list(value: Any) -> list:
-    """Gamma отдаёт outcomes/outcomePrices/clobTokenIds строками с JSON внутри."""
+    """Gamma returns outcomes/outcomePrices/clobTokenIds as JSON-encoded strings."""
     if value is None:
         return []
     if isinstance(value, list):
@@ -35,7 +35,7 @@ def _num(raw: dict, *keys: str) -> float:
 
 
 def _normalize_spread(value: float) -> float:
-    """Gamma отдаёт rewardsMaxSpread в центах (3.5) — приводим к вероятности."""
+    """Gamma returns rewardsMaxSpread in cents (3.5) — normalize to a probability."""
     return value / 100.0 if value > 1.0 else value
 
 
@@ -49,7 +49,7 @@ def _parse_dt(value: Any) -> datetime | None:
 
 
 class Market(BaseModel):
-    """Один бинарный рынок Polymarket (Yes/No) c контекстом события."""
+    """A single binary Polymarket market (Yes/No) with event context."""
 
     model_config = ConfigDict(frozen=False)
 
@@ -74,10 +74,10 @@ class Market(BaseModel):
     min_order_size: float = 5.0
     resolution_source: str = ""
     closed: bool = False
-    # Liquidity Rewards Program: параметры отдаёт Gamma — не хардкодим.
-    rewards_min_size: float = 0.0     # минимальный размер котировки для rewards
-    rewards_max_spread: float = 0.0   # макс. отклонение от midpoint (в вероятности)
-    # Контекст события (группы рынков) — нужен кросс-рыночной когерентности.
+    # Liquidity Rewards Program: params come from Gamma — do not hardcode.
+    rewards_min_size: float = 0.0     # minimum quote size for rewards
+    rewards_max_spread: float = 0.0   # max deviation from midpoint (as probability)
+    # Event context (market groups) — needed for cross-market coherence.
     event_id: str = ""
     event_title: str = ""
     event_neg_risk: bool = False
@@ -134,11 +134,11 @@ class Market(BaseModel):
         return (self.end_date - now).total_seconds() / 86400.0
 
     def resolved_winner_index(self) -> int | None:
-        """Для закрытых рынков: индекс победившего исхода по финальным ценам."""
+        """For closed markets: index of the winning outcome by final prices."""
         if not self.closed or not self.outcome_prices:
             return None
         best = max(self.outcome_prices)
-        if best < 0.95:  # резолюция неоднозначна / рынок отменён
+        if best < 0.95:  # resolution is ambiguous / market voided
             return None
         return self.outcome_prices.index(best)
 
@@ -168,7 +168,7 @@ class OrderBook(BaseModel):
         return bid or ask
 
     def bid_depth_usd_within(self, pct_from_mid: float) -> float:
-        """Долларовая глубина бидов не дальше pct от mid — поддержка нашей стороны."""
+        """Dollar depth of bids within pct of mid — support on our side."""
         mid = self.mid
         if mid <= 0:
             return 0.0
@@ -177,12 +177,12 @@ class OrderBook(BaseModel):
 
 
 class Candidate(BaseModel):
-    """Дешёвый исход, прошедший фильтры первого уровня."""
+    """A cheap outcome that passed the first-level filters."""
 
     market: Market
     outcome_index: int
     token_id: str
-    p_mkt: float                      # рыночная цена = имплайд-вероятность
+    p_mkt: float                      # market price = implied probability
     book: OrderBook | None = None
 
     @property
@@ -195,16 +195,16 @@ class Candidate(BaseModel):
 
 
 class Signal(BaseModel):
-    """Результат одного источника оценки вероятности."""
+    """Result from a single probability-estimation source."""
 
     name: str
-    p_est: float | None = None        # None = сигнал воздержался
-    confidence: float = 0.0           # 0..1, используется как вес в ансамбле
+    p_est: float | None = None        # None = the signal abstained
+    confidence: float = 0.0           # 0..1, used as the weight in the ensemble
     rationale: str = ""
 
 
 class Estimate(BaseModel):
-    """Итоговая оценка кандидата ансамблем сигналов."""
+    """Final ensemble estimate for a candidate."""
 
     candidate: Candidate
     p_mkt: float
@@ -222,12 +222,12 @@ class Estimate(BaseModel):
 
 
 class TradePlan(BaseModel):
-    """Сделка, одобренная портфельным модулем."""
+    """A trade approved by the portfolio module."""
 
     estimate: Estimate
     category: str
     size_usd: float
-    limit_price_cap: float            # выше этой цены edge исчезает — не платить больше
+    limit_price_cap: float            # above this price the edge vanishes — do not pay more
 
     @property
     def token_id(self) -> str:
@@ -243,7 +243,7 @@ class ExecutionResult(BaseModel):
 
 
 def simple_estimate(market: Market, outcome_index: int, price: float) -> Estimate:
-    """Минимальная оценка для сделок не-лонгшот стратегий (арбитраж, MM)."""
+    """Minimal estimate for non-longshot strategy trades (arbitrage, MM)."""
     return Estimate(
         candidate=Candidate(
             market=market,

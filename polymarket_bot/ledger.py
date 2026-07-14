@@ -1,8 +1,8 @@
-"""Журнал: sqlite со снапшотами сделок, оценок, резолюций и банка.
+"""Ledger: sqlite with snapshots of trades, estimates, resolutions and bank.
 
-Каждая сделка пишется с полным снимком контекста (p_mkt, p_est, вклад
-сигналов, книга) — после резолюции это позволяет атрибутировать PnL по
-источникам edge и считать калибровку (Brier score).
+Every trade is written with a full context snapshot (p_mkt, p_est, signal
+contributions, book) — after resolution this lets us attribute PnL to edge
+sources and compute calibration (Brier score).
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ CREATE TABLE IF NOT EXISTS seen_markets (
     ts TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS smart_money_seen (
-    key TEXT PRIMARY KEY,             -- wallet:asset — позиция, о которой уже алертили
+    key TEXT PRIMARY KEY,             -- wallet:asset — a position already alerted on
     ts TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS estimates (
@@ -60,7 +60,7 @@ CREATE TABLE IF NOT EXISTS resolutions (
     token_id TEXT PRIMARY KEY,
     market_id TEXT,
     ts TEXT NOT NULL,
-    won INTEGER NOT NULL,             -- 1 = исход выиграл, акция платит $1
+    won INTEGER NOT NULL,             -- 1 = outcome won, share pays $1
     payout_per_share REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS markouts (
@@ -70,7 +70,7 @@ CREATE TABLE IF NOT EXISTS markouts (
     horizon_sec INTEGER NOT NULL,
     fill_price REAL NOT NULL,
     mark_price REAL NOT NULL,
-    markout REAL NOT NULL,            -- mark - fill; для покупки >0 = цена ушла за нами
+    markout REAL NOT NULL,            -- mark - fill; for a buy >0 = price moved our way
     ts TEXT NOT NULL,
     UNIQUE (trade_id, horizon_sec)
 );
@@ -93,8 +93,8 @@ class Ledger:
     def __init__(self, db_path: str | Path):
         path = Path(db_path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        # check_same_thread=False + лок: в леджер пишут и основной цикл,
-        # и websocket-поток fastlane (мгновенные входы/выходы).
+        # check_same_thread=False + lock: both the main cycle and the websocket
+        # fastlane thread (instant entries/exits) write to the ledger.
         self._conn = sqlite3.connect(str(path), check_same_thread=False, timeout=30)
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.RLock()
@@ -105,7 +105,7 @@ class Ledger:
     def close(self) -> None:
         self._conn.close()
 
-    # --- запись ---
+    # --- writes ---
 
     def record_trade(self, *, mode: str, estimate: Estimate, category: str,
                      side: str, price: float, size: float,
@@ -177,10 +177,10 @@ class Ledger:
         )
         self._conn.commit()
 
-    # --- позиции и экспозиция ---
+    # --- positions and exposure ---
 
     def open_positions(self, mode: str) -> list[Position]:
-        """Открытые позиции = покупки - продажи - резолюции (по токену)."""
+        """Open positions = buys - sells - resolutions (per token)."""
         rows = self._conn.execute(
             "SELECT * FROM trades WHERE mode = ? AND status != 'failed' ORDER BY id", (mode,)
         ).fetchall()
@@ -198,7 +198,7 @@ class Ledger:
                 slot["size"] += r["size"]
                 slot["cost"] += r["usd"]
             else:
-                # Продажа уменьшает позицию по средней цене входа.
+                # A sell reduces the position at the average entry price.
                 if slot["size"] > 0:
                     avg = slot["cost"] / slot["size"]
                     slot["cost"] -= avg * min(r["size"], slot["size"])
@@ -226,7 +226,7 @@ class Ledger:
         return sum(p.cost_usd for p in self.open_positions(mode))
 
     def has_position_or_open_buy(self, token_id: str, mode: str) -> bool:
-        """Идемпотентность: не дублировать вход по токену."""
+        """Idempotency: do not duplicate an entry for a token."""
         row = self._conn.execute(
             "SELECT COUNT(*) AS n FROM trades WHERE mode = ? AND token_id = ? "
             "AND side = 'BUY' AND status != 'failed' AND status != 'canceled'",
@@ -234,10 +234,10 @@ class Ledger:
         ).fetchone()
         return row["n"] > 0
 
-    # --- PnL и метрики ---
+    # --- PnL and metrics ---
 
     def realized_pnl(self, mode: str) -> float:
-        """PnL по закрытым событиям: резолюции + продажи против стоимости входа."""
+        """PnL from closed events: resolutions + sells against entry cost."""
         rows = self._conn.execute(
             "SELECT t.token_id, t.side, t.price, t.size, t.usd, r.won "
             "FROM trades t LEFT JOIN resolutions r ON r.token_id = t.token_id "
@@ -261,22 +261,22 @@ class Ledger:
         pnl = 0.0
         for slot in per_token.values():
             avg = slot["buy_usd"] / slot["buy_size"] if slot["buy_size"] > 0 else 0.0
-            pnl += slot["sell_usd"] - avg * slot["sell_size"]      # реализовано продажами
+            pnl += slot["sell_usd"] - avg * slot["sell_size"]      # realized by sells
             if slot["won"] is not None:
                 remaining = max(slot["buy_size"] - slot["sell_size"], 0.0)
                 payout = remaining * (1.0 if slot["won"] else 0.0)
-                pnl += payout - avg * remaining                    # реализовано резолюцией
+                pnl += payout - avg * remaining                    # realized by resolution
         return pnl
 
     def first_bank_equity_since(self, ts_iso: str) -> float | None:
-        """Первый снапшот equity после отметки времени (для дневного стопа)."""
+        """First equity snapshot after a timestamp (for the daily stop)."""
         row = self._conn.execute(
             "SELECT equity FROM bank WHERE ts >= ? ORDER BY id LIMIT 1", (ts_iso,)
         ).fetchone()
         return float(row["equity"]) if row else None
 
     def realized_pnl_by_strategy(self, mode: str) -> dict[str, float]:
-        """Реализованный PnL по стратегиям (для аллокации и атрибуции)."""
+        """Realized PnL by strategy (for allocation and attribution)."""
         rows = self._conn.execute(
             "SELECT t.token_id, t.side, t.size, t.usd, t.strategy, r.won "
             "FROM trades t LEFT JOIN resolutions r ON r.token_id = t.token_id "
@@ -306,12 +306,12 @@ class Ledger:
             out[slot["strategy"]] += pnl
         return dict(out)
 
-    # --- markout-аналитика: куда ушла цена после наших филлов ---
+    # --- markout analytics: where price went after our fills ---
 
     def fills_needing_markout(self, mode: str, horizon_sec: int,
                               max_age_sec: float = 172_800,
                               limit: int = 20) -> list[dict]:
-        """Исполненные покупки, которым пора замерить markout на горизонте."""
+        """Filled buys due for a markout measurement at the horizon."""
         now = datetime.now(timezone.utc)
         rows = self._conn.execute(
             "SELECT t.id, t.token_id, t.price, t.ts FROM trades t "
@@ -340,10 +340,10 @@ class Ledger:
         self._conn.commit()
 
     def markout_stats(self, mode: str) -> list[dict]:
-        """Средний markout по (стратегия, горизонт): главный тест качества филлов.
+        """Average markout by (strategy, horizon): the key fill-quality test.
 
-        Для покупки markout < 0 означает adverse selection: цена после нашего
-        филла систематически падает — нас переезжают информированные.
+        For a buy, markout < 0 means adverse selection: price after our fill
+        systematically drops — the informed are running us over.
         """
         rows = self._conn.execute(
             "SELECT t.strategy, m.horizon_sec, COUNT(*) AS n, "
@@ -371,7 +371,7 @@ class Ledger:
         return float(row["hwm"] or 0.0)
 
     def metrics(self, mode: str) -> dict:
-        """Hit rate, средний множитель, Brier по p_est/p_mkt, ROI, атрибуция PnL."""
+        """Hit rate, average multiple, Brier for p_est/p_mkt, ROI, PnL attribution."""
         rows = self._conn.execute(
             "SELECT t.token_id, t.price, t.size, t.usd, t.snapshot, r.won "
             "FROM trades t JOIN resolutions r ON r.token_id = t.token_id "
@@ -395,7 +395,7 @@ class Ledger:
             brier_mkt += (p_mkt - outcome) ** 2
             if r["won"] and r["price"] > 0:
                 multiples.append(1.0 / r["price"])
-            # Атрибуция: PnL сделки распределяем по сигналам пропорционально весам.
+            # Attribution: split the trade PnL across signals proportional to weights.
             trade_pnl = (r["size"] if r["won"] else 0.0) - r["usd"]
             signals = [s for s in snap.get("signals", []) if s.get("name") != "market"]
             total_w = sum(s.get("confidence", 0) for s in signals)

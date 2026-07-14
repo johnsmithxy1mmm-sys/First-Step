@@ -1,4 +1,4 @@
-"""Портфель: fractional Kelly, лимиты концентрации, kill-switch, правила выхода."""
+"""Portfolio: fractional Kelly, concentration limits, kill-switch, exit rules."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ _CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
                 "shutdown", "tariff", "stock", "s&p"),
 }
 
-# Экспертная матрица корреляций категорий: насколько шоки перетекают между ними.
+# Expert category-correlation matrix: how much shocks spill between them.
 _CORRELATION: dict[frozenset[str], float] = {
     frozenset({"geopolitics", "economy"}): 0.5,
     frozenset({"geopolitics", "crypto"}): 0.3,
@@ -54,9 +54,9 @@ def correlation(cat_a: str, cat_b: str) -> float:
 
 
 def kelly_fraction(p: float, price: float) -> float:
-    """Доля банка по Келли для бинарной ставки: купить по price, выплата $1.
+    """Kelly bankroll fraction for a binary bet: buy at price, payout $1.
 
-    f* = (p - price) / (1 - price); отрицательный edge -> 0.
+    f* = (p - price) / (1 - price); negative edge -> 0.
     """
     if not 0 < price < 1:
         return 0.0
@@ -69,10 +69,10 @@ class Portfolio:
         self._ledger = ledger
         self._mode = mode
 
-    # --- состояние банка ---
+    # --- bankroll state ---
 
     def equity(self, marks: dict[str, float] | None = None) -> float:
-        """Банк + реализованный PnL + открытые позиции (по марку или по коcту)."""
+        """Bankroll + realized PnL + open positions (at mark or at cost)."""
         positions = self._ledger.open_positions(self._mode)
         marks = marks or {}
         open_value = sum(
@@ -92,22 +92,22 @@ class Portfolio:
         return max(0.0, (hwm - eq) / hwm) if hwm > 0 else 0.0
 
     def observe_only(self, marks: dict[str, float] | None = None) -> bool:
-        """Kill-switch: просадка ≥ max_drawdown_pct переводит бота в наблюдение."""
+        """Kill-switch: drawdown >= max_drawdown_pct puts the bot in observe mode."""
         dd = self.drawdown(marks)
         if dd >= self._cfg.max_drawdown_pct:
-            log.error("KILL-SWITCH: просадка %.1f%% >= %.0f%% — observe-only",
+            log.error("KILL-SWITCH: drawdown %.1f%% >= %.0f%% — observe-only",
                       dd * 100, self._cfg.max_drawdown_pct * 100)
             return True
         return False
 
-    # --- сайзинг ---
+    # --- sizing ---
 
     def size_usd(self, category: str, p_est: float, p_mkt: float,
                  min_order_notional: float = 1.0) -> float | None:
-        """Размер позиции по Kelly со всеми кэпами; None = места нет.
+        """Position size by Kelly with all caps; None = no room.
 
-        Единый сайзинг для лонгшотов и фейда: kelly от edge, кэп на рынок,
-        на категорию (с матрицей корреляций) и на суммарную экспозицию.
+        Single sizing path for longshots and fade: kelly from edge, cap per
+        market, per category (with the correlation matrix) and on total exposure.
         """
         cfg = self._cfg
         bankroll = cfg.bankroll_usd
@@ -144,18 +144,18 @@ class Portfolio:
                              c.market.min_order_size * estimate.p_mkt)
         if size is None:
             return None
-        # Выше этой цены edge падает ниже порога — executor не должен платить больше.
-        min_edge = max(estimate.edge_ratio / 2, 1.2)  # запас: половина найденного edge
+        # Above this price the edge falls below threshold — the executor must not pay more.
+        min_edge = max(estimate.edge_ratio / 2, 1.2)  # margin: half the found edge
         price_cap = min(estimate.p_est / min_edge, 0.99)
         return TradePlan(estimate=estimate, category=category,
                          size_usd=size, limit_price_cap=price_cap)
 
-    # --- выходы ---
+    # --- exits ---
 
     def exit_plan(self, position: Position, current_price: float) -> tuple[float, float] | None:
-        """(size_to_sell, min_price) если позиция выросла до take-profit multiple.
+        """(size_to_sell, min_price) if the position grew to the take-profit multiple.
 
-        Продаём take_profit_fraction, остаток — бесплатный лотерейный билет.
+        Sell take_profit_fraction; the remainder is a free lottery ticket.
         """
         cfg = self._cfg
         if position.avg_price <= 0 or current_price <= 0:
@@ -166,6 +166,6 @@ class Portfolio:
         sell_size = math.floor(position.size * cfg.take_profit_fraction)
         if sell_size <= 0:
             return None
-        # Не сливать сильно ниже триггерного уровня.
+        # Do not dump far below the trigger level.
         min_price = position.avg_price * cfg.take_profit_multiple * 0.8
         return float(sell_size), min_price

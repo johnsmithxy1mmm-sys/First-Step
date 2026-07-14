@@ -1,16 +1,15 @@
-"""Риск-фреймворк: абсолютные лимиты и kill-switch (жёсткие требования).
+"""Risk framework: absolute limits and kill-switch (hard requirements).
 
-Kill-switch срабатывает автоматически при: превышении риск-лимита
-(дневной убыток, просадка от HWM), WS-disconnect дольше порога,
-расхождении локального состояния ордеров с биржевым (reconcile),
-ошибках подписи. Действие: отменить все ордера, уведомить, остановить
-стратегии.
+The kill-switch trips automatically on: a risk-limit breach (daily loss,
+drawdown from HWM), a WS disconnect longer than the threshold, a mismatch
+between local order state and the exchange (reconcile), signature errors.
+Action: cancel all orders, notify, stop the strategies.
 
-Два уровня:
-  PAUSE — временная блокировка новых ордеров (WS-outage): автоснятие
-          после восстановления потока;
-  HALT  — полная остановка торговли до ручного рестарта (дневной стоп,
-          просадка, рассинхрон, подпись).
+Two levels:
+  PAUSE — temporary block on new orders (WS outage): auto-cleared once the
+          stream recovers;
+  HALT  — full trading stop until a manual restart (daily stop, drawdown,
+          desync, signature).
 """
 
 from __future__ import annotations
@@ -37,7 +36,7 @@ class KillSwitch:
         self.paused = False
         self.reason = ""
 
-    # --- состояние ---
+    # --- state ---
 
     @property
     def trading_allowed(self) -> bool:
@@ -50,7 +49,7 @@ class KillSwitch:
         self.reason = reason
         log.error("KILL-SWITCH HALT: %s", reason)
         self._safe_cancel()
-        self._alert(f"KILL-SWITCH (halt до ручного рестарта): {reason}")
+        self._alert(f"KILL-SWITCH (halt until manual restart): {reason}")
 
     def trip_pause(self, reason: str) -> None:
         if self.paused or self.halted:
@@ -59,12 +58,12 @@ class KillSwitch:
         self.reason = reason
         log.warning("KILL-SWITCH PAUSE: %s", reason)
         self._safe_cancel()
-        self._alert(f"Пауза торговли (авто-возврат): {reason}")
+        self._alert(f"Trading paused (auto-resume): {reason}")
 
     def resume_from_pause(self) -> None:
         if self.paused and not self.halted:
             self.paused = False
-            log.info("kill-switch: пауза снята, торговля возобновлена")
+            log.info("kill-switch: pause lifted, trading resumed")
 
     def _safe_cancel(self) -> None:
         try:
@@ -72,14 +71,14 @@ class KillSwitch:
         except Exception:
             log.exception("kill-switch: bulk-cancel")
 
-    # --- проверки (вызываются каждый цикл) ---
+    # --- checks (called every cycle) ---
 
     def check_daily_loss(self, equity_now: float) -> None:
-        """Дневной стоп: просадка от equity на начало суток UTC."""
+        """Daily stop: drawdown from equity at the start of the UTC day."""
         day_start = self._day_start_equity(equity_now)
         loss = day_start - equity_now
         if loss >= self._cfg.max_daily_loss_usd:
-            self.trip_halt(f"дневной убыток ${loss:,.2f} >= "
+            self.trip_halt(f"daily loss ${loss:,.2f} >= "
                            f"${self._cfg.max_daily_loss_usd:,.2f}")
 
     def _day_start_equity(self, fallback: float) -> float:
@@ -89,25 +88,25 @@ class KillSwitch:
 
     def check_drawdown(self, equity_now: float, hwm: float) -> None:
         if hwm > 0 and (hwm - equity_now) / hwm >= self._cfg.max_drawdown_pct:
-            self.trip_halt(f"просадка {((hwm - equity_now) / hwm) * 100:.1f}% "
-                           f">= {self._cfg.max_drawdown_pct * 100:.0f}% от HWM")
+            self.trip_halt(f"drawdown {((hwm - equity_now) / hwm) * 100:.1f}% "
+                           f">= {self._cfg.max_drawdown_pct * 100:.0f}% from HWM")
 
     def check_global_exposure(self, exposure_usd: float) -> bool:
-        """True = лимит общей экспозиции исчерпан (новые входы запрещены)."""
+        """True = total exposure limit reached (new entries forbidden)."""
         return exposure_usd >= self._cfg.max_global_exposure_usd
 
     def reconcile(self, local_order_ids: set[str], exchange_order_ids: set[str]) -> None:
-        """Рассинхрон стейта с биржей — торговать нельзя, состояние ненадёжно."""
+        """State desync with the exchange — cannot trade, state is unreliable."""
         ghost = exchange_order_ids - local_order_ids
         if ghost:
-            self.trip_halt(f"reconcile: на бирже {len(ghost)} неизвестных ордеров "
-                           f"(первый: {next(iter(ghost))[:20]})")
+            self.trip_halt(f"reconcile: {len(ghost)} unknown orders on the exchange "
+                           f"(first: {next(iter(ghost))[:20]})")
 
     def on_ws_disconnect(self, gap_sec: float) -> None:
-        self.trip_pause(f"WS-поток мёртв {gap_sec:.0f}с")
+        self.trip_pause(f"WS stream dead for {gap_sec:.0f}s")
 
     def on_ws_recovered(self) -> None:
         self.resume_from_pause()
 
     def on_signature_error(self, exc: Exception) -> None:
-        self.trip_halt(f"ошибка подписи ордера: {exc}")
+        self.trip_halt(f"order signature error: {exc}")

@@ -1,4 +1,4 @@
-"""Конфигурация: config.yaml → pydantic-модели. Секреты — только из .env."""
+"""Configuration: config.yaml -> pydantic models. Secrets come only from .env."""
 
 from __future__ import annotations
 
@@ -8,8 +8,8 @@ import yaml
 from pydantic import BaseModel, Field, field_validator
 
 PACKAGE_DIR = Path(__file__).parent
-# config.yaml — личный конфиг пользователя (вне git). config.example.yaml —
-# шаблон в репозитории; используется, если своего config.yaml ещё нет.
+# config.yaml is the user's personal config (outside git). config.example.yaml
+# is the repo template; used when there is no config.yaml of your own yet.
 DEFAULT_CONFIG_PATH = PACKAGE_DIR / "config.yaml"
 EXAMPLE_CONFIG_PATH = PACKAGE_DIR / "config.example.yaml"
 
@@ -22,7 +22,7 @@ class ScannerConfig(BaseModel):
     book_depth_pct_from_mid: float = 0.20
     min_days_to_resolution: float = 3.0
     max_days_to_resolution: float = 120.0
-    # Неоднозначная резолюция: требуем источник резолюции или внятное описание правил.
+    # Ambiguous resolution: require a resolution source or a clear rules description.
     require_resolution_clarity: bool = True
     min_description_chars: int = 80
     exclude_keywords: list[str] = Field(default_factory=list)
@@ -33,7 +33,7 @@ class ScannerConfig(BaseModel):
 
 
 class LLMConfig(BaseModel):
-    enabled: bool = False              # включать после калибровки остальных сигналов
+    enabled: bool = False              # enable after calibrating the other signals
     model: str = "claude-sonnet-5"
     max_calls_per_cycle: int = 10
     cache_ttl_hours: float = 24.0
@@ -41,31 +41,32 @@ class LLMConfig(BaseModel):
 
 
 class EstimatorConfig(BaseModel):
-    # Порог мисспрайсинга: p_est / p_mkt ≥ min_edge_ratio при p_mkt ≤ max_p_mkt.
+    # Mispricing threshold: p_est / p_mkt >= min_edge_ratio when p_mkt <= max_p_mkt.
     min_edge_ratio: float = 2.0
     max_p_mkt: float = 0.05
     base_rates_file: str = "base_rates.yaml"
-    # Вес рыночной цены как якоря в ансамбле (0.9 = почти доверяем рынку;
-    # ниже — сигналы легче перевешивают рынок, edge находить проще, но шумнее).
+    # Weight of the market price as an anchor in the ensemble (0.9 = almost trust
+    # the market; lower -> signals outweigh the market more easily, edge is easier
+    # to find but noisier).
     market_anchor_confidence: float = 0.85
     llm: LLMConfig = Field(default_factory=LLMConfig)
 
 
 class PortfolioConfig(BaseModel):
     bankroll_usd: float = 5_000.0
-    kelly_fraction: float = 0.15       # λ дробного Келли (0.1–0.25)
-    max_market_pct: float = 0.01       # ≤ 1% банка на рынок
-    max_category_pct: float = 0.10     # ≤ 10% на категорию (с учётом корреляций)
+    kelly_fraction: float = 0.15       # lambda of fractional Kelly (0.1-0.25)
+    max_market_pct: float = 0.01       # <= 1% of bankroll per market
+    max_category_pct: float = 0.10     # <= 10% per category (accounting for correlations)
     max_total_exposure_pct: float = 0.30
-    max_drawdown_pct: float = 0.25     # стоп всей системы
-    take_profit_multiple: float = 7.0  # частичная фиксация на 5–10x
-    take_profit_fraction: float = 0.6  # продаём 50–70%
+    max_drawdown_pct: float = 0.25     # stop for the whole system
+    take_profit_multiple: float = 7.0  # partial take at 5-10x
+    take_profit_fraction: float = 0.6  # sell 50-70%
 
     @field_validator("kelly_fraction")
     @classmethod
     def _kelly_sane(cls, v: float) -> float:
         if not 0 < v <= 0.5:
-            raise ValueError("kelly_fraction должен быть в (0, 0.5]")
+            raise ValueError("kelly_fraction must be in (0, 0.5]")
         return v
 
 
@@ -77,34 +78,34 @@ class ExecutorConfig(BaseModel):
 
 
 class FadeConfig(BaseModel):
-    """Фейдинг переоценённых хвостов: покупаем NO, когда YES-хвост переоценён.
+    """Fading overpriced tails: buy NO when the YES tail is overpriced.
 
-    Прибыльная сторона favorite-longshot bias: толпа раздувает цену дешёвых
-    исходов, мы систематически снимаем этот перекос, покупая NO. Плюсово в
-    среднем (bias реален), но каждая ставка асимметрична — редкий крупный
-    убыток при срабатывании хвоста, поэтому жёсткие кэпы и диверсификация.
+    The profitable side of favorite-longshot bias: the crowd inflates the price
+    of cheap outcomes, we systematically harvest that skew by buying NO.
+    Positive on average (the bias is real), but each bet is asymmetric — a rare
+    large loss when the tail hits — hence hard caps and diversification.
     """
     enabled: bool = False
-    # Систематическая поправка: хвост считаем переоценённым минимум на эту долю
-    # (0.30 = "дешёвые исходы в среднем на 30% дороже честной цены").
+    # Systematic correction: treat the tail as overpriced by at least this fraction
+    # (0.30 = "cheap outcomes are on average 30% above fair price").
     bias_discount: float = 0.30
-    fade_max_price: float = 0.10       # фейдим только хвосты дешевле этой цены YES
-    min_tail_price: float = 0.005      # ниже — неликвид/шум
-    min_edge_after_fees: float = 0.005  # минимум 0.5% чистого edge на NO-стороне
-    # Вето: если оценщик видит НАСТОЯЩИЙ лонгшот (p_est ≥ ratio × p_mkt — тот же
-    # порог, по которому лонгшот-стратегия ПОКУПАЕТ YES), не фейдим против своего
-    # же сигнала. Лёгкий дрейф p_est выше рынка — шум якоря, фейду не помеха.
+    fade_max_price: float = 0.10       # fade only tails cheaper than this YES price
+    min_tail_price: float = 0.005      # below this — illiquid / noise
+    min_edge_after_fees: float = 0.005  # at least 0.5% net edge on the NO side
+    # Veto: if the estimator sees a REAL longshot (p_est >= ratio * p_mkt — the same
+    # threshold the longshot strategy BUYS Yes on), don't fade against our own
+    # signal. A slight drift of p_est above market is anchor noise, no obstacle.
     longshot_veto_ratio: float = 2.0
 
 
 class ArbitrageConfig(BaseModel):
-    """Стратегия №1: структурный арбитраж neg-risk корзин (YES и NO)."""
+    """Strategy #1: structural arbitrage of neg-risk baskets (YES and NO)."""
     enabled: bool = True
-    execute: bool = False              # обнаружение+алерт по умолчанию; ордера — явно
+    execute: bool = False              # detect+alert by default; orders explicitly
     interval_sec: float = 60.0
-    min_profit_pct: float = 0.015      # минимум 1.5% ЧИСТОГО edge (после комиссий)
-    suspicious_gross_edge: float = 0.05  # gross выше -> вероятно неполная корзина, не исполнять
-    prefilter_tolerance: float = 0.01  # порог отбора по ценам Gamma (грубее реального)
+    min_profit_pct: float = 0.015      # at least 1.5% NET edge (after fees)
+    suspicious_gross_edge: float = 0.05  # gross above this -> likely incomplete basket, don't execute
+    prefilter_tolerance: float = 0.01  # selection threshold on Gamma prices (coarser than real)
     max_stake_usd: float = 300.0
     min_sets: int = 5
     max_legs: int = 20
@@ -113,20 +114,20 @@ class ArbitrageConfig(BaseModel):
 
 
 class MarketMakerConfig(BaseModel):
-    """Ядро (80% капитала): маркет-мейкинг + liquidity rewards farming."""
-    enabled: bool = False              # включать осознанно: требует капитала на котировки
+    """Core (80% of capital): market making + liquidity rewards farming."""
+    enabled: bool = False              # enable deliberately: needs capital for quotes
     interval_sec: float = 30.0
     max_markets: int = 5
-    # Отбор рынков (скоринг-модуль): объём, горизонт, rewards, стабильность.
+    # Market selection (scoring module): volume, horizon, rewards, stability.
     min_volume_24h_usd: float = 50_000.0
     min_days_to_resolution: float = 30.0
     require_rewards_program: bool = True
-    max_daily_midpoint_move: float = 0.05   # реализованная волатильность midpoint
-    # Котирование.
+    max_daily_midpoint_move: float = 0.05   # realized midpoint volatility
+    # Quoting.
     half_spread: float = 0.01
     quote_size_usd: float = 10.0
-    inventory_skew_k: float = 0.5      # сдвиг fair против инвентаря
-    # Requote-гистерезис: лишний churn ест rate limit и rewards-сэмплинг.
+    inventory_skew_k: float = 0.5      # shift fair against inventory
+    # Requote hysteresis: excess churn eats rate limit and rewards sampling.
     requote_threshold_ticks: float = 2.0
     requote_timer_sec: float = 120.0
     # Adverse selection guard.
@@ -136,24 +137,24 @@ class MarketMakerConfig(BaseModel):
 
 
 class RiskLimitsConfig(BaseModel):
-    """Абсолютные лимиты риск-фреймворка (жёсткие требования мастер-промпта)."""
+    """Absolute risk-framework limits (hard requirements from the master prompt)."""
     max_position_per_market_usd: float = 50.0
     max_global_exposure_usd: float = 300.0
-    max_daily_loss_usd: float = 25.0        # дневной стоп → halt до ручного рестарта
-    max_drawdown_pct: float = 0.15          # от high-water mark → полный halt
+    max_daily_loss_usd: float = 25.0        # daily stop -> halt until manual restart
+    max_drawdown_pct: float = 0.15          # from the high-water mark -> full halt
     min_edge_after_fees: float = 0.01
     reconcile_interval_sec: float = 60.0
     ws_staleness_kill_sec: float = 10.0
 
 
 class FeesConfig(BaseModel):
-    """Fee Structure V2 (март 2026). Проверяйте актуальность на docs.polymarket.com."""
+    """Fee Structure V2 (March 2026). Verify it's current at docs.polymarket.com."""
     taker: dict[str, float] = Field(default_factory=lambda: {
         "crypto": 0.07, "sports": 0.03, "finance": 0.04, "politics": 0.04,
         "tech": 0.04, "economics": 0.05, "culture": 0.05, "weather": 0.05,
         "geopolitics": 0.0, "other": 0.04,
     })
-    maker_rebate_frac: float = 0.35    # rebate 20-50% от taker fee; середина
+    maker_rebate_frac: float = 0.35    # rebate 20-50% of the taker fee; midpoint
 
 
 class WSConfig(BaseModel):
@@ -163,7 +164,7 @@ class WSConfig(BaseModel):
 
 
 class RateLimitConfig(BaseModel):
-    """Собственный token-bucket даже при повышенных лимитах V2."""
+    """Own token bucket even under the raised V2 limits."""
     orders_per_sec: float = 20.0
     orders_burst: float = 100.0
     reads_per_sec: float = 30.0
@@ -171,13 +172,13 @@ class RateLimitConfig(BaseModel):
 
 
 class SatelliteConfig(BaseModel):
-    """Сателлит (20%): T-10s TA на 5-мин BTC up/down. По умолчанию ВЫКЛЮЧЕН."""
+    """Satellite (20%): T-10s TA on 5-min BTC up/down. DISABLED by default."""
     enabled: bool = False
     slug_template: str = "btc-updown-5m-{ts}"
     window_sec: int = 300
-    entry_from_sec: float = 30.0       # входим за 10-30 сек до закрытия окна
+    entry_from_sec: float = 30.0       # enter 10-30 sec before the window closes
     entry_to_sec: float = 10.0
-    edge_threshold: float = 0.05       # P(model) - implied - fee > порога
+    edge_threshold: float = 0.05       # P(model) - implied - fee > threshold
     kelly_fraction: float = 0.25       # quarter-Kelly
     max_bet_usd: float = 10.0
     candles_url: str = ("https://api.binance.com/api/v3/klines"
@@ -185,11 +186,11 @@ class SatelliteConfig(BaseModel):
 
 
 class CrossMarketConfig(BaseModel):
-    """Стратегия №2: расхождения с другими площадками (алерты, без автоторговли)."""
+    """Strategy #2: divergences with other venues (alerts, no auto-trading)."""
     enabled: bool = True
     interval_min: float = 15.0
-    min_divergence: float = 0.04       # от 4 п.п.
-    min_similarity: float = 0.65       # порог совпадения заголовков (Жаккар)
+    min_divergence: float = 0.04       # from 4 pp
+    min_similarity: float = 0.65       # title match threshold (Jaccard)
     min_volume_24h_usd: float = 10_000.0
     max_alerts_per_cycle: int = 10
 
@@ -200,7 +201,7 @@ class Watchlist(BaseModel):
 
 
 class NicheConfig(BaseModel):
-    """Стратегия №5: мгновенные алерты о новых рынках в ваших нишах."""
+    """Strategy #5: instant alerts on new markets in your niches."""
     enabled: bool = True
     watchlists: list[Watchlist] = Field(default_factory=lambda: [
         Watchlist(name="post-soviet", keywords=[
@@ -228,18 +229,18 @@ class NicheConfig(BaseModel):
 
 
 class SmartMoneyConfig(BaseModel):
-    """Трекер «умных денег»: алерты, когда сильные кошельки заходят в рынок.
+    """Smart-money tracker: alerts when strong wallets enter a market.
 
-    Использует публичный Data API Polymarket (/positions по адресу).
-    watch_wallets — адреса, за которыми следим (сильные игроки, которых вы
-    нашли на leaderboard'е polymarket.com). Пусто = трекер молчит.
+    Uses Polymarket's public Data API (/positions by address). watch_wallets are
+    the addresses we follow (strong players you found on the polymarket.com
+    leaderboard). Empty = the tracker stays silent.
     """
     enabled: bool = False
     interval_min: float = 10.0
     watch_wallets: list[str] = Field(default_factory=list)
-    min_position_usd: float = 50.0     # игнорируем пыль
-    tail_max_price: float = 0.10       # вход дешевле — помечаем как хвостовой
-    only_niche_or_tail: bool = False   # true = алертить лишь про нишу/хвост
+    min_position_usd: float = 50.0     # ignore dust
+    tail_max_price: float = 0.10       # entry cheaper than this — flag as a tail
+    only_niche_or_tail: bool = False   # true = alert only on niche/tail
 
 
 class RuntimeConfig(BaseModel):
@@ -256,7 +257,7 @@ class RuntimeConfig(BaseModel):
 
 class BacktestConfig(BaseModel):
     max_markets: int = 300
-    lookback_days_before_end: float = 21.0  # смотрим цену за N дней до резолюции
+    lookback_days_before_end: float = 21.0  # look at price N days before resolution
 
 
 class BotConfig(BaseModel):
@@ -283,9 +284,9 @@ class BotConfig(BaseModel):
         if path is not None:
             chosen = Path(path)
         elif DEFAULT_CONFIG_PATH.exists():
-            chosen = DEFAULT_CONFIG_PATH          # личный конфиг пользователя
+            chosen = DEFAULT_CONFIG_PATH          # user's personal config
         elif EXAMPLE_CONFIG_PATH.exists():
-            chosen = EXAMPLE_CONFIG_PATH          # свежий клон без своего config.yaml
+            chosen = EXAMPLE_CONFIG_PATH          # fresh clone with no config.yaml of its own
         else:
             return cls()
         if not chosen.exists():

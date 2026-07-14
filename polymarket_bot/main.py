@@ -1,4 +1,4 @@
-"""Оркестратор: режимы dry-run (дефолт) / live / backtest, циклы, graceful shutdown."""
+"""Orchestrator: dry-run (default) / live / backtest modes, cycles, graceful shutdown."""
 
 from __future__ import annotations
 
@@ -53,14 +53,14 @@ class Bot:
         self.fade = FadeStrategy(cfg, self.ledger, self.portfolio, self.executor, mode)
         self.dashboard = Dashboard()
         self.errors: list[str] = []
-        # WS-фид стаканов: «мгновенно» для MM и выходов; gap-detect → kill-switch.
+        # WS order-book feed: "instant" for MM and exits; gap-detect -> kill-switch.
         self.ws: WSFeed | None = None
         if cfg.ws.enabled:
             self.ws = WSFeed(cfg.ws.url,
                              on_disconnect=self._on_ws_disconnect,
                              staleness_kill_sec=cfg.risk.ws_staleness_kill_sec,
                              ping_interval_sec=cfg.ws.ping_interval_sec)
-        # Стратегии: MM-ядро, арбитраж-алерты, кросс-платформа, ниши, сателлит.
+        # Strategies: MM core, arbitrage alerts, cross-platform, niches, satellite.
         self.arb = ArbitrageScanner(cfg, self.ledger, self.clob, self.trader, mode)
         self.mm = MarketMaker(cfg, self.ledger, self.clob, self.trader, mode,
                               top_source=(self.ws.top if self.ws else None))
@@ -68,11 +68,11 @@ class Bot:
         self.niche = NicheWatcher(cfg, self.ledger)
         self.smart_money = SmartMoneyTracker(cfg, self.ledger, self.niche)
         self.satellite = BTC5mSatellite(cfg, self.ledger, self.clob, self.trader, mode)
-        # Kill-switch: bulk-cancel + halt. Восстановление стейта — reconcile.
+        # Kill-switch: bulk-cancel + halt. State recovery is via reconcile.
         self.killswitch = KillSwitch(cfg, self.ledger, mode,
                                      cancel_all=self._cancel_everything, alert=alert)
-        # Кэш активных рынков: обновляется основным циклом, быстрые стратегии
-        # берут метаданные отсюда, а точные цены — из WS/живых стаканов.
+        # Active-markets cache: refreshed by the main cycle; fast strategies take
+        # metadata from here and exact prices from WS / live order books.
         self.markets_cache: list[Market] = []
 
     def _cancel_everything(self) -> None:
@@ -88,17 +88,17 @@ class Bot:
 
     def close(self) -> None:
         try:
-            self._cancel_everything()   # снять все котировки
+            self._cancel_everything()   # pull all quotes
         except Exception:
             log.exception("shutdown cancel")
         if self.ws is not None:
             self.ws.stop()
         self.ledger.close()
 
-    # --- один торговый цикл ---
+    # --- one trading cycle ---
 
     def cycle(self) -> None:
-        log.info("=== цикл начат (mode=%s) ===", self.mode)
+        log.info("=== cycle started (mode=%s) ===", self.mode)
         self.errors.clear()
         top: list[Estimate] = []
         marks: dict[str, float] = {}
@@ -111,11 +111,11 @@ class Bot:
             return
 
         try:
-            self.niche.cycle(markets)  # №5: алерты о новых рынках в нишах
+            self.niche.cycle(markets)  # #5: alerts on new markets in niches
         except Exception as exc:
             self._error(f"niche: {exc}")
 
-        # Марки открытых позиций (нужны для equity/drawdown/выходов).
+        # Marks for open positions (needed for equity/drawdown/exits).
         positions = self.ledger.open_positions(self.mode)
         for p in positions:
             book = self.clob.order_book(p.token_id)
@@ -125,7 +125,7 @@ class Bot:
 
         observe_only = self.portfolio.observe_only(marks)
         if observe_only:
-            alert("Polymarket bot: KILL-SWITCH — просадка выше лимита, режим observe-only.")
+            alert("Polymarket bot: KILL-SWITCH — drawdown above limit, observe-only mode.")
 
         try:
             candidates = self.scanner.scan(markets)
@@ -137,20 +137,20 @@ class Bot:
                 self.ledger.record_estimate(est, ok)
                 if ok:
                     qualifying.append(est)
-            log.info("оценок: %d, проходят порог edge: %d", len(estimates), len(qualifying))
+            log.info("estimates: %d, passing edge threshold: %d", len(estimates), len(qualifying))
 
             if not observe_only:
                 self._enter_positions(qualifying)
-                # Фейд покупает NO — глубина на YES-стороне (verify_depth) ему
-                # не нужна. Кормим его кандидатами ДО проверки глубины; NO-книгу
-                # проверит executor при постановке лимитки.
+                # Fade buys NO — YES-side depth (verify_depth) is irrelevant to
+                # it. Feed it candidates BEFORE the depth check; the executor
+                # checks the NO book when placing the limit order.
                 fade_candidates = self.scanner.first_level_filter(markets)
                 fade_estimates = self.estimator.estimate_all(fade_candidates, markets)
                 self.fade.cycle(fade_estimates)
                 self._exit_positions(marks)
         except Exception as exc:
             self._error(f"cycle: {exc}")
-            log.exception("сбой цикла")
+            log.exception("cycle failure")
 
         self.portfolio.snapshot(marks)
         self.dashboard.render(
@@ -174,12 +174,12 @@ class Bot:
             if result.status == "filled":
                 entered += 1
                 c = est.candidate
-                msg = (f"ВХОД [{self.mode}] {result.avg_price:.4f} x {result.filled_size:,.0f} "
+                msg = (f"ENTRY [{self.mode}] {result.avg_price:.4f} x {result.filled_size:,.0f} "
                        f"= ${result.avg_price * result.filled_size:,.2f} "
                        f"(edge {est.edge_ratio:.2f}) [{c.outcome}] {c.market.question[:70]}")
                 log.info(msg)
                 alert(msg)
-        log.info("входов за цикл: %d", entered)
+        log.info("entries this cycle: %d", entered)
 
     def _exit_positions(self, marks: dict[str, float]) -> None:
         for position in self.ledger.open_positions(self.mode):
@@ -190,7 +190,7 @@ class Bot:
             if exit_plan is None:
                 continue
             size, min_price = exit_plan
-            # Для продажи достаточно псевдо-оценки: executor берёт цену из книги.
+            # A pseudo-estimate is enough to sell: the executor reads price from the book.
             from .models import Candidate
             est = Estimate(
                 candidate=Candidate(
@@ -200,8 +200,8 @@ class Bot:
             )
             result = self.executor.execute_sell(est_to_plan(est, position.category), size, min_price)
             if result.status == "filled":
-                msg = (f"ТЕЙК-ПРОФИТ [{self.mode}] продано {size:,.0f} по {result.avg_price:.4f} "
-                       f"(вход {position.avg_price:.4f}) — {position.question[:60]}")
+                msg = (f"TAKE-PROFIT [{self.mode}] sold {size:,.0f} at {result.avg_price:.4f} "
+                       f"(entry {position.avg_price:.4f}) — {position.question[:60]}")
                 log.info(msg)
                 alert(msg)
 
@@ -215,14 +215,14 @@ class Bot:
         )
 
     def _settle_resolutions(self, markets, positions) -> None:
-        """Отмечает резолюции по открытым позициям, чей рынок закрылся."""
+        """Records resolutions for open positions whose market has closed."""
         by_id = {m.id: m for m in markets}
         for p in positions:
             m = by_id.get(p.market_id)
             if m is not None and not m.closed:
                 continue
-            # Рынка нет среди активных: проверяем закрытие точечно через Gamma нельзя
-            # дёшево — используем данные позиции только если рынок явно закрыт.
+            # Market not among active ones: checking closure per-market via Gamma
+            # isn't cheap — use position data only if the market is clearly closed.
             if m is None:
                 continue
             winner = m.resolved_winner_index()
@@ -230,8 +230,8 @@ class Bot:
                 continue
             won = p.token_id == (m.clob_token_ids[winner] if winner < len(m.clob_token_ids) else "")
             self.ledger.record_resolution(p.token_id, p.market_id, won)
-            msg = (f"РЕЗОЛЮЦИЯ [{self.mode}] {'ВЫИГРЫШ' if won else 'проигрыш'}: "
-                   f"{p.question[:60]} ({p.size:,.0f} шт по {p.avg_price:.4f})")
+            msg = (f"RESOLUTION [{self.mode}] {'WIN' if won else 'loss'}: "
+                   f"{p.question[:60]} ({p.size:,.0f} sh at {p.avg_price:.4f})")
             log.info(msg)
             alert(msg)
 
@@ -239,27 +239,27 @@ class Bot:
         self.errors.append(text)
         log.error(text)
 
-    # --- джобы дополнительных стратегий (свои интервалы, изолированные ошибки) ---
+    # --- extra-strategy jobs (own intervals, isolated errors) ---
 
     def arb_job(self) -> None:
-        """№1: neg-risk корзины. Цены проверяются по живым стаканам."""
+        """#1: neg-risk baskets. Prices are checked against live order books."""
         if not self.markets_cache:
             return
         try:
             found = self.arb.cycle(self.markets_cache)
             for a in found[:3]:
-                warn = " ⚠️ подозрительно: проверьте полноту корзины" if a.suspect else ""
+                warn = " ⚠️ suspect: verify basket completeness" if a.suspect else ""
                 will_execute = self.cfg.arbitrage.execute and not a.suspect
-                note = "" if will_execute else " (execute выключен)"
-                alert(f"АРБИТРАЖ {a.side}-корзина «{a.event_title[:60]}»: "
-                      f"NET после комиссий +{a.net_profit_pct * 100:.2f}% "
+                note = "" if will_execute else " (execute off)"
+                alert(f"ARBITRAGE {a.side} basket \"{a.event_title[:60]}\": "
+                      f"NET after fees +{a.net_profit_pct * 100:.2f}% "
                       f"(gross +{a.profit_pct * 100:.1f}%), "
-                      f"глубина {a.max_sets_by_depth()} комплектов{warn}{note}")
+                      f"depth {a.max_sets_by_depth()} sets{warn}{note}")
         except Exception:
             log.exception("arb job")
 
     def mm_job(self) -> None:
-        """Ядро: маркет-мейкинг. Блокируется kill-switch'ем и observe-only."""
+        """Core: market making. Blocked by the kill-switch and observe-only."""
         if not self.markets_cache:
             return
         try:
@@ -269,7 +269,7 @@ class Bot:
                 self.mm.shutdown()
                 return
             quotes = self.mm.cycle(self.markets_cache)
-            # WS-подписка на токены котируемых рынков + открытых позиций.
+            # WS subscription to tokens of quoted markets + open positions.
             if self.ws is not None:
                 tokens: set[str] = set()
                 for q in quotes:
@@ -282,7 +282,7 @@ class Bot:
             log.exception("mm job")
 
     def satellite_job(self) -> None:
-        """Сателлит btc_5m_ta (выключен по умолчанию)."""
+        """Satellite btc_5m_ta (disabled by default)."""
         try:
             if self.killswitch.trading_allowed:
                 self.satellite.cycle()
@@ -290,14 +290,14 @@ class Bot:
             log.exception("satellite job")
 
     def smart_money_job(self) -> None:
-        """№5: алерты, когда сильные кошельки заходят в рынок."""
+        """#5: alerts when strong wallets enter a market."""
         try:
             self.smart_money.cycle()
         except Exception:
             log.exception("smart-money job")
 
     def risk_job(self) -> None:
-        """Проверки kill-switch: дневной стоп, просадка, reconcile с биржей."""
+        """Kill-switch checks: daily stop, drawdown, reconcile with the exchange."""
         try:
             equity = self.portfolio.equity()
             self.killswitch.check_daily_loss(equity)
@@ -315,7 +315,7 @@ class Bot:
     MARKOUT_HORIZONS_SEC = (60, 600)
 
     def markout_job(self) -> None:
-        """Замер markout: где цена через 1 и 10 минут после каждого филла."""
+        """Markout measurement: where price is 1 and 10 minutes after each fill."""
         try:
             for horizon in self.MARKOUT_HORIZONS_SEC:
                 for fill in self.ledger.fills_needing_markout(self.mode, horizon):
@@ -336,23 +336,23 @@ class Bot:
             log.exception("markout job")
 
     def digest_job(self) -> None:
-        """Telegram-дайджест: PnL, инвентарь, атрибуция по стратегиям."""
+        """Telegram digest: PnL, inventory, per-strategy attribution."""
         try:
             equity = self.portfolio.equity()
             positions = self.ledger.open_positions(self.mode)
             pnl = self.ledger.realized_pnl_by_strategy(self.mode)
             pnl_lines = "\n".join(f"  {k}: {v:+,.2f}" for k, v in pnl.items()) or "  —"
-            alert(f"Дайджест [{self.mode}]\n"
-                  f"Equity: ${equity:,.2f} | просадка {self.portfolio.drawdown() * 100:.1f}%\n"
-                  f"Открытых позиций: {len(positions)} "
+            alert(f"Digest [{self.mode}]\n"
+                  f"Equity: ${equity:,.2f} | drawdown {self.portfolio.drawdown() * 100:.1f}%\n"
+                  f"Open positions: {len(positions)} "
                   f"(${sum(p.cost_usd for p in positions):,.2f})\n"
-                  f"Реализованный PnL по стратегиям:\n{pnl_lines}\n"
-                  f"Kill-switch: {'HALT: ' + self.killswitch.reason if self.killswitch.halted else 'норма'}")
+                  f"Realized PnL by strategy:\n{pnl_lines}\n"
+                  f"Kill-switch: {'HALT: ' + self.killswitch.reason if self.killswitch.halted else 'normal'}")
         except Exception:
             log.exception("digest job")
 
     def cross_job(self) -> None:
-        """№2: расхождения с внешними площадками — только алерты."""
+        """#2: divergences with external venues — alerts only."""
         if not self.markets_cache:
             return
         try:
@@ -370,27 +370,27 @@ def est_to_plan(est: Estimate, category: str):
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="polymarket_bot",
-        description="Барбелл на мисспрайсинге хвостовых исходов Polymarket",
+        description="Barbell on the mispricing of Polymarket tail outcomes",
     )
     parser.add_argument("--mode",
                         choices=("dry-run", "paper", "live", "backtest",
                                  "record-books", "replay", "report", "diagnose"),
                         default="dry-run",
-                        help="dry-run -> paper -> live (переход только вручную); "
-                             "backtest/record-books/replay — офлайн-фазы")
-    parser.add_argument("--config", default=None, help="путь к config.yaml")
-    parser.add_argument("--once", action="store_true", help="один цикл и выход")
+                        help="dry-run -> paper -> live (manual promotion only); "
+                             "backtest/record-books/replay — offline phases")
+    parser.add_argument("--config", default=None, help="path to config.yaml")
+    parser.add_argument("--once", action="store_true", help="one cycle and exit")
     parser.add_argument("--report-mode", default="paper",
                         choices=("dry-run", "paper", "live"),
-                        help="чьи данные показывать в --mode report")
+                        help="whose data to show in --mode report")
     parser.add_argument("--minutes", type=float, default=2880,
-                        help="длительность record-books (по умолчанию 48ч)")
+                        help="record-books duration (default 48h)")
     parser.add_argument("--i-understand-the-risk", action="store_true",
-                        dest="risk_ack", help="обязательный флаг для --mode live")
+                        dest="risk_ack", help="required flag for --mode live")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args(argv)
 
-    # .env ищем и рядом с пакетом, и от текущей директории вверх.
+    # Look for .env both next to the package and up from the current directory.
     from .config import PACKAGE_DIR
     load_dotenv(PACKAGE_DIR / ".env")
     load_dotenv()
@@ -411,7 +411,7 @@ def main(argv: list[str] | None = None) -> None:
         from .analytics import compute_report, print_report
         ledger = Ledger(cfg.runtime.db_path)
         try:
-            # Отчёт по тому режиму, в котором копились данные (paper по умолчанию).
+            # Report for the mode the data accumulated in (paper by default).
             print_report(compute_report(ledger, args.report_mode))
         finally:
             ledger.close()
@@ -421,7 +421,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.mode == "record-books":
         from .replay import BookRecorder
         n = BookRecorder(cfg, snaps_db).record(minutes=args.minutes)
-        log.info("записано снапшотов: %d -> %s", n, snaps_db)
+        log.info("snapshots recorded: %d -> %s", n, snaps_db)
         return
     if args.mode == "replay":
         from . import replay as replay_mod
@@ -434,10 +434,10 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.mode == "live":
         if not args.risk_ack:
-            sys.exit("live-режим требует явного флага --i-understand-the-risk")
+            sys.exit("live mode requires the explicit --i-understand-the-risk flag")
         if not os.environ.get("POLYMARKET_PRIVATE_KEY"):
-            sys.exit("POLYMARKET_PRIVATE_KEY не задан — см. .env.example")
-        log.warning("LIVE-РЕЖИМ: реальные деньги.")
+            sys.exit("POLYMARKET_PRIVATE_KEY not set — see .env.example")
+        log.warning("LIVE MODE: real money.")
 
     bot = Bot(cfg, args.mode)
     if bot.ws is not None and not args.once:
@@ -458,7 +458,7 @@ def main(argv: list[str] | None = None) -> None:
     stop_event = threading.Event()
 
     def shutdown(signum, frame):  # noqa: ARG001
-        log.info("получен сигнал %s — останавливаюсь", signum)
+        log.info("received signal %s — shutting down", signum)
         stop_event.set()
 
     signal.signal(signal.SIGINT, shutdown)
@@ -495,12 +495,12 @@ def main(argv: list[str] | None = None) -> None:
     scheduler.add_job(bot.markout_job, "interval", seconds=30,
                       max_instances=1, coalesce=True)
     scheduler.start()
-    bot.cycle()  # первый цикл сразу
+    bot.cycle()  # first cycle immediately
 
     stop_event.wait()
     scheduler.shutdown(wait=True)
     bot.close()
-    log.info("остановлен корректно.")
+    log.info("stopped cleanly.")
 
 
 if __name__ == "__main__":

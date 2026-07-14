@@ -1,29 +1,29 @@
-"""Ядро (80% капитала): маркет-мейкинг + liquidity rewards farming.
+"""Core (80% of capital): market making + liquidity rewards farming.
 
-Три потока дохода на одних ордерах: bid-ask спред, maker rebate, дневной
-rewards-пул. Edge структурный — не зависит от скорости и предсказания
-исходов.
+Three income streams on the same orders: bid-ask spread, maker rebate, daily
+rewards pool. The edge is structural — independent of speed and of predicting
+outcomes.
 
-Механика (по мастер-промпту):
-1. Fair value = microprice (midpoint, взвешенный объёмами bid/ask).
-2. Котировки симметрично вокруг fair внутри max_spread rewards-программы
-   (иначе не засчитываются в quadratic scoring); размер >= rewards_min_size.
-3. Inventory skew — главный механизм риска: fair сдвигается против
-   инвентаря пропорционально skew_k * inventory / max_position.
-4. Requote с гистерезисом: переставляем ордера только если fair ушёл на
-   >= requote_threshold_ticks ИЛИ котировка старше requote_timer_sec.
-   Каждая лишняя отмена ест rate limit и прерывает rewards-сэмплинг.
-5. Adverse selection guard: скачок midpoint / всплеск объёма → снять
-   котировки, cooldown.
-6. При midpoint <0.10 или >0.90 двусторонняя котировка обязательна для
-   rewards; если инвентарь позволяет только одну сторону — покидаем рынок.
+Mechanics (per the master prompt):
+1. Fair value = microprice (midpoint weighted by bid/ask sizes).
+2. Quotes symmetric around fair within the rewards program's max_spread
+   (otherwise they do not count in quadratic scoring); size >= rewards_min_size.
+3. Inventory skew — the main risk mechanism: fair shifts against inventory
+   proportional to skew_k * inventory / max_position.
+4. Requote with hysteresis: reprice only if fair moved
+   >= requote_threshold_ticks OR the quote is older than requote_timer_sec.
+   Every extra cancel eats rate limit and interrupts rewards sampling.
+5. Adverse selection guard: midpoint jump / volume spike -> pull quotes,
+   cooldown.
+6. At midpoint <0.10 or >0.90 a two-sided quote is required for rewards; if
+   inventory allows only one side — leave the market.
 
-Котирование двумя ПОКУПКАМИ (Yes-бид + No-бид): обе стороны требуют только
-pUSD; исполнение обеих даёт Yes+No = $1 к выкупу, прибыль = спред + rebate.
+Quoting with two BUYS (Yes bid + No bid): both sides need only pUSD; filling
+both gives Yes+No = $1 at redemption, profit = spread + rebate.
 
-Режимы: dry-run — логируются намерения; paper — виртуальные исполнения по
-реальному потоку (бид «филлится», когда рынок проторговывается сквозь его
-цену); live — реальные ордера.
+Modes: dry-run — intentions are logged; paper — virtual fills on the real
+flow (a bid "fills" when the market trades through its price); live — real
+orders.
 """
 
 from __future__ import annotations
@@ -50,7 +50,7 @@ class Quote(BaseModel):
     market: Market
     fair: float
     yes_bid: float
-    no_bid: float               # бид на No-токен; в Yes-терминах это ask = 1 - no_bid
+    no_bid: float               # bid on the No token; in Yes terms this is ask = 1 - no_bid
     size: float
     ts: float = 0.0
 
@@ -76,8 +76,8 @@ class MarketMaker:
     def __init__(self, cfg: BotConfig, ledger: Ledger, clob: ClobReader,
                  trader: Trader | None, mode: str,
                  top_source=None):
-        """top_source: callable(token_id) -> TopOfBook | None (WS-фид);
-        без него топ книги берётся из REST."""
+        """top_source: callable(token_id) -> TopOfBook | None (WS feed);
+        without it the top of book is taken from REST."""
         self._cfg = cfg.market_maker
         self._risk = cfg.risk
         self._fees = FeeModel(cfg.fees)
@@ -89,10 +89,10 @@ class MarketMaker:
         self._top_source = top_source
         self._last_mid: dict[str, float] = {}
         self._cooldown: dict[str, int] = {}
-        self._quotes: dict[str, Quote] = {}          # активные котировки (все режимы)
-        self._orders: dict[str, list[TrackedOrder]] = {}  # live-ордера по рынку
+        self._quotes: dict[str, Quote] = {}          # active quotes (all modes)
+        self._orders: dict[str, list[TrackedOrder]] = {}  # live orders per market
 
-    # --- источники данных ---
+    # --- data sources ---
 
     def _top(self, token: str) -> TopOfBook | None:
         if self._top_source is not None:
@@ -108,7 +108,7 @@ class MarketMaker:
         return TopOfBook(bid=bid, bid_size=bid_size, ask=ask, ask_size=ask_size,
                          ts=time.time())
 
-    # --- котировки ---
+    # --- quotes ---
 
     def compute_quote(self, market: Market, top: TopOfBook) -> Quote | None:
         c = self._cfg
@@ -117,11 +117,11 @@ class MarketMaker:
             return None
 
         fair = top.microprice
-        # Inventory skew: длинный Yes → fair вниз (bid ниже, ask агрессивнее).
+        # Inventory skew: long Yes -> fair down (bid lower, ask more aggressive).
         skew = c.inventory_skew_k * self._inventory_frac(market)
         fair -= skew * max(c.half_spread, tick)
 
-        # Полуспред: внутри rewards-диапазона, но не ниже fee-безубыточности.
+        # Half-spread: inside the rewards band, but not below fee break-even.
         category = classify_category(market.question, market.category)
         min_half = self._fees.mm_min_half_spread(
             category, market.category, self._risk.min_edge_after_fees)
@@ -129,21 +129,21 @@ class MarketMaker:
         if market.in_rewards_program:
             half = min(half, market.rewards_max_spread * 0.9)
             if half < max(min_half, tick):
-                return None  # reward-диапазон уже fee-безубыточности — не котируем
+                return None  # reward band narrower than fee break-even — do not quote
 
         yes_bid = round_to_tick(fair - half, tick)
         yes_ask = round_to_tick(fair + half, tick)
-        # Не пересекать книгу.
+        # Do not cross the book.
         yes_bid = min(yes_bid, round_to_tick(top.ask - tick, tick))
         yes_ask = max(yes_ask, round_to_tick(top.bid + tick, tick))
         if not tick <= yes_bid < yes_ask <= 1 - tick:
             return None
 
         size = float(math.floor(c.quote_size_usd / max(yes_bid, tick)))
-        size = max(size, market.rewards_min_size)  # иначе не засчитается в rewards
+        size = max(size, market.rewards_min_size)  # otherwise it will not count for rewards
         if size < market.min_order_size:
             return None
-        # Кэп позиции на рынок.
+        # Per-market position cap.
         if abs(self._inventory_usd(market)) + size * yes_bid \
                 > self._risk.max_position_per_market_usd * 2:
             return None
@@ -152,7 +152,7 @@ class MarketMaker:
                      size=size, ts=time.time())
 
     def needs_requote(self, market: Market, top: TopOfBook) -> bool:
-        """Гистерезис: не дёргать ордера без необходимости."""
+        """Hysteresis: do not churn orders without need."""
         current = self._quotes.get(market.id)
         if current is None:
             return True
@@ -161,7 +161,7 @@ class MarketMaker:
             return True
         return (time.time() - current.ts) >= self._cfg.requote_timer_sec
 
-    # --- инвентарь ---
+    # --- inventory ---
 
     def _inventory_usd(self, market: Market) -> float:
         yes_token, no_token = market.clob_token_ids[0], market.clob_token_ids[1]
@@ -182,7 +182,7 @@ class MarketMaker:
         cap = self._risk.max_position_per_market_usd
         return inv < cap, inv > -cap
 
-    # --- guard от adverse selection ---
+    # --- adverse-selection guard ---
 
     def guard_blocks(self, market: Market, top: TopOfBook) -> bool:
         c = self._cfg
@@ -193,7 +193,7 @@ class MarketMaker:
             self._cooldown[market.id] -= 1
             return True
         if prev is not None and abs(mid - prev) >= c.guard_price_move:
-            log.info("MM guard: %s mid %.3f -> %.3f — снимаем котировки, cooldown",
+            log.info("MM guard: %s mid %.3f -> %.3f — pulling quotes, cooldown",
                      market.question[:40], prev, mid)
             self._cooldown[market.id] = c.guard_cooldown_cycles
             return True
@@ -202,7 +202,7 @@ class MarketMaker:
             return True
         return False
 
-    # --- исполнение ---
+    # --- execution ---
 
     def _cancel_market(self, market_id: str) -> None:
         self._quotes.pop(market_id, None)
@@ -238,7 +238,7 @@ class MarketMaker:
                     order.matched_recorded += new_fill
 
     def _paper_fills(self) -> None:
-        """Paper-режим: бид исполняется, если рынок проторговался сквозь него."""
+        """Paper mode: a bid fills if the market traded through it."""
         for quote in list(self._quotes.values()):
             m = quote.market
             yes_top = self._top(m.clob_token_ids[0])
@@ -258,7 +258,7 @@ class MarketMaker:
         m = quote.market
         self._quotes[m.id] = quote
         if self._mode != "live":
-            log.info("MM [%s] котировка %s: bid %.3f / ask %.3f (fair %.4f) x %.0f",
+            log.info("MM [%s] quote %s: bid %.3f / ask %.3f (fair %.4f) x %.0f",
                      self._mode, m.question[:40], quote.yes_bid,
                      quote.implied_yes_ask, quote.fair, quote.size)
             return
@@ -283,7 +283,7 @@ class MarketMaker:
         if placed:
             self._orders[m.id] = placed
 
-    # --- цикл ---
+    # --- cycle ---
 
     def cycle(self, markets: list[Market]) -> list[Quote]:
         if not self._cfg.enabled:
@@ -317,8 +317,8 @@ class MarketMaker:
             quote = self.compute_quote(market, top)
             quote_yes, quote_no = self.sides_allowed(market)
             mid = top.mid
-            # Экстремальный midpoint: двусторонняя котировка обязательна для
-            # rewards; одностороннюю не ставим — покидаем рынок.
+            # Extreme midpoint: a two-sided quote is required for rewards; we do
+            # not place a one-sided quote — leave the market.
             if (mid < 0.10 or mid > 0.90) and not (quote_yes and quote_no):
                 self._cancel_market(market.id)
                 continue

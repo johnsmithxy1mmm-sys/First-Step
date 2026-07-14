@@ -1,9 +1,9 @@
-"""Исполнение: только maker-лимитки, репрайсинг, дробление, идемпотентность.
+"""Execution: maker limit orders only, repricing, child-splitting, idempotency.
 
-На хвостах спред огромный — маркет-ордер в тонкую книгу мгновенно
-уничтожает edge. Поэтому: встаём бидом чуть выше best bid, ждём fill с
-таймаутом, ограниченно репрайсим, снимаем ордер, если цена ушла выше
-порога edge (limit_price_cap из портфеля).
+On tails the spread is huge — a market order into a thin book instantly
+destroys the edge. So: bid just above best bid, wait for a fill with a
+timeout, reprice a limited number of times, cancel the order if price moves
+above the edge threshold (limit_price_cap from the portfolio).
 """
 
 from __future__ import annotations
@@ -28,13 +28,13 @@ class Executor:
         self._cfg = cfg.executor
         self._ledger = ledger
         self._clob = clob
-        self._trader = trader          # None = dry-run: виртуальные ордера
+        self._trader = trader          # None = dry-run: virtual orders
         self._mode = mode
 
-    # --- идемпотентность ---
+    # --- idempotency ---
 
     def already_entered(self, token_id: str) -> bool:
-        """Перед любым ордером сверяем локальный стейт и фактические позиции API."""
+        """Before any order, reconcile local state and the API's actual positions."""
         if self._ledger.has_position_or_open_buy(token_id, self._mode):
             return True
         if self._trader is not None:
@@ -46,11 +46,11 @@ class Executor:
                     if str(o.get("asset_id")) == token_id:
                         return True
             except Exception as exc:
-                log.warning("reconcile: %s (считаем, что позиция есть — безопаснее)", exc)
+                log.warning("reconcile: %s (assume a position exists — safer)", exc)
                 return True
         return False
 
-    # --- вход ---
+    # --- entry ---
 
     def execute(self, plan: TradePlan, strategy: str = "longshot") -> ExecutionResult:
         if self.already_entered(plan.token_id):
@@ -62,7 +62,7 @@ class Executor:
         filled_usd = 0.0
         order_ids: list[str] = []
 
-        # Дробление крупной заявки на детей ≤ max_child_order_usd.
+        # Split a large order into children <= max_child_order_usd.
         n_children = max(1, math.ceil(plan.size_usd / self._cfg.max_child_order_usd))
         child_usd = plan.size_usd / n_children
 
@@ -95,7 +95,7 @@ class Executor:
                                avg_price=avg_price, order_ids=order_ids)
 
     def _maker_bid(self, plan: TradePlan) -> float | None:
-        """Цена maker-бида: чуть выше best bid, никогда не пересекая ask и cap."""
+        """Maker bid price: just above best bid, never crossing ask or the cap."""
         c = plan.estimate.candidate
         book = self._clob.order_book(c.token_id)
         if book is None:
@@ -103,27 +103,27 @@ class Executor:
         tick = c.market.tick_size
         best_bid, best_ask = book.best_bid, book.best_ask
         if best_ask > 0 and best_ask <= plan.limit_price_cap:
-            # Ask уже внутри допустимой цены: встаём на тик ниже ask (максимальный
-            # приоритет очереди, всё ещё maker).
+            # Ask already within the allowed price: sit one tick below ask (max
+            # queue priority, still a maker).
             price = best_ask - tick
         else:
             price = best_bid + tick if best_bid > 0 else tick
         price = min(price, plan.limit_price_cap)
         if best_ask > 0:
-            price = min(price, best_ask - tick)  # не пересекаем книгу
+            price = min(price, best_ask - tick)  # do not cross the book
         price = round_to_tick(price, tick)
         if price < tick or price <= 0:
             return None
         return price
 
     def _place_maker_child(self, plan: TradePlan, usd: float) -> tuple[float, float, str | None] | None:
-        """Один дочерний ордер: ставим бид, ждём, репрайсим. -> (size, price, order_id)."""
+        """One child order: place bid, wait, reprice. -> (size, price, order_id)."""
         c = plan.estimate.candidate
 
         for attempt in range(self._cfg.max_reprices + 1):
             price = self._maker_bid(plan)
             if price is None:
-                log.info("skip child %s: нет валидной maker-цены (edge cap %.4f)",
+                log.info("skip child %s: no valid maker price (edge cap %.4f)",
                          c.token_id[:16], plan.limit_price_cap)
                 return None
             size = float(math.floor(usd / price))
@@ -131,8 +131,8 @@ class Executor:
                 return None
 
             if self._trader is None:
-                # Dry-run: оптимистичная модель — maker-бид считается исполненным
-                # по нашей цене. Реальный fill-rate ниже; см. README.
+                # Dry-run: optimistic model — the maker bid is treated as filled
+                # at our price. Real fill-rate is lower; see README.
                 return size, price, None
 
             try:
@@ -148,13 +148,13 @@ class Executor:
             matched = self._wait_fill(order_id)
             if matched >= size * 0.99:
                 return matched, price, order_id
-            # Не исполнились за таймаут: снимаем и решаем — репрайс или отказ.
+            # No fill within the timeout: cancel and decide — reprice or give up.
             try:
                 self._trader.cancel(order_id)
             except Exception:
                 pass
             if matched > 0:
-                return matched, price, order_id  # частичный fill фиксируем
+                return matched, price, order_id  # record the partial fill
             log.info("reprice %d/%d for %s", attempt + 1, self._cfg.max_reprices,
                      c.token_id[:16])
         return None
@@ -173,10 +173,10 @@ class Executor:
             time.sleep(self._cfg.poll_interval_sec)
         return matched
 
-    # --- выход (take-profit) ---
+    # --- exit (take-profit) ---
 
     def execute_sell(self, plan: TradePlan, size: float, min_price: float) -> ExecutionResult:
-        """Продажа доли позиции по best bid (не ниже min_price)."""
+        """Sell part of a position at best bid (not below min_price)."""
         c = plan.estimate.candidate
         book = self._clob.order_book(c.token_id)
         if book is None or book.best_bid <= 0 or book.best_bid < min_price:

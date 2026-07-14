@@ -1,28 +1,28 @@
-"""Стратегия №1: структурный арбитраж внутри neg-risk событий.
+"""Strategy #1: structural arbitrage within neg-risk events.
 
-В мульти-исходном событии (выборы, номинации) ровно один исход резолвится
-YES. Два зеркальных окна:
+In a multi-outcome event (elections, nominations) exactly one outcome
+resolves YES. Two mirror windows:
 
-  YES-корзина: Σ ask(Yes_i) < 1  → купить Yes всех исходов;
-               выплата $1 за комплект, прибыль = 1 - Σask.
-  NO-корзина:  Σ bid(Yes_i) > 1  ⟺ Σ ask(No_i) < n-1 → купить No всех
-               исходов; выплата $(n-1) за комплект, прибыль = (n-1) - Σask(No).
+  YES basket: sum ask(Yes_i) < 1  -> buy Yes of all outcomes;
+              pays $1 per set, profit = 1 - sum(ask).
+  NO basket:  sum bid(Yes_i) > 1  <=> sum ask(No_i) < n-1 -> buy No of all
+              outcomes; pays $(n-1) per set, profit = (n-1) - sum(ask No).
 
-Две честные поправки к «математически гарантированной прибыли»:
+Two honest corrections to "mathematically guaranteed profit":
 
-  Комиссии. Чтобы забрать окно, ноги покупаются агрессивно (taker). Edge
-  считается ПОСЛЕ taker-fee по категории — иначе +1.7% «до комиссий» на
-  спорт-корзине (fee ~3%) на деле убыток. Порог min_profit_pct применяется
-  к ЧИСТОМУ edge.
+  Fees. To take the window, legs are bought aggressively (taker). Edge is
+  computed AFTER the per-category taker fee — otherwise a +1.7% "pre-fee" on
+  a sports basket (fee ~3%) is actually a loss. The min_profit_pct threshold
+  applies to the NET edge.
 
-  Полнота корзины. «Безрисковость» держится, только если куплены ВСЕ
-  взаимоисключающие исходы. Если у события есть исход, которого сканер не
-  видит («другая команда»/field), сумма выглядит заниженной, а на деле это
-  направленная позиция, а не арбитраж. Аномально большой gross edge
-  (> suspicious_gross_edge) помечается suspect и НЕ исполняется автоматически.
+  Basket completeness. "Risk-free" only holds if ALL mutually exclusive
+  outcomes are bought. If the event has an outcome the scanner does not see
+  ("the other team"/field), the sum looks understated but is actually a
+  directional position, not an arbitrage. An abnormally large gross edge
+  (> suspicious_gross_edge) is flagged suspect and NOT executed automatically.
 
-Окна живут секунды-минуты и выедаются скоростными ботами; REST-поллинг —
-«медленный охотник».
+Windows live seconds to minutes and are eaten by fast bots; REST polling is
+the "slow hunter".
 """
 
 from __future__ import annotations
@@ -45,8 +45,8 @@ class ArbLeg(BaseModel):
     market: Market
     outcome_index: int          # 0 = Yes, 1 = No
     token_id: str
-    ask: float                  # лучшая цена покупки этой ноги
-    depth: float                # сколько акций доступно по ask
+    ask: float                  # best buy price for this leg
+    depth: float                # shares available at ask
 
 
 class BasketArb(BaseModel):
@@ -54,8 +54,8 @@ class BasketArb(BaseModel):
     event_title: str
     side: str                   # "YES" | "NO"
     legs: list[ArbLeg] = Field(default_factory=list)
-    taker_fee: float = 0.0      # доля от notional входа (по категории)
-    suspect: bool = False       # аномальный edge — вероятно неполная корзина
+    taker_fee: float = 0.0      # fraction of entry notional (by category)
+    suspect: bool = False       # abnormal edge — likely an incomplete basket
 
     @property
     def cost_per_set(self) -> float:
@@ -63,10 +63,10 @@ class BasketArb(BaseModel):
 
     @property
     def payout_per_set(self) -> float:
-        # YES-корзина платит $1; NO-корзина платит $(n-1).
+        # YES basket pays $1; NO basket pays $(n-1).
         return 1.0 if self.side == "YES" else float(len(self.legs) - 1)
 
-    # --- gross (до комиссий) ---
+    # --- gross (before fees) ---
 
     @property
     def profit_per_set(self) -> float:
@@ -76,7 +76,7 @@ class BasketArb(BaseModel):
     def profit_pct(self) -> float:
         return self.profit_per_set / self.cost_per_set if self.cost_per_set > 0 else 0.0
 
-    # --- net (после taker-комиссий на вход) ---
+    # --- net (after entry taker fees) ---
 
     @property
     def fee_per_set(self) -> float:
@@ -104,10 +104,10 @@ class ArbitrageScanner:
         self._trader = trader
         self._mode = mode
 
-    # --- отбор событий, стоящих похода в стаканы ---
+    # --- selecting events worth hitting the books for ---
 
     def prefilter_events(self, markets: list[Market]) -> list[list[Market]]:
-        """Группы neg-risk рынков, где сумма Yes-цен Gamma намекает на окно."""
+        """Groups of neg-risk markets where the sum of Gamma Yes prices hints at a window."""
         by_event: dict[str, list[Market]] = {}
         for m in markets:
             if (m.event_neg_risk and m.event_id and not m.closed
@@ -122,7 +122,7 @@ class ArbitrageScanner:
             if min(mm.volume_24h_usd for mm in group) < self._cfg.min_leg_volume_24h_usd:
                 continue
             total = sum(mm.outcome_prices[0] for mm in group)
-            # Порог мягче реального edge: Gamma-цены запаздывают, точность даст стакан.
+            # Threshold looser than real edge: Gamma prices lag; the book gives precision.
             if total < 1.0 - self._cfg.prefilter_tolerance \
                     or total > 1.0 + self._cfg.prefilter_tolerance:
                 suspicious.append(group)
@@ -130,7 +130,7 @@ class ArbitrageScanner:
                         reverse=True)
         return suspicious[: self._cfg.max_events_per_cycle]
 
-    # --- проверка по реальным стаканам ---
+    # --- verification against real order books ---
 
     def verify(self, group: list[Market]) -> BasketArb | None:
         yes_books: list[tuple[Market, OrderBook]] = []
@@ -139,7 +139,7 @@ class ArbitrageScanner:
             yb = self._clob.order_book(m.clob_token_ids[0])
             nb = self._clob.order_book(m.clob_token_ids[1])
             if yb is None or nb is None or yb.best_ask <= 0 or nb.best_ask <= 0:
-                return None  # без полного комплекта ног арбитража нет
+                return None  # no arbitrage without the full set of legs
             yes_books.append((m, yb))
             no_books.append((m, nb))
 
@@ -147,14 +147,14 @@ class ArbitrageScanner:
         yes_arb = self._build("YES", [(m, b, 0) for m, b in yes_books])
         no_arb = self._build("NO", [(m, b, 1) for m, b in no_books])
         for arb in (yes_arb, no_arb):
-            # Порог — по ЧИСТОМУ edge (после комиссий).
+            # Threshold is on the NET edge (after fees).
             if arb is not None and arb.net_profit_pct >= self._cfg.min_profit_pct \
                     and arb.max_sets_by_depth() >= self._cfg.min_sets:
                 candidates.append(arb)
         if not candidates:
             return None
         best = max(candidates, key=lambda a: a.net_profit_pct)
-        # Аномально большой gross edge = вероятно корзина неполная.
+        # Abnormally large gross edge = the basket is probably incomplete.
         best.suspect = best.profit_pct > self._cfg.suspicious_gross_edge
         return best
 
@@ -174,17 +174,17 @@ class ArbitrageScanner:
                         side=side, legs=legs, taker_fee=taker_fee)
         return arb if arb.profit_per_set > 0 else None
 
-    # --- исполнение ---
+    # --- execution ---
 
     def execute(self, arb: BasketArb) -> float:
-        """Покупает комплекты. Возвращает потраченные доллары (0 = не исполнено).
+        """Buys sets. Returns dollars spent (0 = not executed).
 
-        Риск ноги: часть лимиток может не исполниться, если стакан сдвинулся, —
-        тогда остаётся направленная позиция вместо арбитража. Подозрительные
-        (возможно неполные) корзины не исполняются вовсе.
+        Leg risk: some limit orders may not fill if the book moved — leaving a
+        directional position instead of an arbitrage. Suspect (possibly
+        incomplete) baskets are not executed at all.
         """
         if arb.suspect:
-            log.warning("арбитраж «%s» помечен suspect — не исполняем", arb.event_title[:50])
+            log.warning("arbitrage %s flagged suspect - not executing", arb.event_title[:50])
             return 0.0
         sets = min(
             arb.max_sets_by_depth(),
@@ -204,7 +204,7 @@ class ArbitrageScanner:
                                                   neg_risk=True)
                     order_id = (resp or {}).get("orderID")
                 except Exception as exc:
-                    log.error("arb leg failed %s: %s — остальные ноги не переплатят",
+                    log.error("arb leg failed %s: %s - other legs will not overpay",
                               leg.token_id[:16], exc)
                     continue
             self._ledger.record_trade(
@@ -218,7 +218,7 @@ class ArbitrageScanner:
             spent += price * sets
         return spent
 
-    # --- цикл ---
+    # --- cycle ---
 
     def cycle(self, markets: list[Market]) -> list[BasketArb]:
         if not self._cfg.enabled:
@@ -229,15 +229,15 @@ class ArbitrageScanner:
             if arb is None:
                 continue
             found.append(arb)
-            warn = ("  ⚠️ ПОДОЗРИТЕЛЬНО: вероятно неполная корзина, проверьте руками"
+            warn = ("  ⚠️ SUSPECT: likely an incomplete basket, check by hand"
                     if arb.suspect else "")
-            log.info("АРБИТРАЖ %s «%s»: %d ног, комплект $%.4f, gross +%.2f%% -> "
-                     "NET после комиссий +%.2f%% (fee %.1f%%), глубина %d комплектов%s",
+            log.info("ARBITRAGE %s %s: %d legs, set $%.4f, gross +%.2f%% -> "
+                     "NET after fees +%.2f%% (fee %.1f%%), depth %d sets%s",
                      arb.side, arb.event_title[:50], len(arb.legs), arb.cost_per_set,
                      arb.profit_pct * 100, arb.net_profit_pct * 100,
                      arb.taker_fee * 100, arb.max_sets_by_depth(), warn)
             if self._cfg.execute and not arb.suspect:
                 spent = self.execute(arb)
                 if spent > 0:
-                    log.info("арбитраж исполнен: $%.2f", spent)
+                    log.info("arbitrage executed: $%.2f", spent)
         return found
