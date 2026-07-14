@@ -141,7 +141,12 @@ class Bot:
 
             if not observe_only:
                 self._enter_positions(qualifying)
-                self.fade.cycle(estimates)
+                # Фейд покупает NO — глубина на YES-стороне (verify_depth) ему
+                # не нужна. Кормим его кандидатами ДО проверки глубины; NO-книгу
+                # проверит executor при постановке лимитки.
+                fade_candidates = self.scanner.first_level_filter(markets)
+                fade_estimates = self.estimator.estimate_all(fade_candidates, markets)
+                self.fade.cycle(fade_estimates)
                 self._exit_positions(marks)
         except Exception as exc:
             self._error(f"cycle: {exc}")

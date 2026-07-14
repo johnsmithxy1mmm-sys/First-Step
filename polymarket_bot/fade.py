@@ -52,9 +52,11 @@ class FadeStrategy:
             return None
         if c.outcome_index not in (0, 1) or len(market.clob_token_ids) < 2:
             return None
-        # Если оценщик считает хвост НЕдооценённым — это лонгшот-покупка, не фейд.
-        # Допуск на float-шум: без сигнала якорь даёт p_est ≈ p_mkt.
-        if estimate.p_est > p_mkt_yes + 1e-9:
+        # Вето только на НАСТОЯЩИЙ лонгшот: p_est ≥ ratio × p_mkt (тот же порог,
+        # по которому лонгшот ПОКУПАЕТ YES) — тогда не фейдим против своего же
+        # сигнала. Лёгкий дрейф p_est выше рынка — шум якоря (0.85), а тезис
+        # фейда держится на СИСТЕМАТИЧЕСКОМ смещении, не на пер-рынок оценке.
+        if estimate.p_est >= p_mkt_yes * cfg.longshot_veto_ratio:
             return None
 
         # Честная вероятность Yes с поправкой на систематический bias.

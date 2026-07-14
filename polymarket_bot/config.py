@@ -91,6 +91,10 @@ class FadeConfig(BaseModel):
     fade_max_price: float = 0.10       # фейдим только хвосты дешевле этой цены YES
     min_tail_price: float = 0.005      # ниже — неликвид/шум
     min_edge_after_fees: float = 0.005  # минимум 0.5% чистого edge на NO-стороне
+    # Вето: если оценщик видит НАСТОЯЩИЙ лонгшот (p_est ≥ ratio × p_mkt — тот же
+    # порог, по которому лонгшот-стратегия ПОКУПАЕТ YES), не фейдим против своего
+    # же сигнала. Лёгкий дрейф p_est выше рынка — шум якоря, фейду не помеха.
+    longshot_veto_ratio: float = 2.0
 
 
 class ArbitrageConfig(BaseModel):

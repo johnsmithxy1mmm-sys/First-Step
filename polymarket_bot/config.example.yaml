@@ -181,6 +181,7 @@ fade:
   fade_max_price: 0.10      # фейдим только YES-хвосты дешевле этой цены
   min_tail_price: 0.005
   min_edge_after_fees: 0.005
+  longshot_veto_ratio: 2.0  # p_est ≥ 2× рынка -> настоящий лонгшот, не фейдим
 
 runtime:
   gamma_host: https://gamma-api.polymarket.com

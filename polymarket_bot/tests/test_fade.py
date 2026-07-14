@@ -57,7 +57,21 @@ def test_signal_deepens_fade(cfg, ledger):
 def test_no_fade_for_underpriced_tail(cfg, ledger):
     """Если оценщик считает хвост НЕдооценённым — это лонгшот, не фейд."""
     fade, _ = make_fade(cfg, ledger)
-    assert fade.plan(make_estimate(p_mkt=0.05, p_est=0.15)) is None
+    assert fade.plan(make_estimate(p_mkt=0.05, p_est=0.15)) is None    # ratio 3.0 ≥ 2.0
+
+
+def test_mild_drift_above_market_still_fades(cfg, ledger):
+    """p_est чуть выше рынка (< veto ratio) — шум якоря, фейд не отменяем."""
+    fade, _ = make_fade(cfg, ledger)
+    plan = fade.plan(make_estimate(p_mkt=0.03, p_est=0.042))           # ratio 1.4 < 2.0
+    assert plan is not None
+    assert plan.estimate.candidate.outcome_index == 1                 # покупаем NO
+
+
+def test_genuine_longshot_vetoes_fade(cfg, ledger):
+    """p_est на пороге veto (2× рынка) — настоящий лонгшот, не фейд."""
+    fade, _ = make_fade(cfg, ledger)
+    assert fade.plan(make_estimate(p_mkt=0.03, p_est=0.06)) is None    # ratio 2.0 ≥ 2.0
 
 
 def test_no_fade_above_max_price(cfg, ledger):
