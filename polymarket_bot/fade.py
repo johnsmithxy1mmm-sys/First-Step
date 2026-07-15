@@ -26,6 +26,7 @@ from .config import BotConfig
 from .executor import Executor
 from .ledger import Ledger
 from .models import Candidate, Estimate, TradePlan
+from .monitor import alert
 from .portfolio import Portfolio, classify_category
 
 log = logging.getLogger(__name__)
@@ -110,10 +111,16 @@ class FadeStrategy:
             if result.status == "filled":
                 entered += 1
                 m = plan.estimate.candidate.market
-                log.info("FADE No %.3f x %.0f = $%.2f (fair Yes %.3f vs market %.3f) [%s]",
-                         result.avg_price, result.filled_size,
+                side = plan.estimate.candidate.outcome
+                log.info("FADE %s %.3f x %.0f = $%.2f (fair Yes %.3f vs market %.3f) [%s]",
+                         side, result.avg_price, result.filled_size,
                          result.avg_price * result.filled_size,
                          1 - plan.estimate.p_est, est.p_mkt, m.question[:50])
+                alert(f"FADE fill [{self._mode}] {side} {result.avg_price:.3f} "
+                      f"x {result.filled_size:,.0f} "
+                      f"= ${result.avg_price * result.filled_size:,.2f} "
+                      f"(fair Yes {1 - plan.estimate.p_est:.3f} vs market {est.p_mkt:.3f}) "
+                      f"— {m.question[:60]}")
         if entered:
             log.info("fades this cycle: %d", entered)
         return entered

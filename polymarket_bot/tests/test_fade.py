@@ -108,13 +108,17 @@ def test_fade_cycle_enters_and_tags_strategy(cfg, ledger):
     fade, clob = make_fade(cfg, ledger)
     # NO-token book: ask 0.95, bid 0.94 — maker bid within cap.
     clob.order_book.return_value = make_book(best_bid=0.94, best_ask=0.96, depth=100_000)
-    entered = fade.cycle([make_estimate(p_mkt=0.05, p_est=None)])
+    with mock.patch("polymarket_bot.fade.alert") as a:
+        entered = fade.cycle([make_estimate(p_mkt=0.05, p_est=None)])
     assert entered == 1
     positions = ledger.open_positions("dry-run")
     assert len(positions) == 1
     # Recorded as strategy 'fade', buying the NO outcome.
     row = ledger._conn.execute("SELECT strategy, side FROM trades").fetchone()
     assert row["strategy"] == "fade" and row["side"] == "BUY"
+    # The fill is announced to Telegram.
+    a.assert_called_once()
+    assert "FADE fill" in a.call_args[0][0]
 
 
 def test_fade_disabled_is_silent(cfg, ledger):
