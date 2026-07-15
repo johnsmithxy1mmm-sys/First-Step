@@ -102,6 +102,28 @@ class FadeConfig(BaseModel):
     max_days_to_resolution: float = 45.0
 
 
+class ResolutionConfig(BaseModel):
+    """Resolution alpha: buy a near-resolved side for a small near-riskless gain.
+
+    When a market's top outcome trades at 0.95-0.985 with fresh volume and is
+    at/near its end date, the outcome is effectively decided but not yet paid.
+    Buying it (taker) earns (1 - price) over hours. Honest residual risk: a UMA
+    dispute — reserved via dispute_haircut. Detect+alert by default.
+    """
+    enabled: bool = False
+    execute: bool = False
+    interval_sec: float = 120.0
+    near_min: float = 0.95             # top outcome in this band = likely resolved-pending
+    near_max: float = 0.985
+    min_net_edge: float = 0.01         # after taker fee + dispute haircut
+    dispute_haircut: float = 0.02      # reserve for UMA dispute risk
+    min_volume_24h_usd: float = 20_000.0
+    volume_spike_ratio: float = 0.10   # 24h volume >= this fraction of total = fresh activity
+    max_days_to_resolution: float = 7.0
+    max_stake_usd: float = 200.0
+    max_alerts_per_cycle: int = 10
+
+
 class ArbitrageConfig(BaseModel):
     """Strategy #1: structural arbitrage of neg-risk baskets (YES and NO)."""
     enabled: bool = True
@@ -273,6 +295,7 @@ class BotConfig(BaseModel):
     portfolio: PortfolioConfig = Field(default_factory=PortfolioConfig)
     executor: ExecutorConfig = Field(default_factory=ExecutorConfig)
     arbitrage: ArbitrageConfig = Field(default_factory=ArbitrageConfig)
+    resolution: ResolutionConfig = Field(default_factory=ResolutionConfig)
     fade: FadeConfig = Field(default_factory=FadeConfig)
     market_maker: MarketMakerConfig = Field(default_factory=MarketMakerConfig)
     risk: RiskLimitsConfig = Field(default_factory=RiskLimitsConfig)

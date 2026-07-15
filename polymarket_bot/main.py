@@ -30,6 +30,7 @@ from .models import Estimate, Market
 from .monitor import Dashboard, alert
 from .niche import NicheWatcher
 from .portfolio import Portfolio
+from .resolution import ResolutionAlpha
 from .risk import KillSwitch
 from .satellite import BTC5mSatellite
 from .scanner import Scanner
@@ -70,6 +71,7 @@ class Bot:
         self.mm = MarketMaker(cfg, self.ledger, self.clob, self.trader, mode,
                               top_source=(self.ws.top if self.ws else None),
                               feedback=self.markout_feedback)
+        self.resolution = ResolutionAlpha(cfg, self.ledger, self.clob, self.trader, mode)
         self.cross = CrossMarketScanner(cfg)
         self.niche = NicheWatcher(cfg, self.ledger)
         self.smart_money = SmartMoneyTracker(cfg, self.ledger, self.niche)
@@ -341,6 +343,15 @@ class Bot:
         except Exception:
             log.exception("markout job")
 
+    def resolution_job(self) -> None:
+        """#Resolution alpha: near-riskless carry on effectively-decided markets."""
+        if not self.markets_cache:
+            return
+        try:
+            self.resolution.cycle(self.markets_cache)
+        except Exception:
+            log.exception("resolution job")
+
     def calibration_job(self) -> None:
         """Refit the self-calibrators from the ledger (fade bias, MM markout)."""
         try:
@@ -500,6 +511,10 @@ def main(argv: list[str] | None = None) -> None:
                           max_instances=1, coalesce=True)
     if cfg.satellite.enabled:
         scheduler.add_job(bot.satellite_job, "interval", seconds=5,
+                          max_instances=1, coalesce=True)
+    if cfg.resolution.enabled:
+        scheduler.add_job(bot.resolution_job, "interval",
+                          seconds=cfg.resolution.interval_sec,
                           max_instances=1, coalesce=True)
     scheduler.add_job(bot.risk_job, "interval",
                       seconds=cfg.risk.reconcile_interval_sec,

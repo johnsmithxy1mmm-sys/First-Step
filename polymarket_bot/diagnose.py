@@ -66,6 +66,13 @@ def run_diagnose(cfg: BotConfig, gamma: GammaClient | None = None) -> None:
                   "depth check and the edge threshold (edge >= 2.0 drops almost "
                   "everything — by design).[/dim]\n")
 
+    from .resolution import ResolutionAlpha
+    res = ResolutionAlpha(cfg, Ledger(":memory:"), None, None, "dry-run")
+    res_reasons, res_passed = funnel(markets, res.reject_reason)
+    _print_funnel(console, "RESOLUTION alpha", total, "markets", res_reasons, res_passed)
+    console.print("[dim]\"passed\" = a near-resolved side (0.95-0.985, fresh volume, "
+                  "imminent) with net edge after taker fee + dispute reserve.[/dim]\n")
+
     scorer = MarketScorer(cfg)
     mm_reasons, mm_passed = funnel(markets, scorer.reject_reason)
     _print_funnel(console, "MARKET MAKER (scorer)", total, "markets", mm_reasons, mm_passed)
