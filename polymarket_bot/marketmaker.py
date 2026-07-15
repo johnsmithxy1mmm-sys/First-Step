@@ -38,6 +38,7 @@ from .clob import ClobReader, Trader, round_to_tick
 from .config import BotConfig
 from .fees import FeeModel
 from .ledger import Ledger
+from .microstructure import RealizedVol
 from .models import Market, simple_estimate
 from .monitor import alert
 from .portfolio import classify_category
@@ -90,6 +91,8 @@ class MarketMaker:
         self._mode = mode
         self._top_source = top_source
         self._feedback = feedback
+        self._vol = RealizedVol()
+        self._size_map: dict[str, float] = {}        # rewards-weighted quote sizes
         self._last_mid: dict[str, float] = {}
         self._cooldown: dict[str, int] = {}
         self._quotes: dict[str, Quote] = {}          # active quotes (all modes)
@@ -128,16 +131,19 @@ class MarketMaker:
             return None
 
         fair = top.microprice
+        sigma = self._vol.update(market.id, top.mid)   # A-S realized volatility
         # Inventory skew: long Yes -> fair down (bid lower, ask more aggressive).
+        # Scaled by (1 + vol) so we lean harder against inventory in fast markets.
         skew = c.inventory_skew_k * self._inventory_frac(market)
-        fair -= skew * max(c.half_spread, tick)
+        fair -= skew * max(c.half_spread, tick) * (1.0 + c.vol_spread_k * sigma)
 
         # Half-spread: inside the rewards band, but not below fee break-even.
-        # Widened where realized markout says we get adversely selected.
+        # Widened by realized markout (adverse selection) and realized volatility.
         category = classify_category(market.question, market.category)
         min_half = self._fees.mm_min_half_spread(
             category, market.category, self._risk.min_edge_after_fees)
-        half = max(c.half_spread * self._spread_mult(market.id), min_half, tick)
+        base_half = c.half_spread * self._spread_mult(market.id) * (1.0 + c.vol_spread_k * sigma)
+        half = max(base_half, min_half, tick)
         if market.in_rewards_program:
             half = min(half, market.rewards_max_spread * 0.9)
             if half < max(min_half, tick):
@@ -151,7 +157,8 @@ class MarketMaker:
         if not tick <= yes_bid < yes_ask <= 1 - tick:
             return None
 
-        size = float(math.floor(c.quote_size_usd / max(yes_bid, tick)))
+        quote_usd = self._size_map.get(market.id, c.quote_size_usd)
+        size = float(math.floor(quote_usd / max(yes_bid, tick)))
         size = max(size, market.rewards_min_size)  # otherwise it will not count for rewards
         if size < market.min_order_size:
             return None
@@ -300,6 +307,20 @@ class MarketMaker:
         if placed:
             self._orders[m.id] = placed
 
+    def _rewards_weighted_sizes(self, selected, books) -> dict[str, float]:
+        """Allocate the quote budget across markets by rewards score, not evenly."""
+        c = self._cfg
+        if not c.rewards_weighting or not selected:
+            return {}
+        scores = {m.id: max(self._scorer.score(m, books.get(m.clob_token_ids[0])), 0.0)
+                  for m in selected}
+        total = sum(scores.values())
+        if total <= 0:
+            return {}
+        budget = c.quote_size_usd * len(selected)     # same total, redistributed
+        lo, hi = c.quote_size_usd * 0.3, c.quote_size_usd * 3.0
+        return {mid: min(max(budget * s / total, lo), hi) for mid, s in scores.items()}
+
     # --- cycle ---
 
     def cycle(self, markets: list[Market]) -> list[Quote]:
@@ -312,6 +333,7 @@ class MarketMaker:
         books = {m.clob_token_ids[0]: self._clob.order_book(m.clob_token_ids[0])
                  for m in markets if self._scorer.eligible(m)}
         selected = self._scorer.top_markets(markets, books)
+        self._size_map = self._rewards_weighted_sizes(selected, books)
         selected_ids = {m.id for m in selected}
         for market_id in list(self._quotes) + list(self._orders):
             if market_id not in selected_ids:

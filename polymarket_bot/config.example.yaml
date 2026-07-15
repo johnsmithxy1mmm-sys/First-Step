@@ -78,6 +78,8 @@ market_maker:
   half_spread: 0.01
   quote_size_usd: 25        # AGGR: $25 per quote (was $10) — fills matter more
   inventory_skew_k: 0.5     # main risk mechanism: shift fair against inventory
+  vol_spread_k: 10.0        # MM 2.0: widen spread by 10x realized sigma (Avellaneda-Stoikov)
+  rewards_weighting: true   # MM 2.0: allocate quote size across markets by rewards score
   requote_threshold_ticks: 2  # hysteresis: do not burn rate limit or rewards sampling
   requote_timer_sec: 120
   guard_price_move: 0.03    # adverse selection: pull quotes on a shock

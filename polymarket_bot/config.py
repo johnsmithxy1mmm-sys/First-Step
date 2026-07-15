@@ -131,6 +131,9 @@ class MarketMakerConfig(BaseModel):
     half_spread: float = 0.01
     quote_size_usd: float = 10.0
     inventory_skew_k: float = 0.5      # shift fair against inventory
+    # MM 2.0 (default off = classic behavior):
+    vol_spread_k: float = 0.0          # A-S: widen half-spread by k * realized sigma
+    rewards_weighting: bool = False    # allocate quote size across markets by score
     # Requote hysteresis: excess churn eats rate limit and rewards sampling.
     requote_threshold_ticks: float = 2.0
     requote_timer_sec: float = 120.0
