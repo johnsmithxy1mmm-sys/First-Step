@@ -88,6 +88,16 @@ def test_no_fade_for_far_horizon(cfg, ledger):
     assert "too far out" in fade.reject_reason(make_estimate(p_mkt=0.05, end_date=far))
 
 
+def test_irr_planner_prefers_short_horizon(cfg, ledger):
+    """Same edge, nearer resolution -> higher IRR score -> entered first."""
+    from datetime import datetime, timedelta, timezone
+    fade, _ = make_fade(cfg, ledger)
+    now = datetime.now(timezone.utc)
+    near = make_estimate(p_mkt=0.05, end_date=now + timedelta(days=5))
+    far = make_estimate(p_mkt=0.05, end_date=now + timedelta(days=40))
+    assert fade._irr_score(near) > fade._irr_score(far)
+
+
 def test_thin_edge_rejected(cfg, ledger):
     fade, _ = make_fade(cfg, ledger)
     cfg.fade.bias_discount = 0.05        # edge = 0.05*0.05 = 0.0025 < threshold 0.005

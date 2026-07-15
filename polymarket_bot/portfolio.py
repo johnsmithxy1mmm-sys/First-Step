@@ -4,12 +4,59 @@ from __future__ import annotations
 
 import logging
 import math
+from collections import defaultdict
 
 from .config import BotConfig
 from .ledger import Ledger
 from .models import Estimate, Position, TradePlan
 
 log = logging.getLogger(__name__)
+
+
+def risk_group_key(p: Position) -> tuple[str, str]:
+    """Positions that cannot lose simultaneously share a key (netted worst-case).
+
+    In a neg-risk event exactly one outcome wins, so at most one NO leg there
+    can lose. Everything else is its own solo group.
+    """
+    if p.neg_risk and p.event_id:
+        return ("event", p.event_id)
+    return ("solo", p.token_id)
+
+
+def event_netted_exposure(positions: list[Position]) -> dict[str, float]:
+    """Worst-case USD exposure per category, netting neg-risk event baskets.
+
+    A neg-risk basket's worst case is its largest single leg (at most one loses),
+    not the sum — so self-hedged clusters stop eating the category budget.
+    """
+    groups: dict[tuple[str, str], list[Position]] = defaultdict(list)
+    for p in positions:
+        groups[risk_group_key(p)].append(p)
+    by_cat: dict[str, float] = defaultdict(float)
+    for key, ps in groups.items():
+        worst = max(p.cost_usd for p in ps) if (key[0] == "event" and len(ps) > 1) \
+            else sum(p.cost_usd for p in ps)
+        cat = max(ps, key=lambda p: p.cost_usd).category
+        by_cat[cat] += worst
+    return dict(by_cat)
+
+
+def event_exposure_breakdown(positions: list[Position]) -> list[tuple[str, int, float, float]]:
+    """Per risk-group rows for reporting: (label, legs, gross_usd, worst_case_usd)."""
+    groups: dict[tuple[str, str], list[Position]] = defaultdict(list)
+    for p in positions:
+        groups[risk_group_key(p)].append(p)
+    rows: list[tuple[str, int, float, float]] = []
+    for key, ps in groups.items():
+        gross = sum(p.cost_usd for p in ps)
+        netted = key[0] == "event" and len(ps) > 1
+        worst = max(p.cost_usd for p in ps) if netted else gross
+        label = (f"{len(ps)}x {ps[0].question[:33]}" if netted
+                 else ps[0].question[:38])
+        rows.append((label, len(ps), gross, worst))
+    rows.sort(key=lambda r: r[3], reverse=True)
+    return rows
 
 CATEGORIES = ("geopolitics", "crypto", "elections", "nature", "sports", "economy", "other")
 
@@ -118,7 +165,9 @@ class Portfolio:
         size = cfg.kelly_fraction * f_star * bankroll
         size = min(size, cfg.max_market_pct * bankroll)
 
-        exposure = self._ledger.exposure_by_category(self._mode)
+        # Event-netted category exposure: a self-hedged neg-risk basket counts
+        # as its worst-case leg, not the sum, freeing room for such clusters.
+        exposure = event_netted_exposure(self._ledger.open_positions(self._mode))
         effective = exposure.get(category, 0.0) + sum(
             correlation(category, other) * usd
             for other, usd in exposure.items() if other != category

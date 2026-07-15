@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS trades (
     order_id TEXT,
     status TEXT,
     strategy TEXT DEFAULT 'longshot', -- longshot | arb | mm
+    neg_risk INTEGER DEFAULT 0,       -- 1 = mutually-exclusive (neg-risk) event
     snapshot TEXT                     -- JSON: p_mkt, p_est, edge, signals, book
 );
 CREATE TABLE IF NOT EXISTS seen_markets (
@@ -100,7 +101,14 @@ class Ledger:
         self._lock = threading.RLock()
         with self._lock:
             self._conn.executescript(SCHEMA)
+            self._migrate()
             self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Add columns to pre-existing tables (CREATE IF NOT EXISTS won't)."""
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(trades)")}
+        if "neg_risk" not in cols:
+            self._conn.execute("ALTER TABLE trades ADD COLUMN neg_risk INTEGER DEFAULT 0")
 
     def close(self) -> None:
         with self._lock:
@@ -136,13 +144,15 @@ class Ledger:
             "signals": [s.model_dump() for s in estimate.signals],
             "book": c.book.model_dump() if c.book else None,
         }
+        neg_risk = int(bool(c.market.event_neg_risk or c.market.neg_risk))
         self._execute(
             "INSERT INTO trades (ts, mode, market_id, event_id, question, outcome, "
-            "category, token_id, side, price, size, usd, order_id, status, strategy, snapshot) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "category, token_id, side, price, size, usd, order_id, status, strategy, "
+            "neg_risk, snapshot) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (_now(), mode, c.market.id, c.market.event_id, c.market.question,
              c.outcome, category, c.token_id, side, price, size,
-             round(price * size, 6), order_id, status, strategy,
+             round(price * size, 6), order_id, status, strategy, neg_risk,
              json.dumps(snapshot, ensure_ascii=False, default=str)),
         )
 
@@ -202,7 +212,8 @@ class Ledger:
             slot = agg.setdefault(token, {
                 "size": 0.0, "cost": 0.0, "market_id": r["market_id"],
                 "question": r["question"], "outcome": r["outcome"],
-                "category": r["category"],
+                "category": r["category"], "event_id": r["event_id"] or "",
+                "neg_risk": bool(r["neg_risk"] if "neg_risk" in r.keys() else 0),
             })
             if r["side"] == "BUY":
                 slot["size"] += r["size"]
@@ -223,6 +234,7 @@ class Ledger:
                 question=slot["question"] or "", outcome=slot["outcome"] or "",
                 category=slot["category"] or "other",
                 size=slot["size"], avg_price=slot["cost"] / slot["size"],
+                event_id=slot["event_id"], neg_risk=slot["neg_risk"],
             ))
         return out
 

@@ -125,3 +125,19 @@ def print_report(report: dict) -> None:
             t.add_row(p.category, f"[{p.outcome}] {p.question[:55]}",
                       f"{p.size:,.0f}", f"{p.avg_price:.4f}", f"{p.cost_usd:,.2f}")
         c.print(t)
+
+        from .portfolio import event_exposure_breakdown
+        rows = event_exposure_breakdown(positions)
+        gross_total = sum(r[2] for r in rows)
+        worst_total = sum(r[3] for r in rows)
+        t = Table(title=f"Risk by event (gross ${gross_total:,.0f} -> "
+                        f"true worst-case ${worst_total:,.0f})")
+        for col in ("Event / market", "Legs", "Gross, $", "Worst-case, $"):
+            t.add_column(col)
+        for label, legs, gross, worst in rows[:15]:
+            t.add_row(label, str(legs), f"{gross:,.2f}", f"{worst:,.2f}")
+        c.print(t)
+        c.print("[dim]Neg-risk baskets net down: exactly one outcome wins, so at "
+                "most one NO leg loses — worst-case is the largest leg, not the "
+                "sum. The portfolio caps use this true risk, freeing room for "
+                "self-hedged clusters.[/dim]")

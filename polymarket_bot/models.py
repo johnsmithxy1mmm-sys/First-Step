@@ -265,6 +265,8 @@ class Position(BaseModel):
     category: str
     size: float
     avg_price: float
+    event_id: str = ""
+    neg_risk: bool = False       # part of a mutually-exclusive (neg-risk) event
 
     @property
     def cost_usd(self) -> float:

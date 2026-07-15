@@ -103,12 +103,20 @@ class FadeStrategy:
         return TradePlan(estimate=no_est, category=category,
                          size_usd=size, limit_price_cap=price_cap)
 
+    def _irr_score(self, est: Estimate) -> float:
+        """Fade IRR proxy: edge per day. Capital goes to the fastest recyclers."""
+        days = est.candidate.market.days_to_resolution()
+        edge = est.p_mkt * self._cfg.bias_discount     # ~fade edge on the NO side
+        return edge / max(days if days is not None else 999.0, 0.5)
+
     def cycle(self, estimates: list[Estimate]) -> int:
         """Fades overpriced tails among the scored candidates. -> entries."""
         if not self._cfg.enabled:
             return 0
         entered = 0
-        for est in estimates:
+        # IRR planner: enter shortest-horizon / highest-edge first, so the best
+        # opportunities get capital before the portfolio caps fill.
+        for est in sorted(estimates, key=self._irr_score, reverse=True):
             plan = self.plan(est)
             if plan is None:
                 continue
