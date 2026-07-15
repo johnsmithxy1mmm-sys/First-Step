@@ -432,7 +432,8 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("--mode",
                         choices=("dry-run", "paper", "live", "backtest",
-                                 "record-books", "replay", "report", "diagnose"),
+                                 "record-books", "replay", "report", "diagnose",
+                                 "autotune"),
                         default="dry-run",
                         help="dry-run -> paper -> live (manual promotion only); "
                              "backtest/record-books/replay — offline phases")
@@ -463,6 +464,19 @@ def main(argv: list[str] | None = None) -> None:
     if args.mode == "diagnose":
         from .diagnose import run_diagnose
         run_diagnose(cfg)
+        return
+
+    if args.mode == "autotune":
+        from .research import tune_edge_ratio
+        report = backtest_mod.run_backtest(cfg)
+        ranked = tune_edge_ratio(report, [1.5, 2.0, 2.5, 3.0, 4.0])
+        log.info("Walk-forward edge-ratio search (out-of-sample ROI), proposal only:")
+        for params, score in ranked:
+            log.info("  min_edge_ratio=%.1f -> mean OOS ROI %+.1f%%",
+                     params["min_edge_ratio"], score * 100)
+        if ranked:
+            log.info("Best: min_edge_ratio=%.1f (current: %.1f). Apply manually if it holds.",
+                     ranked[0][0]["min_edge_ratio"], cfg.estimator.min_edge_ratio)
         return
 
     if args.mode == "report":
