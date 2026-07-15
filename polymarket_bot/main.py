@@ -32,6 +32,7 @@ from .niche import NicheWatcher
 from .portfolio import Portfolio
 from .resolution import ResolutionAlpha
 from .risk import KillSwitch
+from .risk2 import MarketDataGuard, StrategyCircuitBreaker
 from .satellite import BTC5mSatellite
 from .scanner import Scanner
 from .smartmoney import SmartMoneyTracker
@@ -76,6 +77,9 @@ class Bot:
         self.niche = NicheWatcher(cfg, self.ledger)
         self.smart_money = SmartMoneyTracker(cfg, self.ledger, self.niche)
         self.satellite = BTC5mSatellite(cfg, self.ledger, self.clob, self.trader, mode)
+        # Risk 2.0: data-anomaly guard + per-strategy circuit breaker.
+        self.data_guard = MarketDataGuard()
+        self.breaker = StrategyCircuitBreaker()
         # Kill-switch: bulk-cancel + halt. State recovery is via reconcile.
         self.killswitch = KillSwitch(cfg, self.ledger, mode,
                                      cancel_all=self._cancel_everything, alert=alert)
@@ -118,6 +122,11 @@ class Bot:
             self._error(f"gamma: {exc}")
             return
 
+        # Risk 2.0 data guard: corrupt feed -> pause trading, don't act on it.
+        problems = self.data_guard.problems(markets)
+        if problems:
+            self.killswitch.trip_pause("market data anomaly: " + "; ".join(problems))
+
         try:
             self.niche.cycle(markets)  # #5: alerts on new markets in niches
         except Exception as exc:
@@ -147,14 +156,16 @@ class Bot:
                     qualifying.append(est)
             log.info("estimates: %d, passing edge threshold: %d", len(estimates), len(qualifying))
 
-            if not observe_only:
-                self._enter_positions(qualifying)
-                # Fade buys NO — YES-side depth (verify_depth) is irrelevant to
-                # it. Feed it candidates BEFORE the depth check; the executor
-                # checks the NO book when placing the limit order.
-                fade_candidates = self.scanner.first_level_filter(markets)
-                fade_estimates = self.estimator.estimate_all(fade_candidates, markets)
-                self.fade.cycle(fade_estimates)
+            if not observe_only and self.killswitch.trading_allowed:
+                if self.breaker.allows("longshot"):
+                    self._enter_positions(qualifying)
+                if self.breaker.allows("fade"):
+                    # Fade buys NO — YES-side depth (verify_depth) is irrelevant
+                    # to it. Feed it candidates BEFORE the depth check; the
+                    # executor checks the NO book when placing the limit order.
+                    fade_candidates = self.scanner.first_level_filter(markets)
+                    fade_estimates = self.estimator.estimate_all(fade_candidates, markets)
+                    self.fade.cycle(fade_estimates)
                 self._exit_positions(marks)
         except Exception as exc:
             self._error(f"cycle: {exc}")
@@ -273,7 +284,8 @@ class Bot:
         try:
             if self.ws is not None and self.ws.healthy:
                 self.killswitch.on_ws_recovered()
-            if not self.killswitch.trading_allowed or self.portfolio.observe_only():
+            if not self.killswitch.trading_allowed or self.portfolio.observe_only() \
+                    or not self.breaker.allows("mm"):
                 self.mm.shutdown()
                 return
             quotes = self.mm.cycle(self.markets_cache)
@@ -317,6 +329,11 @@ class Bot:
                                 for o in self.trader.open_orders()}
                 exchange_ids.discard("")
                 self.killswitch.reconcile(self.mm.local_order_ids(), exchange_ids)
+            # Per-strategy circuit breaker: a losing streak disables that strategy.
+            was = set(self.breaker.disabled)
+            self.breaker.update(self.ledger.realized_pnl_by_strategy(self.mode))
+            for s in self.breaker.disabled - was:
+                alert(f"CIRCUIT BREAKER: strategy '{s}' disabled after a losing streak.")
         except Exception:
             log.exception("risk job")
 
@@ -345,7 +362,7 @@ class Bot:
 
     def resolution_job(self) -> None:
         """#Resolution alpha: near-riskless carry on effectively-decided markets."""
-        if not self.markets_cache:
+        if not self.markets_cache or not self.breaker.allows("resolution"):
             return
         try:
             self.resolution.cycle(self.markets_cache)

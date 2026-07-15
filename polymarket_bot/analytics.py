@@ -41,7 +41,13 @@ def compute_report(ledger: Ledger, mode: str) -> dict:
         "markouts": ledger.markout_stats(mode),
         "positions": ledger.open_positions(mode),
         "learned_bias": _learned_bias(ledger, mode),
+        "stress": _stress(ledger.open_positions(mode)),
     }
+
+
+def _stress(positions) -> dict:
+    from .risk2 import portfolio_stress
+    return portfolio_stress(positions)
 
 
 def _learned_bias(ledger: Ledger, mode: str) -> list[dict]:
@@ -148,6 +154,13 @@ def print_report(report: dict) -> None:
                 "most one NO leg loses — worst-case is the largest leg, not the "
                 "sum. The portfolio caps use this true risk, freeing room for "
                 "self-hedged clusters.[/dim]")
+
+    st = report.get("stress") or {}
+    if st.get("gross_usd"):
+        c.print(f"[bold]Risk:[/bold] gross ${st['gross_usd']:,.0f} | "
+                f"true worst-case ${st['worst_case_usd']:,.0f} | "
+                f"largest event ${st['largest_event_usd']:,.0f} | "
+                f"VaR95 ~${st['var95_usd']:,.0f}")
 
     learned = report.get("learned_bias") or []
     if learned:
