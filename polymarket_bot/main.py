@@ -33,9 +33,10 @@ from .portfolio import Portfolio
 from .resolution import ResolutionAlpha
 from .risk import KillSwitch
 from .risk2 import MarketDataGuard, StrategyCircuitBreaker
+from .ruleslawyer import RulesLawyer
 from .satellite import BTC5mSatellite
 from .scanner import Scanner
-from .smartmoney import SmartMoneyTracker
+from .smartmoney import SmartMoneySignal, SmartMoneyTracker
 from .ws_feed import WSFeed
 
 log = logging.getLogger(__name__)
@@ -48,7 +49,10 @@ class Bot:
         self.gamma = GammaClient(cfg)
         self.clob = ClobReader(cfg)
         self.scanner = Scanner(cfg, self.clob)
-        self.estimator = Estimator(cfg)
+        # Smart-money signal (iteration 7): fed into the ensemble when enabled.
+        self.smart_signal = SmartMoneySignal(cfg.smart_money.signal_max_confidence)
+        self.estimator = Estimator(
+            cfg, extra_signals=[self.smart_signal] if cfg.smart_money.as_signal else None)
         self.ledger = Ledger(cfg.runtime.db_path)
         self.portfolio = Portfolio(cfg, self.ledger, mode)
         self.trader = Trader(cfg) if mode == "live" else None
@@ -76,6 +80,7 @@ class Bot:
         self.cross = CrossMarketScanner(cfg)
         self.niche = NicheWatcher(cfg, self.ledger)
         self.smart_money = SmartMoneyTracker(cfg, self.ledger, self.niche)
+        self.rules_lawyer = RulesLawyer(cfg, self.ledger)
         self.satellite = BTC5mSatellite(cfg, self.ledger, self.clob, self.trader, mode)
         # Risk 2.0: data-anomaly guard + per-strategy circuit breaker.
         self.data_guard = MarketDataGuard()
@@ -310,11 +315,22 @@ class Bot:
             log.exception("satellite job")
 
     def smart_money_job(self) -> None:
-        """#5: alerts when strong wallets enter a market."""
+        """#5: alerts when strong wallets enter a market; refresh the signal."""
         try:
             self.smart_money.cycle()
+            if self.cfg.smart_money.as_signal:
+                self.smart_signal.set_hot(self.smart_money.build_hot_tokens())
         except Exception:
             log.exception("smart-money job")
+
+    def rules_lawyer_job(self) -> None:
+        """#4: LLM flags headline-vs-rules discrepancies on fresh liquid markets."""
+        if not self.markets_cache:
+            return
+        try:
+            self.rules_lawyer.cycle(self.markets_cache)
+        except Exception:
+            log.exception("rules-lawyer job")
 
     def risk_job(self) -> None:
         """Kill-switch checks: daily stop, drawdown, reconcile with the exchange."""
@@ -532,6 +548,9 @@ def main(argv: list[str] | None = None) -> None:
     if cfg.resolution.enabled:
         scheduler.add_job(bot.resolution_job, "interval",
                           seconds=cfg.resolution.interval_sec,
+                          max_instances=1, coalesce=True)
+    if cfg.ruleslawyer.enabled:
+        scheduler.add_job(bot.rules_lawyer_job, "interval", minutes=20,
                           max_instances=1, coalesce=True)
     scheduler.add_job(bot.risk_job, "interval",
                       seconds=cfg.risk.reconcile_interval_sec,

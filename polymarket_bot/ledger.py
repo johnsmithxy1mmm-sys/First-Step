@@ -45,6 +45,10 @@ CREATE TABLE IF NOT EXISTS smart_money_seen (
     key TEXT PRIMARY KEY,             -- wallet:asset — a position already alerted on
     ts TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS rules_seen (
+    market_id TEXT PRIMARY KEY,       -- market already analyzed by the rules lawyer
+    ts TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS estimates (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts TEXT NOT NULL,
@@ -189,6 +193,14 @@ class Ledger:
         self._executemany(
             "INSERT OR IGNORE INTO smart_money_seen (key, ts) VALUES (?, ?)",
             [(k, _now()) for k in keys])
+
+    def seen_rules_ids(self) -> set[str]:
+        return {r["market_id"] for r in self._query("SELECT market_id FROM rules_seen")}
+
+    def mark_rules_seen(self, market_ids: list[str]) -> None:
+        self._executemany(
+            "INSERT OR IGNORE INTO rules_seen (market_id, ts) VALUES (?, ?)",
+            [(mid, _now()) for mid in market_ids])
 
     def snapshot_bank(self, cash: float, exposure: float) -> None:
         equity = cash + exposure

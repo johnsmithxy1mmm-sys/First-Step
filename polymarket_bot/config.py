@@ -124,6 +124,15 @@ class ResolutionConfig(BaseModel):
     max_alerts_per_cycle: int = 10
 
 
+class RulesLawyerConfig(BaseModel):
+    """Strategy #4 support: LLM compares the headline with the resolution rules."""
+    enabled: bool = False
+    model: str = "claude-sonnet-5"
+    max_calls_per_cycle: int = 5
+    min_volume_24h_usd: float = 20_000.0
+    max_tokens: int = 512
+
+
 class ArbitrageConfig(BaseModel):
     """Strategy #1: structural arbitrage of neg-risk baskets (YES and NO)."""
     enabled: bool = True
@@ -270,6 +279,9 @@ class SmartMoneyConfig(BaseModel):
     min_position_usd: float = 50.0     # ignore dust
     tail_max_price: float = 0.10       # entry cheaper than this — flag as a tail
     only_niche_or_tail: bool = False   # true = alert only on niche/tail
+    as_signal: bool = False            # feed strong-wallet entries into the ensemble
+    signal_max_confidence: float = 0.40  # cap on the smart-money signal weight
+    signal_min_pnl_usd: float = 1_000.0  # wallet needs this realized PnL to count
 
 
 class RuntimeConfig(BaseModel):
@@ -296,6 +308,7 @@ class BotConfig(BaseModel):
     executor: ExecutorConfig = Field(default_factory=ExecutorConfig)
     arbitrage: ArbitrageConfig = Field(default_factory=ArbitrageConfig)
     resolution: ResolutionConfig = Field(default_factory=ResolutionConfig)
+    ruleslawyer: RulesLawyerConfig = Field(default_factory=RulesLawyerConfig)
     fade: FadeConfig = Field(default_factory=FadeConfig)
     market_maker: MarketMakerConfig = Field(default_factory=MarketMakerConfig)
     risk: RiskLimitsConfig = Field(default_factory=RiskLimitsConfig)

@@ -16,11 +16,15 @@ log = logging.getLogger(__name__)
 
 
 class Estimator:
-    def __init__(self, cfg: BotConfig, llm: LLMSignal | None = None):
+    def __init__(self, cfg: BotConfig, llm: LLMSignal | None = None,
+                 extra_signals: list | None = None):
         self._cfg = cfg
         self._base_rates = BaseRatesSignal(load_base_rates(cfg.base_rates_path()))
         self._momentum = MomentumSignal()
         self._llm = llm if llm is not None else LLMSignal(cfg)
+        # Extra signal sources with an .evaluate(candidate) -> Signal|None method
+        # (e.g. the smart-money signal). Each contributes to the ensemble.
+        self._extra = extra_signals or []
 
     def estimate_all(self, candidates: list[Candidate],
                      all_markets: list[Market]) -> list[Estimate]:
@@ -31,12 +35,14 @@ class Estimator:
         estimates: list[Estimate] = []
         for c in candidates:
             signals = []
-            for producer in (
+            producers = [
                 lambda: coherence.evaluate(c),          # priority #1
                 lambda: self._base_rates.evaluate(c),
                 lambda: self._momentum.evaluate(c),
                 lambda: self._llm.evaluate(c),
-            ):
+            ]
+            producers += [(lambda s=s: s.evaluate(c)) for s in self._extra]
+            for producer in producers:
                 try:
                     signal = producer()
                 except Exception as exc:  # one signal must not break the estimate

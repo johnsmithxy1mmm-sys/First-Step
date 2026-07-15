@@ -24,10 +24,37 @@ from pydantic import BaseModel
 from .config import BotConfig
 from .http_client import get_with_backoff, make_client
 from .ledger import Ledger
+from .models import Candidate, Signal
 from .monitor import alert
 from .niche import NicheWatcher
 
 log = logging.getLogger(__name__)
+
+
+class SmartMoneySignal:
+    """Ensemble signal: a profitable watched wallet holding a tail nudges p_est up.
+
+    Not blind copying — a bounded contribution to the estimate, weighted by the
+    wallet's realized PnL. Hot-token map is refreshed by the smart-money tracker.
+    """
+
+    name = "smart_money"
+
+    def __init__(self, max_confidence: float = 0.40):
+        self._max = max_confidence
+        self._hot: dict[str, float] = {}     # token_id -> confidence
+
+    def set_hot(self, hot: dict[str, float]) -> None:
+        self._hot = hot
+
+    def evaluate(self, candidate: Candidate) -> Signal | None:
+        conf = self._hot.get(candidate.token_id)
+        if not conf:
+            return None
+        p_est = min(candidate.p_mkt * 1.5, 0.999)   # they see value the crowd doesn't
+        return Signal(name=self.name, p_est=p_est,
+                      confidence=min(conf, self._max),
+                      rationale="a profitable watched wallet holds this token")
 
 
 class WalletPosition(BaseModel):
@@ -134,3 +161,20 @@ class SmartMoneyTracker:
         if fresh_keys:
             self._ledger.mark_smart_money_seen(fresh_keys)
         return alerted
+
+    def build_hot_tokens(self) -> dict[str, float]:
+        """{token_id: confidence} for tails held by profitable watched wallets."""
+        if not self._cfg.as_signal or not self._cfg.watch_wallets:
+            return {}
+        hot: dict[str, float] = {}
+        for wallet in self._cfg.watch_wallets:
+            positions = self.fetch_positions(wallet)
+            wallet_pnl = sum(p.cash_pnl for p in positions)
+            if wallet_pnl < self._cfg.signal_min_pnl_usd:
+                continue
+            weight = min(self._cfg.signal_max_confidence,
+                         0.10 + (wallet_pnl / 50_000.0) * 0.30)
+            for p in positions:
+                if self._is_tail(p) and p.usd >= self._cfg.min_position_usd:
+                    hot[p.asset] = max(hot.get(p.asset, 0.0), weight)
+        return hot
