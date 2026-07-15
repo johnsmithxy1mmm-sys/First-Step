@@ -79,6 +79,15 @@ def test_no_fade_above_max_price(cfg, ledger):
     assert fade.plan(make_estimate(p_mkt=0.30, p_est=None)) is None    # not a tail
 
 
+def test_no_fade_for_far_horizon(cfg, ledger):
+    """Distant resolution -> tiny IRR; fade only near-term tails."""
+    from datetime import datetime, timedelta, timezone
+    fade, _ = make_fade(cfg, ledger)
+    far = datetime.now(timezone.utc) + timedelta(days=200)
+    assert fade.plan(make_estimate(p_mkt=0.05, end_date=far)) is None
+    assert "too far out" in fade.reject_reason(make_estimate(p_mkt=0.05, end_date=far))
+
+
 def test_thin_edge_rejected(cfg, ledger):
     fade, _ = make_fade(cfg, ledger)
     cfg.fade.bias_discount = 0.05        # edge = 0.05*0.05 = 0.0025 < threshold 0.005

@@ -96,6 +96,10 @@ class FadeConfig(BaseModel):
     # threshold the longshot strategy BUYS Yes on), don't fade against our own
     # signal. A slight drift of p_est above market is anchor noise, no obstacle.
     longshot_veto_ratio: float = 2.0
+    # Horizon cap: only fade tails resolving within this many days. The fade edge
+    # (~bias) is fixed per bet, so a distant resolution means a tiny IRR (capital
+    # locked for months to earn a few %). Near-term tails recycle capital fast.
+    max_days_to_resolution: float = 45.0
 
 
 class ArbitrageConfig(BaseModel):

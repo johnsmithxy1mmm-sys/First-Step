@@ -54,6 +54,11 @@ class FadeStrategy:
             return f"tail price outside [{cfg.min_tail_price}, {cfg.fade_max_price}]"
         if c.outcome_index not in (0, 1) or len(c.market.clob_token_ids) < 2:
             return "not a binary market"
+        # Near-term only: the fade edge is fixed per bet, so a distant resolution
+        # means a tiny IRR (capital locked for months). Recycle capital fast.
+        days = c.market.days_to_resolution()
+        if days is None or days > cfg.max_days_to_resolution:
+            return "resolution too far out"
         # If the estimator sees a REAL longshot (p_est >= ratio * p_mkt, the same
         # threshold the longshot strategy BUYS Yes on), don't fade our own signal.
         if estimate.p_est >= p_mkt_yes * cfg.longshot_veto_ratio:
