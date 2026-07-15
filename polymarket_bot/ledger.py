@@ -373,6 +373,30 @@ class Ledger:
             "ORDER BY t.strategy, m.horizon_sec", (mode,))
         return [dict(r) for r in rows]
 
+    def markout_by_market(self, mode: str, horizon_sec: int) -> dict[str, tuple[float, int]]:
+        """{market_id: (avg_markout, n)} at a horizon — MM adverse-selection feedback."""
+        rows = self._query(
+            "SELECT t.market_id, AVG(m.markout) AS avg_m, COUNT(*) AS n "
+            "FROM markouts m JOIN trades t ON t.id = m.trade_id "
+            "WHERE t.mode = ? AND m.horizon_sec = ? GROUP BY t.market_id",
+            (mode, horizon_sec))
+        return {r["market_id"]: (float(r["avg_m"] or 0.0), int(r["n"])) for r in rows}
+
+    def resolved_for_calibration(self, mode: str, strategy: str) -> list[dict]:
+        """Resolved BUYs of a strategy: {category, p_mkt (entry), won} for learning."""
+        rows = self._query(
+            "SELECT t.category, t.snapshot, r.won FROM trades t "
+            "JOIN resolutions r ON r.token_id = t.token_id "
+            "WHERE t.mode = ? AND t.strategy = ? AND t.side = 'BUY' "
+            "AND t.status != 'failed'", (mode, strategy))
+        out: list[dict] = []
+        for r in rows:
+            snap = json.loads(r["snapshot"] or "{}")
+            out.append({"category": r["category"] or "other",
+                        "p_mkt": float(snap.get("p_mkt", 0.0)),
+                        "won": bool(r["won"])})
+        return out
+
     def bank_series(self) -> list[dict]:
         return [dict(r) for r in self._query(
             "SELECT ts, equity, hwm FROM bank ORDER BY id")]

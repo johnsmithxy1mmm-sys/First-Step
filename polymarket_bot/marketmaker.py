@@ -76,9 +76,10 @@ class TrackedOrder(BaseModel):
 class MarketMaker:
     def __init__(self, cfg: BotConfig, ledger: Ledger, clob: ClobReader,
                  trader: Trader | None, mode: str,
-                 top_source=None):
+                 top_source=None, feedback=None):
         """top_source: callable(token_id) -> TopOfBook | None (WS feed);
-        without it the top of book is taken from REST."""
+        without it the top of book is taken from REST.
+        feedback: MarkoutFeedback | None — per-market spread multiplier."""
         self._cfg = cfg.market_maker
         self._risk = cfg.risk
         self._fees = FeeModel(cfg.fees)
@@ -88,10 +89,19 @@ class MarketMaker:
         self._trader = trader
         self._mode = mode
         self._top_source = top_source
+        self._feedback = feedback
         self._last_mid: dict[str, float] = {}
         self._cooldown: dict[str, int] = {}
         self._quotes: dict[str, Quote] = {}          # active quotes (all modes)
         self._orders: dict[str, list[TrackedOrder]] = {}  # live orders per market
+
+    def _spread_mult(self, market_id: str) -> float:
+        return self._feedback.multiplier(market_id) if self._feedback is not None else 1.0
+
+    def refresh_feedback(self, horizon_sec: int = 60) -> None:
+        """Refit the markout feedback from the ledger (called by a job)."""
+        if self._feedback is not None:
+            self._feedback.fit(self._ledger.markout_by_market(self._mode, horizon_sec))
 
     # --- data sources ---
 
@@ -123,10 +133,11 @@ class MarketMaker:
         fair -= skew * max(c.half_spread, tick)
 
         # Half-spread: inside the rewards band, but not below fee break-even.
+        # Widened where realized markout says we get adversely selected.
         category = classify_category(market.question, market.category)
         min_half = self._fees.mm_min_half_spread(
             category, market.category, self._risk.min_edge_after_fees)
-        half = max(c.half_spread, min_half, tick)
+        half = max(c.half_spread * self._spread_mult(market.id), min_half, tick)
         if market.in_rewards_program:
             half = min(half, market.rewards_max_spread * 0.9)
             if half < max(min_half, tick):

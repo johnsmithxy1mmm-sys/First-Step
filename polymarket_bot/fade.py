@@ -34,12 +34,24 @@ log = logging.getLogger(__name__)
 
 class FadeStrategy:
     def __init__(self, cfg: BotConfig, ledger: Ledger, portfolio: Portfolio,
-                 executor: Executor, mode: str):
+                 executor: Executor, mode: str, calibrator=None):
         self._cfg = cfg.fade
         self._ledger = ledger
         self._portfolio = portfolio
         self._executor = executor
         self._mode = mode
+        self._calibrator = calibrator     # TailBiasCalibrator | None
+
+    def _bias(self, category: str, p_mkt_yes: float) -> float:
+        """Learned bias_discount for this bucket, or the config prior."""
+        if self._calibrator is not None:
+            return self._calibrator.bias(category, p_mkt_yes)
+        return self._cfg.bias_discount
+
+    def refresh_calibration(self) -> None:
+        """Refit the bias calibrator from resolved fade tails (called by a job)."""
+        if self._calibrator is not None:
+            self._calibrator.fit(self._ledger.resolved_for_calibration(self._mode, "fade"))
 
     def reject_reason(self, estimate: Estimate) -> str | None:
         """None = the tail is fadeable; else the reject reason (for diagnostics).
@@ -63,7 +75,8 @@ class FadeStrategy:
         # threshold the longshot strategy BUYS Yes on), don't fade our own signal.
         if estimate.p_est >= p_mkt_yes * cfg.longshot_veto_ratio:
             return "estimator sees a real longshot"
-        p_fair_yes = min(estimate.p_est, p_mkt_yes * (1.0 - cfg.bias_discount))
+        category = classify_category(c.market.question, c.market.category)
+        p_fair_yes = min(estimate.p_est, p_mkt_yes * (1.0 - self._bias(category, p_mkt_yes)))
         edge = (1.0 - p_fair_yes) - (1.0 - p_mkt_yes)   # = p_mkt_yes - p_fair_yes
         if edge < cfg.min_edge_after_fees:
             return "edge below min after fees"
@@ -79,14 +92,14 @@ class FadeStrategy:
         market = c.market
         p_mkt_yes = estimate.p_mkt
 
-        # Fair Yes probability with the systematic bias correction.
-        p_fair_yes = min(estimate.p_est, p_mkt_yes * (1.0 - cfg.bias_discount))
+        category = classify_category(market.question, market.category)
+        # Fair Yes probability with the (learned or prior) systematic bias.
+        p_fair_yes = min(estimate.p_est, p_mkt_yes * (1.0 - self._bias(category, p_mkt_yes)))
         p_fair_no = 1.0 - p_fair_yes
         entry_no = 1.0 - p_mkt_yes                    # market price of No
         no_index = 1 - c.outcome_index
         no_token = market.clob_token_ids[no_index]
 
-        category = classify_category(market.question, market.category)
         size = self._portfolio.size_usd(category, p_fair_no, entry_no,
                                         market.min_order_size * entry_no)
         if size is None:

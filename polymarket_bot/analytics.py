@@ -40,7 +40,14 @@ def compute_report(ledger: Ledger, mode: str) -> dict:
         "estimates": ledger.estimates_summary(),
         "markouts": ledger.markout_stats(mode),
         "positions": ledger.open_positions(mode),
+        "learned_bias": _learned_bias(ledger, mode),
     }
+
+
+def _learned_bias(ledger: Ledger, mode: str) -> list[dict]:
+    from .calibration import TailBiasCalibrator
+    return TailBiasCalibrator().fit(
+        ledger.resolved_for_calibration(mode, "fade")).summary()
 
 
 def print_report(report: dict) -> None:
@@ -141,3 +148,16 @@ def print_report(report: dict) -> None:
                 "most one NO leg loses — worst-case is the largest leg, not the "
                 "sum. The portfolio caps use this true risk, freeing room for "
                 "self-hedged clusters.[/dim]")
+
+    learned = report.get("learned_bias") or []
+    if learned:
+        t = Table(title="Learned fade bias (from resolutions)")
+        for col in ("Category", "Price bucket", "N", "Learned bias"):
+            t.add_column(col, justify="right")
+        for row in learned:
+            t.add_row(row["category"], f"{row['price_bucket']:.3f}",
+                      str(row["n"]), f"{row['learned_bias']:.3f}")
+        c.print(t)
+        c.print("[dim]bias_discount is no longer a constant — it is the empirical "
+                "tail-overpricing per bucket, shrunk toward the prior on small "
+                "samples.[/dim]")

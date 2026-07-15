@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 
 from . import backtest as backtest_mod
 from .arbitrage import ArbitrageScanner
+from .calibration import MarkoutFeedback, TailBiasCalibrator
 from .clob import ClobReader, Trader
 from .config import BotConfig
 from .crossmarket import CrossMarketScanner
@@ -50,7 +51,11 @@ class Bot:
         self.portfolio = Portfolio(cfg, self.ledger, mode)
         self.trader = Trader(cfg) if mode == "live" else None
         self.executor = Executor(cfg, self.ledger, self.clob, self.trader, mode)
-        self.fade = FadeStrategy(cfg, self.ledger, self.portfolio, self.executor, mode)
+        # Self-calibration: learned from resolutions/markout, refreshed by a job.
+        self.bias_calibrator = TailBiasCalibrator(prior=cfg.fade.bias_discount)
+        self.markout_feedback = MarkoutFeedback()
+        self.fade = FadeStrategy(cfg, self.ledger, self.portfolio, self.executor, mode,
+                                 calibrator=self.bias_calibrator)
         self.dashboard = Dashboard()
         self.errors: list[str] = []
         # WS order-book feed: "instant" for MM and exits; gap-detect -> kill-switch.
@@ -63,7 +68,8 @@ class Bot:
         # Strategies: MM core, arbitrage alerts, cross-platform, niches, satellite.
         self.arb = ArbitrageScanner(cfg, self.ledger, self.clob, self.trader, mode)
         self.mm = MarketMaker(cfg, self.ledger, self.clob, self.trader, mode,
-                              top_source=(self.ws.top if self.ws else None))
+                              top_source=(self.ws.top if self.ws else None),
+                              feedback=self.markout_feedback)
         self.cross = CrossMarketScanner(cfg)
         self.niche = NicheWatcher(cfg, self.ledger)
         self.smart_money = SmartMoneyTracker(cfg, self.ledger, self.niche)
@@ -335,6 +341,14 @@ class Bot:
         except Exception:
             log.exception("markout job")
 
+    def calibration_job(self) -> None:
+        """Refit the self-calibrators from the ledger (fade bias, MM markout)."""
+        try:
+            self.fade.refresh_calibration()
+            self.mm.refresh_feedback()
+        except Exception:
+            log.exception("calibration job")
+
     def digest_job(self) -> None:
         """Telegram digest: PnL, inventory, per-strategy attribution."""
         try:
@@ -494,7 +508,10 @@ def main(argv: list[str] | None = None) -> None:
                       max_instances=1, coalesce=True)
     scheduler.add_job(bot.markout_job, "interval", seconds=30,
                       max_instances=1, coalesce=True)
+    scheduler.add_job(bot.calibration_job, "interval", minutes=30,
+                      max_instances=1, coalesce=True)
     scheduler.start()
+    bot.calibration_job()  # warm the calibrators from any prior data
     bot.cycle()  # first cycle immediately
 
     stop_event.wait()
