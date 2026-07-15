@@ -150,9 +150,33 @@ LLM would leak future knowledge).
   and is read exclusively from `.env`.
 - Polymarket's jurisdictional restrictions are your responsibility.
 
+## v2: event-driven, self-calibrating, portfolio-aware
+
+Beyond the base strategies, the bot has a second layer that makes it react
+faster, learn from itself, and understand its own risk:
+
+| Area | Module | What it does |
+|---|---|---|
+| Event-driven core | `ws_feed.py` + `main.on_tick` | WS ticks drive instant take-profit exits and per-market MM reprices (ms, not up to 30s); scheduler keeps the slow work |
+| Self-calibration | `calibration.py` | fade `bias_discount` learned per (category, price) from resolutions; per-market MM spread widened by realized markout; Platt recalibration of p_est |
+| Event-aware portfolio | `portfolio.py` | a neg-risk basket's risk is its largest leg, not the sum (freeing room for self-hedged clusters); fade IRR planner (edge ÷ days) |
+| MM 2.0 | `microstructure.py`, `marketmaker.py` | volatility-scaled spread/skew (Avellaneda-Stoikov), queue/fill-probability model, rewards-weighted quote sizing |
+| Resolution alpha | `resolution.py` | near-riskless carry on effectively-decided markets, fee + UMA-dispute reserved |
+| LLM rules lawyer | `ruleslawyer.py` | Claude compares headline vs the letter of the rules, flags exploitable gaps |
+| Smart money | `smartmoney.py` | a profitable watched wallet's tail entry becomes a bounded ensemble signal |
+| Risk 2.0 | `risk2.py` | portfolio stress + VaR, market-data anomaly guard, per-strategy circuit breaker |
+| Research | `research.py` | realistic queue/trade-through fill sim, Sharpe allocation, walk-forward tuning (`--mode autotune`, proposal only) |
+| Ops | `ops.py`, `Dockerfile` | Prometheus `/metrics` + `/health`, SIGHUP config hot-reload, docker-compose (bot + Prometheus) |
+
+All of these default OFF or to the prior behavior; the aggressive
+`config.example.yaml` profile enables the sound ones. Extra CLI modes:
+`--mode diagnose` (selection funnels incl. fade & resolution), `--mode report`
+(PnL, markout, learned bias, event risk, VaR), `--mode autotune`.
+
 ## Tests
 
 ```bash
-pytest polymarket_bot/tests/ -q     # offline tests: edge filter, Kelly,
-                                    # coherence, idempotency, ledger, fade, MM, ...
+pytest polymarket_bot/tests/ -q     # 177 offline tests: edge filter, Kelly,
+                                    # coherence, idempotency, ledger, fade, MM,
+                                    # calibration, netting, resolution, risk2, ...
 ```
