@@ -69,6 +69,7 @@ class Bot:
         self.ws: WSFeed | None = None
         if cfg.ws.enabled:
             self.ws = WSFeed(cfg.ws.url,
+                             on_update=self.on_tick,   # event-driven fastlane
                              on_disconnect=self._on_ws_disconnect,
                              staleness_kill_sec=cfg.risk.ws_staleness_kill_sec,
                              ping_interval_sec=cfg.ws.ping_interval_sec)
@@ -92,6 +93,7 @@ class Bot:
         # Active-markets cache: refreshed by the main cycle; fast strategies take
         # metadata from here and exact prices from WS / live order books.
         self.markets_cache: list[Market] = []
+        self._position_tokens: set[str] = set()   # cheap WS-tick membership check
 
     def metrics_snapshot(self) -> dict:
         """Live state for /metrics and /health (never raises)."""
@@ -159,6 +161,7 @@ class Bot:
 
         # Marks for open positions (needed for equity/drawdown/exits).
         positions = self.ledger.open_positions(self.mode)
+        self._position_tokens = {p.token_id for p in positions}
         for p in positions:
             book = self.clob.order_book(p.token_id)
             if book is not None and book.best_bid > 0:
@@ -228,26 +231,46 @@ class Bot:
     def _exit_positions(self, marks: dict[str, float]) -> None:
         for position in self.ledger.open_positions(self.mode):
             mark = marks.get(position.token_id)
-            if not mark:
-                continue
-            exit_plan = self.portfolio.exit_plan(position, mark)
-            if exit_plan is None:
-                continue
-            size, min_price = exit_plan
-            # A pseudo-estimate is enough to sell: the executor reads price from the book.
-            from .models import Candidate
-            est = Estimate(
-                candidate=Candidate(
-                    market=self._market_stub(position),
-                    outcome_index=0, token_id=position.token_id, p_mkt=mark),
-                p_mkt=mark, p_est=mark, signals=[],
-            )
-            result = self.executor.execute_sell(est_to_plan(est, position.category), size, min_price)
-            if result.status == "filled":
-                msg = (f"TAKE-PROFIT [{self.mode}] sold {size:,.0f} at {result.avg_price:.4f} "
-                       f"(entry {position.avg_price:.4f}) — {position.question[:60]}")
-                log.info(msg)
-                alert(msg)
+            if mark:
+                self._exit_one(position, mark)
+
+    def _exit_one(self, position, mark: float) -> bool:
+        """Take-profit a single position at `mark` (used by the cycle and WS fastlane)."""
+        exit_plan = self.portfolio.exit_plan(position, mark)
+        if exit_plan is None:
+            return False
+        size, min_price = exit_plan
+        # A pseudo-estimate is enough to sell: the executor reads price from the book.
+        from .models import Candidate
+        est = Estimate(
+            candidate=Candidate(
+                market=self._market_stub(position),
+                outcome_index=0, token_id=position.token_id, p_mkt=mark),
+            p_mkt=mark, p_est=mark, signals=[],
+        )
+        result = self.executor.execute_sell(est_to_plan(est, position.category), size, min_price)
+        if result.status == "filled":
+            msg = (f"TAKE-PROFIT [{self.mode}] sold {size:,.0f} at {result.avg_price:.4f} "
+                   f"(entry {position.avg_price:.4f}) — {position.question[:60]}")
+            log.info(msg)
+            alert(msg)
+            return True
+        return False
+
+    def on_tick(self, token: str, top) -> None:
+        """WS fastlane (<1s): instant take-profit exits and MM reprice on a tick."""
+        try:
+            if not self.killswitch.trading_allowed:
+                return
+            if token in self._position_tokens and top.bid > 0:
+                for p in self.ledger.open_positions(self.mode):
+                    if p.token_id == token:
+                        self._exit_one(p, top.bid)
+                        break
+            if not self.portfolio.observe_only() and self.breaker.allows("mm"):
+                self.mm.react_to_tick(token, top)
+        except Exception:
+            log.exception("on_tick")
 
     def _market_stub(self, position):
         from .models import Market

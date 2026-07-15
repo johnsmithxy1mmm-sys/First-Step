@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 import time
 
 from pydantic import BaseModel
@@ -97,6 +98,8 @@ class MarketMaker:
         self._cooldown: dict[str, int] = {}
         self._quotes: dict[str, Quote] = {}          # active quotes (all modes)
         self._orders: dict[str, list[TrackedOrder]] = {}  # live orders per market
+        self._quoted: dict[str, Market] = {}         # token_id -> quoted market (WS reprice)
+        self._lock = threading.RLock()               # cycle vs WS-tick react
 
     def _spread_mult(self, market_id: str) -> float:
         return self._feedback.multiplier(market_id) if self._feedback is not None else 1.0
@@ -326,52 +329,75 @@ class MarketMaker:
     def cycle(self, markets: list[Market]) -> list[Quote]:
         if not self._cfg.enabled:
             return []
-        self._sync_live_fills()
-        if self._mode == "paper":
-            self._paper_fills()
+        with self._lock:
+            self._sync_live_fills()
+            if self._mode == "paper":
+                self._paper_fills()
 
-        books = {m.clob_token_ids[0]: self._clob.order_book(m.clob_token_ids[0])
-                 for m in markets if self._scorer.eligible(m)}
-        selected = self._scorer.top_markets(markets, books)
-        self._size_map = self._rewards_weighted_sizes(selected, books)
-        selected_ids = {m.id for m in selected}
-        for market_id in list(self._quotes) + list(self._orders):
-            if market_id not in selected_ids:
-                self._cancel_market(market_id)
+            books = {m.clob_token_ids[0]: self._clob.order_book(m.clob_token_ids[0])
+                     for m in markets if self._scorer.eligible(m)}
+            selected = self._scorer.top_markets(markets, books)
+            self._size_map = self._rewards_weighted_sizes(selected, books)
+            selected_ids = {m.id for m in selected}
+            for market_id in list(self._quotes) + list(self._orders):
+                if market_id not in selected_ids:
+                    self._cancel_market(market_id)
 
-        active: list[Quote] = []
-        for market in selected:
-            top = self._top(market.clob_token_ids[0])
-            if top is None:
-                continue
-            if self.guard_blocks(market, top):
-                self._cancel_market(market.id)
-                continue
-            if not self.needs_requote(market, top):
-                current = self._quotes.get(market.id)
-                if current is not None:
-                    active.append(current)
-                continue
+            active: list[Quote] = []
+            self._quoted = {}
+            for market in selected:
+                top = self._top(market.clob_token_ids[0])
+                if top is None:
+                    continue
+                quote = self._requote_market(market, top)
+                if quote is not None:
+                    active.append(quote)
+                    for tok in market.clob_token_ids[:2]:   # for WS-tick reprice
+                        self._quoted[tok] = market
+            return active
 
-            quote = self.compute_quote(market, top)
-            quote_yes, quote_no = self.sides_allowed(market)
-            mid = top.mid
-            # Extreme midpoint: a two-sided quote is required for rewards; we do
-            # not place a one-sided quote — leave the market.
-            if (mid < 0.10 or mid > 0.90) and not (quote_yes and quote_no):
-                self._cancel_market(market.id)
-                continue
-            if quote is None or not (quote_yes or quote_no):
-                self._cancel_market(market.id)
-                continue
+    def _requote_market(self, market: Market, top: TopOfBook) -> Quote | None:
+        """One market's quote decision (shared by the cycle and the WS fastlane)."""
+        if self.guard_blocks(market, top):
             self._cancel_market(market.id)
-            self._place(quote, quote_yes, quote_no)
-            active.append(quote)
-        return active
+            return None
+        if not self.needs_requote(market, top):
+            return self._quotes.get(market.id)
+
+        quote = self.compute_quote(market, top)
+        quote_yes, quote_no = self.sides_allowed(market)
+        mid = top.mid
+        # Extreme midpoint: a two-sided quote is required for rewards; skip one-sided.
+        if (mid < 0.10 or mid > 0.90) and not (quote_yes and quote_no):
+            self._cancel_market(market.id)
+            return None
+        if quote is None or not (quote_yes or quote_no):
+            self._cancel_market(market.id)
+            return None
+        self._cancel_market(market.id)
+        self._place(quote, quote_yes, quote_no)
+        return quote
+
+    def react_to_tick(self, token: str, top: TopOfBook) -> bool:
+        """WS fastlane: instantly reprice the quoted market this token belongs to."""
+        if not self._cfg.enabled or top.bid <= 0 or top.ask <= 0:
+            return False
+        with self._lock:
+            market = self._quoted.get(token)
+            if market is None:
+                return False
+            # Use the tick as the market's top of book (it is a YES/NO token).
+            yes_top = top if token == market.clob_token_ids[0] else self._top(
+                market.clob_token_ids[0])
+            if yes_top is None:
+                return False
+            return self._requote_market(market, yes_top) is not None
 
     def local_order_ids(self) -> set[str]:
-        return {o.order_id for orders in self._orders.values() for o in orders}
+        with self._lock:
+            return {o.order_id for orders in self._orders.values() for o in orders}
 
     def shutdown(self) -> None:
-        for market_id in list(self._quotes) + list(self._orders):
-            self._cancel_market(market_id)
+        with self._lock:
+            for market_id in list(self._quotes) + list(self._orders):
+                self._cancel_market(market_id)

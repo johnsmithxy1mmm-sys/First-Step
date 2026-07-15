@@ -159,6 +159,21 @@ def test_paper_fill_when_market_trades_through(cfg, ledger):
     assert "MM fill" in a.call_args[0][0]
 
 
+def test_react_to_tick_reprices_only_quoted_markets(cfg, ledger):
+    tops = {"mm1-yes": top(bid=0.43, ask=0.47), "mm1-no": top(bid=0.53, ask=0.57)}
+    mm = make_mm(cfg, ledger, tops=tops)
+    m = mm_market()
+    with mock.patch.object(mm._scorer, "top_markets", return_value=[m]), \
+         mock.patch.object(mm._scorer, "eligible", return_value=True):
+        mm.cycle([m])
+    assert "mm1-yes" in mm._quoted            # cycle registered the quoted market
+    # A moderate move (past the requote threshold, under the guard) reprices;
+    # an unknown token does nothing.
+    moved = top(bid=0.44, ask=0.48)
+    assert mm.react_to_tick("mm1-yes", moved) is True
+    assert mm.react_to_tick("unknown-token", moved) is False
+
+
 def test_dry_run_never_places_orders(cfg, ledger):
     tops = {"mm1-yes": top(), "mm1-no": top(bid=0.53, ask=0.57)}
     mm = make_mm(cfg, ledger, tops=tops)
