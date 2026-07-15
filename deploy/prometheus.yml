@@ -1,0 +1,8 @@
+# Prometheus scrape config for the Polymarket bot's /metrics endpoint.
+global:
+  scrape_interval: 30s
+
+scrape_configs:
+  - job_name: polybot
+    static_configs:
+      - targets: ["bot:9090"]

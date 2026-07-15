@@ -194,6 +194,10 @@ fade:
   max_days_to_resolution: 14  # AGGR: near-term only — fast capital recycling (higher IRR).
                               # Lower (7) = even faster but fewer tails; raise (30) for more.
 
+ops:
+  metrics_enabled: true     # Prometheus /metrics + /health on the port below
+  metrics_port: 9090
+
 runtime:
   gamma_host: https://gamma-api.polymarket.com
   clob_host: https://clob.polymarket.com

@@ -296,6 +296,12 @@ class RuntimeConfig(BaseModel):
     max_retries: int = 4
 
 
+class OpsConfig(BaseModel):
+    """Prometheus /metrics + /health server (stdlib, no extra deps)."""
+    metrics_enabled: bool = False
+    metrics_port: int = 9090
+
+
 class BacktestConfig(BaseModel):
     max_markets: int = 300
     lookback_days_before_end: float = 21.0  # look at price N days before resolution
@@ -320,6 +326,7 @@ class BotConfig(BaseModel):
     niche: NicheConfig = Field(default_factory=NicheConfig)
     smart_money: SmartMoneyConfig = Field(default_factory=SmartMoneyConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
+    ops: OpsConfig = Field(default_factory=OpsConfig)
     backtest: BacktestConfig = Field(default_factory=BacktestConfig)
 
     @classmethod

@@ -29,7 +29,8 @@ from .marketmaker import MarketMaker
 from .models import Estimate, Market
 from .monitor import Dashboard, alert
 from .niche import NicheWatcher
-from .portfolio import Portfolio
+from .ops import MetricsServer, reload_config_inplace
+from .portfolio import Portfolio, event_exposure_breakdown
 from .resolution import ResolutionAlpha
 from .risk import KillSwitch
 from .risk2 import MarketDataGuard, StrategyCircuitBreaker
@@ -91,6 +92,25 @@ class Bot:
         # Active-markets cache: refreshed by the main cycle; fast strategies take
         # metadata from here and exact prices from WS / live order books.
         self.markets_cache: list[Market] = []
+
+    def metrics_snapshot(self) -> dict:
+        """Live state for /metrics and /health (never raises)."""
+        try:
+            positions = self.ledger.open_positions(self.mode)
+            worst = sum(r[3] for r in event_exposure_breakdown(positions))
+            return {
+                "mode": self.mode,
+                "equity": round(self.portfolio.equity(), 2),
+                "drawdown": round(self.portfolio.drawdown(), 4),
+                "positions": len(positions),
+                "exposure": round(sum(p.cost_usd for p in positions), 2),
+                "worst_case": round(worst, 2),
+                "errors": len(self.errors),
+                "halted": self.killswitch.halted,
+                "pnl_by_strategy": self.ledger.realized_pnl_by_strategy(self.mode),
+            }
+        except Exception:
+            return {"mode": self.mode, "halted": self.killswitch.halted}
 
     def _cancel_everything(self) -> None:
         self.mm.shutdown()
@@ -536,6 +556,17 @@ def main(argv: list[str] | None = None) -> None:
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
+    if hasattr(signal, "SIGHUP"):
+        def reload_cfg(signum, frame):  # noqa: ARG001
+            changed = reload_config_inplace(bot.cfg, args.config)
+            log.info("SIGHUP: config reloaded, changed: %s", changed or "nothing")
+        signal.signal(signal.SIGHUP, reload_cfg)
+
+    metrics = None
+    if cfg.ops.metrics_enabled:
+        metrics = MetricsServer(bot.metrics_snapshot, cfg.ops.metrics_port)
+        metrics.start()
+
     scheduler = BackgroundScheduler()
     scheduler.add_job(bot.cycle, "interval",
                       minutes=cfg.scanner.interval_minutes,
@@ -581,6 +612,8 @@ def main(argv: list[str] | None = None) -> None:
 
     stop_event.wait()
     scheduler.shutdown(wait=True)
+    if metrics is not None:
+        metrics.stop()
     bot.close()
     log.info("stopped cleanly.")
 

@@ -1,0 +1,29 @@
+# Polymarket bot + Prometheus. Secrets come from polymarket_bot/.env (gitignored).
+# Start paper trading:  docker compose up -d
+# The ledger/logs persist in the named volume `bot-data`.
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - polymarket_bot/.env
+    command: ["--mode", "paper"]     # change to live only after paper validation
+    ports:
+      - "9090:9090"                  # /metrics, /health
+    volumes:
+      - bot-data:/app/polymarket_bot/data
+      - ./polymarket_bot/config.yaml:/app/polymarket_bot/config.yaml:ro
+    mem_limit: 1g
+
+  prometheus:
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9091:9090"
+    depends_on:
+      - bot
+
+volumes:
+  bot-data:
