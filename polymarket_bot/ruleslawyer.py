@@ -91,9 +91,14 @@ class RulesLawyer:
                 break
             if m.id in seen or m.closed or m.volume_24h_usd < self._cfg.min_volume_24h_usd:
                 continue
-            fresh.append(m.id)
+            if not m.description.strip():
+                fresh.append(m.id)     # nothing to analyze, don't revisit
+                continue
             verdict = self.analyze(m)
-            if verdict is not None and verdict.discrepancy:
+            if verdict is None:
+                continue               # API error: leave unseen so we retry later
+            fresh.append(m.id)         # mark seen only after a successful analysis
+            if verdict.discrepancy:
                 flagged.append((m, verdict))
                 alert(f"RULES DISCREPANCY [favors {verdict.favored_side}] "
                       f"{m.question[:60]}\n{verdict.rationale[:200]}\n"

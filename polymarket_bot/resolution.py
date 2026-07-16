@@ -57,7 +57,8 @@ class ResolutionAlpha:
         if m.volume_24h_usd < c.min_volume_24h_usd:
             return f"24h volume < ${c.min_volume_24h_usd:,.0f}"
         days = m.days_to_resolution()
-        if days is not None and days > c.max_days_to_resolution:
+        # No end date = we cannot verify imminence -> not a candidate.
+        if days is None or days > c.max_days_to_resolution:
             return "resolution not imminent"
         if m.volume_usd > 0 and m.volume_24h_usd / m.volume_usd < c.volume_spike_ratio:
             return "no fresh volume (stale)"
@@ -114,6 +115,8 @@ class ResolutionAlpha:
             return []
         found: list[ResolutionCandidate] = []
         for m in markets:
+            if len(found) >= self._cfg.max_alerts_per_cycle:
+                break     # the cap bounds alerts AND executions, not just the return
             cand = self.evaluate(m)
             if cand is None:
                 continue
@@ -127,4 +130,4 @@ class ResolutionAlpha:
                 spent = self.execute(cand)
                 if spent > 0:
                     log.info("resolution executed: $%.2f", spent)
-        return found[: self._cfg.max_alerts_per_cycle]
+        return found

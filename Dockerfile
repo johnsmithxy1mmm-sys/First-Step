@@ -16,8 +16,11 @@ VOLUME ["/app/polymarket_bot/data"]
 
 # Prometheus /metrics + /health (enable ops.metrics_enabled in config).
 EXPOSE 9090
+# Metrics disabled (connection refused) counts as healthy; a served /health
+# reporting non-200 counts as unhealthy. Set ops.metrics_bind: "0.0.0.0" in the
+# container config for the compose port map to work.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:9090/health', timeout=3).status==200 else 1)" || exit 1
+  CMD ["python", "deploy/healthcheck.py"]
 
 ENTRYPOINT ["python", "-m", "polymarket_bot"]
 CMD ["--mode", "paper"]

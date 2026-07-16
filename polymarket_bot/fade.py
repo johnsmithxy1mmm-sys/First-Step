@@ -117,9 +117,15 @@ class FadeStrategy:
                          size_usd=size, limit_price_cap=price_cap)
 
     def _irr_score(self, est: Estimate) -> float:
-        """Fade IRR proxy: edge per day. Capital goes to the fastest recyclers."""
-        days = est.candidate.market.days_to_resolution()
-        edge = est.p_mkt * self._cfg.bias_discount     # ~fade edge on the NO side
+        """Fade IRR proxy: edge per day. Capital goes to the fastest recyclers.
+
+        Uses the same (learned or prior) bias as plan(), so the ranking agrees
+        with the sizing.
+        """
+        m = est.candidate.market
+        days = m.days_to_resolution()
+        category = classify_category(m.question, m.category)
+        edge = est.p_mkt * self._bias(category, est.p_mkt)   # ~fade edge, NO side
         return edge / max(days if days is not None else 999.0, 0.5)
 
     def cycle(self, estimates: list[Estimate]) -> int:

@@ -137,16 +137,22 @@ class SmartMoneyTracker:
                 f"${pos.usd:,.0f} | wallet PnL on this position ${pos.cash_pnl:,.0f}\n"
                 f"https://polymarket.com/profile/{pos.wallet}")
 
-    def cycle(self) -> list[WalletPosition]:
+    def snapshot(self) -> dict[str, list[WalletPosition]]:
+        """One Data API pass over the watched wallets (shared by cycle + signal)."""
+        return {w: self.fetch_positions(w) for w in self._cfg.watch_wallets}
+
+    def cycle(self, snapshot: dict[str, list[WalletPosition]] | None = None
+              ) -> list[WalletPosition]:
         """Checks the watched wallets, alerts on new positions."""
         if not self._cfg.enabled or not self._cfg.watch_wallets:
             return []
+        snapshot = snapshot if snapshot is not None else self.snapshot()
         seen = self._ledger.smart_money_seen_keys()
         alerted: list[WalletPosition] = []
         fresh_keys: list[str] = []
 
         for wallet in self._cfg.watch_wallets:
-            for pos in self.fetch_positions(wallet):
+            for pos in snapshot.get(wallet, []):
                 if pos.key in seen or pos.usd < self._cfg.min_position_usd:
                     continue
                 fresh_keys.append(pos.key)   # mark seen regardless of alerting
@@ -162,13 +168,15 @@ class SmartMoneyTracker:
             self._ledger.mark_smart_money_seen(fresh_keys)
         return alerted
 
-    def build_hot_tokens(self) -> dict[str, float]:
+    def build_hot_tokens(self, snapshot: dict[str, list[WalletPosition]] | None = None
+                         ) -> dict[str, float]:
         """{token_id: confidence} for tails held by profitable watched wallets."""
         if not self._cfg.as_signal or not self._cfg.watch_wallets:
             return {}
+        snapshot = snapshot if snapshot is not None else self.snapshot()
         hot: dict[str, float] = {}
         for wallet in self._cfg.watch_wallets:
-            positions = self.fetch_positions(wallet)
+            positions = snapshot.get(wallet, [])
             wallet_pnl = sum(p.cash_pnl for p in positions)
             if wallet_pnl < self._cfg.signal_min_pnl_usd:
                 continue

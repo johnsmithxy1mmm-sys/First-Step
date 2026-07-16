@@ -48,9 +48,10 @@ def format_metrics(snapshot: dict) -> str:
 class MetricsServer:
     """Serves /metrics (Prometheus) and /health (JSON) from a background thread."""
 
-    def __init__(self, snapshot_fn, port: int = 9090):
+    def __init__(self, snapshot_fn, port: int = 9090, bind: str = "127.0.0.1"):
         self._fn = snapshot_fn
         self._port = port
+        self._bind = bind
         self._httpd: HTTPServer | None = None
 
     def start(self) -> None:
@@ -86,10 +87,10 @@ class MetricsServer:
                     self.send_response(404)
                     self.end_headers()
 
-        self._httpd = HTTPServer(("0.0.0.0", self._port), Handler)
+        self._httpd = HTTPServer((self._bind, self._port), Handler)
         threading.Thread(target=self._httpd.serve_forever, daemon=True,
                          name="metrics").start()
-        log.info("metrics server on :%d (/metrics, /health)", self._port)
+        log.info("metrics server on %s:%d (/metrics, /health)", self._bind, self._port)
 
     def stop(self) -> None:
         if self._httpd is not None:

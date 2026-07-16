@@ -199,6 +199,8 @@ fade:
 ops:
   metrics_enabled: true     # Prometheus /metrics + /health on the port below
   metrics_port: 9090
+  metrics_bind: "127.0.0.1" # /metrics shows equity/PnL — bind localhost unless
+                            # firewalled; use "0.0.0.0" inside Docker
 
 runtime:
   gamma_host: https://gamma-api.polymarket.com

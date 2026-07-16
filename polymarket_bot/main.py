@@ -185,7 +185,9 @@ class Bot:
             alert("Polymarket bot: KILL-SWITCH — drawdown above limit, observe-only mode.")
 
         try:
-            candidates = self.scanner.scan(markets)
+            # ONE estimator pass per cycle (one LLM budget): both the longshot
+            # path and the fade consume the same first-level estimates.
+            candidates = self.scanner.first_level_filter(markets)
             estimates = self.estimator.estimate_all(candidates, markets)
             top = estimates[:20]
             qualifying = []
@@ -195,17 +197,21 @@ class Bot:
                 if ok:
                     qualifying.append(est)
             log.info("estimates: %d, passing edge threshold: %d", len(estimates), len(qualifying))
+            if qualifying:
+                # YES-side book depth matters only to the longshot buys; check it
+                # just for the few qualifying candidates (cheap).
+                ok_tokens = {c.token_id for c in self.scanner.verify_depth(
+                    [e.candidate for e in qualifying])}
+                qualifying = [e for e in qualifying
+                              if e.candidate.token_id in ok_tokens]
 
             if not observe_only and self.killswitch.trading_allowed:
                 if self.breaker.allows("longshot"):
                     self._enter_positions(qualifying)
                 if self.breaker.allows("fade"):
-                    # Fade buys NO — YES-side depth (verify_depth) is irrelevant
-                    # to it. Feed it candidates BEFORE the depth check; the
+                    # Fade buys NO — YES-side depth is irrelevant to it; the
                     # executor checks the NO book when placing the limit order.
-                    fade_candidates = self.scanner.first_level_filter(markets)
-                    fade_estimates = self.estimator.estimate_all(fade_candidates, markets)
-                    self.fade.cycle(fade_estimates)
+                    self.fade.cycle(estimates)
                 self._exit_positions(marks)
             # Refresh the fastlane cache after this cycle's entries/exits.
             self._positions_by_token = {
@@ -381,9 +387,12 @@ class Bot:
     def smart_money_job(self) -> None:
         """#5: alerts when strong wallets enter a market; refresh the signal."""
         try:
-            self.smart_money.cycle()
+            if not self.cfg.smart_money.enabled or not self.cfg.smart_money.watch_wallets:
+                return
+            snapshot = self.smart_money.snapshot()   # one API pass, shared below
+            self.smart_money.cycle(snapshot)
             if self.cfg.smart_money.as_signal:
-                self.smart_signal.set_hot(self.smart_money.build_hot_tokens())
+                self.smart_signal.set_hot(self.smart_money.build_hot_tokens(snapshot))
         except Exception:
             log.exception("smart-money job")
 
@@ -565,7 +574,8 @@ def main(argv: list[str] | None = None) -> None:
         ledger = Ledger(cfg.runtime.db_path)
         try:
             # Report for the mode the data accumulated in (paper by default).
-            print_report(compute_report(ledger, args.report_mode))
+            print_report(compute_report(ledger, args.report_mode,
+                                        fade_prior=cfg.fade.bias_discount))
         finally:
             ledger.close()
         return
@@ -625,7 +635,8 @@ def main(argv: list[str] | None = None) -> None:
 
     metrics = None
     if cfg.ops.metrics_enabled:
-        metrics = MetricsServer(bot.metrics_snapshot, cfg.ops.metrics_port)
+        metrics = MetricsServer(bot.metrics_snapshot, cfg.ops.metrics_port,
+                                bind=cfg.ops.metrics_bind)
         metrics.start()
 
     scheduler = BackgroundScheduler()

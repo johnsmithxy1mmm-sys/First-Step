@@ -58,3 +58,22 @@ def test_disabled_without_api(cfg, ledger):
     law = RulesLawyer(cfg, ledger)                # enabled False, no client
     assert law.available is False
     assert law.cycle([make_market()]) == []
+
+
+def test_api_error_leaves_market_unseen_for_retry(cfg, ledger):
+    cfg.ruleslawyer.enabled = True
+    client = mock.Mock()
+    client.messages.parse.side_effect = RuntimeError("api down")
+    law = RulesLawyer(cfg, ledger, client=client)
+    m = make_market(id="retry-me", volume_24h_usd=50_000, description="rules text")
+    with mock.patch("polymarket_bot.ruleslawyer.alert"):
+        law.cycle([m])
+    assert "retry-me" not in ledger.seen_rules_ids()   # not burned by the failure
+    # Next cycle retries the same market.
+    client.messages.parse.side_effect = None
+    client.messages.parse.return_value = mock.Mock(
+        parsed_output=RulesVerdict(discrepancy=False, favored_side="none",
+                                   rationale="ok"))
+    with mock.patch("polymarket_bot.ruleslawyer.alert"):
+        law.cycle([m])
+    assert "retry-me" in ledger.seen_rules_ids()

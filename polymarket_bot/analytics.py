@@ -16,7 +16,7 @@ from rich.table import Table
 from .ledger import Ledger
 
 
-def compute_report(ledger: Ledger, mode: str) -> dict:
+def compute_report(ledger: Ledger, mode: str, fade_prior: float = 0.35) -> dict:
     """Gathers all metrics into one dict (testable without rich)."""
     bank = ledger.bank_series()
     equity_start = bank[0]["equity"] if bank else None
@@ -40,7 +40,7 @@ def compute_report(ledger: Ledger, mode: str) -> dict:
         "estimates": ledger.estimates_summary(),
         "markouts": ledger.markout_stats(mode),
         "positions": ledger.open_positions(mode),
-        "learned_bias": _learned_bias(ledger, mode),
+        "learned_bias": _learned_bias(ledger, mode, fade_prior),
         "stress": _stress(ledger.open_positions(mode)),
     }
 
@@ -50,9 +50,9 @@ def _stress(positions) -> dict:
     return portfolio_stress(positions)
 
 
-def _learned_bias(ledger: Ledger, mode: str) -> list[dict]:
+def _learned_bias(ledger: Ledger, mode: str, prior: float = 0.35) -> list[dict]:
     from .calibration import TailBiasCalibrator
-    return TailBiasCalibrator().fit(
+    return TailBiasCalibrator(prior=prior).fit(
         ledger.resolved_for_calibration(mode, "fade")).summary()
 
 

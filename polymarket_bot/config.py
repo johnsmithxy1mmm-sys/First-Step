@@ -307,6 +307,9 @@ class OpsConfig(BaseModel):
     """Prometheus /metrics + /health server (stdlib, no extra deps)."""
     metrics_enabled: bool = False
     metrics_port: int = 9090
+    # Bind localhost by default: /metrics exposes equity/PnL. Set "0.0.0.0"
+    # only behind a firewall or inside Docker (compose needs it for the port map).
+    metrics_bind: str = "127.0.0.1"
 
 
 class BacktestConfig(BaseModel):

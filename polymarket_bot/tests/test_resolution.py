@@ -57,6 +57,22 @@ def test_rejects_far_horizon(cfg, ledger):
     assert "not imminent" in res.reject_reason(far)
 
 
+def test_rejects_market_without_end_date(cfg, ledger):
+    """No end date = imminence unverifiable — must NOT count as imminent."""
+    res = make_res(cfg, ledger)
+    assert "not imminent" in res.reject_reason(near_market(end_date=None))
+
+
+def test_alert_cap_bounds_alerts_not_just_return(cfg, ledger):
+    res = make_res(cfg, ledger)
+    cfg.resolution.max_alerts_per_cycle = 3
+    markets = [near_market(id=f"r{i}") for i in range(10)]
+    with mock.patch("polymarket_bot.resolution.alert") as a:
+        found = res.cycle(markets)
+    assert len(found) == 3
+    assert a.call_count == 3          # alerts were capped too, not sliced after
+
+
 def test_cycle_alerts_and_optionally_executes(cfg, ledger):
     clob = mock.Mock()
     clob.order_book.return_value = make_book(best_bid=0.96, best_ask=0.97, depth=100_000)
