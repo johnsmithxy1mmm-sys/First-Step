@@ -56,6 +56,33 @@ def test_ledger_round_trips_event_and_neg_risk(cfg, ledger):
     assert p.event_id == "ev" and p.neg_risk is True
 
 
+def test_backfill_heals_legacy_rows(cfg, ledger):
+    """Rows written before the neg_risk column (or flag) net after backfill."""
+    for i in range(3):
+        m = make_market(id=f"lg{i}", clob_token_ids=[f"y{i}", f"n{i}"],
+                        event_id="ev-old", event_neg_risk=False,   # legacy: flag unknown
+                        question="Will candidate X win the award?")
+        ledger.record_trade(mode="dry-run", estimate=simple_estimate(m, 1, 0.97),
+                            category="other", side="BUY", price=0.97, size=100,
+                            order_id=None, status="sim-filled", strategy="fade")
+    before = event_netted_exposure(ledger.open_positions("dry-run"))["other"]
+    assert before == 291.0                              # 3 x 97, no netting
+    # Live metadata now says these markets' event IS neg-risk.
+    healed = ledger.backfill_neg_risk(["lg0", "lg1", "lg2"])
+    assert healed == 3
+    after = event_netted_exposure(ledger.open_positions("dry-run"))["other"]
+    assert after == 97.0                                # basket nets to one leg
+    assert ledger.backfill_neg_risk(["lg0", "lg1", "lg2"]) == 0   # idempotent
+
+
+def test_var95_never_exceeds_max_loss():
+    from polymarket_bot.risk2 import portfolio_stress
+    ps = [pos(cost=500, category="geopolitics", neg_risk=False, event_id="", token="a"),
+          pos(cost=500, category="economy", neg_risk=False, event_id="", token="b")]
+    st = portfolio_stress(ps)
+    assert st["var95_usd"] <= st["worst_case_usd"]
+
+
 def test_size_usd_uses_netted_category_room(cfg, ledger):
     cfg.portfolio.bankroll_usd = 5000
     cfg.portfolio.max_category_pct = 0.10   # $500 category cap

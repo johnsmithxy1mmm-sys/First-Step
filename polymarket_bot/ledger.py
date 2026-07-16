@@ -114,6 +114,24 @@ class Ledger:
         if "neg_risk" not in cols:
             self._conn.execute("ALTER TABLE trades ADD COLUMN neg_risk INTEGER DEFAULT 0")
 
+    def backfill_neg_risk(self, market_ids: list[str]) -> int:
+        """Mark legacy trade rows as neg-risk from live market metadata.
+
+        Rows recorded before the neg_risk column existed default to 0, which
+        blocks event netting for those positions. The cycle calls this with the
+        ids of markets whose event IS neg-risk; returns rows updated.
+        """
+        if not market_ids:
+            return 0
+        with self._lock:
+            placeholders = ",".join("?" * len(market_ids))
+            cur = self._conn.execute(
+                f"UPDATE trades SET neg_risk = 1 "
+                f"WHERE neg_risk = 0 AND market_id IN ({placeholders})",
+                list(market_ids))
+            self._conn.commit()
+            return cur.rowcount
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()

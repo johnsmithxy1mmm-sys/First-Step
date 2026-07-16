@@ -170,6 +170,14 @@ class Bot:
         except Exception as exc:
             self._error(f"niche: {exc}")
 
+        # Heal legacy rows: trades recorded before the neg_risk column existed
+        # default to 0, which blocks event netting. Live market metadata knows
+        # which events ARE neg-risk — backfill so old baskets net properly.
+        neg_ids = [m.id for m in markets if m.event_neg_risk or m.neg_risk]
+        healed = self.ledger.backfill_neg_risk(neg_ids)
+        if healed:
+            log.info("ledger: backfilled neg_risk on %d legacy trade rows", healed)
+
         # Marks for open positions (needed for equity/drawdown/exits).
         positions = self.ledger.open_positions(self.mode)
         self._positions_by_token = {p.token_id: p for p in positions}

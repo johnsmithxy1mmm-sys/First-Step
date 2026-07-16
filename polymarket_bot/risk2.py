@@ -32,11 +32,13 @@ def parametric_var(positions: list[Position], z: float = 1.65) -> float:
 def portfolio_stress(positions: list[Position]) -> dict:
     """Instant worst-case picture of the open book."""
     rows = event_exposure_breakdown(positions)
+    worst = sum(r[3] for r in rows)                     # sum of per-event worst cases
     return {
         "gross_usd": sum(r[2] for r in rows),
-        "worst_case_usd": sum(r[3] for r in rows),      # sum of per-event worst cases
+        "worst_case_usd": worst,
         "largest_event_usd": max((r[3] for r in rows), default=0.0),
-        "var95_usd": parametric_var(positions),
+        # A VaR estimate above the maximum possible loss is meaningless — clamp.
+        "var95_usd": min(parametric_var(positions), worst),
     }
 
 
