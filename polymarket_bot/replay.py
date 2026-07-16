@@ -108,8 +108,17 @@ class ReplayReport:
         return self.fills / self.quotes_posted if self.quotes_posted else 0.0
 
 
+def queue_aware_fill(quote, outcome_index: int, top) -> float:
+    """Honest replay fill: the trade-through must consume the size queued ahead
+    of us (proxied by the resting size at the touch) before any of ours fills."""
+    from .research import simulate_maker_fill
+    price = quote.yes_bid if outcome_index == 0 else quote.no_bid
+    return simulate_maker_fill(price, "BUY", [(top.ask, top.ask_size)],
+                               our_size=quote.size, queue_ahead=top.bid_size)
+
+
 def replay(cfg: BotConfig, db_path: str | Path, ledger) -> ReplayReport:
-    """Replay MM logic over recorded order books (paper fill model)."""
+    """Replay MM logic over recorded order books (queue-aware fill model)."""
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     markets: dict[str, Market] = {}
@@ -126,6 +135,7 @@ def replay(cfg: BotConfig, db_path: str | Path, ledger) -> ReplayReport:
 
     mm = MarketMaker(cfg, ledger, clob=_NullClob(), trader=None,
                      mode="paper", top_source=top_source)
+    mm.fill_model = queue_aware_fill      # honest fills: queue + trade-through
     report = ReplayReport()
     market_list = list(markets.values())
 

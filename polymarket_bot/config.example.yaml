@@ -27,6 +27,7 @@ estimator:
   max_p_mkt: 0.05
   base_rates_file: base_rates.yaml
   market_anchor_confidence: 0.85
+  platt_enabled: true         # recalibrate p_est on realized outcomes (auto-fitted)
   llm:
     enabled: false            # enable after calibrating base rates + coherence
     model: claude-sonnet-5
@@ -82,6 +83,7 @@ market_maker:
   rewards_weighting: true   # MM 2.0: allocate quote size across markets by rewards score
   requote_threshold_ticks: 2  # hysteresis: do not burn rate limit or rewards sampling
   requote_timer_sec: 120
+  requote_min_fill_prob: 0.25 # keep an order likely to fill instead of losing its queue
   guard_price_move: 0.03    # adverse selection: pull quotes on a shock
   guard_cooldown_cycles: 3
   guard_volume_ratio: 0.5

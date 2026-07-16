@@ -49,6 +49,9 @@ class EstimatorConfig(BaseModel):
     # the market; lower -> signals outweigh the market more easily, edge is easier
     # to find but noisier).
     market_anchor_confidence: float = 0.85
+    # Platt recalibration of p_est against realized outcomes (fitted by the
+    # calibration job; identity until enough resolutions accumulate).
+    platt_enabled: bool = False
     llm: LLMConfig = Field(default_factory=LLMConfig)
 
 
@@ -168,6 +171,10 @@ class MarketMakerConfig(BaseModel):
     # Requote hysteresis: excess churn eats rate limit and rewards sampling.
     requote_threshold_ticks: float = 2.0
     requote_timer_sec: float = 120.0
+    # Queue preservation: if the new level is within one tick of the old and the
+    # current order's fill probability exceeds this, keep the order (its queue
+    # position is worth more than the tick). 0 = off (classic behavior).
+    requote_min_fill_prob: float = 0.0
     # Adverse selection guard.
     guard_price_move: float = 0.03
     guard_cooldown_cycles: int = 3

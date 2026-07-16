@@ -406,6 +406,7 @@ class Ledger:
             snap = json.loads(r["snapshot"] or "{}")
             out.append({"category": r["category"] or "other",
                         "p_mkt": float(snap.get("p_mkt", 0.0)),
+                        "p_est": float(snap.get("p_est", 0.0)),
                         "won": bool(r["won"])})
         return out
 

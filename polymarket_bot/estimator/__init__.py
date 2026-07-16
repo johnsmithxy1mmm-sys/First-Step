@@ -17,7 +17,7 @@ log = logging.getLogger(__name__)
 
 class Estimator:
     def __init__(self, cfg: BotConfig, llm: LLMSignal | None = None,
-                 extra_signals: list | None = None):
+                 extra_signals: list | None = None, platt=None):
         self._cfg = cfg
         self._base_rates = BaseRatesSignal(load_base_rates(cfg.base_rates_path()))
         self._momentum = MomentumSignal()
@@ -25,6 +25,9 @@ class Estimator:
         # Extra signal sources with an .evaluate(candidate) -> Signal|None method
         # (e.g. the smart-money signal). Each contributes to the ensemble.
         self._extra = extra_signals or []
+        # Optional PlattCalibrator: recalibrates the ensemble p_est against
+        # realized outcomes (identity until fitted with enough resolutions).
+        self._platt = platt
 
     def estimate_all(self, candidates: list[Candidate],
                      all_markets: list[Market]) -> list[Estimate]:
@@ -51,6 +54,8 @@ class Estimator:
                 if signal is not None:
                     signals.append(signal)
             est = combine(c, signals, self._cfg.estimator.market_anchor_confidence)
+            if self._platt is not None:
+                est = est.model_copy(update={"p_est": self._platt.calibrate(est.p_est)})
             estimates.append(est)
             log.debug(
                 "estimate market=%s p_mkt=%.4f p_est=%.4f edge=%.2f signals=%s",

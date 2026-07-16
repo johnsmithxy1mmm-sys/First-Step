@@ -39,7 +39,7 @@ from .clob import ClobReader, Trader, round_to_tick
 from .config import BotConfig
 from .fees import FeeModel
 from .ledger import Ledger
-from .microstructure import RealizedVol
+from .microstructure import RealizedVol, fill_probability
 from .models import Market, simple_estimate
 from .monitor import alert
 from .portfolio import classify_category
@@ -100,6 +100,9 @@ class MarketMaker:
         self._orders: dict[str, list[TrackedOrder]] = {}  # live orders per market
         self._quoted: dict[str, Market] = {}         # token_id -> quoted market (WS reprice)
         self._lock = threading.RLock()               # cycle vs WS-tick react
+        # Optional paper-fill sizer: callable(quote, outcome_index, top) -> size.
+        # None = classic optimistic full fill; the replay installs a queue-aware one.
+        self.fill_model = None
 
     def _spread_mult(self, market_id: str) -> float:
         return self._feedback.multiplier(market_id) if self._feedback is not None else 1.0
@@ -274,21 +277,32 @@ class MarketMaker:
                     order.matched_recorded += new_fill
 
     def _paper_fills(self) -> None:
-        """Paper mode: a bid fills if the market traded through it."""
+        """Paper mode: a bid fills if the market traded through it.
+
+        fill_model (callable(quote, outcome_index, top) -> size), when set,
+        decides the filled size (e.g. the replay's queue-aware simulator);
+        otherwise the classic optimistic full-size fill applies.
+        """
         for quote in list(self._quotes.values()):
             m = quote.market
             yes_top = self._top(m.clob_token_ids[0])
             no_top = self._top(m.clob_token_ids[1])
             if yes_top is not None and 0 < yes_top.ask <= quote.yes_bid:
-                self._record_fill(m, 0, quote.yes_bid, quote.size, None, "paper-filled")
-                self._quotes.pop(m.id, None)
-                log.info("MM paper fill: Yes %.3f x %.0f (%s)",
-                         quote.yes_bid, quote.size, m.question[:40])
+                size = (self.fill_model(quote, 0, yes_top)
+                        if self.fill_model is not None else quote.size)
+                if size > 0:
+                    self._record_fill(m, 0, quote.yes_bid, size, None, "paper-filled")
+                    self._quotes.pop(m.id, None)
+                    log.info("MM paper fill: Yes %.3f x %.0f (%s)",
+                             quote.yes_bid, size, m.question[:40])
             elif no_top is not None and 0 < no_top.ask <= quote.no_bid:
-                self._record_fill(m, 1, quote.no_bid, quote.size, None, "paper-filled")
-                self._quotes.pop(m.id, None)
-                log.info("MM paper fill: No %.3f x %.0f (%s)",
-                         quote.no_bid, quote.size, m.question[:40])
+                size = (self.fill_model(quote, 1, no_top)
+                        if self.fill_model is not None else quote.size)
+                if size > 0:
+                    self._record_fill(m, 1, quote.no_bid, size, None, "paper-filled")
+                    self._quotes.pop(m.id, None)
+                    log.info("MM paper fill: No %.3f x %.0f (%s)",
+                             quote.no_bid, size, m.question[:40])
 
     def _place(self, quote: Quote, quote_yes: bool, quote_no: bool) -> None:
         m = quote.market
@@ -384,6 +398,18 @@ class MarketMaker:
         if quote is None or not (quote_yes or quote_no):
             self._cancel_market(market.id)
             return None
+        # Queue preservation: a cancel-replace for a <=1-tick improvement loses
+        # our place in line. If the resting order is likely to fill where it
+        # is, keep it — the queue position is worth more than the tick.
+        current = self._quotes.get(market.id)
+        if (current is not None and self._cfg.requote_min_fill_prob > 0
+                and abs(quote.yes_bid - current.yes_bid) <= market.tick_size + 1e-12):
+            queue_ahead = top.bid * top.bid_size          # size at the touch (proxy)
+            recent_flow = market.volume_24h_usd * (self._cfg.interval_sec / 86_400.0)
+            p_fill = fill_probability(queue_ahead, current.size * current.yes_bid,
+                                      recent_flow)
+            if p_fill >= self._cfg.requote_min_fill_prob:
+                return current
         self._cancel_market(market.id)
         self._place(quote, quote_yes, quote_no)
         return quote

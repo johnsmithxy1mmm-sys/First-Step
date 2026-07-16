@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 
 from . import backtest as backtest_mod
 from .arbitrage import ArbitrageScanner
-from .calibration import MarkoutFeedback, TailBiasCalibrator
+from .calibration import MarkoutFeedback, PlattCalibrator, TailBiasCalibrator
 from .clob import ClobReader, Trader
 from .config import BotConfig
 from .crossmarket import CrossMarketScanner
@@ -52,8 +52,10 @@ class Bot:
         self.scanner = Scanner(cfg, self.clob)
         # Smart-money signal (iteration 7): fed into the ensemble when enabled.
         self.smart_signal = SmartMoneySignal(cfg.smart_money.signal_max_confidence)
+        self.platt = PlattCalibrator()
         self.estimator = Estimator(
-            cfg, extra_signals=[self.smart_signal] if cfg.smart_money.as_signal else None)
+            cfg, extra_signals=[self.smart_signal] if cfg.smart_money.as_signal else None,
+            platt=self.platt if cfg.estimator.platt_enabled else None)
         self.ledger = Ledger(cfg.runtime.db_path)
         self.portfolio = Portfolio(cfg, self.ledger, mode)
         self.trader = Trader(cfg) if mode == "live" else None
@@ -96,6 +98,8 @@ class Bot:
         # WS-fastlane caches: on_tick must NEVER hit the DB or the network.
         self._positions_by_token: dict[str, Position] = {}
         self._observe_only = False
+        # Per-strategy PnL checkpoints (one per digest) for Sharpe allocation.
+        self._pnl_history: dict[str, list[float]] = {}
 
     def metrics_snapshot(self) -> dict:
         """Live state for /metrics and /health (never raises)."""
@@ -446,25 +450,42 @@ class Bot:
             log.exception("resolution job")
 
     def calibration_job(self) -> None:
-        """Refit the self-calibrators from the ledger (fade bias, MM markout)."""
+        """Refit the self-calibrators from the ledger (fade bias, MM markout, Platt)."""
         try:
             self.fade.refresh_calibration()
             self.mm.refresh_feedback()
+            if self.cfg.estimator.platt_enabled:
+                pairs = [(r["p_est"], 1.0 if r["won"] else 0.0)
+                         for strategy in ("longshot", "fade")
+                         for r in self.ledger.resolved_for_calibration(self.mode, strategy)
+                         if r.get("p_est")]
+                self.platt.fit(pairs)
         except Exception:
             log.exception("calibration job")
 
     def digest_job(self) -> None:
-        """Telegram digest: PnL, inventory, per-strategy attribution."""
+        """Telegram digest: PnL, inventory, attribution, Sharpe allocation hint."""
         try:
             equity = self.portfolio.equity()
             positions = self.ledger.open_positions(self.mode)
             pnl = self.ledger.realized_pnl_by_strategy(self.mode)
             pnl_lines = "\n".join(f"  {k}: {v:+,.2f}" for k, v in pnl.items()) or "  —"
+            # Sharpe allocation: a recommendation, never auto-applied.
+            for k, v in pnl.items():
+                self._pnl_history.setdefault(k, []).append(v)
+            weights_line = ""
+            series = {k: v for k, v in self._pnl_history.items() if len(v) >= 3}
+            if series:
+                from .research import sharpe_allocation
+                w = sharpe_allocation(series)
+                weights_line = ("\nSuggested capital weights (Sharpe, advisory): "
+                                + ", ".join(f"{k} {v:.0%}" for k, v in sorted(w.items())))
             alert(f"Digest [{self.mode}]\n"
                   f"Equity: ${equity:,.2f} | drawdown {self.portfolio.drawdown() * 100:.1f}%\n"
                   f"Open positions: {len(positions)} "
                   f"(${sum(p.cost_usd for p in positions):,.2f})\n"
-                  f"Realized PnL by strategy:\n{pnl_lines}\n"
+                  f"Realized PnL by strategy:\n{pnl_lines}"
+                  f"{weights_line}\n"
                   f"Kill-switch: {'HALT: ' + self.killswitch.reason if self.killswitch.halted else 'normal'}")
         except Exception:
             log.exception("digest job")
