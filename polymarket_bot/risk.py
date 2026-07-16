@@ -33,10 +33,17 @@ class KillSwitch:
         self._cancel_all = cancel_all
         self._alert = alert
         self.halted = False
-        self.paused = False
+        # Pause sources are independent: "ws" (stream outage) and "data" (feed
+        # anomaly). Each resumes only from its own source, so a healthy WS
+        # cannot clear a data-anomaly pause.
+        self._pause_sources: set[str] = set()
         self.reason = ""
 
     # --- state ---
+
+    @property
+    def paused(self) -> bool:
+        return bool(self._pause_sources)
 
     @property
     def trading_allowed(self) -> bool:
@@ -51,19 +58,22 @@ class KillSwitch:
         self._safe_cancel()
         self._alert(f"KILL-SWITCH (halt until manual restart): {reason}")
 
-    def trip_pause(self, reason: str) -> None:
-        if self.paused or self.halted:
+    def trip_pause(self, reason: str, source: str = "ws") -> None:
+        if self.halted or source in self._pause_sources:
             return
-        self.paused = True
+        first = not self.paused
+        self._pause_sources.add(source)
         self.reason = reason
-        log.warning("KILL-SWITCH PAUSE: %s", reason)
-        self._safe_cancel()
-        self._alert(f"Trading paused (auto-resume): {reason}")
+        log.warning("KILL-SWITCH PAUSE [%s]: %s", source, reason)
+        if first:
+            self._safe_cancel()
+            self._alert(f"Trading paused (auto-resume): {reason}")
 
-    def resume_from_pause(self) -> None:
-        if self.paused and not self.halted:
-            self.paused = False
-            log.info("kill-switch: pause lifted, trading resumed")
+    def resume_from_pause(self, source: str = "ws") -> None:
+        if source in self._pause_sources and not self.halted:
+            self._pause_sources.discard(source)
+            if not self._pause_sources:
+                log.info("kill-switch: pause lifted, trading resumed")
 
     def _safe_cancel(self) -> None:
         try:

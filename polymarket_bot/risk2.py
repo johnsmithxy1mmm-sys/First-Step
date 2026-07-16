@@ -78,15 +78,20 @@ class StrategyCircuitBreaker:
     def update(self, pnl_by_strategy: dict[str, float]) -> None:
         for strategy, pnl in pnl_by_strategy.items():
             h = self._history[strategy]
+            if h and pnl == h[-1]:
+                continue    # flat check = no new information: quiet minutes must
+                            # neither trip the breaker nor "heal" a tripped one
             h.append(pnl)
             if len(h) > self._streak + 1:
                 h.pop(0)
             if len(h) < self._streak + 1:
                 continue
             deltas = [h[i + 1] - h[i] for i in range(len(h) - 1)]
-            if all(d < 0 for d in deltas[-self._streak:]):
+            window = deltas[-self._streak:]
+            if all(d < 0 for d in window):
                 self.disabled.add(strategy)
-            elif all(d >= 0 for d in deltas[-self._streak:]):
+            elif sum(window) > 0:
+                # Re-enable only on REAL net recovery over the window.
                 self.disabled.discard(strategy)
 
     def allows(self, strategy: str) -> bool:

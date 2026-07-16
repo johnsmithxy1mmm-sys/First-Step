@@ -112,13 +112,28 @@ def test_sides_disabled_at_position_cap(cfg, ledger):
 
 
 def test_guard_on_midpoint_jump(cfg, ledger):
+    import time as _time
     mm = make_mm(cfg, ledger)
     m = mm_market()
     assert not mm.guard_blocks(m, top(bid=0.43, ask=0.47))
     assert mm.guard_blocks(m, top(bid=0.48, ask=0.52))     # jump >= 0.03
-    for _ in range(cfg.market_maker.guard_cooldown_cycles):
-        assert mm.guard_blocks(m, top(bid=0.48, ask=0.52))  # cooldown
+    # Cooldown is wall-clock (cycles * interval_sec): call frequency can't burn it.
+    for _ in range(50):
+        assert mm.guard_blocks(m, top(bid=0.48, ask=0.52))
+    mm._cooldown_until[m.id] = _time.time() - 1            # cooldown expired
     assert not mm.guard_blocks(m, top(bid=0.48, ask=0.52))
+
+
+def test_guard_sees_cumulative_tick_moves(cfg, ledger):
+    """Many small WS ticks adding up to a shock must still trip the guard."""
+    mm = make_mm(cfg, ledger)
+    m = mm_market()
+    assert not mm.guard_blocks(m, top(bid=0.43, ask=0.47))          # anchor at 0.45
+    blocked = False
+    for i in range(1, 11):                                          # +0.004/tick
+        t = top(bid=0.43 + 0.004 * i, ask=0.47 + 0.004 * i)
+        blocked = mm.guard_blocks(m, t, anchor=False) or blocked    # per-tick calls
+    assert blocked                                                  # cumulative +0.04 seen
 
 
 def test_extreme_midpoint_requires_two_sided_or_exit(cfg, ledger):

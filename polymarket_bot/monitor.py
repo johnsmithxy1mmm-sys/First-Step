@@ -1,9 +1,16 @@
-"""Monitoring: rich terminal dashboard + optional Telegram alerts."""
+"""Monitoring: rich terminal dashboard + optional Telegram alerts.
+
+alert() must never block a hot path (the WS tick thread, the MM lock): it only
+enqueues; a daemon worker thread does the actual HTTP send with its timeout.
+"""
 
 from __future__ import annotations
 
 import logging
 import os
+import queue
+import threading
+
 from datetime import datetime, timezone
 
 import httpx
@@ -15,9 +22,12 @@ from .models import Estimate, Position
 
 log = logging.getLogger(__name__)
 
+_queue: "queue.Queue[str]" = queue.Queue()
+_worker_lock = threading.Lock()
+_worker_started = False
 
-def alert(text: str) -> bool:
-    """Telegram alert; silently disabled if TELEGRAM_* vars are unset."""
+
+def _send(text: str) -> bool:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
@@ -32,6 +42,30 @@ def alert(text: str) -> bool:
     except httpx.HTTPError as exc:
         log.warning("telegram alert failed: %s", exc)
         return False
+
+
+def _drain() -> None:
+    while True:
+        text = _queue.get()
+        try:
+            _send(text)
+        except Exception:
+            log.exception("telegram worker")
+        finally:
+            _queue.task_done()
+
+
+def alert(text: str) -> bool:
+    """Queue a Telegram alert (non-blocking); False if TELEGRAM_* vars unset."""
+    if not os.environ.get("TELEGRAM_BOT_TOKEN") or not os.environ.get("TELEGRAM_CHAT_ID"):
+        return False
+    global _worker_started
+    with _worker_lock:
+        if not _worker_started:
+            threading.Thread(target=_drain, daemon=True, name="tg-alerts").start()
+            _worker_started = True
+    _queue.put(text)
+    return True
 
 
 class Dashboard:

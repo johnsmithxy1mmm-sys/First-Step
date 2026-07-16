@@ -94,8 +94,8 @@ class MarketMaker:
         self._feedback = feedback
         self._vol = RealizedVol()
         self._size_map: dict[str, float] = {}        # rewards-weighted quote sizes
-        self._last_mid: dict[str, float] = {}
-        self._cooldown: dict[str, int] = {}
+        self._last_mid: dict[str, float] = {}       # cycle-anchored mid per market
+        self._cooldown_until: dict[str, float] = {}  # guard cooldown deadline (epoch s)
         self._quotes: dict[str, Quote] = {}          # active quotes (all modes)
         self._orders: dict[str, list[TrackedOrder]] = {}  # live orders per market
         self._quoted: dict[str, Market] = {}         # token_id -> quoted market (WS reprice)
@@ -206,18 +206,27 @@ class MarketMaker:
 
     # --- adverse-selection guard ---
 
-    def guard_blocks(self, market: Market, top: TopOfBook) -> bool:
+    def guard_blocks(self, market: Market, top: TopOfBook, anchor: bool = True) -> bool:
+        """Adverse-selection guard.
+
+        The reference mid is CYCLE-anchored (updated only when anchor=True, i.e.
+        from the scheduler cycle) so per-tick calls from the WS fastlane compare
+        against the window start and see cumulative moves — many small ticks
+        adding up to a shock still trip the guard. The cooldown is wall-clock
+        (cycles * interval_sec), so tick frequency cannot burn it.
+        """
         c = self._cfg
         mid = top.mid
         prev = self._last_mid.get(market.id)
-        self._last_mid[market.id] = mid
-        if self._cooldown.get(market.id, 0) > 0:
-            self._cooldown[market.id] -= 1
+        if anchor:
+            self._last_mid[market.id] = mid
+        if time.time() < self._cooldown_until.get(market.id, 0.0):
             return True
         if prev is not None and abs(mid - prev) >= c.guard_price_move:
             log.info("MM guard: %s mid %.3f -> %.3f — pulling quotes, cooldown",
                      market.question[:40], prev, mid)
-            self._cooldown[market.id] = c.guard_cooldown_cycles
+            self._cooldown_until[market.id] = (
+                time.time() + c.guard_cooldown_cycles * c.interval_sec)
             return True
         if market.volume_usd > 0 and \
                 market.volume_24h_usd / market.volume_usd >= c.guard_volume_ratio:
@@ -356,9 +365,10 @@ class MarketMaker:
                         self._quoted[tok] = market
             return active
 
-    def _requote_market(self, market: Market, top: TopOfBook) -> Quote | None:
+    def _requote_market(self, market: Market, top: TopOfBook,
+                        anchor: bool = True) -> Quote | None:
         """One market's quote decision (shared by the cycle and the WS fastlane)."""
-        if self.guard_blocks(market, top):
+        if self.guard_blocks(market, top, anchor=anchor):
             self._cancel_market(market.id)
             return None
         if not self.needs_requote(market, top):
@@ -386,12 +396,18 @@ class MarketMaker:
             market = self._quoted.get(token)
             if market is None:
                 return False
-            # Use the tick as the market's top of book (it is a YES/NO token).
-            yes_top = top if token == market.clob_token_ids[0] else self._top(
-                market.clob_token_ids[0])
+            # WS thread: use the tick or the WS store only — NEVER fall back to
+            # REST here (a blocking HTTP call would stall the recv loop and can
+            # trip the staleness kill-switch).
+            if token == market.clob_token_ids[0]:
+                yes_top = top
+            elif self._top_source is not None:
+                yes_top = self._top_source(market.clob_token_ids[0])
+            else:
+                return False
             if yes_top is None:
                 return False
-            return self._requote_market(market, yes_top) is not None
+            return self._requote_market(market, yes_top, anchor=False) is not None
 
     def local_order_ids(self) -> set[str]:
         with self._lock:

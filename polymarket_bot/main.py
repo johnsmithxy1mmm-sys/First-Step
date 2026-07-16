@@ -26,7 +26,7 @@ from .gamma import GammaClient
 from .ledger import Ledger
 from .logging_setup import setup_logging
 from .marketmaker import MarketMaker
-from .models import Estimate, Market
+from .models import Estimate, Market, Position
 from .monitor import Dashboard, alert
 from .niche import NicheWatcher
 from .ops import MetricsServer, reload_config_inplace
@@ -93,7 +93,9 @@ class Bot:
         # Active-markets cache: refreshed by the main cycle; fast strategies take
         # metadata from here and exact prices from WS / live order books.
         self.markets_cache: list[Market] = []
-        self._position_tokens: set[str] = set()   # cheap WS-tick membership check
+        # WS-fastlane caches: on_tick must NEVER hit the DB or the network.
+        self._positions_by_token: dict[str, Position] = {}
+        self._observe_only = False
 
     def metrics_snapshot(self) -> dict:
         """Live state for /metrics and /health (never raises)."""
@@ -150,9 +152,14 @@ class Bot:
             return
 
         # Risk 2.0 data guard: corrupt feed -> pause trading, don't act on it.
+        # The pause source is "data" so a healthy WS cannot clear it; it lifts
+        # only when the feed itself is clean again.
         problems = self.data_guard.problems(markets)
         if problems:
-            self.killswitch.trip_pause("market data anomaly: " + "; ".join(problems))
+            self.killswitch.trip_pause("market data anomaly: " + "; ".join(problems),
+                                       source="data")
+        else:
+            self.killswitch.resume_from_pause("data")
 
         try:
             self.niche.cycle(markets)  # #5: alerts on new markets in niches
@@ -161,7 +168,7 @@ class Bot:
 
         # Marks for open positions (needed for equity/drawdown/exits).
         positions = self.ledger.open_positions(self.mode)
-        self._position_tokens = {p.token_id for p in positions}
+        self._positions_by_token = {p.token_id: p for p in positions}
         for p in positions:
             book = self.clob.order_book(p.token_id)
             if book is not None and book.best_bid > 0:
@@ -169,6 +176,7 @@ class Bot:
         self._settle_resolutions(markets, positions)
 
         observe_only = self.portfolio.observe_only(marks)
+        self._observe_only = observe_only     # cached for the WS fastlane
         if observe_only:
             alert("Polymarket bot: KILL-SWITCH — drawdown above limit, observe-only mode.")
 
@@ -195,6 +203,9 @@ class Bot:
                     fade_estimates = self.estimator.estimate_all(fade_candidates, markets)
                     self.fade.cycle(fade_estimates)
                 self._exit_positions(marks)
+            # Refresh the fastlane cache after this cycle's entries/exits.
+            self._positions_by_token = {
+                p.token_id: p for p in self.ledger.open_positions(self.mode)}
         except Exception as exc:
             self._error(f"cycle: {exc}")
             log.exception("cycle failure")
@@ -258,16 +269,19 @@ class Bot:
         return False
 
     def on_tick(self, token: str, top) -> None:
-        """WS fastlane (<1s): instant take-profit exits and MM reprice on a tick."""
+        """WS fastlane: instant take-profit exits and MM reprice on a tick.
+
+        Runs in the WS thread — must never hit the DB or the network directly:
+        positions and observe-only come from caches refreshed by the cycle.
+        """
         try:
-            if not self.killswitch.trading_allowed:
+            if not self.killswitch.trading_allowed or self._observe_only:
                 return
-            if token in self._position_tokens and top.bid > 0:
-                for p in self.ledger.open_positions(self.mode):
-                    if p.token_id == token:
-                        self._exit_one(p, top.bid)
-                        break
-            if not self.portfolio.observe_only() and self.breaker.allows("mm"):
+            position = self._positions_by_token.get(token)
+            if position is not None and top.bid > 0:
+                if self._exit_one(position, top.bid):
+                    self._positions_by_token.pop(token, None)
+            if self.breaker.allows("mm"):
                 self.mm.react_to_tick(token, top)
         except Exception:
             log.exception("on_tick")
@@ -337,12 +351,15 @@ class Bot:
                 self.mm.shutdown()
                 return
             quotes = self.mm.cycle(self.markets_cache)
+            # MM fills may have changed positions — refresh the fastlane cache.
+            positions = self.ledger.open_positions(self.mode)
+            self._positions_by_token = {p.token_id: p for p in positions}
             # WS subscription to tokens of quoted markets + open positions.
             if self.ws is not None:
                 tokens: set[str] = set()
                 for q in quotes:
                     tokens.update(q.market.clob_token_ids[:2])
-                for p in self.ledger.open_positions(self.mode):
+                for p in positions:
                     tokens.add(p.token_id)
                 if tokens:
                     self.ws.watch(tokens)
