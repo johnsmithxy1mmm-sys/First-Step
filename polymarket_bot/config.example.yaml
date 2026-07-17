@@ -199,6 +199,22 @@ fade:
                               # exist. Empirically 14 gave 0 fadeable; lower it only if
                               # `--mode diagnose` shows the FADE funnel still PASSES > 0.
 
+# Resolution alpha: buy a near-decided side (top outcome ~0.95-0.985, at/near its
+# end date) for a small near-riskless carry until on-chain settlement pays out.
+# Detect + ALERT only by default (execute: false) — the residual risk is a UMA
+# dispute, reserved via dispute_haircut. The window is naturally rare: once an
+# outcome is obvious, its volume dies, so it fails the freshness gate.
+resolution:
+  enabled: true
+  execute: false            # true = cross to grab it; keep false until paper shows
+                            # the candidates are genuinely near-decided, not stuck
+  min_volume_24h_usd: 10000 # was 20000 default — admit less-liquid near-decided
+                            # markets so the funnel isn't always 0. Do NOT go lower
+                            # without checking candidates by hand (dispute risk).
+  dispute_haircut: 0.02     # reserve subtracted from edge for UMA overturning the
+                            # "obvious" outcome — the honest cost of this carry.
+  max_days_to_resolution: 7 # only markets at/just past their end date
+
 ops:
   metrics_enabled: true     # Prometheus /metrics + /health on the port below
   metrics_port: 9090
