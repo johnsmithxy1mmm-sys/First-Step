@@ -193,8 +193,11 @@ fade:
   min_tail_price: 0.005
   min_edge_after_fees: 0.003  # AGGR: accept thinner edges (was 0.005) -> more trades
   longshot_veto_ratio: 2.0  # p_est >= 2x market -> a real longshot, do not fade
-  max_days_to_resolution: 14  # AGGR: near-term only — fast capital recycling (higher IRR).
-                              # Lower (7) = even faster but fewer tails; raise (30) for more.
+  max_days_to_resolution: 90  # Soft horizon: the IRR planner (edge/days) already
+                              # prefers near-term first, so keep this WIDE enough that
+                              # the fade is not dormant when only far-dated cheap tails
+                              # exist. Empirically 14 gave 0 fadeable; lower it only if
+                              # `--mode diagnose` shows the FADE funnel still PASSES > 0.
 
 ops:
   metrics_enabled: true     # Prometheus /metrics + /health on the port below
