@@ -60,6 +60,29 @@ disabled). The kill-switch is shared with the rest of the bot.
 `market_maker.enabled: false` by default — enable deliberately, the strategy
 holds capital in quotes.
 
+### #3b. Short-dated market making (fast capital turnover)
+
+The core MM (#3) quotes markets 30+ days out — the same dollars stay locked in
+quotes for weeks. This variant runs the **identical engine** on **liquid markets
+that resolve within hours to a couple of days**, so the capital is freed at
+settlement in 1-2 days and redeployed. It is the honest way to turn capital
+*fast*: you still earn spread + maker rebate, you do **not** bet on direction
+(the taker fee makes short-horizon direction bets negative-EV).
+
+The trade-off is higher adverse selection near resolution, so the risk profile
+is tighter: it quotes only inside a `[min, max]` **hours** window (staying OUT
+of the final settlement window where direction, not spread, moves the price),
+requires real two-sided liquidity, leans harder against inventory, widens the
+base spread, and pulls quotes on a smaller shock.
+
+**Implementation:** `sprintmaker.py` — `SprintMaker` subclasses `MarketMaker`
+(same quoting, guard, queue-preserving requote, paper/live fills) and only
+swaps selection (`SprintScorer`: hours window + high liquidity, rewards not
+required) and tags fills `strategy="sprint_mm"` for separate PnL / circuit
+breaker / digest attribution. `sprint_mm.enabled: false` by default. Watch the
+**SPRINT MM** funnel in `--mode diagnose`; an empty funnel is normal when
+nothing liquid resolves that soon.
+
 ## #4. Resolution edge (rules lawyering)
 
 Trading the gap between the market headline and the letter of the UMA

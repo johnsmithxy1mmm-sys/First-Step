@@ -26,6 +26,7 @@ from .gamma import GammaClient
 from .ledger import Ledger
 from .logging_setup import setup_logging
 from .marketmaker import MarketMaker
+from .sprintmaker import SprintMaker
 from .models import Estimate, Market, Position
 from .monitor import Dashboard, alert
 from .niche import NicheWatcher
@@ -80,6 +81,10 @@ class Bot:
         self.mm = MarketMaker(cfg, self.ledger, self.clob, self.trader, mode,
                               top_source=(self.ws.top if self.ws else None),
                               feedback=self.markout_feedback)
+        # Short-dated MM (fast capital turnover): same engine, hours-horizon.
+        self.sprint = SprintMaker(cfg, self.ledger, self.clob, self.trader, mode,
+                                  top_source=(self.ws.top if self.ws else None),
+                                  feedback=self.markout_feedback)
         self.resolution = ResolutionAlpha(cfg, self.ledger, self.clob, self.trader, mode)
         self.cross = CrossMarketScanner(cfg)
         self.niche = NicheWatcher(cfg, self.ledger)
@@ -97,6 +102,11 @@ class Bot:
         self.markets_cache: list[Market] = []
         # WS-fastlane caches: on_tick must NEVER hit the DB or the network.
         self._positions_by_token: dict[str, Position] = {}
+        # Each quoting job contributes its tokens; the WS watches the UNION
+        # (ws.watch replaces the desired set, so the jobs must not overwrite
+        # each other's subscription).
+        self._mm_watch: set[str] = set()
+        self._sprint_watch: set[str] = set()
         self._observe_only = False
         # Per-strategy PnL checkpoints (one per digest) for Sharpe allocation.
         self._pnl_history: dict[str, list[float]] = {}
@@ -122,6 +132,7 @@ class Bot:
 
     def _cancel_everything(self) -> None:
         self.mm.shutdown()
+        self.sprint.shutdown()
         if self.trader is not None:
             try:
                 self.trader.cancel_all()
@@ -301,6 +312,8 @@ class Bot:
                     self._positions_by_token.pop(token, None)
             if self.breaker.allows("mm"):
                 self.mm.react_to_tick(token, top)
+            if self.cfg.sprint_mm.enabled and self.breaker.allows("sprint_mm"):
+                self.sprint.react_to_tick(token, top)
         except Exception:
             log.exception("on_tick")
 
@@ -372,17 +385,40 @@ class Bot:
             # MM fills may have changed positions — refresh the fastlane cache.
             positions = self.ledger.open_positions(self.mode)
             self._positions_by_token = {p.token_id: p for p in positions}
-            # WS subscription to tokens of quoted markets + open positions.
-            if self.ws is not None:
-                tokens: set[str] = set()
-                for q in quotes:
-                    tokens.update(q.market.clob_token_ids[:2])
-                for p in positions:
-                    tokens.add(p.token_id)
-                if tokens:
-                    self.ws.watch(tokens)
+            self._mm_watch = {tok for q in quotes
+                              for tok in q.market.clob_token_ids[:2]}
+            self._sync_ws_watch(positions)
         except Exception:
             log.exception("mm job")
+
+    def _sync_ws_watch(self, positions) -> None:
+        """Subscribe the WS to the UNION of both quoting jobs' tokens + positions."""
+        if self.ws is None:
+            return
+        tokens = set(self._mm_watch) | set(self._sprint_watch)
+        tokens.update(p.token_id for p in positions)
+        if tokens:
+            self.ws.watch(tokens)
+
+    def sprint_job(self) -> None:
+        """Short-dated MM: fast capital turnover. Same gates as the core MM."""
+        if not self.markets_cache:
+            return
+        try:
+            if self.ws is not None and self.ws.healthy:
+                self.killswitch.on_ws_recovered()
+            if not self.killswitch.trading_allowed or self.portfolio.observe_only() \
+                    or not self.breaker.allows("sprint_mm"):
+                self.sprint.shutdown()
+                return
+            quotes = self.sprint.cycle(self.markets_cache)
+            positions = self.ledger.open_positions(self.mode)
+            self._positions_by_token = {p.token_id: p for p in positions}
+            self._sprint_watch = {tok for q in quotes
+                                  for tok in q.market.clob_token_ids[:2]}
+            self._sync_ws_watch(positions)
+        except Exception:
+            log.exception("sprint job")
 
     def satellite_job(self) -> None:
         """Satellite btc_5m_ta (disabled by default)."""
@@ -425,7 +461,9 @@ class Bot:
                 exchange_ids = {str(o.get("id") or o.get("orderID") or "")
                                 for o in self.trader.open_orders()}
                 exchange_ids.discard("")
-                self.killswitch.reconcile(self.mm.local_order_ids(), exchange_ids)
+                self.killswitch.reconcile(
+                    self.mm.local_order_ids() | self.sprint.local_order_ids(),
+                    exchange_ids)
             # Per-strategy circuit breaker: a losing streak disables that strategy.
             was = set(self.breaker.disabled)
             self.breaker.update(self.ledger.realized_pnl_by_strategy(self.mode))
@@ -658,6 +696,10 @@ def main(argv: list[str] | None = None) -> None:
     if cfg.market_maker.enabled:
         scheduler.add_job(bot.mm_job, "interval",
                           seconds=cfg.market_maker.interval_sec,
+                          max_instances=1, coalesce=True)
+    if cfg.sprint_mm.enabled:
+        scheduler.add_job(bot.sprint_job, "interval",
+                          seconds=cfg.sprint_mm.interval_sec,
                           max_instances=1, coalesce=True)
     if cfg.crossmarket.enabled:
         scheduler.add_job(bot.cross_job, "interval",

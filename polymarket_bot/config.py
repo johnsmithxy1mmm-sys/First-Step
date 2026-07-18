@@ -181,6 +181,34 @@ class MarketMakerConfig(BaseModel):
     guard_volume_ratio: float = 0.5
 
 
+class SprintMakerConfig(MarketMakerConfig):
+    """Short-dated MM (fast capital turnover): quote LIQUID markets that resolve
+    within hours, earn spread + maker rebate, and recycle the capital at
+    settlement 1-2 days later — instead of the 30d+ horizon of the core MM.
+
+    Same quoting engine, but a tighter risk profile: near-resolution markets
+    have higher adverse selection (info arrives, price jumps), so we lean harder
+    against inventory, widen the base spread, pull quotes on smaller shocks, and
+    refuse the final settlement window (min_hours_to_resolution) where direction
+    dominates. Income is spread + rebate only (short markets are rarely in the
+    rewards program) — still +EV as long as the captured spread beats the
+    adverse-selection cost, which the fee-break-even floor and the guard enforce.
+    """
+    enabled: bool = False
+    interval_sec: float = 20.0             # faster loop — short markets move
+    min_volume_24h_usd: float = 50_000.0   # need real two-sided flow for fast in/out
+    require_rewards_program: bool = False  # short markets rarely in rewards; spread+rebate still +EV
+    max_hours_to_resolution: float = 48.0  # only quote markets resolving this soon
+    min_hours_to_resolution: float = 2.0   # but skip the settlement window (direction dominates)
+    half_spread: float = 0.015             # a touch wider to pay for adverse selection
+    quote_size_usd: float = 25.0
+    inventory_skew_k: float = 1.0          # lean HARDER against inventory than core MM
+    vol_spread_k: float = 8.0              # widen spread with realized volatility
+    guard_price_move: float = 0.02         # pull quotes on a smaller shock
+    guard_cooldown_cycles: int = 3
+    requote_timer_sec: float = 45.0        # refresh quotes more often
+
+
 class RiskLimitsConfig(BaseModel):
     """Absolute risk-framework limits (hard requirements from the master prompt)."""
     max_position_per_market_usd: float = 50.0
@@ -327,6 +355,7 @@ class BotConfig(BaseModel):
     ruleslawyer: RulesLawyerConfig = Field(default_factory=RulesLawyerConfig)
     fade: FadeConfig = Field(default_factory=FadeConfig)
     market_maker: MarketMakerConfig = Field(default_factory=MarketMakerConfig)
+    sprint_mm: SprintMakerConfig = Field(default_factory=SprintMakerConfig)
     risk: RiskLimitsConfig = Field(default_factory=RiskLimitsConfig)
     fees: FeesConfig = Field(default_factory=FeesConfig)
     ws: WSConfig = Field(default_factory=WSConfig)

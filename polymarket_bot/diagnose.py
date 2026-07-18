@@ -80,6 +80,16 @@ def run_diagnose(cfg: BotConfig, gamma: GammaClient | None = None) -> None:
                   "nothing, hence zero trades. Look at the top row of the table: "
                   "that's the filter to loosen in config.yaml (market_maker:).[/dim]\n")
 
+    from .sprintmaker import SprintScorer
+    sprint = SprintScorer(cfg)
+    sp_reasons, sp_passed = funnel(markets, sprint.reject_reason)
+    _print_funnel(console, "SPRINT MM (short-dated)", total, "markets", sp_reasons, sp_passed)
+    console.print("[dim]\"passed\" = a LIQUID market resolving within the sprint "
+                  "hours-window — fast capital turnover on spread + rebate. If 0, "
+                  "loosen max_hours_to_resolution / min_volume_24h_usd in "
+                  "config.yaml (sprint_mm:). Empty is expected when no liquid "
+                  "market resolves that soon.[/dim]\n")
+
     # Fade funnel: runs over the first-level cheap-tail candidates, estimated.
     candidates = scanner.first_level_filter(markets)
     estimates = Estimator(cfg).estimate_all(candidates, markets)

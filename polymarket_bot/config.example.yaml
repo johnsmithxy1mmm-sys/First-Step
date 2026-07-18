@@ -88,6 +88,34 @@ market_maker:
   guard_cooldown_cycles: 3
   guard_volume_ratio: 0.5
 
+# FAST CAPITAL TURNOVER: short-dated market making. Same engine as market_maker,
+# but quotes LIQUID markets that resolve within hours (not 30+ days), so the
+# capital is freed at settlement in 1-2 days and redeployed. Income = spread +
+# maker rebate (honest, structural — NOT a bet on direction). Higher adverse
+# selection near resolution, so the risk profile is tighter: harder inventory
+# lean, wider base spread, tighter shock guard, and it refuses the final
+# settlement window. Test in paper first, and watch the SPRINT MM funnel in
+# `--mode diagnose` (empty is normal when nothing liquid resolves that soon).
+sprint_mm:
+  enabled: false            # turn on deliberately, after paper confirms fills
+  interval_sec: 20          # faster loop than the core MM
+  max_markets: 5
+  min_volume_24h_usd: 50000 # need REAL two-sided flow to enter/exit fast
+  require_rewards_program: false  # short markets rarely in rewards; spread+rebate still +EV
+  max_hours_to_resolution: 48     # only quote markets resolving within ~2 days
+  min_hours_to_resolution: 2      # but stay OUT of the settlement window (direction dominates)
+  half_spread: 0.015        # a touch wider — pay for the adverse selection
+  quote_size_usd: 25
+  inventory_skew_k: 1.0     # lean HARDER against inventory than the core MM
+  vol_spread_k: 8.0         # widen with realized volatility
+  rewards_weighting: false
+  requote_threshold_ticks: 2
+  requote_timer_sec: 45
+  requote_min_fill_prob: 0.25
+  guard_price_move: 0.02    # pull quotes on a smaller shock
+  guard_cooldown_cycles: 3
+  guard_volume_ratio: 0.5
+
 # Risk framework: absolute limits, kill-switch (halt until manual restart).
 # AGGR: limits scaled ~2x, drawdown halt loosened 15% -> 30% (ladder: observe-only
 # at 25% first, then hard halt at 30%). The kill-switch stays — just more room.
