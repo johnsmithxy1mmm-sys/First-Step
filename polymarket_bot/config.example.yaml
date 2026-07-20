@@ -100,9 +100,24 @@ sprint_mm:
   enabled: false            # turn on deliberately, after paper confirms fills
   interval_sec: 20          # faster loop than the core MM
   max_markets: 5
-  min_volume_24h_usd: 50000 # need REAL two-sided flow to enter/exit fast
+  min_volume_24h_usd: 10000 # AGGR: was 50000. Empirically (diagnose horizon
+                            # histogram) even at $10k almost nothing liquid
+                            # resolves under 30d right now -- the constraint is
+                            # available inventory, not this floor. Do NOT go
+                            # lower: below this the book is too thin for a fast
+                            # in/out (the whole point of "sprint"), so it stops
+                            # being honest capital turnover and starts being a
+                            # stuck position.
   require_rewards_program: false  # short markets rarely in rewards; spread+rebate still +EV
-  max_hours_to_resolution: 48     # only quote markets resolving within ~2 days
+  max_hours_to_resolution: 336     # AGGR: was 48. Widened to 14d to admit the
+                            # 7-14d bucket (empirically the only non-empty one
+                            # short of 30d) without reaching into the core MM's
+                            # 30d+ territory -- that would just relabel the
+                            # same trades, not turn capital faster. Recheck
+                            # with `--mode diagnose` (horizon histogram) after
+                            # high-activity days (NFL Sunday, FOMC, CPI print)
+                            # -- short-dated liquid markets appear in bursts,
+                            # not steadily.
   min_hours_to_resolution: 2      # but stay OUT of the settlement window (direction dominates)
   half_spread: 0.015        # a touch wider — pay for the adverse selection
   quote_size_usd: 25
