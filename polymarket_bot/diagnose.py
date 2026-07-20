@@ -11,6 +11,7 @@ it surgically instead of guessing.
 from __future__ import annotations
 
 from collections import Counter
+from datetime import datetime, timezone
 
 from rich.console import Console
 from rich.table import Table
@@ -51,6 +52,61 @@ def _print_funnel(console: Console, title: str, total: int, unit: str,
     console.print(t)
 
 
+HOUR_BUCKETS = [
+    (0, 2, "0-2h (settlement window — sprint refuses)"),
+    (2, 6, "2-6h"),
+    (6, 24, "6-24h"),
+    (24, 48, "24-48h"),
+    (48, 96, "48-96h (2-4d)"),
+    (96, 168, "96-168h (4-7d)"),
+    (168, 336, "168-336h (7-14d)"),
+    (336, 720, "336-720h (14-30d)"),
+    (720, None, "720h+ (30d+, core MM territory)"),
+]
+
+
+def _bucket_label(hours: float) -> str:
+    for lo, hi, label in HOUR_BUCKETS:
+        if hours >= lo and (hi is None or hours < hi):
+            return label
+    return "?"
+
+
+def _print_horizon_histogram(console: Console, markets: list[Market],
+                             volume_floors: list[float]) -> None:
+    """Where liquid markets actually sit in time — the real fix for an empty
+    SPRINT MM funnel is picking max_hours_to_resolution from THIS, not a guess."""
+    now = datetime.now(timezone.utc)
+    live = [m for m in markets
+            if not m.closed and m.enable_order_book and len(m.clob_token_ids) >= 2
+            and m.days_to_resolution(now) is not None and m.days_to_resolution(now) >= 0]
+
+    t = Table(title="Horizon of LIQUID markets (book present, not closed) — "
+                     "pick max_hours_to_resolution from where the mass is")
+    t.add_column("Resolves in")
+    for v in volume_floors:
+        t.add_column(f"24h vol >= ${v:,.0f}", justify="right")
+
+    counts = {v: Counter() for v in volume_floors}
+    for m in live:
+        hours = m.days_to_resolution(now) * 24.0
+        label = _bucket_label(hours)
+        for v in volume_floors:
+            if m.volume_24h_usd >= v:
+                counts[v][label] += 1
+
+    for _, _, label in HOUR_BUCKETS:
+        t.add_row(label, *[str(counts[v][label]) for v in volume_floors])
+    t.add_row("[bold]TOTAL liquid markets[/bold]",
+              *[f"[bold]{sum(counts[v].values())}[/bold]" for v in volume_floors])
+    console.print(t)
+    console.print("[dim]Read this top-to-bottom: find the first bucket with real "
+                  "counts, set max_hours_to_resolution to its upper edge (or the "
+                  "one below to stay conservative). If a column is all zeros, that "
+                  "volume floor filters out everything currently on the "
+                  "board — try the lower column instead.[/dim]\n")
+
+
 def run_diagnose(cfg: BotConfig, gamma: GammaClient | None = None) -> None:
     console = Console()
     gamma = gamma or GammaClient(cfg)
@@ -89,6 +145,9 @@ def run_diagnose(cfg: BotConfig, gamma: GammaClient | None = None) -> None:
                   "loosen max_hours_to_resolution / min_volume_24h_usd in "
                   "config.yaml (sprint_mm:). Empty is expected when no liquid "
                   "market resolves that soon.[/dim]\n")
+
+    floors = sorted({cfg.sprint_mm.min_volume_24h_usd, 20_000.0, 10_000.0}, reverse=True)
+    _print_horizon_histogram(console, markets, floors)
 
     # Fade funnel: runs over the first-level cheap-tail candidates, estimated.
     candidates = scanner.first_level_filter(markets)
