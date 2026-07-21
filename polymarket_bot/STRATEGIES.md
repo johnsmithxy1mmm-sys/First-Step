@@ -26,9 +26,14 @@ Prefilter on Gamma prices → verification against live order books → sizing b
 the minimum of leg depth and `max_stake_usd`. The `arbitrage:` section in
 config.yaml; `execute: false` by default (detect + alert), 60-second interval.
 
-**Honest limit:** this is REST polling, the "slow hunter" — it picks up what is
-left after the websocket bots. The `min_profit_pct` threshold (1.5%) budgets
-for the risk of a leg not filling.
+**Honest limit:** discovery is REST polling — the full board is only re-walked
+every cycle. But tracked structures are faster than that: the polling job
+registers every prefiltered basket (and chain pair) with the WS fastlane
+(`arb_fastlane.py`), so a tick on any of their tokens triggers an immediate
+re-verification against live books in a dedicated worker thread (per-structure
+cooldown stops tick storms from hammering the API). New windows are still found
+at polling speed; known windows are re-checked at tick speed. The
+`min_profit_pct` threshold (1.5%) budgets for the risk of a leg not filling.
 
 ### #1b. Chain (ladder) arbitrage — across nested sibling markets
 

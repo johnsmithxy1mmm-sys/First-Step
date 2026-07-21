@@ -10,9 +10,13 @@ category taker fee AND an honest `dispute_haircut` reserved for the residual
 risk that UMA overturns the "obvious" outcome. Detect + alert by default;
 execution is opt-in.
 
-The price/volume/date heuristic is a proxy for "an oracle proposal is live".
-The clean upgrade is to read the UMA Optimistic Oracle directly — a drop-in
-data source behind the same `evaluate` interface.
+Candidate admission is oracle-first: when Gamma reports a UMA answer on-chain
+(umaResolutionStatus "proposed"/"resolved"), that FACT admits the market and
+the price/volume/date heuristics are skipped (they were only ever a proxy for
+"an oracle proposal is live"). Actively disputed markets are rejected outright.
+Markets with no oracle signal still go through the original heuristics.
+Reading the Optimistic Oracle contract directly (instead of Gamma's report of
+it) remains a drop-in upgrade behind the same `evaluate` interface.
 """
 
 from __future__ import annotations
@@ -30,6 +34,11 @@ from .monitor import alert
 from .portfolio import classify_category
 
 log = logging.getLogger(__name__)
+
+# Gamma's umaResolutionStatus values. An answer EXISTS on-chain:
+ORACLE_CONFIRMED_STATUSES = frozenset({"proposed", "resolved"})
+# The answer is actively contested — trading "near-certain" here is a bet:
+DISPUTED_STATUSES = frozenset({"challenged", "disputed"})
 
 
 class ResolutionCandidate(BaseModel):
@@ -50,18 +59,32 @@ class ResolutionAlpha:
         self._mode = mode
 
     def reject_reason(self, m: Market) -> str | None:
-        """None = a resolution-alpha candidate; else the reject reason (diagnostics)."""
+        """None = a resolution-alpha candidate; else the reject reason (diagnostics).
+
+        Two admission paths:
+          * ORACLE — Gamma reports a UMA answer on-chain ("proposed"/
+            "resolved"): a fact, so the imminence/freshness HEURISTICS are
+            skipped. The price band still applies — the status does not say
+            WHICH outcome was proposed; the market price does, and the band
+            also confirms the market agrees with the oracle.
+          * HEURISTIC — no oracle signal: the original volume/imminence/
+            freshness proxies.
+        An actively disputed market is rejected outright on either path.
+        """
         c = self._cfg
         if m.closed or not m.outcome_prices or len(m.clob_token_ids) < len(m.outcome_prices):
             return "closed / no book"
-        if m.volume_24h_usd < c.min_volume_24h_usd:
-            return f"24h volume < ${c.min_volume_24h_usd:,.0f}"
-        days = m.days_to_resolution()
-        # No end date = we cannot verify imminence -> not a candidate.
-        if days is None or days > c.max_days_to_resolution:
-            return "resolution not imminent"
-        if m.volume_usd > 0 and m.volume_24h_usd / m.volume_usd < c.volume_spike_ratio:
-            return "no fresh volume (stale)"
+        if m.uma_resolution_status in DISPUTED_STATUSES:
+            return "UMA dispute active"
+        if m.uma_resolution_status not in ORACLE_CONFIRMED_STATUSES:
+            if m.volume_24h_usd < c.min_volume_24h_usd:
+                return f"24h volume < ${c.min_volume_24h_usd:,.0f}"
+            days = m.days_to_resolution()
+            # No end date = we cannot verify imminence -> not a candidate.
+            if days is None or days > c.max_days_to_resolution:
+                return "resolution not imminent"
+            if m.volume_usd > 0 and m.volume_24h_usd / m.volume_usd < c.volume_spike_ratio:
+                return "no fresh volume (stale)"
         price = max(m.outcome_prices)
         if not c.near_min <= price <= c.near_max:
             return f"top outcome outside [{c.near_min}, {c.near_max}]"
@@ -72,7 +95,12 @@ class ResolutionAlpha:
     def _net_edge(self, m: Market, price: float) -> float:
         category = classify_category(m.question, m.category)
         fee = self._fees.taker_fee(category, m.category)
-        return (1.0 - price) - fee - self._cfg.dispute_haircut
+        # "resolved" = the dispute window is over, the outcome is final — only
+        # settlement remains, so no dispute reserve. "proposed" can still be
+        # challenged: reserve the FULL haircut.
+        haircut = 0.0 if m.uma_resolution_status == "resolved" \
+            else self._cfg.dispute_haircut
+        return (1.0 - price) - fee - haircut
 
     def evaluate(self, m: Market) -> ResolutionCandidate | None:
         if self.reject_reason(m) is not None:

@@ -280,7 +280,23 @@ resolution:
                             # without checking candidates by hand (dispute risk).
   dispute_haircut: 0.02     # reserve subtracted from edge for UMA overturning the
                             # "obvious" outcome — the honest cost of this carry.
+                            # Applied to "proposed"; dropped once "resolved".
   max_days_to_resolution: 7 # only markets at/just past their end date
+                            # NOTE: markets with a live UMA answer (Gamma
+                            # umaResolutionStatus proposed/resolved) skip the
+                            # volume/imminence heuristics entirely — the oracle
+                            # is a fact, the heuristics were only its proxy.
+
+# Auto-redemption (live mode): a winning token pays $1 only after an on-chain
+# redeemPositions call — until then the capital is FROZEN in a decided market.
+# Alert-first; auto-claim is opt-in (execute + web3 installed + POLYGON_RPC_URL
+# in .env). Neg-risk positions always stay a manual claim in the UI (they
+# redeem through a different adapter — a wrong automated call loses money).
+redemption:
+  enabled: true
+  execute: false            # true = send the redeemPositions tx automatically
+  interval_sec: 300
+  min_claim_usd: 1.0        # ignore dust: gas would eat it
 
 ops:
   metrics_enabled: true     # Prometheus /metrics + /health on the port below

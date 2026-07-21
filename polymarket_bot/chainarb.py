@@ -300,6 +300,34 @@ class ChainArbitrage:
 
     # --- cycle ---
 
+    def check_pair(self, subset: Market, superset: Market, kind: str,
+                   allow_execute: bool = True) -> ChainPair | None:
+        """Verify ONE classified pair against live books; execute when allowed.
+
+        Shared by the polling cycle and the WS fastlane (which re-checks just
+        the pair whose token ticked, instead of waiting for the next poll).
+        """
+        pair = self.verify(subset, superset, kind)
+        # A dust-sized best ask can fake an "edge" nobody can trade;
+        # require real depth even for the alert (same idea as arbitrage.py).
+        if pair is None or pair.max_sets_by_depth() < self._cfg.min_sets:
+            return None
+        net_after_haircut = pair.net_profit_pct - self._cfg.classification_haircut
+        if net_after_haircut < self._cfg.min_net_edge:
+            return None
+        log.info("CHAIN ARB [%s] %s: buy YES %s (%.3f) + NO %s (%.3f) -> "
+                 "cost $%.4f/set, worst-case payout $1.00, gross +%.2f%%, "
+                 "NET after fee+haircut +%.2f%%, depth %d sets",
+                 pair.kind, pair.event_title[:40], pair.superset.market.question[:40],
+                 pair.superset.ask, pair.subset.market.question[:40], pair.subset.ask,
+                 pair.cost_per_set, pair.profit_pct * 100, net_after_haircut * 100,
+                 pair.max_sets_by_depth())
+        if self._cfg.execute and allow_execute:
+            spent = self.execute(pair)
+            if spent > 0:
+                log.info("chain arb executed: $%.2f", spent)
+        return pair
+
     def cycle(self, markets: list[Market],
               allow_execute: bool = True) -> list[ChainPair]:
         """allow_execute=False (kill-switch / observe-only / breaker): keep
@@ -308,24 +336,7 @@ class ChainArbitrage:
             return []
         found: list[ChainPair] = []
         for subset, superset, kind in self.prefilter_pairs(markets):
-            pair = self.verify(subset, superset, kind)
-            # A dust-sized best ask can fake an "edge" nobody can trade;
-            # require real depth even for the alert (same idea as arbitrage.py).
-            if pair is None or pair.max_sets_by_depth() < self._cfg.min_sets:
-                continue
-            net_after_haircut = pair.net_profit_pct - self._cfg.classification_haircut
-            if net_after_haircut < self._cfg.min_net_edge:
-                continue
-            found.append(pair)
-            log.info("CHAIN ARB [%s] %s: buy YES %s (%.3f) + NO %s (%.3f) -> "
-                     "cost $%.4f/set, worst-case payout $1.00, gross +%.2f%%, "
-                     "NET after fee+haircut +%.2f%%, depth %d sets",
-                     pair.kind, pair.event_title[:40], pair.superset.market.question[:40],
-                     pair.superset.ask, pair.subset.market.question[:40], pair.subset.ask,
-                     pair.cost_per_set, pair.profit_pct * 100, net_after_haircut * 100,
-                     pair.max_sets_by_depth())
-            if self._cfg.execute and allow_execute:
-                spent = self.execute(pair)
-                if spent > 0:
-                    log.info("chain arb executed: $%.2f", spent)
+            pair = self.check_pair(subset, superset, kind, allow_execute)
+            if pair is not None:
+                found.append(pair)
         return found

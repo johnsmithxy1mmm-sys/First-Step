@@ -220,6 +220,29 @@ class ArbitrageScanner:
 
     # --- cycle ---
 
+    def check_group(self, group: list[Market],
+                    allow_execute: bool = True) -> BasketArb | None:
+        """Verify ONE event group against live books; execute when allowed.
+
+        Shared by the polling cycle and the WS fastlane (which re-checks just
+        the group whose token ticked, instead of waiting for the next poll).
+        """
+        arb = self.verify(group)
+        if arb is None:
+            return None
+        warn = ("  ⚠️ SUSPECT: likely an incomplete basket, check by hand"
+                if arb.suspect else "")
+        log.info("ARBITRAGE %s %s: %d legs, set $%.4f, gross +%.2f%% -> "
+                 "NET after fees +%.2f%% (fee %.1f%%), depth %d sets%s",
+                 arb.side, arb.event_title[:50], len(arb.legs), arb.cost_per_set,
+                 arb.profit_pct * 100, arb.net_profit_pct * 100,
+                 arb.taker_fee * 100, arb.max_sets_by_depth(), warn)
+        if self._cfg.execute and allow_execute and not arb.suspect:
+            spent = self.execute(arb)
+            if spent > 0:
+                log.info("arbitrage executed: $%.2f", spent)
+        return arb
+
     def cycle(self, markets: list[Market],
               allow_execute: bool = True) -> list[BasketArb]:
         """allow_execute=False (kill-switch / observe-only / breaker): keep
@@ -228,19 +251,7 @@ class ArbitrageScanner:
             return []
         found: list[BasketArb] = []
         for group in self.prefilter_events(markets):
-            arb = self.verify(group)
-            if arb is None:
-                continue
-            found.append(arb)
-            warn = ("  ⚠️ SUSPECT: likely an incomplete basket, check by hand"
-                    if arb.suspect else "")
-            log.info("ARBITRAGE %s %s: %d legs, set $%.4f, gross +%.2f%% -> "
-                     "NET after fees +%.2f%% (fee %.1f%%), depth %d sets%s",
-                     arb.side, arb.event_title[:50], len(arb.legs), arb.cost_per_set,
-                     arb.profit_pct * 100, arb.net_profit_pct * 100,
-                     arb.taker_fee * 100, arb.max_sets_by_depth(), warn)
-            if self._cfg.execute and allow_execute and not arb.suspect:
-                spent = self.execute(arb)
-                if spent > 0:
-                    log.info("arbitrage executed: $%.2f", spent)
+            arb = self.check_group(group, allow_execute)
+            if arb is not None:
+                found.append(arb)
         return found

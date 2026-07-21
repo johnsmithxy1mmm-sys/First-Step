@@ -102,3 +102,58 @@ def test_allow_execute_false_alerts_but_places_nothing(cfg, ledger):
         found = res.cycle([near_market()], allow_execute=False)
     assert len(found) == 1 and a.called               # still detected + alerted
     assert ledger._conn.execute("SELECT COUNT(*) c FROM trades").fetchone()["c"] == 0
+
+
+# --- UMA oracle signal (Gamma umaResolutionStatus) ---
+
+def test_oracle_proposed_bypasses_imminence_heuristics(cfg, ledger):
+    """A live on-chain proposal is a FACT: stale volume and a far end date
+    (the old proxies) must not reject the market."""
+    res = make_res(cfg, ledger)
+    m = near_market(uma_resolution_status="proposed",
+                    volume_24h_usd=100,                  # fails the volume floor
+                    volume_usd=10_000_000,               # and the freshness ratio
+                    end_date=datetime.now(timezone.utc) + timedelta(days=60))
+    cand = res.evaluate(m)
+    assert cand is not None
+    assert abs(cand.net_edge - 0.01) < 1e-9              # full haircut still reserved
+
+
+def test_oracle_proposed_still_needs_price_band(cfg, ledger):
+    """The status does not say WHICH outcome was proposed — the price does.
+    Outside the band the market disagrees or there is no meat: reject."""
+    res = make_res(cfg, ledger)
+    m = near_market(uma_resolution_status="proposed", outcome_prices=[0.80, 0.20])
+    assert "outside" in res.reject_reason(m)
+
+
+def test_oracle_resolved_drops_dispute_haircut(cfg, ledger):
+    """After the dispute window the outcome is final — no dispute reserve."""
+    res = make_res(cfg, ledger)
+    cand = res.evaluate(near_market(uma_resolution_status="resolved"))
+    assert cand is not None
+    assert abs(cand.net_edge - 0.03) < 1e-9              # (1-0.97) - 0 fee - 0 haircut
+
+
+def test_active_dispute_rejected_outright(cfg, ledger):
+    """A challenged answer is a live bet, not a near-riskless carry."""
+    res = make_res(cfg, ledger)
+    for status in ("challenged", "disputed"):
+        assert res.reject_reason(near_market(uma_resolution_status=status)) \
+            == "UMA dispute active"
+
+
+def test_no_oracle_signal_keeps_old_heuristics(cfg, ledger):
+    """Without a status the original volume/imminence gates still guard."""
+    res = make_res(cfg, ledger)
+    assert "volume" in res.reject_reason(near_market(volume_24h_usd=100))
+    assert res.evaluate(near_market()) is not None       # baseline unchanged
+
+
+def test_market_model_parses_uma_fields():
+    from polymarket_bot.models import Market
+    from .conftest import gamma_raw_market
+    raw = gamma_raw_market(umaResolutionStatus="Proposed", conditionId="0xabc")
+    m = Market.from_gamma(raw)
+    assert m.uma_resolution_status == "proposed"          # normalized to lower
+    assert m.condition_id == "0xabc"

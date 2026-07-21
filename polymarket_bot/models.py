@@ -74,6 +74,13 @@ class Market(BaseModel):
     min_order_size: float = 5.0
     resolution_source: str = ""
     closed: bool = False
+    # UMA oracle state as reported by Gamma (e.g. "proposed", "challenged",
+    # "resolved", "" when absent/unknown). "proposed"/"resolved" means an
+    # oracle answer EXISTS on-chain — a fact, unlike the price/volume
+    # imminence heuristic.
+    uma_resolution_status: str = ""
+    # CTF condition id — required to redeem winnings on-chain.
+    condition_id: str = ""
     # Liquidity Rewards Program: params come from Gamma — do not hardcode.
     rewards_min_size: float = 0.0     # minimum quote size for rewards
     rewards_max_spread: float = 0.0   # max deviation from midpoint (as probability)
@@ -116,6 +123,8 @@ class Market(BaseModel):
             min_order_size=_num(raw, "orderMinSize") or 5.0,
             resolution_source=raw.get("resolutionSource") or "",
             closed=bool(raw.get("closed", False)),
+            uma_resolution_status=str(raw.get("umaResolutionStatus") or "").lower(),
+            condition_id=str(raw.get("conditionId") or ""),
             rewards_min_size=_num(raw, "rewardsMinSize"),
             rewards_max_spread=_normalize_spread(_num(raw, "rewardsMaxSpread")),
             event_id=str(event.get("id", "")),

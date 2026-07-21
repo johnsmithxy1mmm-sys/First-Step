@@ -127,6 +127,20 @@ class ResolutionConfig(BaseModel):
     max_alerts_per_cycle: int = 10
 
 
+class RedemptionConfig(BaseModel):
+    """Auto-redemption of won positions (live mode): a winning token pays $1
+    only after redeemPositions is called on-chain — until then the capital is
+    frozen in an already-decided market. Alert-first; on-chain execution is
+    opt-in (execute + web3 + POLYGON_RPC_URL). Neg-risk positions are always a
+    manual claim (different adapter — a wrong automated call loses money).
+    """
+    enabled: bool = True
+    execute: bool = False
+    interval_sec: float = 300.0
+    min_claim_usd: float = 1.0     # ignore dust (gas would eat it)
+    rpc_url: str = ""              # empty -> POLYGON_RPC_URL env
+
+
 class RulesLawyerConfig(BaseModel):
     """Strategy #4 support: LLM compares the headline with the resolution rules."""
     enabled: bool = False
@@ -377,6 +391,7 @@ class BotConfig(BaseModel):
     executor: ExecutorConfig = Field(default_factory=ExecutorConfig)
     arbitrage: ArbitrageConfig = Field(default_factory=ArbitrageConfig)
     resolution: ResolutionConfig = Field(default_factory=ResolutionConfig)
+    redemption: RedemptionConfig = Field(default_factory=RedemptionConfig)
     ruleslawyer: RulesLawyerConfig = Field(default_factory=RulesLawyerConfig)
     fade: FadeConfig = Field(default_factory=FadeConfig)
     market_maker: MarketMakerConfig = Field(default_factory=MarketMakerConfig)

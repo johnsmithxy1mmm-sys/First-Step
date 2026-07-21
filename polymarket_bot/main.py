@@ -14,6 +14,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
 
 from . import backtest as backtest_mod
+from .arb_fastlane import ArbFastlane
 from .arbitrage import ArbitrageScanner
 from .chainarb import ChainArbitrage
 from .calibration import MarkoutFeedback, PlattCalibrator, TailBiasCalibrator
@@ -27,6 +28,7 @@ from .gamma import GammaClient
 from .ledger import Ledger
 from .logging_setup import setup_logging
 from .marketmaker import MarketMaker
+from .redeemer import Redeemer
 from .sprintmaker import SprintMaker
 from .models import Estimate, Market, Position
 from .monitor import Dashboard, alert
@@ -88,6 +90,7 @@ class Bot:
                                   top_source=(self.ws.top if self.ws else None),
                                   feedback=self.markout_feedback)
         self.resolution = ResolutionAlpha(cfg, self.ledger, self.clob, self.trader, mode)
+        self.redeemer = Redeemer(cfg, self.trader, mode)
         self.cross = CrossMarketScanner(cfg)
         self.niche = NicheWatcher(cfg, self.ledger)
         self.smart_money = SmartMoneyTracker(cfg, self.ledger, self.niche)
@@ -109,6 +112,14 @@ class Bot:
         # each other's subscription).
         self._mm_watch: set[str] = set()
         self._sprint_watch: set[str] = set()
+        # WS-triggered arbitrage: token -> structure key, plus the structures
+        # themselves, registered by the polling jobs; on_tick flags a dirty
+        # structure, the fastlane worker re-verifies it off the WS thread.
+        self._basket_token_map: dict[str, tuple] = {}
+        self._chain_token_map: dict[str, tuple] = {}
+        self._arb_groups: dict[str, list[Market]] = {}
+        self._chain_pairs: dict[tuple, tuple] = {}
+        self.arb_fastlane = ArbFastlane(self._fastlane_check)
         self._observe_only = False
         # Per-strategy PnL checkpoints (one per digest) for Sharpe allocation.
         self._pnl_history: dict[str, list[float]] = {}
@@ -149,6 +160,7 @@ class Bot:
             self._cancel_everything()   # pull all quotes
         except Exception:
             log.exception("shutdown cancel")
+        self.arb_fastlane.stop()
         if self.ws is not None:
             self.ws.stop()
         self.ledger.close()
@@ -317,6 +329,12 @@ class Bot:
             if position is not None and top.bid > 0:
                 if self._exit_one(position, top.bid):
                     self._positions_by_token.pop(token, None)
+            # Arbitrage fastlane: flag the structure this token belongs to
+            # (set-add only — the re-check runs in the worker thread, and its
+            # execution is gated by _may_execute there).
+            hit = self._basket_token_map.get(token) or self._chain_token_map.get(token)
+            if hit is not None:
+                self.arb_fastlane.flag(hit)
             if self._observe_only:
                 return
             if self.breaker.allows("mm"):
@@ -371,12 +389,28 @@ class Bot:
                 and self.breaker.allows(strategy))
 
     def arb_job(self) -> None:
-        """#1: neg-risk baskets. Prices are checked against live order books."""
-        if not self.markets_cache:
+        """#1: neg-risk baskets. Prices are checked against live order books.
+
+        Also registers the prefiltered groups with the WS fastlane, so a tick
+        on any of their tokens triggers an instant re-check between polls.
+        """
+        if not self.markets_cache or not self.cfg.arbitrage.enabled:
             return
         try:
             may = self._may_execute("arb")
-            found = self.arb.cycle(self.markets_cache, allow_execute=may)
+            groups = self.arb.prefilter_events(self.markets_cache)
+            found = []
+            for group in groups:
+                a = self.arb.check_group(group, allow_execute=may)
+                if a is not None:
+                    found.append(a)
+            # Fastlane registration: token -> event group (atomic swaps).
+            self._arb_groups = {g[0].event_id: g for g in groups if g[0].event_id}
+            self._basket_token_map = {
+                tok: ("basket", g[0].event_id)
+                for g in groups if g[0].event_id
+                for m in g for tok in m.clob_token_ids[:2]}
+            self._sync_ws_watch(list(self._positions_by_token.values()))
             for a in found[:3]:
                 warn = " ⚠️ suspect: verify basket completeness" if a.suspect else ""
                 will_execute = self.cfg.arbitrage.execute and may and not a.suspect
@@ -389,12 +423,29 @@ class Bot:
             log.exception("arb job")
 
     def chain_arb_job(self) -> None:
-        """Chain (ladder) arbitrage: monotonic constraints across nested markets."""
-        if not self.markets_cache:
+        """Chain (ladder) arbitrage: monotonic constraints across nested markets.
+
+        Also registers the classified pairs with the WS fastlane, so a tick on
+        either leg triggers an instant re-check between polls.
+        """
+        if not self.markets_cache or not self.cfg.chain_arb.enabled:
             return
         try:
             may = self._may_execute("chain_arb")
-            found = self.chain_arb.cycle(self.markets_cache, allow_execute=may)
+            pairs = self.chain_arb.prefilter_pairs(self.markets_cache)
+            found = []
+            for subset, superset, kind in pairs:
+                p = self.chain_arb.check_pair(subset, superset, kind,
+                                              allow_execute=may)
+                if p is not None:
+                    found.append(p)
+            # Fastlane registration: the two tradable legs -> the pair.
+            self._chain_pairs = {(s.id, sp.id): (s, sp, k) for s, sp, k in pairs}
+            self._chain_token_map = {}
+            for s, sp, _k in pairs:
+                self._chain_token_map[sp.clob_token_ids[0]] = ("chain", (s.id, sp.id))
+                self._chain_token_map[s.clob_token_ids[1]] = ("chain", (s.id, sp.id))
+            self._sync_ws_watch(list(self._positions_by_token.values()))
             for p in found[:3]:
                 will_execute = self.cfg.chain_arb.execute and may
                 note = "" if will_execute else " (execute off)"
@@ -405,6 +456,21 @@ class Bot:
                       f"depth {p.max_sets_by_depth()} sets{note}")
         except Exception:
             log.exception("chain arb job")
+
+    def _fastlane_check(self, key: tuple) -> None:
+        """Worker-thread callback: re-verify one flagged structure NOW."""
+        kind, ident = key
+        if kind == "basket":
+            group = self._arb_groups.get(ident)
+            if group and self.cfg.arbitrage.enabled:
+                self.arb.check_group(group, allow_execute=self._may_execute("arb"))
+        elif kind == "chain":
+            pair = self._chain_pairs.get(ident)
+            if pair and self.cfg.chain_arb.enabled:
+                subset, superset, k = pair
+                self.chain_arb.check_pair(
+                    subset, superset, k,
+                    allow_execute=self._may_execute("chain_arb"))
 
     def mm_job(self) -> None:
         """Core: market making. Blocked by the kill-switch and observe-only."""
@@ -428,10 +494,12 @@ class Bot:
             log.exception("mm job")
 
     def _sync_ws_watch(self, positions) -> None:
-        """Subscribe the WS to the UNION of both quoting jobs' tokens + positions."""
+        """Subscribe the WS to the UNION of every consumer's tokens: both
+        quoting jobs, open positions, and the arbitrage fastlane structures."""
         if self.ws is None:
             return
-        tokens = set(self._mm_watch) | set(self._sprint_watch)
+        tokens = set(self._mm_watch) | set(self._sprint_watch) \
+            | set(self._basket_token_map) | set(self._chain_token_map)
         tokens.update(p.token_id for p in positions)
         if tokens:
             self.ws.watch(tokens)
@@ -540,6 +608,17 @@ class Bot:
                                   allow_execute=self._may_execute("resolution"))
         except Exception:
             log.exception("resolution job")
+
+    def redemption_job(self) -> None:
+        """Claim resolved winnings back into USDC (frees capital to redeploy).
+
+        Runs even when halted for the ALERT (claiming is the human's decision
+        then); on-chain execution is gated like every other order path.
+        """
+        try:
+            self.redeemer.cycle(allow_execute=self.killswitch.trading_allowed)
+        except Exception:
+            log.exception("redemption job")
 
     def calibration_job(self) -> None:
         """Refit the self-calibrators from the ledger (fade bias, MM markout, Platt)."""
@@ -688,6 +767,7 @@ def main(argv: list[str] | None = None) -> None:
     bot = Bot(cfg, args.mode)
     if bot.ws is not None and not args.once:
         bot.ws.start()
+        bot.arb_fastlane.start()   # WS-triggered arb re-checks (worker thread)
     if args.once:
         try:
             bot.cycle()
@@ -760,6 +840,10 @@ def main(argv: list[str] | None = None) -> None:
                           max_instances=1, coalesce=True)
     if cfg.ruleslawyer.enabled:
         scheduler.add_job(bot.rules_lawyer_job, "interval", minutes=20,
+                          max_instances=1, coalesce=True)
+    if cfg.redemption.enabled and args.mode == "live":
+        scheduler.add_job(bot.redemption_job, "interval",
+                          seconds=cfg.redemption.interval_sec,
                           max_instances=1, coalesce=True)
     scheduler.add_job(bot.risk_job, "interval",
                       seconds=cfg.risk.reconcile_interval_sec,
