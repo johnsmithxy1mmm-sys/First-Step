@@ -66,6 +66,29 @@ arbitrage:
   max_events_per_cycle: 10
   min_leg_volume_24h_usd: 500
 
+# Strategy #1b: chain (ladder) arbitrage -- near-riskless, but between DIFFERENT
+# sibling markets in the same event, not a mutually-exclusive neg-risk basket.
+# "Fed cuts by June" vs "by July" (a later deadline can't be less likely); or
+# "BTC reaches $150k" vs "$200k" by the same date (a higher continuous-path
+# threshold can't be more likely). If the market prices violate that logical
+# ordering, buying the underpriced side of BOTH legs cannot lose by
+# construction -- only by how much it wins. Unlike neg-risk, the pairing is
+# INFERRED from question wording (not an official Polymarket flag), so
+# classification_haircut reserves margin against a bad match, and it does not
+# wait for either leg's own resolution: once the market corrects (or the
+# earlier/subset leg resolves), both legs can usually be sold back at a
+# profit -- faster capital turnover than fade's hold-to-resolution.
+chain_arb:
+  enabled: true
+  execute: false            # true = place orders; false = only find and alert
+  interval_sec: 90
+  min_net_edge: 0.03        # at least 3% NET edge (after fee + haircut)
+  classification_haircut: 0.02  # reserve for a bad ladder-pair match (wording inferred, not flagged)
+  prefilter_tolerance: 0.01
+  max_stake_usd: 200
+  min_leg_volume_24h_usd: 1000
+  max_events_per_cycle: 10
+
 # CORE (80% of capital): market making + liquidity rewards farming.
 # Three income streams: spread + maker rebate + daily rewards pool.
 market_maker:

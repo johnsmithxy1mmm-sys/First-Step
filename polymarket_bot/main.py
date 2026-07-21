@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 
 from . import backtest as backtest_mod
 from .arbitrage import ArbitrageScanner
+from .chainarb import ChainArbitrage
 from .calibration import MarkoutFeedback, PlattCalibrator, TailBiasCalibrator
 from .clob import ClobReader, Trader
 from .config import BotConfig
@@ -78,6 +79,7 @@ class Bot:
                              ping_interval_sec=cfg.ws.ping_interval_sec)
         # Strategies: MM core, arbitrage alerts, cross-platform, niches, satellite.
         self.arb = ArbitrageScanner(cfg, self.ledger, self.clob, self.trader, mode)
+        self.chain_arb = ChainArbitrage(cfg, self.ledger, self.clob, self.trader, mode)
         self.mm = MarketMaker(cfg, self.ledger, self.clob, self.trader, mode,
                               top_source=(self.ws.top if self.ws else None),
                               feedback=self.markout_feedback)
@@ -370,6 +372,24 @@ class Bot:
         except Exception:
             log.exception("arb job")
 
+    def chain_arb_job(self) -> None:
+        """Chain (ladder) arbitrage: monotonic constraints across nested markets."""
+        if not self.markets_cache or not self.killswitch.trading_allowed \
+                or not self.breaker.allows("chain_arb"):
+            return
+        try:
+            found = self.chain_arb.cycle(self.markets_cache)
+            for p in found[:3]:
+                will_execute = self.cfg.chain_arb.execute
+                note = "" if will_execute else " (execute off)"
+                net = p.net_profit_pct - self.cfg.chain_arb.classification_haircut
+                alert(f"CHAIN ARB [{p.kind}] \"{p.event_title[:50]}\": "
+                      f"NET after fee+haircut +{net * 100:.2f}% "
+                      f"(gross +{p.profit_pct * 100:.1f}%), "
+                      f"depth {p.max_sets_by_depth()} sets{note}")
+        except Exception:
+            log.exception("chain arb job")
+
     def mm_job(self) -> None:
         """Core: market making. Blocked by the kill-switch and observe-only."""
         if not self.markets_cache:
@@ -655,6 +675,7 @@ def main(argv: list[str] | None = None) -> None:
         try:
             bot.cycle()
             bot.arb_job()
+            bot.chain_arb_job()
             bot.mm_job()
             bot.cross_job()
             bot.smart_money_job()
@@ -692,6 +713,10 @@ def main(argv: list[str] | None = None) -> None:
     if cfg.arbitrage.enabled:
         scheduler.add_job(bot.arb_job, "interval",
                           seconds=cfg.arbitrage.interval_sec,
+                          max_instances=1, coalesce=True)
+    if cfg.chain_arb.enabled:
+        scheduler.add_job(bot.chain_arb_job, "interval",
+                          seconds=cfg.chain_arb.interval_sec,
                           max_instances=1, coalesce=True)
     if cfg.market_maker.enabled:
         scheduler.add_job(bot.mm_job, "interval",

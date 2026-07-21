@@ -30,6 +30,43 @@ config.yaml; `execute: false` by default (detect + alert), 60-second interval.
 left after the websocket bots. The `min_profit_pct` threshold (1.5%) budgets
 for the risk of a leg not filling.
 
+### #1b. Chain (ladder) arbitrage — across nested sibling markets
+
+Same near-risk-free character as #1, but between two DIFFERENT sibling
+markets in the same event that describe the same underlying fact at two
+"checkpoints" — not officially flagged mutually-exclusive outcomes, but a
+LOGICAL implication forced by how the two questions are worded:
+
+  * **DATE ladder** — "Fed cuts by June" vs "Fed cuts by July": an absorbing
+    fact (once true, stays true), so a later deadline can never be *less*
+    likely than an earlier one.
+  * **VALUE ladder** — "BTC reaches $150k by <date>" vs "$200k by <date>": a
+    continuous price path, so a higher threshold can never be *more* likely
+    than a lower one on the same deadline.
+
+If the market prices violate that ordering, buying the underpriced side of
+BOTH legs (YES on the underpriced superset + NO on the underpriced subset)
+has a worst-case payout of $1/set and best case $2/set — it cannot lose by
+construction, only by how much it wins.
+
+**Implementation:** `chainarb.py` — `classify_pair()` infers the relationship
+from question text (same event, same template with only the date/value token
+differing, verb/marker checks for the correct monotonic direction), then
+`verify()` prices it against live order books. Unlike negRisk, the pairing is
+INFERRED, not an official Polymarket flag — `classification_haircut` reserves
+margin against a bad match. `execute: false` by default (detect + alert).
+
+**Fast turnover:** unlike fade (dead until a single far resolution), a chain
+pair does not have to wait for either leg's own resolution — once the market
+corrects the mispricing, or the earlier/subset leg resolves (informative for
+the far leg), both legs can usually be sold back at a profit well before
+either one's own end date.
+
+**Honest limit:** the inference is text-heuristic, not a platform guarantee —
+run `--mode diagnose` (the CHAIN ARB table) to see how many pairs classify
+and how many currently show a Gamma-price violation before turning on
+`execute: true`.
+
 ## #2. Cross-platform arbitrage
 
 The same outcome on Polymarket, Kalshi, Betfair is quoted with 2–10 pp gaps,

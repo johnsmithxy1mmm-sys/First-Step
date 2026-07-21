@@ -2,7 +2,9 @@
 
 from datetime import datetime, timedelta, timezone
 
-from polymarket_bot.diagnose import funnel
+from rich.console import Console
+
+from polymarket_bot.diagnose import _print_chain_arb_summary, funnel
 from polymarket_bot.scanner import Scanner
 from polymarket_bot.scorer import MarketScorer
 
@@ -67,3 +69,25 @@ def test_funnel_counts(cfg):
     assert passed == 2
     assert reasons["24h volume < $50,000"] == 2
     assert reasons["not in rewards program"] == 1
+
+
+# --- chain (ladder) arb summary: doesn't hit the CLOB, Gamma-price only ---
+
+def test_chain_arb_summary_counts_classified_and_violating_pairs(cfg, capsys):
+    same_date = datetime.now(timezone.utc) + timedelta(days=60)
+    subset_m = make_market(
+        id="btc-200k", event_id="ev1", question="Will Bitcoin reach $200,000 by Dec 2026?",
+        end_date=same_date, outcome_prices=[0.10, 0.90],
+        clob_token_ids=["s-y", "s-n"], volume_24h_usd=50_000)
+    superset_m = make_market(
+        id="btc-150k", event_id="ev1", question="Will Bitcoin reach $150,000 by Dec 2026?",
+        end_date=same_date, outcome_prices=[0.05, 0.95],   # priced BELOW subset -> violation
+        clob_token_ids=["p-y", "p-n"], volume_24h_usd=50_000)
+    unrelated = make_market(id="other", event_id="ev1",
+                            question="Will the home team win?", end_date=same_date,
+                            clob_token_ids=["o-y", "o-n"], volume_24h_usd=50_000)
+    console = Console()
+    _print_chain_arb_summary(console, cfg, [subset_m, superset_m, unrelated])
+    out = capsys.readouterr().out
+    assert "CHAIN ARB" in out
+    assert "3 same-event market pairs checked" in out

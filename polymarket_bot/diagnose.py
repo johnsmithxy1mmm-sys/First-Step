@@ -107,6 +107,54 @@ def _print_horizon_histogram(console: Console, markets: list[Market],
                   "board — try the lower column instead.[/dim]\n")
 
 
+def _print_chain_arb_summary(console: Console, cfg: BotConfig, markets: list[Market]) -> None:
+    """Gamma-price-only summary (no live order books — that's what paper/live
+    do automatically): how many same-event sibling pairs classify as a valid
+    ladder, and how many already show a Gamma-price violation worth checking
+    the real books for."""
+    from .chainarb import classify_pair
+
+    c = cfg.chain_arb
+    by_event: dict[str, list[Market]] = {}
+    for m in markets:
+        if (m.event_id and not m.closed and m.enable_order_book
+                and m.outcome_prices and len(m.clob_token_ids) >= 2
+                and m.volume_24h_usd >= c.min_leg_volume_24h_usd):
+            by_event.setdefault(m.event_id, []).append(m)
+
+    total_pairs = 0
+    classified: Counter = Counter()
+    violations: Counter = Counter()
+    for group in by_event.values():
+        if len(group) < 2:
+            continue
+        for i in range(len(group)):
+            for j in range(i + 1, len(group)):
+                total_pairs += 1
+                result = classify_pair(group[i], group[j])
+                if result is None:
+                    continue
+                subset, superset, kind = result
+                classified[kind] += 1
+                gross = subset.outcome_prices[0] - superset.outcome_prices[0]
+                if gross > c.prefilter_tolerance:
+                    violations[kind] += 1
+
+    t = Table(title=f"CHAIN ARB (ladder): {total_pairs} same-event market pairs checked")
+    t.add_column("Ladder kind")
+    t.add_column("Classified as a valid ladder pair", justify="right")
+    t.add_column("Gamma-price violation (worth checking books)", justify="right")
+    for kind in ("date", "value"):
+        t.add_row(kind, str(classified[kind]), str(violations[kind]))
+    console.print(t)
+    console.print("[dim]\"Classified\" = same event, same question template with only "
+                  "the date/value token differing, wording confirms a monotonic "
+                  "implication (chainarb.classify_pair). \"Gamma-price violation\" = "
+                  "worth fetching the real order books for. This step does NOT hit the "
+                  "CLOB — final NET edge (after taker fee + classification_haircut) is "
+                  "only known once --mode paper/live checks the real books.[/dim]\n")
+
+
 def run_diagnose(cfg: BotConfig, gamma: GammaClient | None = None) -> None:
     console = Console()
     gamma = gamma or GammaClient(cfg)
@@ -148,6 +196,8 @@ def run_diagnose(cfg: BotConfig, gamma: GammaClient | None = None) -> None:
 
     floors = sorted({cfg.sprint_mm.min_volume_24h_usd, 20_000.0, 10_000.0}, reverse=True)
     _print_horizon_histogram(console, markets, floors)
+
+    _print_chain_arb_summary(console, cfg, markets)
 
     # Fade funnel: runs over the first-level cheap-tail candidates, estimated.
     candidates = scanner.first_level_filter(markets)

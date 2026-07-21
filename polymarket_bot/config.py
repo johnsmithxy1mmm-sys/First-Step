@@ -151,6 +151,30 @@ class ArbitrageConfig(BaseModel):
     min_leg_volume_24h_usd: float = 500.0
 
 
+class ChainArbConfig(BaseModel):
+    """Strategy: near-riskless arbitrage across logically nested ('ladder')
+    sibling markets in the same event -- e.g. "Fed cuts by June" vs "Fed cuts
+    by July" (a later ABSORBING deadline can never be less likely), or "BTC
+    reaches $150k by <date>" vs "$200k by <date>" (a higher continuous-path
+    threshold can never be MORE likely). The relationship is a logical fact of
+    how the two markets are WORDED, not a probability estimate.
+
+    Unlike neg-risk (an official Polymarket flag), the pairing here is
+    INFERRED from question text (chainarb.classify_pair) -- classification_
+    haircut reserves margin against a bad match turning "riskless" into a
+    real bet. Detect + alert by default (execute: false).
+    """
+    enabled: bool = True
+    execute: bool = False
+    interval_sec: float = 90.0
+    min_net_edge: float = 0.03          # at least 3% NET edge (after fee + haircut)
+    classification_haircut: float = 0.02  # reserve for a bad ladder-pair match
+    prefilter_tolerance: float = 0.01   # Gamma-price threshold before hitting real books
+    max_stake_usd: float = 200.0
+    min_leg_volume_24h_usd: float = 1_000.0
+    max_events_per_cycle: int = 10
+
+
 class MarketMakerConfig(BaseModel):
     """Core (80% of capital): market making + liquidity rewards farming."""
     enabled: bool = False              # enable deliberately: needs capital for quotes
@@ -356,6 +380,7 @@ class BotConfig(BaseModel):
     fade: FadeConfig = Field(default_factory=FadeConfig)
     market_maker: MarketMakerConfig = Field(default_factory=MarketMakerConfig)
     sprint_mm: SprintMakerConfig = Field(default_factory=SprintMakerConfig)
+    chain_arb: ChainArbConfig = Field(default_factory=ChainArbConfig)
     risk: RiskLimitsConfig = Field(default_factory=RiskLimitsConfig)
     fees: FeesConfig = Field(default_factory=FeesConfig)
     ws: WSConfig = Field(default_factory=WSConfig)
