@@ -233,6 +233,9 @@ class Bot:
                     # Fade buys NO — YES-side depth is irrelevant to it; the
                     # executor checks the NO book when placing the limit order.
                     self.fade.cycle(estimates)
+            if self.killswitch.trading_allowed:
+                # Observe-only is a brake on NEW risk; REDUCING risk stays
+                # allowed — in a drawdown, take-profits must not be frozen.
                 self._exit_positions(marks)
             # Refresh the fastlane cache after this cycle's entries/exits.
             self._positions_by_token = {
@@ -306,12 +309,16 @@ class Bot:
         positions and observe-only come from caches refreshed by the cycle.
         """
         try:
-            if not self.killswitch.trading_allowed or self._observe_only:
+            if not self.killswitch.trading_allowed:
                 return
+            # Exits (risk REDUCTION) run even in observe-only — only new risk
+            # (MM quoting) is frozen by the drawdown brake below.
             position = self._positions_by_token.get(token)
             if position is not None and top.bid > 0:
                 if self._exit_one(position, top.bid):
                     self._positions_by_token.pop(token, None)
+            if self._observe_only:
+                return
             if self.breaker.allows("mm"):
                 self.mm.react_to_tick(token, top)
             if self.cfg.sprint_mm.enabled and self.breaker.allows("sprint_mm"):
@@ -355,15 +362,24 @@ class Bot:
 
     # --- extra-strategy jobs (own intervals, isolated errors) ---
 
+    def _may_execute(self, strategy: str) -> bool:
+        """Common execution gate for detect+alert strategies: the kill-switch,
+        the observe-only drawdown brake and the per-strategy circuit breaker
+        block ORDERS, while detection/alerts keep running for the human."""
+        return (self.killswitch.trading_allowed
+                and not self.portfolio.observe_only()
+                and self.breaker.allows(strategy))
+
     def arb_job(self) -> None:
         """#1: neg-risk baskets. Prices are checked against live order books."""
         if not self.markets_cache:
             return
         try:
-            found = self.arb.cycle(self.markets_cache)
+            may = self._may_execute("arb")
+            found = self.arb.cycle(self.markets_cache, allow_execute=may)
             for a in found[:3]:
                 warn = " ⚠️ suspect: verify basket completeness" if a.suspect else ""
-                will_execute = self.cfg.arbitrage.execute and not a.suspect
+                will_execute = self.cfg.arbitrage.execute and may and not a.suspect
                 note = "" if will_execute else " (execute off)"
                 alert(f"ARBITRAGE {a.side} basket \"{a.event_title[:60]}\": "
                       f"NET after fees +{a.net_profit_pct * 100:.2f}% "
@@ -374,13 +390,13 @@ class Bot:
 
     def chain_arb_job(self) -> None:
         """Chain (ladder) arbitrage: monotonic constraints across nested markets."""
-        if not self.markets_cache or not self.killswitch.trading_allowed \
-                or not self.breaker.allows("chain_arb"):
+        if not self.markets_cache:
             return
         try:
-            found = self.chain_arb.cycle(self.markets_cache)
+            may = self._may_execute("chain_arb")
+            found = self.chain_arb.cycle(self.markets_cache, allow_execute=may)
             for p in found[:3]:
-                will_execute = self.cfg.chain_arb.execute
+                will_execute = self.cfg.chain_arb.execute and may
                 note = "" if will_execute else " (execute off)"
                 net = p.net_profit_pct - self.cfg.chain_arb.classification_haircut
                 alert(f"CHAIN ARB [{p.kind}] \"{p.event_title[:50]}\": "
@@ -517,10 +533,11 @@ class Bot:
 
     def resolution_job(self) -> None:
         """#Resolution alpha: near-riskless carry on effectively-decided markets."""
-        if not self.markets_cache or not self.breaker.allows("resolution"):
+        if not self.markets_cache:
             return
         try:
-            self.resolution.cycle(self.markets_cache)
+            self.resolution.cycle(self.markets_cache,
+                                  allow_execute=self._may_execute("resolution"))
         except Exception:
             log.exception("resolution job")
 

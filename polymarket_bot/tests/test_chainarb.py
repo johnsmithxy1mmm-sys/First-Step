@@ -272,3 +272,49 @@ def test_execute_returns_zero_below_min_size(cfg, ledger):
                      subset=subset_leg, superset=superset_leg, taker_fee=0.0)
     chain = make_chain(cfg, ledger)
     assert chain.execute(pair) == 0.0
+
+
+def test_allow_execute_false_detects_but_places_nothing(cfg, ledger):
+    """Kill-switch/observe-only/breaker: alerts keep flowing, orders do not."""
+    same_date = datetime.now(timezone.utc) + timedelta(days=60)
+    subset_m = dated(id="btc-200k", event_id="ev1",
+                     question="Will Bitcoin reach $200,000 by Dec 2026?",
+                     end_date=same_date, outcome_prices=[0.30, 0.70],
+                     clob_token_ids=["s-y", "s-n"], volume_24h_usd=50_000,
+                     min_order_size=1.0, tick_size=0.001)
+    superset_m = dated(id="btc-150k", event_id="ev1",
+                       question="Will Bitcoin reach $150,000 by Dec 2026?",
+                       end_date=same_date, outcome_prices=[0.10, 0.90],
+                       clob_token_ids=["p-y", "p-n"], volume_24h_usd=50_000,
+                       min_order_size=1.0, tick_size=0.001)
+    clob = mock.Mock()
+    clob.order_book.side_effect = lambda tok: {
+        "p-y": book(ask=0.10, ask_size=100),
+        "s-n": book(ask=0.70, ask_size=100),
+    }[tok]
+    cfg.chain_arb.execute = True
+    cfg.chain_arb.max_stake_usd = 1000
+    chain = make_chain(cfg, ledger, clob=clob)
+    found = chain.cycle([subset_m, superset_m], allow_execute=False)
+    assert len(found) == 1                            # still detected
+    assert ledger.open_positions("dry-run") == []     # but nothing traded
+
+
+def test_dust_depth_produces_no_alert(cfg, ledger):
+    """A 2-share ask can fake an edge nobody can trade — below min_sets, skip."""
+    same_date = datetime.now(timezone.utc) + timedelta(days=60)
+    subset_m = dated(id="btc-200k", event_id="ev1",
+                     question="Will Bitcoin reach $200,000 by Dec 2026?",
+                     end_date=same_date, outcome_prices=[0.30, 0.70],
+                     clob_token_ids=["s-y", "s-n"], volume_24h_usd=50_000)
+    superset_m = dated(id="btc-150k", event_id="ev1",
+                       question="Will Bitcoin reach $150,000 by Dec 2026?",
+                       end_date=same_date, outcome_prices=[0.10, 0.90],
+                       clob_token_ids=["p-y", "p-n"], volume_24h_usd=50_000)
+    clob = mock.Mock()
+    clob.order_book.side_effect = lambda tok: {
+        "p-y": book(ask=0.10, ask_size=2),            # dust
+        "s-n": book(ask=0.70, ask_size=100),
+    }[tok]
+    chain = make_chain(cfg, ledger, clob=clob)
+    assert chain.cycle([subset_m, superset_m]) == []

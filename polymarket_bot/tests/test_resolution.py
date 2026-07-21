@@ -89,3 +89,16 @@ def test_cycle_alerts_and_optionally_executes(cfg, ledger):
 def test_disabled_is_silent(cfg, ledger):
     res = ResolutionAlpha(cfg, ledger, mock.Mock(), None, "dry-run")  # enabled=False
     assert res.cycle([near_market()]) == []
+
+
+def test_allow_execute_false_alerts_but_places_nothing(cfg, ledger):
+    """Kill-switch/observe-only/breaker: alerts keep flowing, orders do not."""
+    clob = mock.Mock()
+    clob.order_book.return_value = make_book(best_bid=0.96, best_ask=0.97,
+                                             depth=100_000)
+    res = make_res(cfg, ledger, clob)
+    cfg.resolution.execute = True
+    with mock.patch("polymarket_bot.resolution.alert") as a:
+        found = res.cycle([near_market()], allow_execute=False)
+    assert len(found) == 1 and a.called               # still detected + alerted
+    assert ledger._conn.execute("SELECT COUNT(*) c FROM trades").fetchone()["c"] == 0

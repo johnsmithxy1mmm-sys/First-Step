@@ -159,3 +159,16 @@ def test_execute_skips_tiny_windows(cfg, ledger):
     scanner = make_scanner(cfg, ledger, books)
     arb = scanner.verify(group)
     assert arb is None or scanner.execute(arb) == 0.0
+
+def test_allow_execute_false_detects_but_places_nothing(cfg, ledger):
+    """Kill-switch/observe-only/breaker: alerts keep flowing, orders do not."""
+    cfg.arbitrage.execute = True
+    group = negrisk_group([0.31, 0.32, 0.33], category="geopolitics")
+    books = {}
+    for i, ask in enumerate([0.32, 0.32, 0.33]):     # real executable window
+        books[f"m{i}-yes"] = book(ask, depth=40)
+        books[f"m{i}-no"] = book(0.95)
+    scanner = make_scanner(cfg, ledger, books)
+    found = scanner.cycle(group, allow_execute=False)
+    assert len(found) == 1                            # still detected
+    assert ledger.open_positions("dry-run") == []     # but nothing traded

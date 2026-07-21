@@ -86,6 +86,7 @@ chain_arb:
   classification_haircut: 0.02  # reserve for a bad ladder-pair match (wording inferred, not flagged)
   prefilter_tolerance: 0.01
   max_stake_usd: 200
+  min_sets: 5               # dust depth at the ask can fake an untradable edge
   min_leg_volume_24h_usd: 1000
   max_events_per_cycle: 10
 

@@ -110,7 +110,10 @@ class ResolutionAlpha:
             strategy="resolution")
         return price * size
 
-    def cycle(self, markets: list[Market]) -> list[ResolutionCandidate]:
+    def cycle(self, markets: list[Market],
+              allow_execute: bool = True) -> list[ResolutionCandidate]:
+        """allow_execute=False (kill-switch / observe-only / breaker): keep
+        detecting and alerting — a human can still act — but place no orders."""
         if not self._cfg.enabled:
             return []
         found: list[ResolutionCandidate] = []
@@ -122,11 +125,11 @@ class ResolutionAlpha:
                 continue
             found.append(cand)
             outcome = m.outcomes[cand.outcome_index] if cand.outcome_index < len(m.outcomes) else "?"
-            note = "" if self._cfg.execute else " (execute off)"
+            note = "" if self._cfg.execute and allow_execute else " (execute off)"
             alert(f"RESOLUTION alpha [{self._mode}] [{outcome}] @ {cand.price:.3f} "
                   f"-> net edge +{cand.net_edge * 100:.2f}% after fee+dispute reserve "
                   f"— {m.question[:60]}{note}")
-            if self._cfg.execute:
+            if self._cfg.execute and allow_execute:
                 spent = self.execute(cand)
                 if spent > 0:
                     log.info("resolution executed: $%.2f", spent)

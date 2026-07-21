@@ -110,3 +110,36 @@ def test_both_pause_sources_must_clear(cfg, ledger):
     assert ks.paused                          # data still pausing
     ks.resume_from_pause("data")
     assert ks.trading_allowed
+
+
+def test_on_tick_exits_still_run_in_observe_only(tmp_path):
+    """Observe-only freezes NEW risk (MM quoting) but must not freeze
+    risk REDUCTION: take-profit exits keep working in a drawdown."""
+    bot = make_bot(tmp_path)
+    bot._observe_only = True
+    from polymarket_bot.models import Position
+    pos = Position(token_id="t1", market_id="m", question="Q?", outcome="Yes",
+                   category="other", size=100, avg_price=0.01)
+    bot._positions_by_token = {"t1": pos}
+    with mock.patch.object(bot, "_exit_one", return_value=True) as exit_one, \
+            mock.patch.object(bot.mm, "react_to_tick") as react:
+        bot.on_tick("t1", TopOfBook(bid=0.20, bid_size=10, ask=0.22,
+                                    ask_size=10, ts=1.0))
+    exit_one.assert_called_once()     # exit allowed
+    react.assert_not_called()         # quoting still frozen
+    bot.close()
+
+
+def test_on_tick_halt_blocks_everything(tmp_path):
+    """A hard HALT (unlike observe-only) freezes exits too: state is unreliable."""
+    bot = make_bot(tmp_path)
+    bot.killswitch.halted = True
+    from polymarket_bot.models import Position
+    pos = Position(token_id="t1", market_id="m", question="Q?", outcome="Yes",
+                   category="other", size=100, avg_price=0.01)
+    bot._positions_by_token = {"t1": pos}
+    with mock.patch.object(bot, "_exit_one") as exit_one:
+        bot.on_tick("t1", TopOfBook(bid=0.20, bid_size=10, ask=0.22,
+                                    ask_size=10, ts=1.0))
+    exit_one.assert_not_called()
+    bot.close()

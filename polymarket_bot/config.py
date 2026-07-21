@@ -171,6 +171,7 @@ class ChainArbConfig(BaseModel):
     classification_haircut: float = 0.02  # reserve for a bad ladder-pair match
     prefilter_tolerance: float = 0.01   # Gamma-price threshold before hitting real books
     max_stake_usd: float = 200.0
+    min_sets: int = 5                   # dust depth at the ask can fake an edge
     min_leg_volume_24h_usd: float = 1_000.0
     max_events_per_cycle: int = 10
 

@@ -271,7 +271,7 @@ class ChainArbitrage:
         )
         min_size = max(int(pair.superset.market.min_order_size),
                        int(pair.subset.market.min_order_size))
-        if sets < max(1, min_size):
+        if sets < max(self._cfg.min_sets, min_size):
             return 0.0
 
         spent = 0.0
@@ -300,13 +300,18 @@ class ChainArbitrage:
 
     # --- cycle ---
 
-    def cycle(self, markets: list[Market]) -> list[ChainPair]:
+    def cycle(self, markets: list[Market],
+              allow_execute: bool = True) -> list[ChainPair]:
+        """allow_execute=False (kill-switch / observe-only / breaker): keep
+        detecting and alerting — a human can still act — but place no orders."""
         if not self._cfg.enabled:
             return []
         found: list[ChainPair] = []
         for subset, superset, kind in self.prefilter_pairs(markets):
             pair = self.verify(subset, superset, kind)
-            if pair is None or pair.max_sets_by_depth() < 1:
+            # A dust-sized best ask can fake an "edge" nobody can trade;
+            # require real depth even for the alert (same idea as arbitrage.py).
+            if pair is None or pair.max_sets_by_depth() < self._cfg.min_sets:
                 continue
             net_after_haircut = pair.net_profit_pct - self._cfg.classification_haircut
             if net_after_haircut < self._cfg.min_net_edge:
@@ -319,7 +324,7 @@ class ChainArbitrage:
                      pair.superset.ask, pair.subset.market.question[:40], pair.subset.ask,
                      pair.cost_per_set, pair.profit_pct * 100, net_after_haircut * 100,
                      pair.max_sets_by_depth())
-            if self._cfg.execute:
+            if self._cfg.execute and allow_execute:
                 spent = self.execute(pair)
                 if spent > 0:
                     log.info("chain arb executed: $%.2f", spent)

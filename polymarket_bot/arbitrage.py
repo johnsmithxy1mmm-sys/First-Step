@@ -220,7 +220,10 @@ class ArbitrageScanner:
 
     # --- cycle ---
 
-    def cycle(self, markets: list[Market]) -> list[BasketArb]:
+    def cycle(self, markets: list[Market],
+              allow_execute: bool = True) -> list[BasketArb]:
+        """allow_execute=False (kill-switch / observe-only / breaker): keep
+        detecting and alerting — a human can still act — but place no orders."""
         if not self._cfg.enabled:
             return []
         found: list[BasketArb] = []
@@ -236,7 +239,7 @@ class ArbitrageScanner:
                      arb.side, arb.event_title[:50], len(arb.legs), arb.cost_per_set,
                      arb.profit_pct * 100, arb.net_profit_pct * 100,
                      arb.taker_fee * 100, arb.max_sets_by_depth(), warn)
-            if self._cfg.execute and not arb.suspect:
+            if self._cfg.execute and allow_execute and not arb.suspect:
                 spent = self.execute(arb)
                 if spent > 0:
                     log.info("arbitrage executed: $%.2f", spent)
