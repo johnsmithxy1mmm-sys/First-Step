@@ -370,6 +370,26 @@ class RuntimeConfig(BaseModel):
     max_retries: int = 4
 
 
+class TicksConfig(BaseModel):
+    """Continuous market-data recording — the raw material for every learned
+    model (correlations, fill calibration). Cheap to keep on; the learning
+    loop is only as good as the history it has."""
+    enabled: bool = True
+    db_path: str = str(PACKAGE_DIR / "data" / "ticks.sqlite")
+    retention_days: float = 30.0
+    flush_sec: float = 2.0
+
+
+class AllocatorConfig(BaseModel):
+    """Sharpe allocator that ACTS: digest-time Sharpe weights move per-strategy
+    sizing multipliers inside a clamped corridor. Hard risk caps always apply
+    AFTER the multiplier, so it can tilt capital but never break a limit."""
+    enabled: bool = True
+    floor: float = 0.7             # multiplier corridor
+    ceil: float = 1.3
+    smoothing: float = 0.5         # EMA weight of the new target per update
+
+
 class OpsConfig(BaseModel):
     """Prometheus /metrics + /health server (stdlib, no extra deps)."""
     metrics_enabled: bool = False
@@ -392,6 +412,8 @@ class BotConfig(BaseModel):
     arbitrage: ArbitrageConfig = Field(default_factory=ArbitrageConfig)
     resolution: ResolutionConfig = Field(default_factory=ResolutionConfig)
     redemption: RedemptionConfig = Field(default_factory=RedemptionConfig)
+    ticks: TicksConfig = Field(default_factory=TicksConfig)
+    allocator: AllocatorConfig = Field(default_factory=AllocatorConfig)
     ruleslawyer: RulesLawyerConfig = Field(default_factory=RulesLawyerConfig)
     fade: FadeConfig = Field(default_factory=FadeConfig)
     market_maker: MarketMakerConfig = Field(default_factory=MarketMakerConfig)

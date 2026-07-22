@@ -89,9 +89,9 @@ def test_replay_installs_queue_aware_model(cfg, ledger, tmp_path, monkeypatch):
     assert seen["mm"].fill_model is replay_mod.queue_aware_fill
 
 
-# --- Sharpe advisory in the digest ---
+# --- Sharpe allocation in the digest (now ACTS, not just advises) ---
 
-def test_digest_includes_sharpe_advice(tmp_path):
+def test_digest_includes_sharpe_weights_and_applies_them(tmp_path):
     from .test_hardening import make_bot
     bot = make_bot(tmp_path)
     bot._pnl_history = {"fade": [0, 5, 10, 15], "mm": [0, 8, -6, 2]}
@@ -100,5 +100,10 @@ def test_digest_includes_sharpe_advice(tmp_path):
                            return_value={"fade": 20.0, "mm": 3.0}):
         bot.digest_job()
     text = a.call_args[0][0]
-    assert "Suggested capital weights" in text
+    assert "Capital weights (Sharpe)" in text
+    assert "Applied sizing multipliers" in text
+    # The winning strategy is tilted up, the losing one down, inside the corridor.
+    assert bot.fade.size_scale > 1.0
+    assert bot.mm.size_factor < 1.0
+    assert bot.cfg.allocator.floor <= bot.mm.size_factor <= bot.cfg.allocator.ceil
     bot.close()

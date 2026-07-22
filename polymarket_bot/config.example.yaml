@@ -298,6 +298,24 @@ redemption:
   interval_sec: 300
   min_claim_usd: 1.0        # ignore dust: gas would eat it
 
+# Learning loop foundation: record market data continuously so the learned
+# models (category correlations, fill calibration) have history to fit on.
+# Cheap to keep on; own sqlite file, retention-pruned. Turn OFF only to save disk.
+ticks:
+  enabled: true
+  retention_days: 30        # older rows are pruned hourly
+  flush_sec: 2              # writer batches queued ticks this often
+
+# Sharpe allocator that ACTS: the digest's per-strategy Sharpe weights move
+# sizing multipliers inside a clamped corridor. Hard risk caps apply AFTER the
+# multiplier, so it can tilt capital toward what is earning but never break a
+# limit. Set enabled: false to keep the digest advisory-only.
+allocator:
+  enabled: true
+  floor: 0.7                # a cold strategy is sized down to at most this...
+  ceil: 1.3                 # ...a hot one up to at most this (the corridor)
+  smoothing: 0.5            # EMA weight of the new target per digest (anti-whipsaw)
+
 ops:
   metrics_enabled: true     # Prometheus /metrics + /health on the port below
   metrics_port: 9090

@@ -17,7 +17,9 @@ from . import backtest as backtest_mod
 from .arb_fastlane import ArbFastlane
 from .arbitrage import ArbitrageScanner
 from .chainarb import ChainArbitrage
-from .calibration import MarkoutFeedback, PlattCalibrator, TailBiasCalibrator
+from .alloc import StrategyAllocator
+from .calibration import (CorrelationLearner, FillCalibrator, MarkoutFeedback,
+                          PlattCalibrator, TailBiasCalibrator)
 from .clob import ClobReader, Trader
 from .config import BotConfig
 from .crossmarket import CrossMarketScanner
@@ -34,7 +36,8 @@ from .models import Estimate, Market, Position
 from .monitor import Dashboard, alert
 from .niche import NicheWatcher
 from .ops import MetricsServer, reload_config_inplace
-from .portfolio import Portfolio, event_exposure_breakdown
+from .portfolio import (Portfolio, classify_category, event_exposure_breakdown,
+                        set_learned_correlation)
 from .resolution import ResolutionAlpha
 from .risk import KillSwitch
 from .risk2 import MarketDataGuard, StrategyCircuitBreaker
@@ -42,6 +45,7 @@ from .ruleslawyer import RulesLawyer
 from .satellite import BTC5mSatellite
 from .scanner import Scanner
 from .smartmoney import SmartMoneySignal, SmartMoneyTracker
+from .tickstore import TickStore
 from .ws_feed import WSFeed
 
 log = logging.getLogger(__name__)
@@ -123,6 +127,20 @@ class Bot:
         self._observe_only = False
         # Per-strategy PnL checkpoints (one per digest) for Sharpe allocation.
         self._pnl_history: dict[str, list[float]] = {}
+        # Learning loop: continuous tick/category recording feeds the learned
+        # correlations; quote outcomes feed the fill calibrator; digest Sharpe
+        # weights feed the acting allocator. All start as identity/prior.
+        self.ticks: TickStore | None = None
+        if cfg.ticks.enabled:
+            self.ticks = TickStore(cfg.ticks.db_path, cfg.ticks.retention_days,
+                                   cfg.ticks.flush_sec)
+            self.ticks.start()
+        self.corr_learner = CorrelationLearner()
+        self.fill_calibrator = FillCalibrator()
+        self.mm.fill_calibrator = self.fill_calibrator
+        self.sprint.fill_calibrator = self.fill_calibrator
+        self.allocator = StrategyAllocator(cfg)
+        self._longshot_scale = 1.0
 
     def metrics_snapshot(self) -> dict:
         """Live state for /metrics and /health (never raises)."""
@@ -163,6 +181,8 @@ class Bot:
         self.arb_fastlane.stop()
         if self.ws is not None:
             self.ws.stop()
+        if self.ticks is not None:
+            self.ticks.close()
         self.ledger.close()
 
     # --- one trading cycle ---
@@ -194,6 +214,9 @@ class Bot:
             self.niche.cycle(markets)  # #5: alerts on new markets in niches
         except Exception as exc:
             self._error(f"niche: {exc}")
+
+        if self.ticks is not None:
+            self._record_category_indexes(markets)
 
         # Heal legacy rows: trades recorded before the neg_risk column existed
         # default to 0, which blocks event netting. Live market metadata knows
@@ -271,7 +294,7 @@ class Bot:
     def _enter_positions(self, qualifying: list[Estimate]) -> None:
         entered = 0
         for est in qualifying:
-            plan = self.portfolio.size_trade(est)
+            plan = self.portfolio.size_trade(est, scale=self._longshot_scale)
             if plan is None:
                 continue
             result = self.executor.execute(plan)
@@ -321,6 +344,12 @@ class Bot:
         positions and observe-only come from caches refreshed by the cycle.
         """
         try:
+            # Analytics first: record the tick even when trading is frozen —
+            # the learning loop wants ALL history (enqueue only, never blocks).
+            if self.ticks is not None:
+                self.ticks.record_tick(token, top.bid, top.ask,
+                                       top.bid_size, top.ask_size,
+                                       top.ts if top.ts > 0 else None)
             if not self.killswitch.trading_allowed:
                 return
             # Exits (risk REDUCTION) run even in observe-only — only new risk
@@ -352,6 +381,27 @@ class Bot:
             outcome_prices=[0.0, 0.0],
             clob_token_ids=[position.token_id, ""],
         )
+
+    def _record_category_indexes(self, markets) -> None:
+        """One row per category per cycle: volume-weighted mean daily price
+        change — the factor series the correlation learner fits on."""
+        import time as _time
+        acc: dict[str, list[float]] = {}
+        for m in markets:
+            if m.closed or not m.outcome_prices:
+                continue
+            w = max(m.volume_24h_usd, 0.0)
+            if w <= 0:
+                continue
+            cat = classify_category(m.question, m.category)
+            slot = acc.setdefault(cat, [0.0, 0.0, 0.0])
+            slot[0] += w * m.one_day_price_change
+            slot[1] += w
+            slot[2] += 1
+        ts = _time.time()
+        for cat, (sw, w, n) in acc.items():
+            if w > 0 and n >= 3:      # a 1-2 market "category" is not a factor
+                self.ticks.record_category_index(cat, sw / w, int(n), ts)
 
     def _settle_resolutions(self, markets, positions) -> None:
         """Records resolutions for open positions whose market has closed."""
@@ -621,7 +671,8 @@ class Bot:
             log.exception("redemption job")
 
     def calibration_job(self) -> None:
-        """Refit the self-calibrators from the ledger (fade bias, MM markout, Platt)."""
+        """Refit every learner from recorded data (bias, markout, Platt,
+        correlations, fill calibration)."""
         try:
             self.fade.refresh_calibration()
             self.mm.refresh_feedback()
@@ -631,6 +682,13 @@ class Bot:
                          for r in self.ledger.resolved_for_calibration(self.mode, strategy)
                          if r.get("p_est")]
                 self.platt.fit(pairs)
+            if self.ticks is not None:
+                self.corr_learner.fit(self.ticks.category_series())
+                if self.corr_learner.learned:
+                    set_learned_correlation(self.corr_learner.learned)
+                    log.info("calibration: %d learned category correlations active",
+                             len(self.corr_learner.learned))
+            self.fill_calibrator.fit(self.ledger.quote_outcomes(self.mode))
         except Exception:
             log.exception("calibration job")
 
@@ -641,7 +699,8 @@ class Bot:
             positions = self.ledger.open_positions(self.mode)
             pnl = self.ledger.realized_pnl_by_strategy(self.mode)
             pnl_lines = "\n".join(f"  {k}: {v:+,.2f}" for k, v in pnl.items()) or "  —"
-            # Sharpe allocation: a recommendation, never auto-applied.
+            # Sharpe allocation: weights move the sizing multipliers inside the
+            # allocator's clamped corridor (hard caps still apply after them).
             for k, v in pnl.items():
                 self._pnl_history.setdefault(k, []).append(v)
             weights_line = ""
@@ -649,8 +708,19 @@ class Bot:
             if series:
                 from .research import sharpe_allocation
                 w = sharpe_allocation(series)
-                weights_line = ("\nSuggested capital weights (Sharpe, advisory): "
+                weights_line = ("\nCapital weights (Sharpe): "
                                 + ", ".join(f"{k} {v:.0%}" for k, v in sorted(w.items())))
+                changes = self.allocator.update(w)
+                self.mm.size_factor = self.allocator.factor("mm")
+                self.sprint.size_factor = self.allocator.factor("sprint_mm")
+                self.fade.size_scale = self.allocator.factor("fade")
+                self._longshot_scale = self.allocator.factor("longshot")
+                if self.allocator.summary():
+                    weights_line += ("\nApplied sizing multipliers "
+                                     f"[{self.cfg.allocator.floor}..{self.cfg.allocator.ceil}]: "
+                                     + self.allocator.summary())
+                if changes:
+                    log.info("digest: allocator moved %s", changes)
             alert(f"Digest [{self.mode}]\n"
                   f"Equity: ${equity:,.2f} | drawdown {self.portfolio.drawdown() * 100:.1f}%\n"
                   f"Open positions: {len(positions)} "

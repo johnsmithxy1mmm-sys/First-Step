@@ -75,6 +75,9 @@ _CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
 }
 
 # Expert category-correlation matrix: how much shocks spill between them.
+# This is the PRIOR — set_learned_correlation() overlays pairs actually
+# learned from recorded category-index history (calibration.CorrelationLearner);
+# unlearned pairs keep the prior.
 _CORRELATION: dict[frozenset[str], float] = {
     frozenset({"geopolitics", "economy"}): 0.5,
     frozenset({"geopolitics", "crypto"}): 0.3,
@@ -82,6 +85,12 @@ _CORRELATION: dict[frozenset[str], float] = {
     frozenset({"elections", "geopolitics"}): 0.4,
     frozenset({"elections", "economy"}): 0.3,
 }
+_LEARNED_CORRELATION: dict[frozenset, float] = {}
+
+
+def set_learned_correlation(learned: dict[frozenset, float]) -> None:
+    global _LEARNED_CORRELATION
+    _LEARNED_CORRELATION = dict(learned)
 
 
 def classify_category(question: str, hint: str = "") -> str:
@@ -97,7 +106,10 @@ def classify_category(question: str, hint: str = "") -> str:
 def correlation(cat_a: str, cat_b: str) -> float:
     if cat_a == cat_b:
         return 1.0
-    return _CORRELATION.get(frozenset({cat_a, cat_b}), 0.1)
+    key = frozenset({cat_a, cat_b})
+    if key in _LEARNED_CORRELATION:
+        return _LEARNED_CORRELATION[key]
+    return _CORRELATION.get(key, 0.1)
 
 
 def kelly_fraction(p: float, price: float) -> float:
@@ -150,11 +162,13 @@ class Portfolio:
     # --- sizing ---
 
     def size_usd(self, category: str, p_est: float, p_mkt: float,
-                 min_order_notional: float = 1.0) -> float | None:
+                 min_order_notional: float = 1.0, scale: float = 1.0) -> float | None:
         """Position size by Kelly with all caps; None = no room.
 
         Single sizing path for longshots and fade: kelly from edge, cap per
         market, per category (with the correlation matrix) and on total exposure.
+        `scale` is the Sharpe allocator's tilt — applied BEFORE the caps, so it
+        can shift capital between strategies but never break a hard limit.
         """
         cfg = self._cfg
         bankroll = cfg.bankroll_usd
@@ -162,7 +176,7 @@ class Portfolio:
         f_star = kelly_fraction(p_est, p_mkt)
         if f_star <= 0:
             return None
-        size = cfg.kelly_fraction * f_star * bankroll
+        size = cfg.kelly_fraction * f_star * bankroll * scale
         size = min(size, cfg.max_market_pct * bankroll)
 
         # Event-netted category exposure: a self-hedged neg-risk basket counts
@@ -186,11 +200,11 @@ class Portfolio:
             return None
         return round(size, 2)
 
-    def size_trade(self, estimate: Estimate) -> TradePlan | None:
+    def size_trade(self, estimate: Estimate, scale: float = 1.0) -> TradePlan | None:
         c = estimate.candidate
         category = classify_category(c.market.question, c.market.category)
         size = self.size_usd(category, estimate.p_est, estimate.p_mkt,
-                             c.market.min_order_size * estimate.p_mkt)
+                             c.market.min_order_size * estimate.p_mkt, scale=scale)
         if size is None:
             return None
         # Above this price the edge falls below threshold — the executor must not pay more.

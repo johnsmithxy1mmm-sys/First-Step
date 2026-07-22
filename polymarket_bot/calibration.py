@@ -1,14 +1,20 @@
-"""Self-calibration: the bot learns its parameters from its own resolutions.
+"""Self-calibration: the bot learns its parameters from its own data.
 
-Nothing here is a constant-by-decree. Three learners, all fed from the ledger:
+Nothing here is a constant-by-decree. Five learners:
 
   TailBiasCalibrator  — the fade's bias_discount per (category, price bucket),
                         shrunk toward a global prior on small samples.
   MarkoutFeedback     — per-market MM spread multiplier from realized markout
                         (widen where we get adversely selected, tighten where not).
   PlattCalibrator     — a 1-D logistic recalibration of p_est vs outcomes.
+  CorrelationLearner  — pairwise category correlations from the tick store's
+                        category-index series; replaces the expert matrix in
+                        VaR/sizing once there is enough history.
+  FillCalibrator      — binned mapping from PREDICTED fill probability to the
+                        REALIZED fill rate of our own quotes; corrects the
+                        microstructure model where it is systematically off.
 
-All are pure functions of ledger data (testable offline). They start as the
+All are pure functions of recorded data (testable offline). They start as the
 prior/identity and only move as evidence accumulates.
 """
 
@@ -106,6 +112,94 @@ class MarkoutFeedback:
 
     def multiplier(self, market_id: str) -> float:
         return self._mult.get(market_id, 1.0)
+
+
+class CorrelationLearner:
+    """Pairwise category correlations from the tick store's cat_index series.
+
+    Input series are per-category (ts, value) rows written once per cycle
+    (value = volume-weighted mean daily price change of the category). Pairs
+    are aligned on shared timestamps; Pearson correlation is computed only
+    when a pair has >= min_samples aligned points, and clamped away from ±1
+    (a learned 1.0 would make VaR degenerate). Categories without enough
+    history simply stay on the expert prior — fit() returns only what it
+    actually learned.
+    """
+
+    def __init__(self, min_samples: int = 50, clamp: float = 0.95):
+        self._min = min_samples
+        self._clamp = clamp
+        self.learned: dict[frozenset, float] = {}
+
+    def fit(self, series: dict[str, list[tuple[float, float]]]) -> "CorrelationLearner":
+        self.learned = {}
+        cats = [c for c, rows in series.items() if len(rows) >= self._min]
+        for i in range(len(cats)):
+            for j in range(i + 1, len(cats)):
+                a, b = cats[i], cats[j]
+                rho = self._pearson_aligned(dict(series[a]), dict(series[b]))
+                if rho is not None:
+                    self.learned[frozenset({a, b})] = max(-self._clamp,
+                                                          min(self._clamp, rho))
+        return self
+
+    def _pearson_aligned(self, a: dict[float, float],
+                         b: dict[float, float]) -> float | None:
+        shared = sorted(set(a) & set(b))
+        if len(shared) < self._min:
+            return None
+        xs = [a[t] for t in shared]
+        ys = [b[t] for t in shared]
+        n = float(len(shared))
+        mx, my = sum(xs) / n, sum(ys) / n
+        sxx = sum((x - mx) ** 2 for x in xs)
+        syy = sum((y - my) ** 2 for y in ys)
+        if sxx <= 0 or syy <= 0:
+            return None       # a flat series correlates with nothing
+        sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+        return sxy / math.sqrt(sxx * syy)
+
+
+class FillCalibrator:
+    """Binned predicted-vs-realized calibration of the fill-probability model.
+
+    The microstructure fill model is a formula; this checks it against what
+    actually happened to OUR quotes (filled before cancel, or not) and maps a
+    predicted probability to the realized rate of its bin. Bins with fewer
+    than min_per_bin outcomes fall back to the raw prediction — the map only
+    speaks where it has evidence.
+    """
+
+    BIN_EDGES = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.01)
+
+    def __init__(self, min_per_bin: int = 20):
+        self._min = min_per_bin
+        self._rate: dict[int, tuple[float, int]] = {}   # bin -> (realized, n)
+
+    def _bin(self, p: float) -> int:
+        for i, edge in enumerate(self.BIN_EDGES):
+            if p < edge:
+                return i
+        return len(self.BIN_EDGES) - 1
+
+    def fit(self, outcomes: list[tuple[float, bool]]) -> "FillCalibrator":
+        """outcomes: (predicted p_fill at placement, filled before cancel?)."""
+        acc: dict[int, list[float]] = defaultdict(list)
+        for p, filled in outcomes:
+            if 0.0 <= p <= 1.0:
+                acc[self._bin(p)].append(1.0 if filled else 0.0)
+        self._rate = {b: (sum(v) / len(v), len(v)) for b, v in acc.items()}
+        return self
+
+    def calibrate(self, p: float) -> float:
+        rate = self._rate.get(self._bin(p))
+        if rate is None or rate[1] < self._min:
+            return p
+        return rate[0]
+
+    def summary(self) -> list[dict]:
+        return [{"bin": b, "realized": round(r, 3), "n": n}
+                for b, (r, n) in sorted(self._rate.items())]
 
 
 class PlattCalibrator:

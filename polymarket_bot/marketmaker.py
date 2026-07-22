@@ -56,6 +56,7 @@ class Quote(BaseModel):
     no_bid: float               # bid on the No token; in Yes terms this is ask = 1 - no_bid
     size: float
     ts: float = 0.0
+    p_fill_pred: float = -1.0   # fill probability predicted at placement (<0 = none)
 
     @property
     def implied_yes_ask(self) -> float:
@@ -103,6 +104,12 @@ class MarketMaker:
         # Optional paper-fill sizer: callable(quote, outcome_index, top) -> size.
         # None = classic optimistic full fill; the replay installs a queue-aware one.
         self.fill_model = None
+        # Learning hooks (set by the bot; both default to no-ops):
+        # fill_calibrator maps predicted -> realized fill probability;
+        # size_factor is the Sharpe allocator's capital multiplier (caps still
+        # apply after it — it tilts, never breaks a limit).
+        self.fill_calibrator = None
+        self.size_factor: float = 1.0
 
     def _spread_mult(self, market_id: str) -> float:
         return self._feedback.multiplier(market_id) if self._feedback is not None else 1.0
@@ -163,7 +170,7 @@ class MarketMaker:
         if not tick <= yes_bid < yes_ask <= 1 - tick:
             return None
 
-        quote_usd = self._size_map.get(market.id, c.quote_size_usd)
+        quote_usd = self._size_map.get(market.id, c.quote_size_usd) * self.size_factor
         size = float(math.floor(quote_usd / max(yes_bid, tick)))
         size = max(size, market.rewards_min_size)  # otherwise it will not count for rewards
         if size < market.min_order_size:
@@ -172,9 +179,14 @@ class MarketMaker:
         if abs(self._inventory_usd(market)) + size * yes_bid \
                 > self._risk.max_position_per_market_usd * 2:
             return None
+        # Predicted fill probability at placement — checked later against what
+        # actually happens to this quote (FillCalibrator's training data).
+        queue_ahead = top.bid * top.bid_size if yes_bid <= top.bid else 0.0
+        flow = market.volume_24h_usd * (max(c.requote_timer_sec, 1.0) / 86_400.0)
+        p_pred = fill_probability(queue_ahead, size * yes_bid, flow)
         return Quote(market=market, fair=fair, yes_bid=yes_bid,
                      no_bid=round_to_tick(1.0 - yes_ask, tick),
-                     size=size, ts=time.time())
+                     size=size, ts=time.time(), p_fill_pred=p_pred)
 
     def needs_requote(self, market: Market, top: TopOfBook) -> bool:
         """Hysteresis: do not churn orders without need."""
@@ -239,7 +251,11 @@ class MarketMaker:
     # --- execution ---
 
     def _cancel_market(self, market_id: str) -> None:
-        self._quotes.pop(market_id, None)
+        quote = self._quotes.pop(market_id, None)
+        if quote is not None and quote.p_fill_pred >= 0:
+            # The quote died unfilled — a labeled outcome for the calibrator.
+            self._ledger.record_quote_outcome(self._mode, market_id,
+                                              quote.p_fill_pred, filled=False)
         for order in self._orders.pop(market_id, []):
             if self._trader is not None:
                 try:
@@ -261,6 +277,12 @@ class MarketMaker:
         alert(f"MM fill [{self._mode}] {side} {price:.3f} x {size:,.0f} "
               f"= ${price * size:,.2f} — {market.question[:60]}")
 
+    def _record_quote_filled(self, quote: Quote) -> None:
+        if quote.p_fill_pred >= 0:
+            self._ledger.record_quote_outcome(self._mode, quote.market.id,
+                                              quote.p_fill_pred, filled=True)
+            quote.p_fill_pred = -1.0    # one outcome per quote
+
     def _sync_live_fills(self) -> None:
         if self._trader is None:
             return
@@ -275,6 +297,9 @@ class MarketMaker:
                     self._record_fill(order.market, order.outcome_index, order.price,
                                       new_fill, order.order_id, "filled")
                     order.matched_recorded += new_fill
+                    quote = self._quotes.get(order.market.id)
+                    if quote is not None:
+                        self._record_quote_filled(quote)
 
     def _paper_fills(self) -> None:
         """Paper mode: a bid fills if the market traded through it.
@@ -292,6 +317,7 @@ class MarketMaker:
                         if self.fill_model is not None else quote.size)
                 if size > 0:
                     self._record_fill(m, 0, quote.yes_bid, size, None, "paper-filled")
+                    self._record_quote_filled(quote)
                     self._quotes.pop(m.id, None)
                     log.info("MM paper fill: Yes %.3f x %.0f (%s)",
                              quote.yes_bid, size, m.question[:40])
@@ -300,6 +326,7 @@ class MarketMaker:
                         if self.fill_model is not None else quote.size)
                 if size > 0:
                     self._record_fill(m, 1, quote.no_bid, size, None, "paper-filled")
+                    self._record_quote_filled(quote)
                     self._quotes.pop(m.id, None)
                     log.info("MM paper fill: No %.3f x %.0f (%s)",
                              quote.no_bid, size, m.question[:40])
@@ -408,6 +435,10 @@ class MarketMaker:
             recent_flow = market.volume_24h_usd * (self._cfg.interval_sec / 86_400.0)
             p_fill = fill_probability(queue_ahead, current.size * current.yes_bid,
                                       recent_flow)
+            if self.fill_calibrator is not None:
+                # Learned map: what this predicted probability ACTUALLY
+                # converts to on our own quotes.
+                p_fill = self.fill_calibrator.calibrate(p_fill)
             if p_fill >= self._cfg.requote_min_fill_prob:
                 return current
         self._cancel_market(market.id)

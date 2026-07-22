@@ -198,3 +198,40 @@ def test_dry_run_never_places_orders(cfg, ledger):
         quotes = mm.cycle([m])
     assert len(quotes) == 1
     assert mm._orders == {}                       # intentions logged, no orders
+
+
+# --- fill-calibration training data: quote outcomes are labeled ---
+
+def test_paper_fill_records_filled_quote_outcome(cfg, ledger):
+    tops = {"mm1-yes": top(bid=0.43, ask=0.47), "mm1-no": top(bid=0.53, ask=0.57)}
+    mm = make_mm(cfg, ledger, mode="paper", tops=tops)
+    m = mm_market()
+    quote = mm.compute_quote(m, tops["mm1-yes"])
+    assert quote.p_fill_pred >= 0                  # a prediction was attached
+    mm._quotes[m.id] = quote
+    tops["mm1-yes"] = top(bid=0.42, ask=0.44)      # trade through -> fill
+    with mock.patch("polymarket_bot.marketmaker.alert"):
+        mm._paper_fills()
+    outcomes = ledger.quote_outcomes("paper")
+    assert len(outcomes) == 1 and outcomes[0][1] is True    # labeled FILLED
+
+
+def test_cancel_records_unfilled_quote_outcome(cfg, ledger):
+    tops = {"mm1-yes": top(), "mm1-no": top(bid=0.53, ask=0.57)}
+    mm = make_mm(cfg, ledger, tops=tops)
+    m = mm_market()
+    quote = mm.compute_quote(m, tops["mm1-yes"])
+    mm._quotes[m.id] = quote
+    mm._cancel_market(m.id)                         # died unfilled
+    outcomes = ledger.quote_outcomes("dry-run")
+    assert len(outcomes) == 1 and outcomes[0][1] is False   # labeled NOT filled
+
+
+def test_size_factor_scales_quote_budget(cfg, ledger):
+    tops = {"mm1-yes": top(), "mm1-no": top(bid=0.53, ask=0.57)}
+    mm = make_mm(cfg, ledger, tops=tops)
+    m = mm_market()
+    base = mm.compute_quote(m, tops["mm1-yes"]).size
+    mm.size_factor = 2.0
+    scaled = mm.compute_quote(m, tops["mm1-yes"]).size
+    assert scaled > base                           # allocator tilt reaches sizing

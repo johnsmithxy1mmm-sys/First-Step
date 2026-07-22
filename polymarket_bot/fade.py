@@ -41,6 +41,8 @@ class FadeStrategy:
         self._executor = executor
         self._mode = mode
         self._calibrator = calibrator     # TailBiasCalibrator | None
+        # Sharpe allocator tilt (set by the bot); caps still apply after it.
+        self.size_scale: float = 1.0
 
     def _bias(self, category: str, p_mkt_yes: float) -> float:
         """Learned bias_discount for this bucket, or the config prior."""
@@ -101,7 +103,8 @@ class FadeStrategy:
         no_token = market.clob_token_ids[no_index]
 
         size = self._portfolio.size_usd(category, p_fair_no, entry_no,
-                                        market.min_order_size * entry_no)
+                                        market.min_order_size * entry_no,
+                                        scale=self.size_scale)
         if size is None:
             return None
 

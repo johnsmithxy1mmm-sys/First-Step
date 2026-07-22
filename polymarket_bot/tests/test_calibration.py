@@ -2,8 +2,77 @@
 
 import random
 
-from polymarket_bot.calibration import (MarkoutFeedback, PlattCalibrator,
+from polymarket_bot.calibration import (CorrelationLearner, FillCalibrator,
+                                         MarkoutFeedback, PlattCalibrator,
                                          TailBiasCalibrator)
+
+
+# --- CorrelationLearner ---
+
+def _series(pairs, start=0.0):
+    return [(start + i, v) for i, v in enumerate(pairs)]
+
+
+def test_correlation_learns_positive_pair():
+    n = 60
+    a = _series([i * 0.1 for i in range(n)])
+    b = _series([i * 0.1 for i in range(n)])          # identical -> rho = +1, clamped
+    learned = CorrelationLearner(min_samples=50).fit({"x": a, "y": b}).learned
+    assert learned[frozenset({"x", "y"})] == 0.95     # clamp keeps VaR non-degenerate
+
+
+def test_correlation_learns_negative_pair():
+    n = 60
+    a = _series([i * 0.1 for i in range(n)])
+    b = _series([-i * 0.1 for i in range(n)])
+    rho = CorrelationLearner(min_samples=50).fit({"x": a, "y": b}).learned
+    assert rho[frozenset({"x", "y"})] == -0.95
+
+
+def test_correlation_needs_min_samples():
+    a = _series([1.0, 2.0, 3.0])
+    b = _series([1.0, 2.0, 3.0])
+    assert CorrelationLearner(min_samples=50).fit({"x": a, "y": b}).learned == {}
+
+
+def test_correlation_only_aligns_shared_timestamps():
+    a = [(float(i), i * 0.1) for i in range(60)]
+    b = [(float(i) + 1000, i * 0.1) for i in range(60)]   # no shared ts
+    assert CorrelationLearner(min_samples=50).fit({"x": a, "y": b}).learned == {}
+
+
+def test_correlation_flat_series_is_skipped():
+    a = _series([1.0] * 60)                             # zero variance
+    b = _series([i * 0.1 for i in range(60)])
+    assert CorrelationLearner(min_samples=50).fit({"x": a, "y": b}).learned == {}
+
+
+def test_learned_correlation_overrides_prior():
+    from polymarket_bot import portfolio
+    try:
+        portfolio.set_learned_correlation({frozenset({"crypto", "economy"}): 0.8})
+        assert portfolio.correlation("crypto", "economy") == 0.8
+        assert portfolio.correlation("geopolitics", "economy") == 0.5   # prior kept
+    finally:
+        portfolio.set_learned_correlation({})           # reset global for other tests
+
+
+# --- FillCalibrator ---
+
+def test_fill_calibrator_maps_predicted_to_realized():
+    # Predicted ~0.8 but only 40% actually filled -> calibrate down.
+    outcomes = [(0.82, i < 4) for i in range(10)] * 3   # bin [0.8,0.9): 40% filled
+    fc = FillCalibrator(min_per_bin=20).fit(outcomes)
+    assert fc.calibrate(0.82) == 0.4
+
+
+def test_fill_calibrator_falls_back_below_min_samples():
+    fc = FillCalibrator(min_per_bin=20).fit([(0.82, True), (0.82, False)])
+    assert fc.calibrate(0.82) == 0.82                   # too few -> raw prediction
+
+
+def test_fill_calibrator_identity_before_fit():
+    assert FillCalibrator().calibrate(0.55) == 0.55
 
 
 # --- tail-bias learner ---

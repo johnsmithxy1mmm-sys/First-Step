@@ -87,6 +87,14 @@ CREATE TABLE IF NOT EXISTS bank (
     equity REAL NOT NULL,
     hwm REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS quote_outcomes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    market_id TEXT NOT NULL,
+    p_pred REAL NOT NULL,             -- fill probability predicted at placement
+    filled INTEGER NOT NULL           -- 1 = filled before cancel, 0 = cancelled
+);
 """
 
 
@@ -376,6 +384,21 @@ class Ledger:
                 if len(out) >= limit:
                     break
         return out
+
+    def record_quote_outcome(self, mode: str, market_id: str,
+                             p_pred: float, filled: bool) -> None:
+        """One quote's life: predicted fill probability -> what happened."""
+        self._execute(
+            "INSERT INTO quote_outcomes (ts, mode, market_id, p_pred, filled) "
+            "VALUES (?,?,?,?,?)",
+            (_now(), mode, market_id, p_pred, 1 if filled else 0))
+
+    def quote_outcomes(self, mode: str, limit: int = 5000) -> list[tuple[float, bool]]:
+        """(p_pred, filled) pairs, newest first — FillCalibrator input."""
+        rows = self._query(
+            "SELECT p_pred, filled FROM quote_outcomes WHERE mode = ? "
+            "ORDER BY id DESC LIMIT ?", (mode, limit))
+        return [(float(r["p_pred"]), bool(r["filled"])) for r in rows]
 
     def record_markout(self, trade_id: int, token_id: str, horizon_sec: int,
                        fill_price: float, mark_price: float) -> None:

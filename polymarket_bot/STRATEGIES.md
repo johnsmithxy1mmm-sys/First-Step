@@ -181,3 +181,29 @@ niche:
 All strategies live in one process on their own intervals, write to a shared
 ledger with a `strategy` column (separate PnL attribution) and obey a shared
 drawdown kill-switch.
+
+## The learning loop — nothing stays a constant-by-decree
+
+The bot records its own market data and outcomes, then re-fits its parameters
+from that history. Every learner starts as the prior/identity and only moves
+as evidence accumulates (all pure functions of recorded data, tested offline):
+
+- **Tick recording** (`tickstore.py`) — every WS top-of-book update and a
+  per-cycle per-category price-change index are streamed to their own sqlite
+  (non-blocking enqueue, drop-oldest under backpressure, retention-pruned).
+  This is the raw material; without it, "self-calibration" is just a word.
+- **Category correlations** (`CorrelationLearner`) — Pearson correlations of
+  the recorded category-index series replace the expert VaR/sizing matrix,
+  pair by pair, once a pair has enough aligned history (clamped off ±1 so VaR
+  never degenerates). Unlearned pairs keep the expert prior.
+- **Fill calibration** (`FillCalibrator`) — every MM quote is labeled at death
+  (filled-before-cancel or not) against the fill probability predicted at
+  placement; the learner maps predicted → realized and feeds the corrected
+  probability back into the queue-preservation decision.
+- **Fade bias, MM markout, Platt** — as before (per-bucket tail bias, per-
+  market adverse-selection spread widening, p_est recalibration).
+- **Acting Sharpe allocator** (`alloc.py`) — the digest's per-strategy Sharpe
+  weights move sizing multipliers inside a clamped corridor (default
+  0.7–1.3, EMA-smoothed). Capital tilts toward what is actually earning, but
+  **every hard risk cap applies after the multiplier** — it can tilt, never
+  break a limit. The circuit breaker still owns on/off.
