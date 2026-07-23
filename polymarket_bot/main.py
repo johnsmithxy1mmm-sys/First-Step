@@ -916,7 +916,7 @@ def main(argv: list[str] | None = None) -> None:
                         choices=("dry-run", "paper", "live", "backtest",
                                  "record-books", "replay", "report", "diagnose",
                                  "autotune", "sync-config", "capacity",
-                                 "leadlag"),
+                                 "leadlag", "coherence"),
                         default="dry-run",
                         help="dry-run -> paper -> live (manual promotion only); "
                              "backtest/record-books/replay — offline phases; "
@@ -994,6 +994,11 @@ def main(argv: list[str] | None = None) -> None:
     if args.mode == "leadlag":
         from .leadlag import run_leadlag
         run_leadlag(cfg)
+        return
+
+    if args.mode == "coherence":
+        from .coherence import run_coherence
+        run_coherence(cfg)
         return
 
     snaps_db = str(Path(cfg.runtime.db_path).parent / "book_snaps.sqlite")
