@@ -29,6 +29,11 @@ markets, subtly different resolution rules) turns "riskless" into a real bet.
 `classification_haircut` reserves margin against that, and execution is
 alert-only (`execute: false`) until paper confirms the matches are sane.
 
+The ladder DIRECTION is read from the deadline in the question TEXT, and it
+must agree with Gamma's endDate. Trusting endDate alone inverted real pairs
+(Gamma's endDate often lags the wording), which fabricated "+200% arbitrages" —
+so on any text-vs-metadata disagreement the pair is refused, not guessed.
+
 Fast turnover: a chain pair does not have to wait for either leg's own
 resolution to realize its gain. Once the market corrects the mispricing (or
 the near/subset leg resolves — informative for the far leg), both legs can
@@ -41,6 +46,7 @@ from __future__ import annotations
 
 import logging
 import re
+from datetime import date
 
 from pydantic import BaseModel
 
@@ -73,6 +79,37 @@ _INCREASING_WORDS = ("reach", "hit", "exceed", "surpass", "top", "cross",
                      "above", "over", "at least")
 _DECREASING_WORDS = ("below", "under", "less than", "drop", "fall", "dip")
 _ABSORBING_MARKERS = ("by ", "before ", "no later than")
+
+_MONTH_NUM = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+              "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
+# "<Month> [<day>,] <year>" — the resolution deadline stated in the wording.
+# The 4-digit year is required (so "the 2026 Ballon d'Or" with no month never
+# matches, and "2026" is never mis-read as a day); the day is optional.
+_DEADLINE_RE = re.compile(
+    r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z.]*\s+"
+    r"(?:(\d{1,2})(?:st|nd|rd|th)?,?\s+)?"
+    r"(\d{4})\b",
+    re.IGNORECASE,
+)
+
+
+def _extract_deadline(market: Market) -> date | None:
+    """The deadline parsed from the QUESTION TEXT (the resolution truth), not
+    from Gamma's endDate metadata — which for these events often disagrees with
+    the text and, trusted alone, inverts the ladder (a fake "arbitrage").
+
+    A month with no day resolves to day 28: enough to order two different
+    months correctly, and never overshoots a real month-end.
+    """
+    m = _DEADLINE_RE.search(market.question)
+    if not m:
+        return None
+    month = _MONTH_NUM[m.group(1).lower()[:3]]
+    day = int(m.group(2)) if m.group(2) else 28
+    try:
+        return date(int(m.group(3)), month, day)
+    except ValueError:
+        return None
 
 
 def _template(question: str) -> str:
@@ -121,12 +158,17 @@ def classify_pair(a: Market, b: Market) -> tuple[Market, Market, str] | None:
     if _template(a.question) != _template(b.question):
         return None
     va, vb = _extract_dollar(a.question), _extract_dollar(b.question)
+    da, db = _extract_deadline(a), _extract_deadline(b)
     same_date = abs((a.end_date - b.end_date).total_seconds()) < 86_400
     same_value = va is not None and vb is not None and abs(va - vb) < 1e-6
 
     # Same deadline, different $ threshold -> continuous-path VALUE ladder.
     if same_date and va is not None and vb is not None and not same_value:
         if not _increasing_threshold(a.question):
+            return None
+        # If both wordings carry a deadline, they must be the SAME date — a
+        # value ladder shares the deadline (only the threshold differs).
+        if da is not None and db is not None and da != db:
             return None
         subset, superset = (a, b) if va > vb else (b, a)   # higher $ = subset
         return subset, superset, "value"
@@ -136,7 +178,14 @@ def classify_pair(a: Market, b: Market) -> tuple[Market, Market, str] | None:
     if value_matches and not same_date:
         if not (_absorbing(a.question) and _absorbing(b.question)):
             return None
-        subset, superset = (a, b) if a.end_date < b.end_date else (b, a)  # earlier = subset
+        # Order by the TEXT deadline, not endDate. Refuse unless both parse and
+        # differ, AND the text order agrees with endDate — a disagreement means
+        # one of the two signals is wrong, and "riskless" cannot rest on a guess.
+        if da is None or db is None or da == db:
+            return None
+        if (da < db) != (a.end_date < b.end_date):
+            return None
+        subset, superset = (a, b) if da < db else (b, a)   # earlier deadline = subset
         return subset, superset, "date"
 
     return None

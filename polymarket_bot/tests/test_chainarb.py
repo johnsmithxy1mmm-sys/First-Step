@@ -318,3 +318,72 @@ def test_dust_depth_produces_no_alert(cfg, ledger):
     }[tok]
     chain = make_chain(cfg, ledger, clob=clob)
     assert chain.cycle([subset_m, superset_m]) == []
+
+
+# --- date-ladder direction from TEXT, not endDate (the GPT-6 inversion bug) ---
+
+def test_date_ladder_uses_text_deadline_not_endDate():
+    """endDate INVERTED vs the wording (the real Gamma bug): refuse, don't
+    fabricate an arbitrage from a mis-ordered pair."""
+    # Wording: July (earlier) should be subset, Sept (later) superset.
+    # But endDate is inverted: the July market carries a LATER endDate.
+    july = dated(id="gpt-jul", event_id="ev",
+                 question="Will GPT-6 be released by July 31, 2026?",
+                 end_date=datetime(2026, 9, 30, tzinfo=timezone.utc),   # WRONG/late
+                 clob_token_ids=["jy", "jn"])
+    sept = dated(id="gpt-sep", event_id="ev",
+                 question="Will GPT-6 be released by September 30, 2026?",
+                 end_date=datetime(2026, 8, 1, tzinfo=timezone.utc),    # WRONG/early
+                 clob_token_ids=["sy", "sn"])
+    assert classify_pair(july, sept) is None       # text vs metadata disagree -> refuse
+
+
+def test_date_ladder_text_and_metadata_agree_orders_by_deadline():
+    july = dated(id="gpt-jul", event_id="ev",
+                 question="Will GPT-6 be released by July 31, 2026?",
+                 end_date=datetime(2026, 7, 31, tzinfo=timezone.utc),
+                 clob_token_ids=["jy", "jn"])
+    sept = dated(id="gpt-sep", event_id="ev",
+                 question="Will GPT-6 be released by September 30, 2026?",
+                 end_date=datetime(2026, 9, 30, tzinfo=timezone.utc),
+                 clob_token_ids=["sy", "sn"])
+    subset, superset, kind = classify_pair(july, sept)
+    assert kind == "date"
+    assert subset.id == "gpt-jul"                  # earlier text deadline = subset
+    assert superset.id == "gpt-sep"
+
+
+def test_deadline_parser_ignores_year_only_as_day():
+    """'June 2026' (no day) must not read '20' out of '2026' as the day."""
+    from polymarket_bot.chainarb import _extract_deadline
+    m = dated(question="Will the Fed cut rates by June 2026?",
+              end_date=datetime(2026, 6, 30, tzinfo=timezone.utc))
+    d = _extract_deadline(m)
+    assert d is not None and d.month == 6 and d.year == 2026
+
+
+def test_date_ladder_refuses_without_parseable_deadline():
+    """No year in the wording -> cannot verify direction from text -> refuse."""
+    a = dated(question="Will the Fed cut rates by summer?",
+              end_date=datetime(2026, 6, 30, tzinfo=timezone.utc))
+    b = dated(question="Will the Fed cut rates by autumn?",
+              end_date=datetime(2026, 9, 30, tzinfo=timezone.utc))
+    assert classify_pair(a, b) is None
+
+
+def test_inverted_pair_yields_no_arb_through_cycle(cfg, ledger):
+    """End to end: the mis-ordered GPT-6 pair the bot spammed must produce
+    zero chain-arb candidates now (it is refused at classification)."""
+    july = dated(id="gpt-jul", event_id="ev",
+                 question="Will GPT-6 be released by July 31, 2026?",
+                 end_date=datetime(2026, 9, 30, tzinfo=timezone.utc),
+                 outcome_prices=[0.006, 0.994], clob_token_ids=["jy", "jn"],
+                 volume_24h_usd=50_000)
+    sept = dated(id="gpt-sep", event_id="ev",
+                 question="Will GPT-6 be released by September 30, 2026?",
+                 end_date=datetime(2026, 8, 1, tzinfo=timezone.utc),
+                 outcome_prices=[0.74, 0.26], clob_token_ids=["sy", "sn"],
+                 volume_24h_usd=50_000)
+    chain = make_chain(cfg, ledger)
+    assert chain.prefilter_pairs([july, sept]) == []
+    assert chain.cycle([july, sept]) == []
