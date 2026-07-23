@@ -147,6 +147,10 @@ class Bot:
         self.tg_control = TelegramControl(self._telegram_handlers())
         # Position guardian: early warning when a sold tail is materializing.
         self.guardian = PositionGuardian(cfg)
+        # Auto-postmortems: a structured lesson appended on every resolution.
+        from .postmortem import PostmortemWriter
+        self.postmortem = PostmortemWriter(cfg.postmortem.path,
+                                           cfg.postmortem.enabled)
 
     def metrics_snapshot(self) -> dict:
         """Live state for /metrics and /health (never raises)."""
@@ -537,8 +541,11 @@ class Bot:
                 continue
             won = p.token_id == (m.clob_token_ids[winner] if winner < len(m.clob_token_ids) else "")
             self.ledger.record_resolution(p.token_id, p.market_id, won)
+            pm = self.postmortem.record(p, won)         # self-documenting fund
             msg = (f"RESOLUTION [{self.mode}] {'WIN' if won else 'loss'}: "
                    f"{p.question[:60]} ({p.size:,.0f} sh at {p.avg_price:.4f})")
+            if pm is not None:
+                msg += f"\n  lesson: {pm['lesson']}"
             log.info(msg)
             alert(msg)
 
@@ -916,7 +923,7 @@ def main(argv: list[str] | None = None) -> None:
                         choices=("dry-run", "paper", "live", "backtest",
                                  "record-books", "replay", "report", "diagnose",
                                  "autotune", "sync-config", "capacity",
-                                 "leadlag", "coherence", "timemachine"),
+                                 "leadlag", "coherence", "timemachine", "chaos"),
                         default="dry-run",
                         help="dry-run -> paper -> live (manual promotion only); "
                              "backtest/record-books/replay — offline phases; "
@@ -1004,6 +1011,11 @@ def main(argv: list[str] | None = None) -> None:
     if args.mode == "timemachine":
         from .timemachine import run_timemachine
         run_timemachine(cfg)
+        return
+
+    if args.mode == "chaos":
+        from .chaos import run_chaos
+        run_chaos(cfg)
         return
 
     snaps_db = str(Path(cfg.runtime.db_path).parent / "book_snaps.sqlite")

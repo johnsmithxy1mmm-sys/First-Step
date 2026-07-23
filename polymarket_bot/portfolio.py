@@ -161,6 +161,15 @@ class Portfolio:
 
     # --- sizing ---
 
+    def effective_bankroll(self) -> float:
+        """Static bankroll, or bankroll + realized PnL when compounding (floored
+        so a drawdown can't shrink the base to nothing)."""
+        cfg = self._cfg
+        if not cfg.compounding:
+            return cfg.bankroll_usd
+        live = cfg.bankroll_usd + self._ledger.realized_pnl(self._mode)
+        return max(live, cfg.compound_floor * cfg.bankroll_usd)
+
     def size_usd(self, category: str, p_est: float, p_mkt: float,
                  min_order_notional: float = 1.0, scale: float = 1.0) -> float | None:
         """Position size by Kelly with all caps; None = no room.
@@ -171,7 +180,7 @@ class Portfolio:
         can shift capital between strategies but never break a hard limit.
         """
         cfg = self._cfg
-        bankroll = cfg.bankroll_usd
+        bankroll = self.effective_bankroll()
 
         f_star = kelly_fraction(p_est, p_mkt)
         if f_star <= 0:

@@ -51,6 +51,11 @@ portfolio:
   max_drawdown_pct: 0.25      # drawdown >= 25% -> observe-only + alert (soft brake)
   take_profit_multiple: 7.0   # partial take on an N-x rise
   take_profit_fraction: 0.6
+  compounding: false          # true = size off (bankroll + realized pnl), so
+                              # banked profit grows the next bet and losses
+                              # shrink it (honest anti-martingale). Realized
+                              # only — never inflates on unrealized markups.
+  compound_floor: 0.5         # effective bankroll never drops below this x base
 
 executor:
   max_reprices: 3
@@ -354,6 +359,11 @@ guardian:
   min_entry_price: 0.5      # only guard the 'sure thing' side
   adverse_drop: 0.10        # price fell this much from entry -> warn
   reduce_fraction: 0.5      # how much of the leg to trim when auto_reduce
+
+# Auto-postmortems: append a structured lesson (entry -> outcome -> lesson) to a
+# JSONL on every resolution, so the fund documents itself. No LLM needed.
+postmortem:
+  enabled: true
 
 ops:
   metrics_enabled: true     # Prometheus /metrics + /health on the port below

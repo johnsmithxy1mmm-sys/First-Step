@@ -201,6 +201,12 @@ class PortfolioConfig(BaseModel):
     max_drawdown_pct: float = 0.25     # stop for the whole system
     take_profit_multiple: float = 7.0  # partial take at 5-10x
     take_profit_fraction: float = 0.6  # sell 50-70%
+    # Compounding: size off (bankroll + REALIZED pnl) instead of the static
+    # bankroll, so banked profit grows the next bet and banked losses shrink it
+    # (honest anti-martingale). Uses realized only — never inflates on unrealized
+    # markups. Clamped so a drawdown can't shrink the base below compound_floor.
+    compounding: bool = False
+    compound_floor: float = 0.5        # effective bankroll >= this x static bankroll
 
     @field_validator("kelly_fraction")
     @classmethod
@@ -509,6 +515,14 @@ class RuntimeConfig(BaseModel):
     max_retries: int = 4
 
 
+class PostmortemConfig(BaseModel):
+    """Auto-postmortems: append a structured lesson to a JSONL on every
+    resolution, so the fund documents itself (which theses paid, which fade
+    tails materialized). No LLM required."""
+    enabled: bool = True
+    path: str = str(PACKAGE_DIR / "data" / "postmortems.jsonl")
+
+
 class GuardianConfig(BaseModel):
     """Position guardian: watches our EXPENSIVE legs (NO fades, resolution
     carry — bought >= min_entry_price) for an adverse move. When such a leg
@@ -588,6 +602,7 @@ class BotConfig(BaseModel):
     alerts: AlertsConfig = Field(default_factory=AlertsConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
     guardian: GuardianConfig = Field(default_factory=GuardianConfig)
+    postmortem: PostmortemConfig = Field(default_factory=PostmortemConfig)
     ruleslawyer: RulesLawyerConfig = Field(default_factory=RulesLawyerConfig)
     fade: FadeConfig = Field(default_factory=FadeConfig)
     market_maker: MarketMakerConfig = Field(default_factory=MarketMakerConfig)
