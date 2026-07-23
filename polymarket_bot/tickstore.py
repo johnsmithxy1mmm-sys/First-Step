@@ -142,6 +142,28 @@ class TickStore:
             conn.close()
         return out
 
+    def token_book_series(self, tokens: list[str], limit_per_token: int = 4000
+                          ) -> dict[str, list[tuple]]:
+        """(ts, bid, ask, bid_size, ask_size) per token, oldest first — the
+        counterfactual replay's input (needs the full top of book, not just mid)."""
+        if not tokens:
+            return {}
+        conn = sqlite3.connect(self._db_path)
+        out: dict[str, list[tuple]] = {}
+        try:
+            for token in tokens:
+                rows = conn.execute(
+                    "SELECT ts, bid, ask, bid_size, ask_size FROM ticks "
+                    "WHERE token=? ORDER BY ts DESC LIMIT ?",
+                    (token, limit_per_token)).fetchall()
+                if rows:
+                    out[token] = [tuple(r) for r in reversed(rows)]
+        except sqlite3.OperationalError:
+            return {}
+        finally:
+            conn.close()
+        return out
+
     # --- writer thread ---
 
     def flush_now(self) -> None:
