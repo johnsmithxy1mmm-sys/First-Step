@@ -29,6 +29,15 @@ class ClobReader:
                 params={"token_id": token_id},
                 max_retries=1,
             )
+        except httpx.HTTPStatusError as exc:
+            # 404 = the CLOB has no book for this token (inactive/untradable
+            # market that Gamma still lists). Expected and benign — the callers
+            # already skip a None book, so do not shout about it.
+            if exc.response.status_code == 404:
+                log.debug("book %s: no CLOB book (404)", token_id[:16])
+            else:
+                log.warning("book %s: %s", token_id[:16], exc)
+            return None
         except httpx.HTTPError as exc:
             log.warning("book %s: %s", token_id[:16], exc)
             return None
