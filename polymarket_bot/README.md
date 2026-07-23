@@ -132,6 +132,14 @@ automatically:
    lottery ticket. Resolutions are recorded in the ledger automatically.
 6. **monitor** — rich dashboard (bank, drawdown, positions, top candidates,
    errors) + Telegram alerts on entries/exits/resolutions/kill-switch.
+   Repeating opportunity alerts (arb/chain/resolution) are deduped: one notice
+   per structure per hour unless its edge moves materially.
+
+**Two-way Telegram** (optional): with `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID`
+in `.env` and `telegram.control_enabled: true`, control the bot from your
+phone — `/status`, `/positions`, `/pnl`, `/pause`, `/resume`, `/help`. Only
+your chat id is honored; everything is read-only except pause/resume of the
+kill-switch (which can only make the bot safer, never place an order).
 
 ## Ledger analytics
 

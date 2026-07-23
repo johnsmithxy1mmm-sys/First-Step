@@ -45,6 +45,7 @@ from .ruleslawyer import RulesLawyer
 from .satellite import BTC5mSatellite
 from .scanner import Scanner
 from .smartmoney import SmartMoneySignal, SmartMoneyTracker
+from .telegram_control import TelegramControl
 from .tickstore import TickStore
 from .ws_feed import WSFeed
 
@@ -141,6 +142,8 @@ class Bot:
         self.sprint.fill_calibrator = self.fill_calibrator
         self.allocator = StrategyAllocator(cfg)
         self._longshot_scale = 1.0
+        # Two-way Telegram: control from the phone (started in the run path only).
+        self.tg_control = TelegramControl(self._telegram_handlers())
 
     def metrics_snapshot(self) -> dict:
         """Live state for /metrics and /health (never raises)."""
@@ -161,6 +164,59 @@ class Bot:
         except Exception:
             return {"mode": self.mode, "halted": self.killswitch.halted}
 
+    def _telegram_handlers(self) -> dict:
+        """Slash-command handlers for two-way Telegram control."""
+        def status() -> str:
+            ks = self.killswitch
+            state = ("HALT: " + ks.reason if ks.halted
+                     else "PAUSED: " + ks.reason if ks.paused
+                     else "observe-only" if self._observe_only else "active")
+            positions = self.ledger.open_positions(self.mode)
+            alloc = self.allocator.summary()
+            return (f"mode {self.mode} | {state}\n"
+                    f"equity ${self.portfolio.equity():,.2f} | "
+                    f"drawdown {self.portfolio.drawdown() * 100:.1f}%\n"
+                    f"open positions: {len(positions)} "
+                    f"(${sum(p.cost_usd for p in positions):,.2f})"
+                    + (f"\nsizing: {alloc}" if alloc else ""))
+
+        def positions() -> str:
+            ps = sorted(self.ledger.open_positions(self.mode),
+                        key=lambda p: p.cost_usd, reverse=True)[:15]
+            if not ps:
+                return "no open positions"
+            return "\n".join(f"[{p.outcome}] {p.question[:45]} — "
+                             f"{p.size:,.0f} @ {p.avg_price:.3f} (${p.cost_usd:,.0f})"
+                             for p in ps)
+
+        def pnl() -> str:
+            by = self.ledger.realized_pnl_by_strategy(self.mode)
+            lines = "\n".join(f"  {k}: {v:+,.2f}" for k, v in sorted(by.items())) or "  —"
+            caps = self.ledger.opportunity_stats(self.mode)
+            cap_lines = "".join(
+                f"\n  {c['strategy']}: {c['windows']} windows, "
+                f"${c['edge_dollars'] or 0:,.0f} capacity" for c in caps)
+            return f"Realized PnL:\n{lines}" + (
+                f"\nOpportunity capacity:{cap_lines}" if cap_lines else "")
+
+        def pause() -> str:
+            self.killswitch.trip_pause("manual pause via Telegram", source="manual")
+            return "⏸ paused — new orders blocked, quotes pulled. /resume to continue."
+
+        def resume() -> str:
+            self.killswitch.resume_from_pause("manual")
+            allowed = self.killswitch.trading_allowed
+            return ("▶ resumed — trading allowed." if allowed
+                    else f"still blocked: {self.killswitch.reason}")
+
+        def help_() -> str:
+            return ("Commands:\n/status — equity, risk state, sizing\n"
+                    "/positions — open book\n/pnl — realized PnL + capacity\n"
+                    "/pause — stop new orders\n/resume — allow trading again")
+
+        return {"status": status, "positions": positions, "pnl": pnl,
+                "pause": pause, "resume": resume, "help": help_, "start": help_}
+
     def _cancel_everything(self) -> None:
         self.mm.shutdown()
         self.sprint.shutdown()
@@ -179,6 +235,7 @@ class Bot:
         except Exception:
             log.exception("shutdown cancel")
         self.arb_fastlane.stop()
+        self.tg_control.stop()
         if self.ws is not None:
             self.ws.stop()
         if self.ticks is not None:
@@ -869,6 +926,8 @@ def main(argv: list[str] | None = None) -> None:
     if bot.ws is not None and not args.once:
         bot.ws.start()
         bot.arb_fastlane.start()   # WS-triggered arb re-checks (worker thread)
+    if not args.once and cfg.telegram.control_enabled and bot.tg_control.enabled:
+        bot.tg_control.start()     # two-way Telegram command listener
     if args.once:
         try:
             bot.cycle()

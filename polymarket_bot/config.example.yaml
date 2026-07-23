@@ -324,6 +324,13 @@ alerts:
   opportunity_cooldown_sec: 3600   # at most one repeat notice per hour per structure
   opportunity_min_edge_change: 0.02  # ...unless net edge moved >= 2 pp
 
+# Two-way Telegram: control the bot from your phone (needs TELEGRAM_BOT_TOKEN +
+# TELEGRAM_CHAT_ID in .env). Only messages from your chat id are honored.
+# Commands: /status /positions /pnl /pause /resume /help. Everything is
+# read-only except pause/resume of the kill-switch (can only make it safer).
+telegram:
+  control_enabled: true
+
 ops:
   metrics_enabled: true     # Prometheus /metrics + /health on the port below
   metrics_port: 9090

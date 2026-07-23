@@ -466,6 +466,13 @@ class RuntimeConfig(BaseModel):
     max_retries: int = 4
 
 
+class TelegramConfig(BaseModel):
+    """Two-way Telegram control. Needs TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID in
+    .env; only messages from that chat id are honored. Commands are read-only
+    except pause/resume of the kill-switch (which can only make the bot safer)."""
+    control_enabled: bool = True
+
+
 class AlertsConfig(BaseModel):
     """Telegram alert hygiene: a repeating opportunity (an arb window seen every
     cycle) re-notifies at most once per cooldown, unless its edge moved enough.
@@ -519,6 +526,7 @@ class BotConfig(BaseModel):
     ticks: TicksConfig = Field(default_factory=TicksConfig)
     allocator: AllocatorConfig = Field(default_factory=AllocatorConfig)
     alerts: AlertsConfig = Field(default_factory=AlertsConfig)
+    telegram: TelegramConfig = Field(default_factory=TelegramConfig)
     ruleslawyer: RulesLawyerConfig = Field(default_factory=RulesLawyerConfig)
     fade: FadeConfig = Field(default_factory=FadeConfig)
     market_maker: MarketMakerConfig = Field(default_factory=MarketMakerConfig)
