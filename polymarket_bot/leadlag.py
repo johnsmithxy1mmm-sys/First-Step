@@ -31,12 +31,17 @@ class LeadLag(BaseModel):
 def _resample(series: list[tuple[float, float]], step_sec: float,
               n: int) -> list[float] | None:
     """Last-observation-carried-forward onto a uniform grid of `n` points ending
-    at the latest timestamp. Returns None if the series is too short/degenerate."""
+    at the latest timestamp. Returns None if the series is too short/degenerate,
+    or does not COVER the grid window: backfilling pre-history with the first
+    observation would plant an artificial jump at the recording start, and two
+    such jumps at staggered starts cross-correlate into a fabricated 'lead'."""
     if len(series) < 3:
         return None
     series = sorted(series)
     end = series[-1][0]
     grid = [end - (n - 1 - i) * step_sec for i in range(n)]
+    if series[0][0] > grid[0]:
+        return None                 # recording starts inside the window — skip
     out: list[float] = []
     j = 0
     for t in grid:
@@ -78,12 +83,18 @@ def best_lag(leader: list[float], laggard: list[float],
 
 def analyze(series_by_token: dict[str, list[tuple[float, float]]],
             *, step_sec: float = 30.0, grid: int = 120, max_lag: int = 6,
-            min_corr: float = 0.5) -> list[LeadLag]:
+            min_corr: float = 0.5, min_moves: int = 5) -> list[LeadLag]:
     """All (leader, laggard) pairs whose lagged return-correlation clears
     min_corr, strongest first. A pair only counts at a STRICTLY positive lag —
-    a contemporaneous match is co-movement, not a lead."""
+    a contemporaneous match is co-movement, not a lead.
+
+    min_moves: a token must have moved at least this many grid steps in the
+    window. A single spike correlates near-1.0 with any other single spike at
+    SOME lag — one coincidence must not read as a lead."""
     grids = {tok: _resample(s, step_sec, grid) for tok, s in series_by_token.items()}
-    grids = {tok: g for tok, g in grids.items() if g is not None}
+    grids = {tok: g for tok, g in grids.items()
+             if g is not None
+             and sum(1 for r in _returns(g) if r != 0.0) >= min_moves}
     out: list[LeadLag] = []
     tokens = sorted(grids)
     for a in tokens:

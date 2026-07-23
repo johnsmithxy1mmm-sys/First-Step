@@ -67,3 +67,33 @@ def test_token_series_from_store(tmp_path):
     assert len(series["tokA"]) == 5
     assert series["tokA"][0][1] == (0.40 + 0.42) / 2       # mid of first tick
     ts.close()
+
+
+# --- false-positive guards found in the release review ---
+
+def test_staggered_recording_start_is_not_a_lead():
+    """Two tokens whose RECORDING started at different times used to fabricate
+    a 'lead' out of the two backfill jumps. Late-starting series are skipped."""
+    base = [0.5 + 0.01 * (i % 9) for i in range(150)]
+    late = _series(base)[100:]              # recording began mid-window
+    rows = analyze({"full": _series(base), "late": late},
+                   step_sec=30.0, min_corr=0.3)
+    assert all("late" not in (r.leader, r.laggard) for r in rows)
+
+
+def test_single_spike_pair_is_not_a_lead():
+    """One coincidental spike in each of two otherwise-flat series must not
+    read as a lead (a lone spike correlates with any other lone spike at
+    SOME lag)."""
+    a = [0.50] * 150
+    b = [0.50] * 150
+    a[70] = 0.60                            # one move each, 3 steps apart
+    b[73] = 0.60
+    assert analyze({"a": _series(a), "b": _series(b)}, min_corr=0.3) == []
+
+
+def test_min_moves_keeps_genuinely_active_pairs():
+    base = [0.5 + 0.01 * (i % 9) for i in range(150)]
+    rows = analyze({"fast": _series(base), "slow": _series(_shift(base, 2))},
+                   min_corr=0.5, min_moves=5)
+    assert rows and rows[0].leader == "fast"     # real activity still detected

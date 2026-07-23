@@ -72,17 +72,60 @@ def _transitive_closure(succ: dict[str, set[str]]) -> dict[str, set[str]]:
     return closure
 
 
-def event_chain(group: list[Market]) -> list[Market] | None:
-    """Order a group into a single implication chain (rarest -> commonest), or
-    None if the markets are not a clean total order (a subset would need a
-    strict out-degree ranking; ties mean it is a partial order we won't guess)."""
+def _components(group: list[Market],
+                succ: dict[str, set[str]]) -> list[list[Market]]:
+    """Connected components of the implication graph (edges as undirected).
+
+    Real events mix ladder markets with unrelated ones ("reach $200k" next to
+    "dip to $50k"); an unrelated market must not veto the valid chain beside
+    it — so chains are sought per component, not on the whole event."""
+    neigh: dict[str, set[str]] = {m.id: set() for m in group}
+    for a, outs in succ.items():
+        for b in outs:
+            neigh[a].add(b)
+            neigh[b].add(a)
+    by_id = {m.id: m for m in group}
+    seen: set[str] = set()
+    comps: list[list[Market]] = []
+    for m in group:
+        if m.id in seen:
+            continue
+        stack, comp = [m.id], []
+        while stack:
+            node = stack.pop()
+            if node in seen:
+                continue
+            seen.add(node)
+            comp.append(by_id[node])
+            stack.extend(neigh[node] - seen)
+        comps.append(comp)
+    return comps
+
+
+def event_chains(group: list[Market]) -> list[list[Market]]:
+    """Every implication chain in the event (rarest -> commonest), one per
+    connected component that forms a STRICT total order. Components with
+    out-degree ties are partial orders — refused, not guessed."""
     if len(group) < 2:
-        return None
-    closure = _transitive_closure(_implication_edges(group))
-    outdeg = {m.id: len(closure[m.id]) for m in group}
-    if len(set(outdeg.values())) != len(group):
-        return None                         # not a strict total order
-    return sorted(group, key=lambda m: outdeg[m.id], reverse=True)
+        return []
+    succ = _implication_edges(group)
+    closure = _transitive_closure(succ)
+    chains: list[list[Market]] = []
+    for comp in _components(group, succ):
+        if len(comp) < 2:
+            continue
+        ids = {m.id for m in comp}
+        outdeg = {m.id: len(closure[m.id] & ids) for m in comp}
+        if len(set(outdeg.values())) != len(comp):
+            continue                        # partial order inside the component
+        chains.append(sorted(comp, key=lambda m: outdeg[m.id], reverse=True))
+    return chains
+
+
+def event_chain(group: list[Market]) -> list[Market] | None:
+    """The LARGEST implication chain in the group, or None if there is none."""
+    chains = event_chains(group)
+    return max(chains, key=len) if chains else None
 
 
 def isotonic_nondecreasing(y: list[float]) -> list[float]:
@@ -106,11 +149,8 @@ def _yes_price(m: Market) -> float:
     return m.outcome_prices[0] if m.outcome_prices else 0.0
 
 
-def analyze_event(group: list[Market]) -> Incoherence | None:
-    """Chain view of one event: coherent projection + the worst ordering gap."""
-    chain = event_chain(group)
-    if chain is None:
-        return None
+def _analyze_chain(chain: list[Market]) -> Incoherence:
+    """Coherent projection + the worst ordering gap for ONE chain."""
     raw = [_yes_price(m) for m in chain]        # non-decreasing if coherent
     fit = isotonic_nondecreasing(raw)
     max_gap = max((raw[i] - raw[i + 1] for i in range(len(raw) - 1)), default=0.0)
@@ -121,24 +161,31 @@ def analyze_event(group: list[Market]) -> Incoherence | None:
                        max_gap=round(max_gap, 4), nodes=nodes)
 
 
+def analyze_event(group: list[Market]) -> Incoherence | None:
+    """Chain view of the LARGEST chain in one event (None if unchained)."""
+    chain = event_chain(group)
+    return _analyze_chain(chain) if chain is not None else None
+
+
 def coherent_probs(markets: list[Market]) -> dict[str, float]:
     """market_id -> coherence-projected YES probability (only chained markets)."""
     out: dict[str, float] = {}
     for group in _by_event(markets):
-        inc = analyze_event(group)
-        if inc is not None:
-            for n in inc.nodes:
+        for chain in event_chains(group):
+            for n in _analyze_chain(chain).nodes:
                 out[n.market_id] = n.p_coherent
     return out
 
 
 def incoherences(markets: list[Market], min_gap: float = 0.02) -> list[Incoherence]:
-    """Events whose chain prices violate monotonicity by at least min_gap."""
+    """Chains whose prices violate monotonicity by at least min_gap — ALL
+    chains of every event, not just the largest one."""
     out = []
     for group in _by_event(markets):
-        inc = analyze_event(group)
-        if inc is not None and inc.max_gap >= min_gap:
-            out.append(inc)
+        for chain in event_chains(group):
+            inc = _analyze_chain(chain)
+            if inc.max_gap >= min_gap:
+                out.append(inc)
     out.sort(key=lambda i: i.max_gap, reverse=True)
     return out
 

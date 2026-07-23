@@ -104,11 +104,14 @@ SCENARIOS = [
 
 
 def run_all(cfg: BotConfig) -> list[tuple[str, bool, str]]:
-    ledger = Ledger(":memory:")
-    try:
-        return [fn(cfg, ledger) for fn in SCENARIOS]
-    finally:
-        ledger.close()
+    results = []
+    for fn in SCENARIOS:
+        ledger = Ledger(":memory:")     # fresh per scenario: no state can leak
+        try:
+            results.append(fn(cfg, ledger))
+        finally:
+            ledger.close()
+    return results
 
 
 def run_chaos(cfg: BotConfig) -> bool:  # pragma: no cover — I/O glue
