@@ -466,6 +466,14 @@ class RuntimeConfig(BaseModel):
     max_retries: int = 4
 
 
+class AlertsConfig(BaseModel):
+    """Telegram alert hygiene: a repeating opportunity (an arb window seen every
+    cycle) re-notifies at most once per cooldown, unless its edge moved enough.
+    One-off events (fills, entries, kill-switch) are never suppressed."""
+    opportunity_cooldown_sec: float = 3600.0
+    opportunity_min_edge_change: float = 0.02   # 2 percentage points of net edge
+
+
 class TicksConfig(BaseModel):
     """Continuous market-data recording — the raw material for every learned
     model (correlations, fill calibration). Cheap to keep on; the learning
@@ -510,6 +518,7 @@ class BotConfig(BaseModel):
     redemption: RedemptionConfig = Field(default_factory=RedemptionConfig)
     ticks: TicksConfig = Field(default_factory=TicksConfig)
     allocator: AllocatorConfig = Field(default_factory=AllocatorConfig)
+    alerts: AlertsConfig = Field(default_factory=AlertsConfig)
     ruleslawyer: RulesLawyerConfig = Field(default_factory=RulesLawyerConfig)
     fade: FadeConfig = Field(default_factory=FadeConfig)
     market_maker: MarketMakerConfig = Field(default_factory=MarketMakerConfig)

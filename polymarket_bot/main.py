@@ -468,7 +468,11 @@ class Bot:
                 alert(f"ARBITRAGE {a.side} basket \"{a.event_title[:60]}\": "
                       f"NET after fees +{a.net_profit_pct * 100:.2f}% "
                       f"(gross +{a.profit_pct * 100:.1f}%), "
-                      f"depth {a.max_sets_by_depth()} sets{warn}{note}")
+                      f"depth {a.max_sets_by_depth()} sets{warn}{note}",
+                      key=f"arb:{a.event_id}:{a.side}",
+                      cooldown_sec=self.cfg.alerts.opportunity_cooldown_sec,
+                      value=a.net_profit_pct,
+                      min_change=self.cfg.alerts.opportunity_min_edge_change)
         except Exception:
             log.exception("arb job")
 
@@ -503,7 +507,11 @@ class Bot:
                 alert(f"CHAIN ARB [{p.kind}] \"{p.event_title[:50]}\": "
                       f"NET after fee+haircut +{net * 100:.2f}% "
                       f"(gross +{p.profit_pct * 100:.1f}%), "
-                      f"depth {p.max_sets_by_depth()} sets{note}")
+                      f"depth {p.max_sets_by_depth()} sets{note}",
+                      key=f"chain:{p.event_id}:{p.subset.market.id}:{p.superset.market.id}",
+                      cooldown_sec=self.cfg.alerts.opportunity_cooldown_sec,
+                      value=net,
+                      min_change=self.cfg.alerts.opportunity_min_edge_change)
         except Exception:
             log.exception("chain arb job")
 

@@ -316,6 +316,14 @@ allocator:
   ceil: 1.3                 # ...a hot one up to at most this (the corridor)
   smoothing: 0.5            # EMA weight of the new target per digest (anti-whipsaw)
 
+# Telegram alert hygiene: a repeating opportunity (an arb/chain/resolution
+# window seen every cycle) re-notifies at most once per cooldown, unless its
+# net edge moved by at least min_edge_change. One-off events (fills, entries,
+# kill-switch trips) are never suppressed.
+alerts:
+  opportunity_cooldown_sec: 3600   # at most one repeat notice per hour per structure
+  opportunity_min_edge_change: 0.02  # ...unless net edge moved >= 2 pp
+
 ops:
   metrics_enabled: true     # Prometheus /metrics + /health on the port below
   metrics_port: 9090

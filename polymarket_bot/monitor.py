@@ -10,6 +10,7 @@ import logging
 import os
 import queue
 import threading
+import time
 
 from datetime import datetime, timezone
 
@@ -25,6 +26,39 @@ log = logging.getLogger(__name__)
 _queue: "queue.Queue[str]" = queue.Queue()
 _worker_lock = threading.Lock()
 _worker_started = False
+
+# Alert dedupe: a repeating OPPORTUNITY (an arb window seen every cycle) should
+# not re-notify every time. Keyed by a stable structure id -> (last_sent_ts,
+# last_value); a repeat within cooldown is suppressed unless its tracked value
+# (e.g. net edge) moved by at least min_change. One-off events (fills, entries,
+# risk trips) pass no key and are never suppressed.
+_dedupe_lock = threading.Lock()
+_dedupe: "dict[str, tuple[float, float | None]]" = {}
+
+
+def _reset_alert_state() -> None:
+    """Test hook: forget dedupe history."""
+    with _dedupe_lock:
+        _dedupe.clear()
+
+
+def _should_send(key: str | None, cooldown_sec: float, value: float | None,
+                 min_change: float | None, now: float) -> bool:
+    if not key or cooldown_sec <= 0:
+        return True
+    with _dedupe_lock:
+        prev = _dedupe.get(key)
+        if prev is not None and now - prev[0] < cooldown_sec:
+            unchanged = (value is None or min_change is None or prev[1] is None
+                         or abs(value - prev[1]) < min_change)
+            if unchanged:
+                return False        # within cooldown, nothing material changed
+        if len(_dedupe) > 5000:     # bound the map: drop entries past a day
+            cutoff = now - 86_400
+            for k in [k for k, v in _dedupe.items() if v[0] < cutoff]:
+                _dedupe.pop(k, None)
+        _dedupe[key] = (now, value)
+        return True
 
 
 def _send(text: str) -> bool:
@@ -55,9 +89,17 @@ def _drain() -> None:
             _queue.task_done()
 
 
-def alert(text: str) -> bool:
-    """Queue a Telegram alert (non-blocking); False if TELEGRAM_* vars unset."""
+def alert(text: str, *, key: str | None = None, cooldown_sec: float = 0.0,
+          value: float | None = None, min_change: float | None = None) -> bool:
+    """Queue a Telegram alert (non-blocking); False if TELEGRAM_* vars unset.
+
+    Pass `key` + `cooldown_sec` to dedupe a repeating opportunity: a repeat of
+    the same key within the window is dropped unless `value` moved by at least
+    `min_change` since the last send. One-off events pass no key.
+    """
     if not os.environ.get("TELEGRAM_BOT_TOKEN") or not os.environ.get("TELEGRAM_CHAT_ID"):
+        return False
+    if not _should_send(key, cooldown_sec, value, min_change, time.time()):
         return False
     global _worker_started
     with _worker_lock:

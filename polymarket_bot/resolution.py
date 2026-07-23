@@ -52,6 +52,7 @@ class ResolutionAlpha:
     def __init__(self, cfg: BotConfig, ledger: Ledger, clob: ClobReader,
                  trader: Trader | None, mode: str):
         self._cfg = cfg.resolution
+        self._alerts = cfg.alerts
         self._fees = FeeModel(cfg.fees)
         self._ledger = ledger
         self._clob = clob
@@ -156,7 +157,11 @@ class ResolutionAlpha:
             note = "" if self._cfg.execute and allow_execute else " (execute off)"
             alert(f"RESOLUTION alpha [{self._mode}] [{outcome}] @ {cand.price:.3f} "
                   f"-> net edge +{cand.net_edge * 100:.2f}% after fee+dispute reserve "
-                  f"— {m.question[:60]}{note}")
+                  f"— {m.question[:60]}{note}",
+                  key=f"resolution:{m.id}",
+                  cooldown_sec=self._alerts.opportunity_cooldown_sec,
+                  value=cand.net_edge,
+                  min_change=self._alerts.opportunity_min_edge_change)
             if self._cfg.execute and allow_execute:
                 spent = self.execute(cand)
                 if spent > 0:
