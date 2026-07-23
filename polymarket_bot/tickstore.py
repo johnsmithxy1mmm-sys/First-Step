@@ -69,11 +69,13 @@ class TickStore:
     def record_tick(self, token: str, bid: float, ask: float,
                     bid_size: float, ask_size: float,
                     ts: float | None = None) -> None:
-        self._put(("tick", ts or time.time(), token, bid, ask, bid_size, ask_size))
+        now = time.time() if ts is None else ts   # a real ts=0.0 is not "missing"
+        self._put(("tick", now, token, bid, ask, bid_size, ask_size))
 
     def record_category_index(self, category: str, value: float, n: int,
                               ts: float | None = None) -> None:
-        self._put(("cat", ts or time.time(), category, value, n))
+        now = time.time() if ts is None else ts
+        self._put(("cat", now, category, value, n))
 
     def _put(self, row: tuple) -> None:
         try:
@@ -113,6 +115,32 @@ class TickStore:
             return 0
         finally:
             conn.close()
+
+    def token_series(self, tokens: list[str], limit_per_token: int = 2000
+                     ) -> dict[str, list[tuple[float, float]]]:
+        """(ts, mid) series per token, oldest first — lead-lag analysis input."""
+        if not tokens:
+            return {}
+        conn = sqlite3.connect(self._db_path)
+        out: dict[str, list[tuple[float, float]]] = {}
+        try:
+            for token in tokens:
+                rows = conn.execute(
+                    "SELECT ts, bid, ask FROM ticks WHERE token=? "
+                    "ORDER BY ts DESC LIMIT ?", (token, limit_per_token)).fetchall()
+                series = []
+                for ts, bid, ask in reversed(rows):
+                    mid = ((bid + ask) / 2.0 if bid and ask and bid > 0 and ask > 0
+                           else (bid or ask or 0.0))
+                    if mid > 0:
+                        series.append((ts, mid))
+                if series:
+                    out[token] = series
+        except sqlite3.OperationalError:
+            return {}
+        finally:
+            conn.close()
+        return out
 
     # --- writer thread ---
 
