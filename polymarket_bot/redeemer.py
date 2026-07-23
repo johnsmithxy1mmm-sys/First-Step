@@ -103,6 +103,13 @@ class Redeemer:
             # Different adapter + calldata; a wrong call burns gas or worse.
             log.info("redeem: %s is neg-risk — manual claim (UI)", item.title)
             return False
+        # Proxy-wallet accounts (email/browser: signature_type 1/2) hold the
+        # tokens in the PROXY, not the EOA — an EOA redeemPositions would target
+        # the wrong holder and just burn gas. Only direct EOA accounts auto-redeem.
+        if os.environ.get("POLYMARKET_SIGNATURE_TYPE", "0") != "0":
+            log.info("redeem: proxy-wallet account (signature_type != 0) — "
+                     "claim %s in the UI", item.title)
+            return False
         private_key = os.environ.get("POLYMARKET_PRIVATE_KEY")
         rpc_url = self._cfg.rpc_url or os.environ.get("POLYGON_RPC_URL", "")
         if not private_key or not rpc_url:
@@ -128,7 +135,11 @@ class Redeemer:
                 "nonce": w3.eth.get_transaction_count(account.address),
             })
             signed = account.sign_transaction(tx)
-            tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+            # web3 v7 renamed rawTransaction -> raw_transaction; support both.
+            raw = getattr(signed, "raw_transaction", None)
+            if raw is None:
+                raw = signed.rawTransaction
+            tx_hash = w3.eth.send_raw_transaction(raw)
             receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
             ok = receipt.get("status") == 1
             (log.info if ok else log.error)(

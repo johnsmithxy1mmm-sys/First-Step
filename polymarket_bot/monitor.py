@@ -74,7 +74,10 @@ def _send(text: str) -> bool:
         )
         return resp.status_code == 200
     except httpx.HTTPError as exc:
-        log.warning("telegram alert failed: %s", exc)
+        # httpx error strings can embed the request URL — which contains the
+        # bot token. Redact before it reaches the log file.
+        log.warning("telegram alert failed: %s",
+                    str(exc).replace(token, "***"))
         return False
 
 

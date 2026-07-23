@@ -71,12 +71,36 @@ def test_fastlane_check_routes_to_the_right_scanner(tmp_path):
     bot._chain_pairs = {("s", "p"): pair}
     with mock.patch.object(bot.arb, "check_group") as cg, \
             mock.patch.object(bot.chain_arb, "check_pair") as cp, \
+            mock.patch.object(bot, "_record_arb_opportunity") as ra, \
+            mock.patch.object(bot, "_record_chain_opportunity") as rc, \
             mock.patch.object(bot, "_may_execute", return_value=False):
         bot._fastlane_check(("basket", "ev1"))
         bot._fastlane_check(("chain", ("s", "p")))
         bot._fastlane_check(("basket", "gone"))   # structure rotated out — no-op
     cg.assert_called_once_with(group, allow_execute=False)
     cp.assert_called_once_with(pair[0], pair[1], "date", allow_execute=False)
+    ra.assert_called_once()                       # fastlane windows are recorded
+    rc.assert_called_once()
+    bot.close()
+
+
+def test_fastlane_found_window_lands_in_opportunity_ledger(tmp_path):
+    """The short-lived windows only the fastlane sees must reach the ledger —
+    otherwise measured capacity understates the fastest opportunities."""
+    from polymarket_bot.arbitrage import ArbLeg, BasketArb
+    from .conftest import make_market
+    bot = make_bot(tmp_path)
+    leg = ArbLeg(market=make_market(), outcome_index=0, token_id="t",
+                 ask=0.30, depth=100)
+    arb = BasketArb(event_id="ev1", event_title="Election", side="YES",
+                    legs=[leg, leg, leg], taker_fee=0.0)
+    bot._arb_groups = {"ev1": [mock.Mock()]}
+    with mock.patch.object(bot.arb, "check_group", return_value=arb), \
+            mock.patch.object(bot, "_may_execute", return_value=False):
+        bot._fastlane_check(("basket", "ev1"))
+    stats = bot.ledger.opportunity_stats("paper")
+    assert stats and stats[0]["strategy"] == "arb" and stats[0]["windows"] == 1
+    assert stats[0]["executed"] == 0              # gates closed -> not executed
     bot.close()
 
 

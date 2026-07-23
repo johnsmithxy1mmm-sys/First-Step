@@ -57,7 +57,10 @@ class TelegramControl(threading.Thread):
         text = (msg.get("text") or "").strip()
         if not text.startswith("/"):
             return None
-        cmd = text[1:].split()[0].split("@")[0].lower()   # "/status@bot foo" -> "status"
+        parts = text[1:].split()
+        if not parts:
+            return None                   # a bare "/" is not a command
+        cmd = parts[0].split("@")[0].lower()   # "/status@bot foo" -> "status"
         handler = self._handlers.get(cmd)
         if handler is None:
             known = ", ".join("/" + k for k in sorted(self._handlers))
@@ -74,6 +77,10 @@ class TelegramControl(threading.Thread):
 
     # --- network ---
 
+    def _redact(self, exc: Exception) -> str:
+        """httpx error strings can embed the URL — which contains the token."""
+        return str(exc).replace(self._token, "***") if self._token else str(exc)
+
     def _get_updates(self) -> list[dict]:
         try:
             resp = httpx.get(
@@ -84,7 +91,7 @@ class TelegramControl(threading.Thread):
                 return []
             return resp.json().get("result", []) or []
         except httpx.HTTPError as exc:
-            log.debug("telegram getUpdates: %s", exc)
+            log.debug("telegram getUpdates: %s", self._redact(exc))
             return []
 
     def _reply(self, text: str) -> None:
@@ -93,19 +100,22 @@ class TelegramControl(threading.Thread):
                        json={"chat_id": self._chat_id, "text": text[:4000]},
                        timeout=10)
         except httpx.HTTPError as exc:
-            log.debug("telegram sendMessage: %s", exc)
+            log.debug("telegram sendMessage: %s", self._redact(exc))
 
     def run(self) -> None:  # pragma: no cover — network loop over tested parts
         if not self.enabled:
             return
         log.info("telegram control: listening for commands")
         while not self._halt.is_set():
-            updates = self._get_updates()
-            self._advance_offset(updates)
-            for u in updates:
-                reply = self.handle_update(u)
-                if reply:
-                    self._reply(reply)
+            try:
+                updates = self._get_updates()
+                self._advance_offset(updates)
+                for u in updates:
+                    reply = self.handle_update(u)
+                    if reply:
+                        self._reply(reply)
+            except Exception:               # one bad update must not kill control
+                log.exception("telegram control loop")
 
     def stop(self) -> None:
         self._halt.set()

@@ -49,6 +49,8 @@ CREATE INDEX IF NOT EXISTS idx_cat_ts ON cat_index(category, ts);
 class TickStore:
     def __init__(self, db_path: str, retention_days: float = 30.0,
                  flush_sec: float = 2.0, max_queue: int = 50_000):
+        from pathlib import Path
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._db_path = db_path
         self._retention_sec = retention_days * 86_400.0
         self._flush_sec = flush_sec

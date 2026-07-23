@@ -103,3 +103,13 @@ def test_execute_gate_blocks_onchain_but_not_alert(cfg):
         r.cycle(allow_execute=False)                 # kill-switch says no orders
     red.assert_not_called()
     a.assert_called_once()                           # the human still hears about it
+
+
+def test_proxy_wallet_never_auto_redeems(cfg, monkeypatch):
+    """signature_type 1/2 holds tokens in the PROXY — an EOA redeem would
+    target the wrong holder. Refuse and point at the UI."""
+    monkeypatch.setenv("POLYMARKET_SIGNATURE_TYPE", "2")
+    monkeypatch.setenv("POLYMARKET_PRIVATE_KEY", "0xabc")
+    monkeypatch.setenv("POLYGON_RPC_URL", "http://rpc")
+    r = make_redeemer(cfg, [])
+    assert r.redeem(Redeemable(condition_id="0xab", size=10)) is False

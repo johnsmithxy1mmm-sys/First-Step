@@ -8,3 +8,4 @@ websockets>=12.0         # WS order books (instant quotes/exits)
 py-clob-client>=0.17     # signed orders (live only); verify V2 in Phase 0
 anthropic>=0.40          # LLM signal (only when estimator.llm.enabled)
 pytest>=8.0              # tests
+# web3>=6               # OPTIONAL: only for redemption.execute (auto-claim on-chain)

@@ -332,7 +332,9 @@ class Bot:
                 # Observe-only is a brake on NEW risk; REDUCING risk stays
                 # allowed — in a drawdown, take-profits must not be frozen.
                 self._exit_positions(marks)
-                self._guardian_pass(marks)
+            # Guardian WARNINGS always run — a materializing tail matters most
+            # during a halt; only the auto-trim is gated (inside the pass).
+            self._guardian_pass(marks)
             # Refresh the fastlane cache after this cycle's entries/exits.
             self._positions_by_token = {
                 p.token_id: p for p in self.ledger.open_positions(self.mode)}
@@ -377,7 +379,9 @@ class Bot:
 
     def _guardian_pass(self, marks: dict[str, float]) -> None:
         """Warn on (and optionally trim) any expensive leg whose sold tail is
-        materializing. The alert dedupes with the WS-fastlane one (same key)."""
+        materializing. The alert dedupes with the WS-fastlane one (same key).
+        Warnings run in EVERY state; the auto-trim (an order) only when the
+        kill-switch allows trading."""
         c = self.cfg.guardian
         for position in self.ledger.open_positions(self.mode):
             mark = marks.get(position.token_id)
@@ -391,7 +395,7 @@ class Bot:
                   cooldown_sec=self.cfg.alerts.opportunity_cooldown_sec,
                   value=verdict.drop,
                   min_change=self.cfg.alerts.opportunity_min_edge_change)
-            if c.auto_reduce:
+            if c.auto_reduce and self.killswitch.trading_allowed:
                 self._reduce_one(position, mark, c.reduce_fraction)
 
     def _reduce_one(self, position, mark: float, fraction: float) -> bool:
@@ -453,14 +457,11 @@ class Bot:
                 self.ticks.record_tick(token, top.bid, top.ask,
                                        top.bid_size, top.ask_size,
                                        top.ts if top.ts > 0 else None)
-            if not self.killswitch.trading_allowed:
-                return
-            # Exits (risk REDUCTION) run even in observe-only — only new risk
-            # (MM quoting) is frozen by the drawdown brake below.
+            # Guardian WARNING runs before any trading gate: a materializing
+            # tail matters MOST during a halt (disasters correlate), and the
+            # alert is read-only (cached mark, non-blocking queue).
             position = self._positions_by_token.get(token)
             if position is not None and top.bid > 0:
-                # Guardian: a sold tail is materializing — warn now (queued,
-                # non-blocking; auto-trim is done in the cycle, not on the tick).
                 verdict = self.guardian.check(position, top.bid)
                 if verdict is not None:
                     alert(verdict.describe(position.question),
@@ -468,6 +469,11 @@ class Bot:
                           cooldown_sec=self.cfg.alerts.opportunity_cooldown_sec,
                           value=verdict.drop,
                           min_change=self.cfg.alerts.opportunity_min_edge_change)
+            if not self.killswitch.trading_allowed:
+                return
+            # Exits (risk REDUCTION) run even in observe-only — only new risk
+            # (MM quoting) is frozen by the drawdown brake below.
+            if position is not None and top.bid > 0:
                 if self._exit_one(position, top.bid):
                     self._positions_by_token.pop(token, None)
             # Arbitrage fastlane: flag the structure this token belongs to
@@ -566,10 +572,7 @@ class Bot:
                 a = self.arb.check_group(group, allow_execute=may)
                 if a is not None:
                     found.append(a)
-                    self.ledger.record_opportunity(
-                        self.mode, "arb", f"{a.event_id}:{a.side}",
-                        a.event_title[:80], a.net_profit_pct,
-                        a.max_sets_by_depth() * a.cost_per_set)
+                    self._record_arb_opportunity(a, may)
             # Fastlane registration: token -> event group (atomic swaps).
             self._arb_groups = {g[0].event_id: g for g in groups if g[0].event_id}
             self._basket_token_map = {
@@ -609,12 +612,7 @@ class Bot:
                                               allow_execute=may)
                 if p is not None:
                     found.append(p)
-                    net = p.net_profit_pct - self.cfg.chain_arb.classification_haircut
-                    self.ledger.record_opportunity(
-                        self.mode, "chain_arb",
-                        f"{p.event_id}:{p.subset.market.id}:{p.superset.market.id}",
-                        p.event_title[:80], net,
-                        p.max_sets_by_depth() * p.cost_per_set)
+                    self._record_chain_opportunity(p, may)
             # Fastlane registration: the two tradable legs -> the pair.
             self._chain_pairs = {(s.id, sp.id): (s, sp, k) for s, sp, k in pairs}
             self._chain_token_map = {}
@@ -637,20 +635,46 @@ class Bot:
         except Exception:
             log.exception("chain arb job")
 
+    def _record_arb_opportunity(self, a, may: bool) -> None:
+        """One basket window into the opportunity ledger (executed = an order
+        was actually attempted for it, i.e. execute on + gates open)."""
+        self.ledger.record_opportunity(
+            self.mode, "arb", f"{a.event_id}:{a.side}", a.event_title[:80],
+            a.net_profit_pct, a.max_sets_by_depth() * a.cost_per_set,
+            executed=self.cfg.arbitrage.execute and may and not a.suspect)
+
+    def _record_chain_opportunity(self, p, may: bool) -> None:
+        net = p.net_profit_pct - self.cfg.chain_arb.classification_haircut
+        self.ledger.record_opportunity(
+            self.mode, "chain_arb",
+            f"{p.event_id}:{p.subset.market.id}:{p.superset.market.id}",
+            p.event_title[:80], net, p.max_sets_by_depth() * p.cost_per_set,
+            executed=self.cfg.chain_arb.execute and may)
+
     def _fastlane_check(self, key: tuple) -> None:
-        """Worker-thread callback: re-verify one flagged structure NOW."""
+        """Worker-thread callback: re-verify one flagged structure NOW.
+
+        Windows found here (the short-lived ones that die between polls) are
+        recorded too — otherwise measured capacity would understate exactly
+        the fastest opportunities.
+        """
         kind, ident = key
         if kind == "basket":
             group = self._arb_groups.get(ident)
             if group and self.cfg.arbitrage.enabled:
-                self.arb.check_group(group, allow_execute=self._may_execute("arb"))
+                may = self._may_execute("arb")
+                a = self.arb.check_group(group, allow_execute=may)
+                if a is not None:
+                    self._record_arb_opportunity(a, may)
         elif kind == "chain":
             pair = self._chain_pairs.get(ident)
             if pair and self.cfg.chain_arb.enabled:
                 subset, superset, k = pair
-                self.chain_arb.check_pair(
-                    subset, superset, k,
-                    allow_execute=self._may_execute("chain_arb"))
+                may = self._may_execute("chain_arb")
+                p = self.chain_arb.check_pair(subset, superset, k,
+                                              allow_execute=may)
+                if p is not None:
+                    self._record_chain_opportunity(p, may)
 
     def mm_job(self) -> None:
         """Core: market making. Blocked by the kill-switch and observe-only."""
@@ -867,7 +891,13 @@ class Bot:
             return
         try:
             for d in self.cross.cycle(self.markets_cache):
-                alert(d.describe())
+                # A persistent divergence re-notifies once per cooldown, or
+                # when the gap moves materially — not every 15-minute poll.
+                alert(d.describe(),
+                      key=f"cross:{d.poly_market.id}:{d.venue_market.url}",
+                      cooldown_sec=self.cfg.alerts.opportunity_cooldown_sec,
+                      value=d.gap,
+                      min_change=self.cfg.alerts.opportunity_min_edge_change)
         except Exception:
             log.exception("crossmarket job")
 

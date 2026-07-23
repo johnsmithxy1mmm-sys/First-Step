@@ -14,6 +14,7 @@ def make_bot(tmp_path):
     cfg.runtime.db_path = str(tmp_path / "l.sqlite")
     cfg.runtime.log_path = str(tmp_path / "b.jsonl")
     cfg.runtime.llm_cache_path = str(tmp_path / "c.json")
+    cfg.ticks.db_path = str(tmp_path / "ticks.sqlite")   # never the repo data dir
     cfg.ws.enabled = False
     return Bot(cfg, "paper")
 
