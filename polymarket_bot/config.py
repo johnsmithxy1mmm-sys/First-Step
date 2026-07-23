@@ -466,6 +466,20 @@ class RuntimeConfig(BaseModel):
     max_retries: int = 4
 
 
+class GuardianConfig(BaseModel):
+    """Position guardian: watches our EXPENSIVE legs (NO fades, resolution
+    carry — bought >= min_entry_price) for an adverse move. When such a leg
+    loses adverse_drop of price, the low-probability tail we sold is
+    materializing (a news event) — alert at once, and optionally trim the leg.
+    This is the mirror of take-profit, and the honest hedge against fade's
+    'rare large loss'. Alert-first; auto_reduce is off by default."""
+    enabled: bool = True
+    auto_reduce: bool = False
+    min_entry_price: float = 0.5     # only the 'sure thing' side is guarded
+    adverse_drop: float = 0.10       # price fell this much from entry -> tail rising
+    reduce_fraction: float = 0.5     # how much of the leg to trim when auto_reduce
+
+
 class TelegramConfig(BaseModel):
     """Two-way Telegram control. Needs TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID in
     .env; only messages from that chat id are honored. Commands are read-only
@@ -527,6 +541,7 @@ class BotConfig(BaseModel):
     allocator: AllocatorConfig = Field(default_factory=AllocatorConfig)
     alerts: AlertsConfig = Field(default_factory=AlertsConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
+    guardian: GuardianConfig = Field(default_factory=GuardianConfig)
     ruleslawyer: RulesLawyerConfig = Field(default_factory=RulesLawyerConfig)
     fade: FadeConfig = Field(default_factory=FadeConfig)
     market_maker: MarketMakerConfig = Field(default_factory=MarketMakerConfig)

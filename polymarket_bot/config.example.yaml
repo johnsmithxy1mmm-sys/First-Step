@@ -331,6 +331,19 @@ alerts:
 telegram:
   control_enabled: true
 
+# Position guardian: the mirror of take-profit and the honest hedge against
+# fade's "rare large loss". It watches our EXPENSIVE legs (NO fades / carry,
+# bought >= min_entry_price) and, the moment one loses adverse_drop of price
+# (the tail we sold is materializing — a news event), alerts immediately so you
+# can act while there is still a book to sell into. auto_reduce trims the leg
+# automatically; leave it off until paper shows the triggers are sane.
+guardian:
+  enabled: true
+  auto_reduce: false        # true = automatically trim a materializing leg
+  min_entry_price: 0.5      # only guard the 'sure thing' side
+  adverse_drop: 0.10        # price fell this much from entry -> warn
+  reduce_fraction: 0.5      # how much of the leg to trim when auto_reduce
+
 ops:
   metrics_enabled: true     # Prometheus /metrics + /health on the port below
   metrics_port: 9090

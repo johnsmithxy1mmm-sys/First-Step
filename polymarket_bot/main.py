@@ -27,6 +27,7 @@ from .estimator import Estimator
 from .executor import Executor
 from .fade import FadeStrategy
 from .gamma import GammaClient
+from .guardian import PositionGuardian
 from .ledger import Ledger
 from .logging_setup import setup_logging
 from .marketmaker import MarketMaker
@@ -144,6 +145,8 @@ class Bot:
         self._longshot_scale = 1.0
         # Two-way Telegram: control from the phone (started in the run path only).
         self.tg_control = TelegramControl(self._telegram_handlers())
+        # Position guardian: early warning when a sold tail is materializing.
+        self.guardian = PositionGuardian(cfg)
 
     def metrics_snapshot(self) -> dict:
         """Live state for /metrics and /health (never raises)."""
@@ -329,6 +332,7 @@ class Bot:
                 # Observe-only is a brake on NEW risk; REDUCING risk stays
                 # allowed — in a drawdown, take-profits must not be frozen.
                 self._exit_positions(marks)
+                self._guardian_pass(marks)
             # Refresh the fastlane cache after this cycle's entries/exits.
             self._positions_by_token = {
                 p.token_id: p for p in self.ledger.open_positions(self.mode)}
@@ -370,6 +374,48 @@ class Bot:
             mark = marks.get(position.token_id)
             if mark:
                 self._exit_one(position, mark)
+
+    def _guardian_pass(self, marks: dict[str, float]) -> None:
+        """Warn on (and optionally trim) any expensive leg whose sold tail is
+        materializing. The alert dedupes with the WS-fastlane one (same key)."""
+        c = self.cfg.guardian
+        for position in self.ledger.open_positions(self.mode):
+            mark = marks.get(position.token_id)
+            if not mark:
+                continue
+            verdict = self.guardian.check(position, mark)
+            if verdict is None:
+                continue
+            alert(verdict.describe(position.question),
+                  key=f"guardian:{position.token_id}",
+                  cooldown_sec=self.cfg.alerts.opportunity_cooldown_sec,
+                  value=verdict.drop,
+                  min_change=self.cfg.alerts.opportunity_min_edge_change)
+            if c.auto_reduce:
+                self._reduce_one(position, mark, c.reduce_fraction)
+
+    def _reduce_one(self, position, mark: float, fraction: float) -> bool:
+        """Guardian stop: sell a fraction of a materializing leg into the book."""
+        import math
+        size = math.floor(position.size * fraction)
+        if size <= 0:
+            return False
+        from .models import Candidate
+        est = Estimate(
+            candidate=Candidate(market=self._market_stub(position),
+                                outcome_index=0, token_id=position.token_id, p_mkt=mark),
+            p_mkt=mark, p_est=mark, signals=[])
+        min_price = round(max(mark * 0.9, 0.01), 4)   # accept slippage to actually exit
+        result = self.executor.execute_sell(
+            est_to_plan(est, position.category), float(size), min_price)
+        if result.status == "filled":
+            msg = (f"GUARDIAN reduce [{self.mode}] sold {size:,.0f} at "
+                   f"{result.avg_price:.4f} (entry {position.avg_price:.4f}) — "
+                   f"capping a materializing tail — {position.question[:50]}")
+            log.info(msg)
+            alert(msg)
+            return True
+        return False
 
     def _exit_one(self, position, mark: float) -> bool:
         """Take-profit a single position at `mark` (used by the cycle and WS fastlane)."""
@@ -413,6 +459,15 @@ class Bot:
             # (MM quoting) is frozen by the drawdown brake below.
             position = self._positions_by_token.get(token)
             if position is not None and top.bid > 0:
+                # Guardian: a sold tail is materializing — warn now (queued,
+                # non-blocking; auto-trim is done in the cycle, not on the tick).
+                verdict = self.guardian.check(position, top.bid)
+                if verdict is not None:
+                    alert(verdict.describe(position.question),
+                          key=f"guardian:{token}",
+                          cooldown_sec=self.cfg.alerts.opportunity_cooldown_sec,
+                          value=verdict.drop,
+                          min_change=self.cfg.alerts.opportunity_min_edge_change)
                 if self._exit_one(position, top.bid):
                     self._positions_by_token.pop(token, None)
             # Arbitrage fastlane: flag the structure this token belongs to
