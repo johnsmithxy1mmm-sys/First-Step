@@ -42,6 +42,8 @@ def compute_report(ledger: Ledger, mode: str, fade_prior: float = 0.35) -> dict:
         "positions": ledger.open_positions(mode),
         "learned_bias": _learned_bias(ledger, mode, fade_prior),
         "stress": _stress(ledger.open_positions(mode)),
+        "opportunities": ledger.opportunity_stats(mode),
+        "top_opportunities": ledger.top_opportunities(mode),
     }
 
 
@@ -161,6 +163,33 @@ def print_report(report: dict) -> None:
                 f"true worst-case ${st['worst_case_usd']:,.0f} | "
                 f"largest event ${st['largest_event_usd']:,.0f} | "
                 f"VaR95 ~${st['var95_usd']:,.0f}")
+
+    opps = report.get("opportunities") or []
+    if opps:
+        t = Table(title="Opportunity capacity (detected windows, taken or not)")
+        for col in ("Strategy", "Windows", "Sightings", "Best edge",
+                    "Capacity $ (edge x depth)", "Executed"):
+            t.add_column(col, justify="right")
+        for o in opps:
+            t.add_row(
+                o["strategy"], str(o["windows"]), str(int(o["sightings"] or 0)),
+                f"{(o['best_edge'] or 0) * 100:.2f}%",
+                f"${o['edge_dollars'] or 0:,.2f}", str(int(o["executed"] or 0)))
+        c.print(t)
+        c.print("[dim]This measures REALIZABLE edge, not paper edge: distinct "
+                "windows actually seen, how persistent they were, and the "
+                "tradable notional at the best edge. A big 'sightings' with tiny "
+                "capacity = the window is real but too thin to matter.[/dim]")
+        top = report.get("top_opportunities") or []
+        if top:
+            t = Table(title="Top opportunities by capacity")
+            for col in ("Strategy", "Label", "Seen", "Best edge", "Depth $"):
+                t.add_column(col)
+            for o in top[:10]:
+                t.add_row(o["strategy"], o["label"][:40], str(o["sightings"]),
+                          f"{(o['best_edge'] or 0) * 100:.2f}%",
+                          f"${o['best_depth_usd'] or 0:,.0f}")
+            c.print(t)
 
     learned = report.get("learned_bias") or []
     if learned:

@@ -454,6 +454,10 @@ class Bot:
                 a = self.arb.check_group(group, allow_execute=may)
                 if a is not None:
                     found.append(a)
+                    self.ledger.record_opportunity(
+                        self.mode, "arb", f"{a.event_id}:{a.side}",
+                        a.event_title[:80], a.net_profit_pct,
+                        a.max_sets_by_depth() * a.cost_per_set)
             # Fastlane registration: token -> event group (atomic swaps).
             self._arb_groups = {g[0].event_id: g for g in groups if g[0].event_id}
             self._basket_token_map = {
@@ -493,6 +497,12 @@ class Bot:
                                               allow_execute=may)
                 if p is not None:
                     found.append(p)
+                    net = p.net_profit_pct - self.cfg.chain_arb.classification_haircut
+                    self.ledger.record_opportunity(
+                        self.mode, "chain_arb",
+                        f"{p.event_id}:{p.subset.market.id}:{p.superset.market.id}",
+                        p.event_title[:80], net,
+                        p.max_sets_by_depth() * p.cost_per_set)
             # Fastlane registration: the two tradable legs -> the pair.
             self._chain_pairs = {(s.id, sp.id): (s, sp, k) for s, sp, k in pairs}
             self._chain_token_map = {}

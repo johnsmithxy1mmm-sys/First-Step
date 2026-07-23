@@ -95,6 +95,27 @@ CREATE TABLE IF NOT EXISTS quote_outcomes (
     p_pred REAL NOT NULL,             -- fill probability predicted at placement
     filled INTEGER NOT NULL           -- 1 = filled before cancel, 0 = cancelled
 );
+-- Opportunity ledger: every DETECTED window (arb/chain/resolution), whether or
+-- not it was taken, with its lifecycle. Measures the realizable capacity of
+-- each strategy (edge x depth x how long the window lived) from real data,
+-- instead of guessing it. One row per (strategy, structure key); re-sightings
+-- update last_seen/sightings and track the best edge/depth observed.
+CREATE TABLE IF NOT EXISTS opportunities (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    mode TEXT NOT NULL,
+    strategy TEXT NOT NULL,
+    okey TEXT NOT NULL,               -- stable structure id (event/legs)
+    label TEXT NOT NULL,
+    first_seen TEXT NOT NULL,
+    last_seen TEXT NOT NULL,
+    sightings INTEGER NOT NULL,
+    best_edge REAL NOT NULL,          -- best NET edge seen (fraction)
+    last_edge REAL NOT NULL,
+    best_depth_usd REAL NOT NULL,     -- best tradable notional at that edge
+    executed INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (mode, strategy, okey)
+);
+CREATE INDEX IF NOT EXISTS idx_opp_strategy ON opportunities(mode, strategy);
 """
 
 
@@ -384,6 +405,51 @@ class Ledger:
                 if len(out) >= limit:
                     break
         return out
+
+    def record_opportunity(self, mode: str, strategy: str, okey: str, label: str,
+                           edge: float, depth_usd: float, executed: bool = False) -> None:
+        """Upsert one detected window: new -> insert; seen before -> bump
+        last_seen/sightings and keep the best edge & depth observed."""
+        now = _now()
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT id, best_edge, best_depth_usd FROM opportunities "
+                "WHERE mode=? AND strategy=? AND okey=?", (mode, strategy, okey))
+            row = cur.fetchone()
+            if row is None:
+                self._conn.execute(
+                    "INSERT INTO opportunities (mode, strategy, okey, label, "
+                    "first_seen, last_seen, sightings, best_edge, last_edge, "
+                    "best_depth_usd, executed) VALUES (?,?,?,?,?,?,1,?,?,?,?)",
+                    (mode, strategy, okey, label, now, now, edge, edge,
+                     depth_usd, 1 if executed else 0))
+            else:
+                self._conn.execute(
+                    "UPDATE opportunities SET last_seen=?, sightings=sightings+1, "
+                    "best_edge=MAX(best_edge,?), last_edge=?, "
+                    "best_depth_usd=MAX(best_depth_usd,?), "
+                    "executed=MAX(executed,?) WHERE id=?",
+                    (now, edge, edge, depth_usd, 1 if executed else 0, row["id"]))
+            self._conn.commit()
+
+    def opportunity_stats(self, mode: str) -> list[dict]:
+        """Per-strategy capacity summary: distinct windows, total sightings,
+        best edge, and the tradable notional at that edge (realizable capacity)."""
+        rows = self._query(
+            "SELECT strategy, COUNT(*) AS windows, SUM(sightings) AS sightings, "
+            "MAX(best_edge) AS best_edge, "
+            "SUM(best_edge * best_depth_usd) AS edge_dollars, "
+            "SUM(best_depth_usd) AS depth_usd, SUM(executed) AS executed "
+            "FROM opportunities WHERE mode=? GROUP BY strategy ORDER BY strategy",
+            (mode,))
+        return [dict(r) for r in rows]
+
+    def top_opportunities(self, mode: str, limit: int = 15) -> list[dict]:
+        rows = self._query(
+            "SELECT strategy, label, sightings, best_edge, best_depth_usd, "
+            "first_seen, last_seen, executed FROM opportunities WHERE mode=? "
+            "ORDER BY best_edge * best_depth_usd DESC LIMIT ?", (mode, limit))
+        return [dict(r) for r in rows]
 
     def record_quote_outcome(self, mode: str, market_id: str,
                              p_pred: float, filled: bool) -> None:
