@@ -6,6 +6,13 @@
 # is unchanged (no buying overpriced tails) and the kill-switch stays, just with
 # more room. Expect bigger swings (drawdowns of ~15-20%, not ~5%).
 
+# One-switch risk posture. "" keeps the tuned values below as-is. Set to
+# "conservative", "moderate", or "aggressive" and the matching preset (sizing +
+# caps + drawdown limits) is applied over these values but UNDER anything you
+# set explicitly — so you pick a posture in one line and still override single
+# knobs. "aggressive" reproduces the numbers already shipped below.
+profile: ""
+
 scanner:
   price_min: 0.002            # below this — dead markets, impossible to buy
   price_max: 0.05             # tail: implied probability <= 5%

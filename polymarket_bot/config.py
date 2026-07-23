@@ -27,6 +27,47 @@ def _read_yaml(path: Path) -> dict:
     return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
 
 
+# One-switch risk presets. `profile: <name>` layers the named bundle over the
+# example base but UNDER your explicit config.yaml values, so you pick a risk
+# posture in one line and still override any individual knob. `aggressive`
+# reproduces the shipped example numbers; leaving profile empty keeps them.
+PROFILES: dict[str, dict] = {
+    "conservative": {
+        "portfolio": {"kelly_fraction": 0.10, "max_market_pct": 0.01,
+                      "max_category_pct": 0.10, "max_total_exposure_pct": 0.25,
+                      "max_drawdown_pct": 0.15},
+        "risk": {"max_position_per_market_usd": 50, "max_global_exposure_usd": 750,
+                 "max_daily_loss_usd": 30, "max_drawdown_pct": 0.15,
+                 "min_edge_after_fees": 0.01},
+        "fade": {"bias_discount": 0.25, "min_edge_after_fees": 0.005},
+        "market_maker": {"quote_size_usd": 10},
+        "sprint_mm": {"quote_size_usd": 10},
+    },
+    "moderate": {
+        "portfolio": {"kelly_fraction": 0.20, "max_market_pct": 0.015,
+                      "max_category_pct": 0.15, "max_total_exposure_pct": 0.35,
+                      "max_drawdown_pct": 0.20},
+        "risk": {"max_position_per_market_usd": 75, "max_global_exposure_usd": 1000,
+                 "max_daily_loss_usd": 45, "max_drawdown_pct": 0.22,
+                 "min_edge_after_fees": 0.007},
+        "fade": {"bias_discount": 0.30, "min_edge_after_fees": 0.004},
+        "market_maker": {"quote_size_usd": 15},
+        "sprint_mm": {"quote_size_usd": 15},
+    },
+    "aggressive": {
+        "portfolio": {"kelly_fraction": 0.30, "max_market_pct": 0.025,
+                      "max_category_pct": 0.20, "max_total_exposure_pct": 0.50,
+                      "max_drawdown_pct": 0.25},
+        "risk": {"max_position_per_market_usd": 125, "max_global_exposure_usd": 1500,
+                 "max_daily_loss_usd": 60, "max_drawdown_pct": 0.30,
+                 "min_edge_after_fees": 0.005},
+        "fade": {"bias_discount": 0.40, "min_edge_after_fees": 0.003},
+        "market_maker": {"quote_size_usd": 25},
+        "sprint_mm": {"quote_size_usd": 25},
+    },
+}
+
+
 def _deep_merge(base: dict, overlay: dict) -> dict:
     """Recursively overlay `overlay` onto `base`; overlay wins at the leaves.
 
@@ -530,6 +571,9 @@ class BacktestConfig(BaseModel):
 
 
 class BotConfig(BaseModel):
+    # One-switch risk posture: "" (keep the shipped values), "conservative",
+    # "moderate", or "aggressive". Applied at load time (see PROFILES / load()).
+    profile: str = ""
     scanner: ScannerConfig = Field(default_factory=ScannerConfig)
     estimator: EstimatorConfig = Field(default_factory=EstimatorConfig)
     portfolio: PortfolioConfig = Field(default_factory=PortfolioConfig)
@@ -578,6 +622,16 @@ class BotConfig(BaseModel):
                          "(absent in %s): %s — run `--mode sync-config` to "
                          "materialize them into your file for editing",
                          user_file.name, ", ".join(adopted))
+        # Risk profile: user's choice wins over the example's; the named bundle
+        # is layered over the example base but under the user's explicit values,
+        # so precedence is user > profile > example > code defaults.
+        profile = str(overlay.get("profile", base.get("profile", "")) or "").lower()
+        if profile in PROFILES:
+            base = _deep_merge(base, PROFILES[profile])
+            log.info("config: risk profile '%s' applied", profile)
+        elif profile:
+            log.warning("config: unknown profile '%s' — ignored (use one of %s)",
+                        profile, ", ".join(PROFILES))
         merged = _deep_merge(base, overlay)
         if not merged:
             return cls()
