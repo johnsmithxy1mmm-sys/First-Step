@@ -2,16 +2,112 @@
 
 from __future__ import annotations
 
+import logging
+import re
 from pathlib import Path
 
 import yaml
 from pydantic import BaseModel, Field, field_validator
 
+log = logging.getLogger(__name__)
+
 PACKAGE_DIR = Path(__file__).parent
-# config.yaml is the user's personal config (outside git). config.example.yaml
-# is the repo template; used when there is no config.yaml of your own yet.
+# config.example.yaml (in git) is the BASE layer: every default + comments,
+# kept current by upstream. config.yaml (yours, outside git) is an OVERLAY —
+# it needs to hold only what you want to change. At load time the overlay is
+# deep-merged onto the base, so any new block added upstream is live after a
+# `git pull` with zero copying, while your explicit values always win.
 DEFAULT_CONFIG_PATH = PACKAGE_DIR / "config.yaml"
 EXAMPLE_CONFIG_PATH = PACKAGE_DIR / "config.example.yaml"
+
+
+def _read_yaml(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+
+
+def _deep_merge(base: dict, overlay: dict) -> dict:
+    """Recursively overlay `overlay` onto `base`; overlay wins at the leaves.
+
+    Nested dicts merge key-by-key; every non-dict value (scalars AND lists) is
+    replaced wholesale by the overlay — a config list (watchlists, keywords)
+    is a deliberate choice, not something to silently concatenate.
+    """
+    out = dict(base)
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _deep_merge(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def _top_level_keys(text: str) -> list[str]:
+    """Ordered top-level YAML section keys (col-0 `key:` lines)."""
+    return [m.group(1) for line in text.splitlines()
+            if (m := re.match(r"^([A-Za-z_][\w]*):", line))]
+
+
+def example_section_blocks() -> list[tuple[str, str]]:
+    """The example split into (section_key, raw_text) blocks, comments kept.
+
+    A block owns the contiguous comment lines directly above its `key:` header,
+    so materializing one into config.yaml carries its documentation along.
+    """
+    text = EXAMPLE_CONFIG_PATH.read_text(encoding="utf-8")
+    lines = text.splitlines(keepends=True)
+    headers = [i for i, ln in enumerate(lines) if re.match(r"^[A-Za-z_][\w]*:", ln)]
+    if not headers:
+        return []
+    starts = []
+    for h in headers:
+        s = h
+        while s - 1 >= 0 and lines[s - 1].lstrip().startswith("#"):
+            s -= 1                    # pull in the comment run directly above
+        starts.append(s)
+    blocks = []
+    for idx, h in enumerate(headers):
+        block_start = starts[idx]
+        block_end = starts[idx + 1] if idx + 1 < len(headers) else len(lines)
+        key = re.match(r"^([A-Za-z_][\w]*):", lines[h]).group(1)
+        blocks.append((key, "".join(lines[block_start:block_end])))
+    return blocks
+
+
+def missing_sections(user_path: Path | None = None) -> list[str]:
+    """Top-level sections present in the example but absent from config.yaml."""
+    user_path = user_path or DEFAULT_CONFIG_PATH
+    if not user_path.exists():
+        return _top_level_keys(EXAMPLE_CONFIG_PATH.read_text(encoding="utf-8"))
+    have = set((yaml.safe_load(user_path.read_text(encoding="utf-8")) or {}).keys())
+    return [k for k, _ in example_section_blocks() if k not in have]
+
+
+def sync_config(user_path: Path | None = None) -> list[str]:
+    """Append example sections missing from config.yaml (comments and all).
+
+    Append-only: never touches a section you already have, so your values and
+    edits are preserved. Creates config.yaml from the full example if absent.
+    Returns the section keys that were added.
+    """
+    user_path = user_path or DEFAULT_CONFIG_PATH
+    if not user_path.exists():
+        user_path.write_text(EXAMPLE_CONFIG_PATH.read_text(encoding="utf-8"),
+                             encoding="utf-8")
+        return _top_level_keys(EXAMPLE_CONFIG_PATH.read_text(encoding="utf-8"))
+    missing = set(missing_sections(user_path))
+    if not missing:
+        return []
+    current = user_path.read_text(encoding="utf-8")
+    additions = [f"\n{text.rstrip()}\n" for key, text in example_section_blocks()
+                 if key in missing]
+    if not current.endswith("\n"):
+        current += "\n"
+    header = ("\n# --- synced from config.example.yaml (edit freely; "
+              "your values are never overwritten) ---\n")
+    user_path.write_text(current + header + "".join(additions), encoding="utf-8")
+    return [k for k, _ in example_section_blocks() if k in missing]
 
 
 class ScannerConfig(BaseModel):
@@ -433,18 +529,27 @@ class BotConfig(BaseModel):
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> "BotConfig":
-        if path is not None:
-            chosen = Path(path)
-        elif DEFAULT_CONFIG_PATH.exists():
-            chosen = DEFAULT_CONFIG_PATH          # user's personal config
-        elif EXAMPLE_CONFIG_PATH.exists():
-            chosen = EXAMPLE_CONFIG_PATH          # fresh clone with no config.yaml of its own
-        else:
+        """config.example.yaml (base) deep-merged under config.yaml (overlay).
+
+        Your file only needs the values you changed; every section you did NOT
+        write comes live from the example — so a `git pull` that ships a new
+        block activates it with the tuned example values, zero hand-copying.
+        Anything you wrote always wins over the example.
+        """
+        base = _read_yaml(EXAMPLE_CONFIG_PATH)
+        user_file = Path(path) if path is not None else DEFAULT_CONFIG_PATH
+        overlay = _read_yaml(user_file)
+        if overlay and base:
+            adopted = sorted(k for k in base if k not in overlay)
+            if adopted:
+                log.info("config: sections inherited from config.example.yaml "
+                         "(absent in %s): %s — run `--mode sync-config` to "
+                         "materialize them into your file for editing",
+                         user_file.name, ", ".join(adopted))
+        merged = _deep_merge(base, overlay)
+        if not merged:
             return cls()
-        if not chosen.exists():
-            return cls()
-        raw = yaml.safe_load(chosen.read_text(encoding="utf-8")) or {}
-        return cls.model_validate(raw)
+        return cls.model_validate(merged)
 
     def base_rates_path(self) -> Path:
         p = Path(self.estimator.base_rates_file)

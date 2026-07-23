@@ -98,10 +98,19 @@ All strategy parameters are in `config.yaml` (scanner filters, edge threshold,
 Kelly λ, caps, take-profit, cycle interval). Secrets go only in `.env`.
 
 `config.yaml` is your personal config, kept **outside git** (code updates don't
-touch it). The repo ships a template `config.example.yaml`. If you have no
-`config.yaml` of your own, the bot reads parameters from the template; to
-customize: `cp polymarket_bot/config.example.yaml polymarket_bot/config.yaml`
-and edit the copy.
+touch it). The repo ships `config.example.yaml` — and the two stay in sync
+automatically:
+
+* **At load time** the example is the BASE layer and your `config.yaml` is an
+  OVERLAY on top of it. Your file only needs the values you changed; every
+  section you did not write comes live from the example. A `git pull` that
+  ships a new strategy block activates it immediately with the tuned example
+  values — no hand-copying. Anything you wrote always wins over the example.
+* **`python -m polymarket_bot.main --mode sync-config`** materializes the
+  missing sections into your `config.yaml` (comments included) so you can see
+  and edit them. Append-only: sections and values you already have are never
+  touched. Run it after a `git pull` whenever you want new blocks visible in
+  your file.
 
 ## What happens in one cycle
 

@@ -755,10 +755,12 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--mode",
                         choices=("dry-run", "paper", "live", "backtest",
                                  "record-books", "replay", "report", "diagnose",
-                                 "autotune"),
+                                 "autotune", "sync-config"),
                         default="dry-run",
                         help="dry-run -> paper -> live (manual promotion only); "
-                             "backtest/record-books/replay — offline phases")
+                             "backtest/record-books/replay — offline phases; "
+                             "sync-config appends example sections missing "
+                             "from your config.yaml")
     parser.add_argument("--config", default=None, help="path to config.yaml")
     parser.add_argument("--once", action="store_true", help="one cycle and exit")
     parser.add_argument("--report-mode", default="paper",
@@ -770,6 +772,17 @@ def main(argv: list[str] | None = None) -> None:
                         dest="risk_ack", help="required flag for --mode live")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args(argv)
+
+    if args.mode == "sync-config":
+        from .config import DEFAULT_CONFIG_PATH, sync_config
+        target = Path(args.config) if args.config else DEFAULT_CONFIG_PATH
+        added = sync_config(target)
+        if added:
+            print(f"Added {len(added)} section(s) to {target}: {', '.join(added)}")
+            print("Your existing sections and values were not touched.")
+        else:
+            print(f"{target} already has every section from config.example.yaml.")
+        return
 
     # Look for .env both next to the package and up from the current directory.
     from .config import PACKAGE_DIR
