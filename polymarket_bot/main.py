@@ -885,7 +885,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--mode",
                         choices=("dry-run", "paper", "live", "backtest",
                                  "record-books", "replay", "report", "diagnose",
-                                 "autotune", "sync-config"),
+                                 "autotune", "sync-config", "capacity"),
                         default="dry-run",
                         help="dry-run -> paper -> live (manual promotion only); "
                              "backtest/record-books/replay — offline phases; "
@@ -953,6 +953,11 @@ def main(argv: list[str] | None = None) -> None:
                                         fade_prior=cfg.fade.bias_discount))
         finally:
             ledger.close()
+        return
+
+    if args.mode == "capacity":
+        from .capacity import run_capacity
+        run_capacity(cfg, args.report_mode)
         return
 
     snaps_db = str(Path(cfg.runtime.db_path).parent / "book_snaps.sqlite")

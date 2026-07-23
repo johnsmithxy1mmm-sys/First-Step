@@ -444,6 +444,13 @@ class Ledger:
             (mode,))
         return [dict(r) for r in rows]
 
+    def all_opportunities(self, mode: str) -> list[dict]:
+        """Full rows (with first/last seen) for persistence analysis."""
+        rows = self._query(
+            "SELECT strategy, label, first_seen, last_seen, sightings, best_edge, "
+            "best_depth_usd, executed FROM opportunities WHERE mode=?", (mode,))
+        return [dict(r) for r in rows]
+
     def top_opportunities(self, mode: str, limit: int = 15) -> list[dict]:
         rows = self._query(
             "SELECT strategy, label, sightings, best_edge, best_depth_usd, "
