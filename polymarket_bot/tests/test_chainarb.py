@@ -270,6 +270,7 @@ def test_execute_returns_zero_below_min_size(cfg, ledger):
     superset_leg = ChainLeg(market=superset_m, outcome_index=0, token_id="p-y", ask=0.60, depth=5)
     pair = ChainPair(event_id="e", event_title="t", kind="date",
                      subset=subset_leg, superset=superset_leg, taker_fee=0.0)
+    cfg.chain_arb.spoof_screen = False   # isolate the min-size guard from the book screen
     chain = make_chain(cfg, ledger)
     assert chain.execute(pair) == 0.0
 

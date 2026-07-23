@@ -72,6 +72,9 @@ arbitrage:
   max_legs: 20
   max_events_per_cycle: 10
   min_leg_volume_24h_usd: 500
+  spoof_screen: true        # refuse to cross into a painted book (fake wall at
+                            # the touch with nothing behind it) — the main way
+                            # an arbitrageur is lured into a losing leg
 
 # Strategy #1b: chain (ladder) arbitrage -- near-riskless, but between DIFFERENT
 # sibling markets in the same event, not a mutually-exclusive neg-risk basket.
@@ -96,6 +99,7 @@ chain_arb:
   min_sets: 5               # dust depth at the ask can fake an untradable edge
   min_leg_volume_24h_usd: 1000
   max_events_per_cycle: 10
+  spoof_screen: true        # refuse to cross into a painted book
 
 # CORE (80% of capital): market making + liquidity rewards farming.
 # Three income streams: spread + maker rebate + daily rewards pool.

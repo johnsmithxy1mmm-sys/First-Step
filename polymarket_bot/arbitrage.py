@@ -176,6 +176,22 @@ class ArbitrageScanner:
 
     # --- execution ---
 
+    def _legs_look_painted(self, legs) -> bool:
+        """Re-fetch each leg's book and refuse if the ask side looks spoofed."""
+        from .spoofguard import screen_ask
+        for leg in legs:
+            book = self._clob.order_book(leg.token_id)
+            if book is None:
+                log.warning("arbitrage: leg %s book vanished before execute",
+                            leg.token_id[:16])
+                return True
+            v = screen_ask(book)
+            if v.suspicious:
+                log.warning("arbitrage: leg %s book looks painted (%s) - skipping",
+                            leg.token_id[:16], "; ".join(v.reasons))
+                return True
+        return False
+
     def execute(self, arb: BasketArb) -> float:
         """Buys sets. Returns dollars spent (0 = not executed).
 
@@ -185,6 +201,8 @@ class ArbitrageScanner:
         """
         if arb.suspect:
             log.warning("arbitrage %s flagged suspect - not executing", arb.event_title[:50])
+            return 0.0
+        if self._cfg.spoof_screen and self._legs_look_painted(arb.legs):
             return 0.0
         sets = min(
             arb.max_sets_by_depth(),

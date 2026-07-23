@@ -300,6 +300,7 @@ class ArbitrageConfig(BaseModel):
     max_legs: int = 20
     max_events_per_cycle: int = 10
     min_leg_volume_24h_usd: float = 500.0
+    spoof_screen: bool = True          # refuse to execute into a painted book
 
 
 class ChainArbConfig(BaseModel):
@@ -325,6 +326,7 @@ class ChainArbConfig(BaseModel):
     min_sets: int = 5                   # dust depth at the ask can fake an edge
     min_leg_volume_24h_usd: float = 1_000.0
     max_events_per_cycle: int = 10
+    spoof_screen: bool = True           # refuse to execute into a painted book
 
 
 class MarketMakerConfig(BaseModel):
