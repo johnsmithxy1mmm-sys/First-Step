@@ -56,7 +56,6 @@ class Executor:
         if self.already_entered(plan.token_id):
             return ExecutionResult(status="skipped", detail="already entered (idempotency)")
 
-        c = plan.estimate.candidate
         remaining_usd = plan.size_usd
         filled_size = 0.0
         filled_usd = 0.0

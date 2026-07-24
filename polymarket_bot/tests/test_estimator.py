@@ -84,15 +84,20 @@ def test_negrisk_basket_fair_sum_is_silent():
     assert CoherenceSignal(markets).evaluate(make_candidate(market=markets[0])) is None
 
 
+def _calendar_pair(q_early="Will X resign by March 31, 2027?",
+                   q_late="Will X resign by June 30, 2027?",
+                   end_early=None, end_late=None):
+    end_early = end_early or datetime(2027, 3, 31, tzinfo=timezone.utc)
+    end_late = end_late or datetime(2027, 6, 30, tzinfo=timezone.utc)
+    early = make_market(id="e", question=q_early, outcome_prices=[0.05, 0.95],
+                        end_date=end_early, clob_token_ids=["e-yes", "e-no"])
+    late = make_market(id="l", question=q_late, outcome_prices=[0.02, 0.98],
+                       end_date=end_late, clob_token_ids=["l-yes", "l-no"])
+    return early, late
+
+
 def test_calendar_chain_violation_detected():
-    early_end = datetime.now(timezone.utc) + timedelta(days=20)
-    late_end = datetime.now(timezone.utc) + timedelta(days=80)
-    early = make_market(id="e", question="Will X resign by March 31?",
-                        outcome_prices=[0.05, 0.95], end_date=early_end,
-                        clob_token_ids=["e-yes", "e-no"])
-    late = make_market(id="l", question="Will X resign by June 30?",
-                       outcome_prices=[0.02, 0.98], end_date=late_end,
-                       clob_token_ids=["l-yes", "l-no"])
+    early, late = _calendar_pair()
     assert normalize_question(early.question) == normalize_question(late.question)
 
     signal = CoherenceSignal([early, late]).evaluate(make_candidate(market=late))
@@ -101,6 +106,37 @@ def test_calendar_chain_violation_detected():
 
     # The earlier market has no violation (no earlier one pricier than it).
     assert CoherenceSignal([early, late]).evaluate(make_candidate(market=early)) is None
+
+
+def test_calendar_chain_refuses_inverted_metadata():
+    """endDate contradicting the wording (the real GPT-6 Gamma bug) must not
+    produce a signal — a 0.85-confidence boost on a lie buys the wrong side."""
+    early, late = _calendar_pair(
+        end_early=datetime(2027, 9, 30, tzinfo=timezone.utc),   # metadata LATE
+        end_late=datetime(2027, 4, 1, tzinfo=timezone.utc))     # metadata EARLY
+    assert CoherenceSignal([early, late]).evaluate(make_candidate(market=late)) is None
+
+
+def test_calendar_chain_refuses_different_thresholds():
+    """normalize_question strips numbers, so '$150k by June' and '$200k by
+    December' share a chain key — but a different threshold breaks the
+    implication and must not read as a calendar violation."""
+    early, late = _calendar_pair(
+        q_early="Will Bitcoin reach $150,000 by June 30, 2027?",
+        q_late="Will Bitcoin reach $200,000 by December 31, 2027?",
+        end_early=datetime(2027, 6, 30, tzinfo=timezone.utc),
+        end_late=datetime(2027, 12, 31, tzinfo=timezone.utc))
+    assert normalize_question(early.question) == normalize_question(late.question)
+    assert CoherenceSignal([early, late]).evaluate(make_candidate(market=late)) is None
+
+
+def test_calendar_chain_refuses_undated_wording():
+    """No parseable year in the text -> direction unverifiable -> no signal."""
+    early, late = _calendar_pair(q_early="Will X resign by March 31?",
+                                 q_late="Will X resign by June 30?",
+                                 end_early=datetime.now(timezone.utc) + timedelta(days=20),
+                                 end_late=datetime.now(timezone.utc) + timedelta(days=80))
+    assert CoherenceSignal([early, late]).evaluate(make_candidate(market=late)) is None
 
 
 # --- base rates ---

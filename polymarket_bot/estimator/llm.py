@@ -138,7 +138,7 @@ class LLMSignal:
             f"Market question: {m.question}\n"
             f"Resolution rules: {m.description[:1200] or 'n/a'}\n"
             f"Resolution source: {m.resolution_source or 'n/a'}\n"
-            f"Days until resolution: {days:.0f}\n"
+            f"Days until resolution: {f'{days:.0f}' if days is not None else 'n/a'}\n"
             f"Current market price of YES: {candidate.p_mkt:.4f}\n"
             f"{news_block}\n"
             "Estimate the true probability that this market resolves YES."

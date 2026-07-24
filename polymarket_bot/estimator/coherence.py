@@ -85,18 +85,44 @@ class CoherenceSignal:
         )
 
     def _calendar_check(self, candidate: Candidate) -> Signal | None:
+        """Monotonicity boost only from a VERIFIED earlier sibling.
+
+        Two hard lessons enforced (both fabricated real edges before):
+        the deadline ORDER comes from the question TEXT and must agree with
+        endDate metadata (Gamma's endDate contradicts the wording on real
+        events — trusting it alone inverted chain-arb pairs); and a differing
+        $ threshold breaks the implication entirely (normalize_question strips
+        numbers, so "$150k by June" and "$200k by December" share a chain key
+        without this check)."""
         if candidate.outcome_index != 0:
             return None
         m = candidate.market
         chain = self._chains.get(normalize_question(m.question), [])
         if len(chain) < 2 or m.end_date is None:
             return None
-        # Max Yes price among same-chain markets with an EARLIER deadline.
-        earlier_max = max(
-            (o.outcome_prices[0] for o in chain
-             if o.id != m.id and o.end_date is not None and o.end_date < m.end_date),
-            default=None,
-        )
+        from ..chainarb import _absorbing, _extract_deadline, _extract_dollar
+        if not _absorbing(m.question):
+            return None                 # "in June" is a window, not a deadline
+        my_deadline = _extract_deadline(m)
+        my_value = _extract_dollar(m.question)
+        if my_deadline is None:
+            return None
+        earlier_max = None
+        for o in chain:
+            if o.id == m.id or o.end_date is None or not _absorbing(o.question):
+                continue
+            o_value = _extract_dollar(o.question)
+            if (my_value is None) != (o_value is None) or \
+                    (my_value is not None and abs(my_value - o_value) > 1e-6):
+                continue                # different $ threshold = no implication
+            o_deadline = _extract_deadline(o)
+            if o_deadline is None or o_deadline >= my_deadline:
+                continue                # need a strictly EARLIER text deadline
+            if (o.end_date < m.end_date) != (o_deadline < my_deadline):
+                continue                # text vs metadata disagree -> refuse
+            price = o.outcome_prices[0]
+            if earlier_max is None or price > earlier_max:
+                earlier_max = price
         if earlier_max is None or earlier_max <= candidate.p_mkt + BASKET_TOLERANCE:
             return None
         # Monotonicity violation: ours (later) must cost >= the earlier one.

@@ -123,7 +123,15 @@ class Trader:
         log.info("Trader: signature mode signature_type=%d, funder=%s",
                  signature_type, (funder or "-")[:12])
         self._data_api = cfg.runtime.data_api_host
-        self._funder = funder
+        # Positions live on the funder (proxy accounts) or, for a plain EOA
+        # with no funder set, on the signer address itself — without this
+        # fallback an EOA account could never see its own positions
+        # (redeemer scan and the idempotency reconcile would both be blind).
+        try:
+            signer = self._client.get_address()
+        except Exception:
+            signer = None
+        self._funder = funder or signer
 
     def _limit_order(self, side, token_id: str, price: float, size: float,
                      neg_risk: bool, order_type: str = "GTC") -> dict:

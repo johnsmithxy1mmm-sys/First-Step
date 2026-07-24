@@ -279,7 +279,9 @@ class Bot:
         except Exception as exc:
             self._error(f"niche: {exc}")
 
-        if self.ticks is not None:
+        # Never feed a corrupt cycle into the learning store: the correlation
+        # learner must not train on the same anomaly the guard just flagged.
+        if self.ticks is not None and not problems:
             self._record_category_indexes(markets)
 
         # Heal legacy rows: trades recorded before the neg_risk column existed
