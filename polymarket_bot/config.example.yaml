@@ -98,6 +98,9 @@ chain_arb:
   execute: false            # true = place orders; false = only find and alert
   interval_sec: 90
   min_net_edge: 0.03        # at least 3% NET edge (after fee + haircut)
+  implausible_net: 0.50     # NET above this = the payout matrix doesn't hold
+                            # (incomplete book / mis-paired legs / non-monotone
+                            # relation) -> flag "IMPLAUSIBLE", never auto-execute
   classification_haircut: 0.02  # reserve for a bad ladder-pair match (wording inferred, not flagged)
   prefilter_tolerance: 0.01
   max_stake_usd: 200

@@ -79,6 +79,12 @@ _INCREASING_WORDS = ("reach", "hit", "exceed", "surpass", "top", "cross",
                      "above", "over", "at least")
 _DECREASING_WORDS = ("below", "under", "less than", "drop", "fall", "dip")
 _ABSORBING_MARKERS = ("by ", "before ", "no later than")
+# A negation flips the monotonicity of the whole predicate: "X will NOT happen
+# by July" is implied BY "NOT by September", the OPPOSITE direction. If it
+# appears in either wording of a pair the ladder direction is no longer safe to
+# infer from the date/value token alone — refuse rather than guess.
+_NEGATION_WORDS = (" not ", " no ", " never ", "n't ", "without ", "fail to ",
+                   "fails to ", "neither ", "nor ")
 
 _MONTH_NUM = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
               "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
@@ -147,16 +153,32 @@ def _absorbing(question: str) -> bool:
     return any(marker in q for marker in _ABSORBING_MARKERS)
 
 
+def _negated(question: str) -> bool:
+    q = f" {question.lower()} "
+    return any(w in q for w in _NEGATION_WORDS)
+
+
 def classify_pair(a: Market, b: Market) -> tuple[Market, Market, str] | None:
     """(subset, superset, kind) if (a, b) form a valid ladder pair, else None.
 
     subset's YES implies superset's YES by construction of the wording, so
-    superset's true probability can never fall below subset's.
+    superset's true probability can never fall below subset's. The consumer
+    (ChainPair) then buys YES(superset) + NO(subset); its outcome matrix, with
+    the impossible state excluded by the implication, is:
+
+        subset(early/higher-$)  superset(late/lower-$)  YES(sup)+NO(sub)
+          YES                     YES                     1 + 0 = $1
+          NO                      YES                     1 + 1 = $2
+          NO                      NO                      0 + 1 = $1
+          YES                     NO                      IMPOSSIBLE
+    -> worst-case $1, best $2; riskless iff cost < $1 net of fees.
     """
     if a.end_date is None or b.end_date is None or a.id == b.id:
         return None
     if _template(a.question) != _template(b.question):
         return None
+    if _negated(a.question) or _negated(b.question):
+        return None                     # negation flips monotonicity — do not guess
     va, vb = _extract_dollar(a.question), _extract_dollar(b.question)
     da, db = _extract_deadline(a), _extract_deadline(b)
     same_date = abs((a.end_date - b.end_date).total_seconds()) < 86_400
@@ -207,6 +229,7 @@ class ChainPair(BaseModel):
     superset: ChainLeg           # we buy YES here
     taker_fee: float = 0.0
     note: str = ""
+    implausible: bool = False    # NET above the sane ceiling -> verify, don't trade
 
     @property
     def cost_per_set(self) -> float:
@@ -323,13 +346,64 @@ class ChainArbitrage:
                 return True
         return False
 
-    def execute(self, pair: ChainPair) -> float:
-        """Buys the two-leg set. Returns dollars spent (0 = not executed).
+    def _buy_leg(self, leg: ChainLeg, price: float, sets: int) -> str | None:
+        """Fill-or-kill BUY of one leg. Returns an order id on a fill, else None.
 
-        Leg risk: if one leg's limit order doesn't fill (book moved), the
-        other leg is a directional position, not an arbitrage — the same
-        honest caveat as arbitrage.py's neg-risk baskets.
+        FOK is the atomicity we can get: a leg either fills fully or is killed,
+        so we never end up half-filled on one side. In paper/dry-run there is no
+        trader — the fill is simulated."""
+        order_id = None
+        if self._trader is not None:
+            resp = self._trader.buy_limit(leg.token_id, price, float(sets),
+                                          neg_risk=leg.market.neg_risk,
+                                          order_type="FOK")
+            order_id = (resp or {}).get("orderID")
+            if not order_id:
+                return None             # FOK killed — this leg did not fill
+        self._ledger.record_trade(
+            mode=self._mode,
+            estimate=simple_estimate(leg.market, leg.outcome_index, price),
+            category="chain_arb", side="BUY", price=price, size=float(sets),
+            order_id=order_id, status="filled" if self._trader else "sim-filled",
+            strategy="chain_arb")
+        return order_id or "sim"
+
+    def _unwind_leg(self, leg: ChainLeg, sets: int) -> None:
+        """Sell a leg back after the OTHER leg failed to fill — turn an
+        accidental directional position back into cash immediately (best-effort,
+        crossing to whatever bid exists)."""
+        book = self._clob.order_book(leg.token_id)
+        bid = book.best_bid if book is not None else 0.0
+        if bid <= 0 or self._trader is None:
+            log.error("chain arb: could NOT unwind leg %s (no bid) — a "
+                      "directional position remains, intervene", leg.token_id[:16])
+            return
+        price = round_to_tick(bid, leg.market.tick_size)
+        try:
+            self._trader.sell_limit(leg.token_id, price, float(sets),
+                                    neg_risk=leg.market.neg_risk, order_type="FOK")
+            self._ledger.record_trade(
+                mode=self._mode,
+                estimate=simple_estimate(leg.market, leg.outcome_index, price),
+                category="chain_arb", side="SELL", price=price, size=float(sets),
+                order_id=None, status="filled", strategy="chain_arb")
+            log.warning("chain arb: unwound leg %s at %.3f after the paired leg "
+                        "failed to fill", leg.token_id[:16], price)
+        except Exception as exc:
+            log.error("chain arb: unwind FAILED %s: %s — directional position "
+                      "remains, intervene", leg.token_id[:16], exc)
+
+    def execute(self, pair: ChainPair) -> float:
+        """Buys the two-leg set atomically-as-possible. Returns dollars spent.
+
+        Leg risk is handled, not just noted: each leg is FOK, and if the second
+        leg is killed after the first filled, the first is immediately unwound
+        so a failed arb never leaves a silent directional position.
         """
+        if pair.implausible:
+            log.warning("chain arb: refusing IMPLAUSIBLE pair %s (NET too high — "
+                        "verify payout matrix)", pair.event_title[:50])
+            return 0.0
         if self._cfg.spoof_screen and self._legs_look_painted(
                 [pair.superset, pair.subset]):
             return 0.0
@@ -343,26 +417,17 @@ class ChainArbitrage:
             return 0.0
 
         spent = 0.0
+        filled: list[ChainLeg] = []
         for leg in (pair.superset, pair.subset):
             price = round_to_tick(leg.ask, leg.market.tick_size)
-            order_id = None
-            if self._trader is not None:
-                try:
-                    resp = self._trader.buy_limit(leg.token_id, price, float(sets),
-                                                  neg_risk=leg.market.neg_risk)
-                    order_id = (resp or {}).get("orderID")
-                except Exception as exc:
-                    log.error("chain arb leg failed %s: %s — other leg will not overpay",
-                              leg.token_id[:16], exc)
-                    continue
-            self._ledger.record_trade(
-                mode=self._mode,
-                estimate=simple_estimate(leg.market, leg.outcome_index, price),
-                category="chain_arb", side="BUY", price=price, size=float(sets),
-                order_id=order_id,
-                status="filled" if self._trader else "sim-filled",
-                strategy="chain_arb",
-            )
+            order_id = self._buy_leg(leg, price, sets)
+            if order_id is None:                    # this leg was killed (FOK)
+                for done in filled:                 # unwind anything already filled
+                    self._unwind_leg(done, sets)
+                log.warning("chain arb: leg %s did not fill — set aborted",
+                            leg.token_id[:16])
+                return 0.0
+            filled.append(leg)
             spent += price * sets
         return spent
 
@@ -383,14 +448,20 @@ class ChainArbitrage:
         net_after_haircut = pair.net_profit_pct - self._cfg.classification_haircut
         if net_after_haircut < self._cfg.min_net_edge:
             return None
+        # Sanity ceiling: a near-riskless ladder pays a few % net, not tens. A
+        # NET above implausible_net means the payout matrix does not hold here
+        # (incomplete book, mis-paired legs, a non-monotone relation the text
+        # heuristic missed) — surface it for a human, never auto-execute it.
+        pair.implausible = net_after_haircut > self._cfg.implausible_net
+        tag = "  IMPLAUSIBLE — verify payout matrix" if pair.implausible else ""
         log.info("CHAIN ARB [%s] %s: buy YES %s (%.3f) + NO %s (%.3f) -> "
                  "cost $%.4f/set, worst-case payout $1.00, gross +%.2f%%, "
-                 "NET after fee+haircut +%.2f%%, depth %d sets",
+                 "NET after fee+haircut +%.2f%%, depth %d sets%s",
                  pair.kind, pair.event_title[:40], pair.superset.market.question[:40],
                  pair.superset.ask, pair.subset.market.question[:40], pair.subset.ask,
                  pair.cost_per_set, pair.profit_pct * 100, net_after_haircut * 100,
-                 pair.max_sets_by_depth())
-        if self._cfg.execute and allow_execute:
+                 pair.max_sets_by_depth(), tag)
+        if self._cfg.execute and allow_execute and not pair.implausible:
             spent = self.execute(pair)
             if spent > 0:
                 log.info("chain arb executed: $%.2f", spent)

@@ -388,3 +388,71 @@ def test_inverted_pair_yields_no_arb_through_cycle(cfg, ledger):
     chain = make_chain(cfg, ledger)
     assert chain.prefilter_pairs([july, sept]) == []
     assert chain.cycle([july, sept]) == []
+
+
+# --- focus-batch audit fixes: negation, implausible, leg unwind ---
+
+def test_negation_wording_refuses_pair():
+    """A negated predicate flips monotonicity; both wordings negated must not
+    classify as a same-direction ladder."""
+    a = dated(id="a", event_id="ev",
+              question="Will GPT-6 NOT be released by July 31, 2027?",
+              end_date=datetime(2027, 7, 31, tzinfo=timezone.utc),
+              clob_token_ids=["ay", "an"])
+    b = dated(id="b", event_id="ev",
+              question="Will GPT-6 NOT be released by September 30, 2027?",
+              end_date=datetime(2027, 9, 30, tzinfo=timezone.utc),
+              clob_token_ids=["by", "bn"])
+    assert classify_pair(a, b) is None
+
+
+def test_implausible_net_flagged_and_not_executed(cfg, ledger):
+    same = datetime.now(timezone.utc) + timedelta(days=60)
+    subset_m = dated(id="s", event_id="ev1",
+                     question="Will Bitcoin reach $200,000 by Dec 2026?",
+                     end_date=same, outcome_prices=[0.30, 0.70],
+                     clob_token_ids=["s-y", "s-n"], volume_24h_usd=50_000,
+                     min_order_size=1.0, tick_size=0.001)
+    superset_m = dated(id="p", event_id="ev1",
+                       question="Will Bitcoin reach $150,000 by Dec 2026?",
+                       end_date=same, outcome_prices=[0.10, 0.90],
+                       clob_token_ids=["p-y", "p-n"], volume_24h_usd=50_000,
+                       min_order_size=1.0, tick_size=0.001)
+    # Both legs almost free -> cost << $1 -> NET hundreds of % -> implausible.
+    clob = mock.Mock()
+    clob.order_book.side_effect = lambda tok: {
+        "p-y": book(ask=0.01, ask_size=100), "s-n": book(ask=0.01, ask_size=100),
+    }[tok]
+    cfg.chain_arb.execute = True
+    cfg.chain_arb.max_stake_usd = 1000
+    chain = make_chain(cfg, ledger, clob=clob)
+    trader = mock.Mock()
+    chain._trader = trader
+    found = chain.cycle([subset_m, superset_m])
+    assert len(found) == 1 and found[0].implausible is True
+    trader.buy_limit.assert_not_called()             # never auto-executed
+
+
+def test_leg_unwind_when_second_leg_killed(cfg, ledger):
+    """First leg fills, second is FOK-killed -> the first is unwound (sold back),
+    not left as a silent directional position."""
+    from polymarket_bot.chainarb import ChainLeg, ChainPair
+    m = dated(id="m", clob_token_ids=["m-y", "m-n"], min_order_size=1.0, tick_size=0.001)
+    superset_leg = ChainLeg(market=m, outcome_index=0, token_id="p-y", ask=0.30, depth=100)
+    subset_leg = ChainLeg(market=m, outcome_index=1, token_id="s-n", ask=0.30, depth=100)
+    pair = ChainPair(event_id="ev", event_title="t", kind="date",
+                     subset=subset_leg, superset=superset_leg, taker_fee=0.0)
+    cfg.chain_arb.execute = True
+    cfg.chain_arb.max_stake_usd = 1000
+    cfg.chain_arb.spoof_screen = False
+    clob = mock.Mock()
+    clob.order_book.return_value = book(ask=0.31, ask_size=100, bid=0.29, bid_size=100)
+    trader = mock.Mock()
+    # superset buy fills (orderID); subset buy is FOK-killed (no orderID).
+    trader.buy_limit.side_effect = [{"orderID": "sup"}, {}]
+    chain = make_chain(cfg, ledger, clob=clob)
+    chain._trader = trader
+    spent = chain.execute(pair)
+    assert spent == 0.0                              # aborted
+    trader.sell_limit.assert_called_once()           # the filled leg was unwound
+    assert trader.sell_limit.call_args.args[0] == "p-y"

@@ -326,6 +326,8 @@ class ChainArbConfig(BaseModel):
     execute: bool = False
     interval_sec: float = 90.0
     min_net_edge: float = 0.03          # at least 3% NET edge (after fee + haircut)
+    implausible_net: float = 0.50       # NET above this = payout matrix broken;
+                                        # flag "IMPLAUSIBLE", never auto-execute
     classification_haircut: float = 0.02  # reserve for a bad ladder-pair match
     prefilter_tolerance: float = 0.01   # Gamma-price threshold before hitting real books
     max_stake_usd: float = 200.0
