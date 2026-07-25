@@ -54,7 +54,7 @@ class BasketArb(BaseModel):
     event_title: str
     side: str                   # "YES" | "NO"
     legs: list[ArbLeg] = Field(default_factory=list)
-    taker_fee: float = 0.0      # fraction of entry notional (by category)
+    taker_coef: float = 0.0     # category coefficient theta, NOT a flat fraction
     suspect: bool = False       # abnormal edge — likely an incomplete basket
 
     @property
@@ -80,7 +80,10 @@ class BasketArb(BaseModel):
 
     @property
     def fee_per_set(self) -> float:
-        return self.taker_fee * self.cost_per_set
+        """Official per-leg fee: sum of theta * p_i * (1 - p_i) over the legs.
+        NOT theta * cost -- see fees.FeeModel for why that overstates it."""
+        return sum(FeeModel.fee_per_share_from_coef(self.taker_coef, leg.ask)
+                   for leg in self.legs)
 
     @property
     def net_profit_per_set(self) -> float:
@@ -169,9 +172,9 @@ class ArbitrageScanner:
                                ask=ask, depth=depth))
         market0 = legs_raw[0][0]
         category = classify_category(market0.question, market0.category)
-        taker_fee = self._fees.taker_fee(category, market0.category)
+        taker_coef = self._fees.taker_coef(category, market0.category)
         arb = BasketArb(event_id=market0.event_id, event_title=market0.event_title,
-                        side=side, legs=legs, taker_fee=taker_fee)
+                        side=side, legs=legs, taker_coef=taker_coef)
         return arb if arb.profit_per_set > 0 else None
 
     # --- execution ---
@@ -251,10 +254,13 @@ class ArbitrageScanner:
         warn = ("  ⚠️ SUSPECT: likely an incomplete basket, check by hand"
                 if arb.suspect else "")
         log.info("ARBITRAGE %s %s: %d legs, set $%.4f, gross +%.2f%% -> "
-                 "NET after fees +%.2f%% (fee %.1f%%), depth %d sets%s",
+                 "NET after fees +%.2f%% (fee $%.4f/set = %.2f%% of cost), "
+                 "depth %d sets%s",
                  arb.side, arb.event_title[:50], len(arb.legs), arb.cost_per_set,
                  arb.profit_pct * 100, arb.net_profit_pct * 100,
-                 arb.taker_fee * 100, arb.max_sets_by_depth(), warn)
+                 arb.fee_per_set,
+                 (arb.fee_per_set / arb.cost_per_set * 100) if arb.cost_per_set else 0.0,
+                 arb.max_sets_by_depth(), warn)
         if self._cfg.execute and allow_execute and not arb.suspect:
             spent = self.execute(arb)
             if spent > 0:

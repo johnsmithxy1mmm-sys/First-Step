@@ -38,17 +38,28 @@ def make_scanner(cfg, ledger, books: dict, trader=None) -> ArbitrageScanner:
 
 # --- pure fee math (no network) ---
 
-def test_fee_math_net_below_gross():
+def test_fee_math_is_per_leg_price_scaled():
+    """Fee = sum of theta*p*(1-p) per leg, NOT theta*cost.
+
+    A three-leg basket at ~33c each pays far less than a flat-fraction model
+    claims; asserting the flat form here is what hid the real fee for months.
+    """
     leg = lambda ask: ArbLeg(market=make_market(), outcome_index=0,
                              token_id="t", ask=ask, depth=1000)
     arb = BasketArb(event_id="e", event_title="World Cup Winner", side="YES",
-                    legs=[leg(0.33), leg(0.33), leg(0.32)], taker_fee=0.03)
+                    legs=[leg(0.33), leg(0.33), leg(0.32)], taker_coef=0.03)
     assert arb.cost_per_set == pytest.approx(0.98)
     assert arb.profit_pct == pytest.approx(0.02 / 0.98)     # gross +2%
-    assert arb.fee_per_set == pytest.approx(0.03 * 0.98)
-    # Exactly the World Cup scenario: +2% gross, but 3% fees -> net LOSS.
-    assert arb.net_profit_per_set == pytest.approx(0.02 - 0.0294)
-    assert arb.net_profit_pct < 0
+    expected = 0.03 * (2 * 0.33 * 0.67 + 0.32 * 0.68)
+    assert arb.fee_per_set == pytest.approx(expected)
+    assert arb.fee_per_set < 0.03 * 0.98                   # cheaper than flat
+    assert arb.net_profit_per_set == pytest.approx(0.02 - expected)
+    # Honest outcome of the correct formula: the real fee (~1.98c) no longer
+    # turns this +2% basket into a loss — it leaves ~+0.02% net. That is still
+    # an order of magnitude below the 1.5% min-edge gate, so it is STILL not a
+    # trade; the gate rejects it, not a fictional fee.
+    assert 0 < arb.net_profit_pct < 0.001
+    assert arb.net_profit_pct < 0.015
 
 
 def test_marginal_arb_rejected_after_fees(cfg, ledger):

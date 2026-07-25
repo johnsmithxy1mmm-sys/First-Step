@@ -57,7 +57,7 @@ def test_arb_execute_skips_painted_book(cfg, ledger):
     m = make_market(min_order_size=1.0, tick_size=0.001)
     legs = [ArbLeg(market=m, outcome_index=0, token_id="a", ask=0.30, depth=100),
             ArbLeg(market=m, outcome_index=0, token_id="b", ask=0.30, depth=100)]
-    arb = BasketArb(event_id="e", event_title="t", side="YES", legs=legs, taker_fee=0.0)
+    arb = BasketArb(event_id="e", event_title="t", side="YES", legs=legs, taker_coef=0.0)
     painted = book(asks=[(0.30, 5000), (0.31, 5)], bids=[(0.29, 50)])
     trader = mock.Mock()
     scanner = make_scanner(cfg, ledger, {"a": painted, "b": painted}, trader)
@@ -73,7 +73,7 @@ def test_arb_execute_proceeds_on_clean_book(cfg, ledger):
     m = make_market(min_order_size=1.0, tick_size=0.001)
     legs = [ArbLeg(market=m, outcome_index=0, token_id="a", ask=0.30, depth=100),
             ArbLeg(market=m, outcome_index=1, token_id="b", ask=0.30, depth=100)]
-    arb = BasketArb(event_id="e", event_title="t", side="YES", legs=legs, taker_fee=0.0)
+    arb = BasketArb(event_id="e", event_title="t", side="YES", legs=legs, taker_coef=0.0)
     clean = book(asks=[(0.30, 100), (0.31, 120), (0.32, 90)], bids=[(0.29, 100)])
     trader = mock.Mock()
     trader.buy_limit.return_value = {"orderID": "x"}
@@ -91,7 +91,7 @@ def test_spoof_screen_can_be_disabled(cfg, ledger):
     m = make_market(min_order_size=1.0, tick_size=0.001)
     legs = [ArbLeg(market=m, outcome_index=0, token_id="a", ask=0.30, depth=100),
             ArbLeg(market=m, outcome_index=1, token_id="b", ask=0.30, depth=100)]
-    arb = BasketArb(event_id="e", event_title="t", side="YES", legs=legs, taker_fee=0.0)
+    arb = BasketArb(event_id="e", event_title="t", side="YES", legs=legs, taker_coef=0.0)
     painted = book(asks=[(0.30, 5000), (0.31, 5)], bids=[(0.29, 50)])
     trader = mock.Mock()
     trader.buy_limit.return_value = {"orderID": "x"}

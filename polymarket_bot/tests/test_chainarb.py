@@ -123,7 +123,7 @@ def test_payoff_is_worst_case_one_dollar_when_cost_below_one():
     superset_leg = ChainLeg(market=dated(id="p"), outcome_index=0,
                             token_id="p-y", ask=0.60, depth=1000)  # buy Yes(superset)
     pair = ChainPair(event_id="e", event_title="t", kind="date",
-                     subset=subset_leg, superset=superset_leg, taker_fee=0.0)
+                     subset=subset_leg, superset=superset_leg, taker_coef=0.0)
     assert pair.cost_per_set == pytest.approx(0.90)
     assert pair.payout_per_set == 1.0
     assert pair.profit_per_set == pytest.approx(0.10)
@@ -131,13 +131,17 @@ def test_payoff_is_worst_case_one_dollar_when_cost_below_one():
 
 
 def test_fee_reduces_net_but_not_gross():
+    """Fee is theta*p*(1-p) per leg, not theta*cost — the latter overstated a
+    two-leg ladder by ~2x and pushed real pairs below the min-edge gate."""
     subset_leg = ChainLeg(market=dated(id="s"), outcome_index=1, token_id="s-n",
                           ask=0.30, depth=1000)
     superset_leg = ChainLeg(market=dated(id="p"), outcome_index=0, token_id="p-y",
                             ask=0.60, depth=1000)
     pair = ChainPair(event_id="e", event_title="t", kind="date",
-                     subset=subset_leg, superset=superset_leg, taker_fee=0.05)
-    assert pair.fee_per_set == pytest.approx(0.05 * 0.90)
+                     subset=subset_leg, superset=superset_leg, taker_coef=0.05)
+    expected = 0.05 * (0.30 * 0.70 + 0.60 * 0.40)
+    assert pair.fee_per_set == pytest.approx(expected)
+    assert pair.fee_per_set < 0.05 * 0.90          # cheaper than the flat model
     assert pair.net_profit_per_set < pair.profit_per_set
 
 
@@ -147,7 +151,7 @@ def test_max_sets_limited_by_thinnest_leg():
     superset_leg = ChainLeg(market=dated(id="p"), outcome_index=0, token_id="p-y",
                             ask=0.60, depth=1000)
     pair = ChainPair(event_id="e", event_title="t", kind="date",
-                     subset=subset_leg, superset=superset_leg, taker_fee=0.0)
+                     subset=subset_leg, superset=superset_leg, taker_coef=0.0)
     assert pair.max_sets_by_depth() == 50
 
 
@@ -269,7 +273,7 @@ def test_execute_returns_zero_below_min_size(cfg, ledger):
     subset_leg = ChainLeg(market=subset_m, outcome_index=1, token_id="s-n", ask=0.30, depth=5)
     superset_leg = ChainLeg(market=superset_m, outcome_index=0, token_id="p-y", ask=0.60, depth=5)
     pair = ChainPair(event_id="e", event_title="t", kind="date",
-                     subset=subset_leg, superset=superset_leg, taker_fee=0.0)
+                     subset=subset_leg, superset=superset_leg, taker_coef=0.0)
     cfg.chain_arb.spoof_screen = False   # isolate the min-size guard from the book screen
     chain = make_chain(cfg, ledger)
     assert chain.execute(pair) == 0.0
@@ -441,7 +445,7 @@ def test_leg_unwind_when_second_leg_killed(cfg, ledger):
     superset_leg = ChainLeg(market=m, outcome_index=0, token_id="p-y", ask=0.30, depth=100)
     subset_leg = ChainLeg(market=m, outcome_index=1, token_id="s-n", ask=0.30, depth=100)
     pair = ChainPair(event_id="ev", event_title="t", kind="date",
-                     subset=subset_leg, superset=superset_leg, taker_fee=0.0)
+                     subset=subset_leg, superset=superset_leg, taker_coef=0.0)
     cfg.chain_arb.execute = True
     cfg.chain_arb.max_stake_usd = 1000
     cfg.chain_arb.spoof_screen = False

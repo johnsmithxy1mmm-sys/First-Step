@@ -8,6 +8,18 @@ import threading
 import time
 
 
+class RateLimited(RuntimeError):
+    """Raised when a throttled READ could not get a token.
+
+    Deliberately an exception rather than an empty result: `open_orders` and
+    `api_positions` feed the idempotency reconcile and the desync kill-switch,
+    and an empty list there reads as "nothing on the exchange" — which would
+    silently disable the desync detector and let the bot double-enter. Every
+    caller already treats an exception conservatively (assume a position
+    exists / skip the cycle), so raising fails safe.
+    """
+
+
 class TokenBucket:
     def __init__(self, rate_per_sec: float, burst: float):
         self._rate = float(rate_per_sec)

@@ -95,7 +95,10 @@ class ResolutionAlpha:
 
     def _net_edge(self, m: Market, price: float) -> float:
         category = classify_category(m.question, m.category)
-        fee = self._fees.taker_fee(category, m.category)
+        # Dollars per share AT THIS PRICE. Critical here: this strategy buys at
+        # 0.95-0.985, where a flat-fraction fee model overstates the cost 20-67x
+        # and made every non-zero-fee category look permanently unprofitable.
+        fee = self._fees.taker_fee_per_share(category, price, m.category)
         # "resolved" = the dispute window is over, the outcome is final — only
         # settlement remains, so no dispute reserve. "proposed" can still be
         # challenged: reserve the FULL haircut.

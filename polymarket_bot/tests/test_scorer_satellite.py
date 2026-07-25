@@ -83,14 +83,15 @@ def test_ta_p_up_direction():
 
 
 def test_satellite_edge_accounts_for_crypto_fee(cfg, ledger):
+    """Fee at a 50c fill is theta*p*(1-p) = 0.07*0.25 = 1.75c per share, not 7c.
+    Threshold is 0.05, so entry needs a raw edge above 0.05 + 0.0175."""
     sat = BTC5mSatellite(cfg, ledger, clob=mock.Mock(), trader=None, mode="paper")
-    # p_up 0.60 vs implied 0.50: raw edge 0.10, but crypto fee 0.07
-    # leaves 0.03 < threshold 0.05 -> no entry.
-    assert sat.decide(p_up=0.60, implied_up=0.50) is None
-    # p_up 0.65: edge after fee 0.08 >= 0.05 -> enter UP.
-    assert sat.decide(p_up=0.65, implied_up=0.50) == (0, 0.65)
-    # Mirror for DOWN.
-    assert sat.decide(p_up=0.35, implied_up=0.50) == (1, 0.65)
+    # raw edge 0.05 -> 0.0325 after fee < 0.05 -> no entry.
+    assert sat.decide(p_up=0.55, implied_up=0.50) is None
+    # raw edge 0.10 -> 0.0825 after fee >= 0.05 -> enter UP.
+    assert sat.decide(p_up=0.60, implied_up=0.50) == (0, 0.60)
+    # Mirror for DOWN: the fee is symmetric in price, so the bar is the same.
+    assert sat.decide(p_up=0.40, implied_up=0.50) == (1, 0.60)
 
 
 def test_satellite_quarter_kelly_capped(cfg, ledger):

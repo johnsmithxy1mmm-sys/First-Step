@@ -130,3 +130,24 @@ def test_real_example_sections_all_parse():
     assert keys == list(parsed.keys())
     joined = "".join(text for _, text in blocks)
     assert yaml.safe_load(joined) == parsed               # slices lose nothing
+
+
+# --- removed keys must not fail silently ---
+
+def test_removed_key_warns_instead_of_being_ignored(tmp_path, monkeypatch, caplog):
+    """Pydantic ignores unknown keys, so a stale fees.maker_rebate_frac would
+    silently do nothing. The loader must say so."""
+    make_files(tmp_path, monkeypatch, EXAMPLE, "fees:\n  maker_rebate_frac: 0.35\n")
+    with caplog.at_level("WARNING"):
+        cfg = BotConfig.load()
+    assert "maker_rebate_frac" in caplog.text
+    assert "no longer used" in caplog.text
+    # And the correct per-category defaults are what actually apply.
+    assert cfg.fees.maker_rebate_share["default"] == 0.25
+
+
+def test_no_warning_for_a_clean_config(tmp_path, monkeypatch, caplog):
+    make_files(tmp_path, monkeypatch, EXAMPLE, "fade:\n  bias_discount: 0.10\n")
+    with caplog.at_level("WARNING"):
+        BotConfig.load()
+    assert "no longer used" not in caplog.text

@@ -93,7 +93,7 @@ def test_fastlane_found_window_lands_in_opportunity_ledger(tmp_path):
     leg = ArbLeg(market=make_market(), outcome_index=0, token_id="t",
                  ask=0.30, depth=100)
     arb = BasketArb(event_id="ev1", event_title="Election", side="YES",
-                    legs=[leg, leg, leg], taker_fee=0.0)
+                    legs=[leg, leg, leg], taker_coef=0.0)
     bot._arb_groups = {"ev1": [mock.Mock()]}
     with mock.patch.object(bot.arb, "check_group", return_value=arb), \
             mock.patch.object(bot, "_may_execute", return_value=False):

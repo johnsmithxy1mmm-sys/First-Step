@@ -153,8 +153,10 @@ class MarketMaker:
         # Half-spread: inside the rewards band, but not below fee break-even.
         # Widened by realized markout (adverse selection) and realized volatility.
         category = classify_category(market.question, market.category)
+        # Rebate is priced at `fair`: near $1 the rebate is almost nothing, so
+        # the break-even floor correctly demands the spread carry the whole edge.
         min_half = self._fees.mm_min_half_spread(
-            category, market.category, self._risk.min_edge_after_fees)
+            category, fair, market.category, self._risk.min_edge_after_fees)
         base_half = c.half_spread * self._spread_mult(market.id) * (1.0 + c.vol_spread_k * sigma)
         half = max(base_half, min_half, tick)
         if market.in_rewards_program:

@@ -227,7 +227,7 @@ class ChainPair(BaseModel):
     kind: str                   # "date" | "value"
     subset: ChainLeg             # we buy NO here
     superset: ChainLeg           # we buy YES here
-    taker_fee: float = 0.0
+    taker_coef: float = 0.0      # category coefficient theta, NOT a flat fraction
     note: str = ""
     implausible: bool = False    # NET above the sane ceiling -> verify, don't trade
 
@@ -251,7 +251,10 @@ class ChainPair(BaseModel):
 
     @property
     def fee_per_set(self) -> float:
-        return self.taker_fee * self.cost_per_set
+        """Official per-leg fee: theta * p * (1 - p) on each leg, summed.
+        NOT theta * cost -- that overstates it by up to 1/(1-p) per leg."""
+        return (FeeModel.fee_per_share_from_coef(self.taker_coef, self.superset.ask)
+                + FeeModel.fee_per_share_from_coef(self.taker_coef, self.subset.ask))
 
     @property
     def net_profit_per_set(self) -> float:
@@ -320,10 +323,10 @@ class ChainArbitrage:
                               token_id=subset.clob_token_ids[1],
                               ask=sub_book.best_ask, depth=sub_depth)
         category = classify_category(superset.question, superset.category)
-        taker_fee = self._fees.taker_fee(category, superset.category)
+        taker_coef = self._fees.taker_coef(category, superset.category)
         pair = ChainPair(
             event_id=superset.event_id, event_title=superset.event_title, kind=kind,
-            subset=subset_leg, superset=superset_leg, taker_fee=taker_fee,
+            subset=subset_leg, superset=superset_leg, taker_coef=taker_coef,
             note=f"{subset.question[:60]!r} implies {superset.question[:60]!r}",
         )
         return pair if pair.profit_per_set > 0 else None

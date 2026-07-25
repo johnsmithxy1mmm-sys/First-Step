@@ -116,6 +116,25 @@ def example_section_blocks() -> list[tuple[str, str]]:
     return blocks
 
 
+# Keys removed from the schema. Pydantic ignores unknown keys, so a stale value
+# in someone's config.yaml would silently do nothing -- say so instead.
+_REMOVED_KEYS: dict[str, str] = {
+    "fees.maker_rebate_frac":
+        "replaced by fees.maker_rebate_share (per-category: default 0.25, "
+        "crypto 0.20, sports 0.15). The old single value also overstated the "
+        "rebate, which lowered the MM break-even floor -- delete the old key.",
+}
+
+
+def _warn_removed_keys(overlay: dict, filename: str) -> None:
+    for dotted, advice in _REMOVED_KEYS.items():
+        section, _, key = dotted.partition(".")
+        block = overlay.get(section)
+        if isinstance(block, dict) and key in block:
+            log.warning("config: %s in %s is no longer used — %s",
+                        dotted, filename, advice)
+
+
 def missing_sections(user_path: Path | None = None) -> list[str]:
     """Top-level sections present in the example but absent from config.yaml."""
     user_path = user_path or DEFAULT_CONFIG_PATH
@@ -407,13 +426,33 @@ class RiskLimitsConfig(BaseModel):
 
 
 class FeesConfig(BaseModel):
-    """Fee Structure V2 (March 2026). Verify it's current at docs.polymarket.com."""
+    """Polymarket fee structure. Verify it's current at docs.polymarket.com.
+
+    The official taker fee is NOT a flat fraction of notional -- it is
+
+        fee_usd = theta * shares * price * (1 - price)
+
+    where `theta` is the per-category coefficient below. The price term matters
+    enormously: the same theta costs theta/4 per share at 50c but only
+    theta*0.0148 per share at 98.5c. Treating theta as a flat fraction of
+    notional overstates the fee by 1/(1-price) -- 2x at 50c, 20x at 95c, 67x at
+    98.5c -- which silently kills every near-$1 strategy. Hence `taker` holds
+    COEFFICIENTS, and only fees.FeeModel may turn them into money.
+
+    Official worked example: 100 shares at 50c in crypto
+        = 100 * 0.07 * 0.5 * 0.5 = $1.75 (the documented cap per 100 shares).
+    """
     taker: dict[str, float] = Field(default_factory=lambda: {
         "crypto": 0.07, "sports": 0.03, "finance": 0.04, "politics": 0.04,
         "tech": 0.04, "economics": 0.05, "culture": 0.05, "weather": 0.05,
         "geopolitics": 0.0, "other": 0.04,
     })
-    maker_rebate_frac: float = 0.35    # rebate 20-50% of the taker fee; midpoint
+    # Share of collected taker fees paid back to makers daily, per category.
+    # Makers are never charged; this is pure income on top of the spread.
+    # "default" applies to any category not listed.
+    maker_rebate_share: dict[str, float] = Field(default_factory=lambda: {
+        "default": 0.25, "crypto": 0.20, "sports": 0.15,
+    })
 
 
 class WSConfig(BaseModel):
@@ -654,6 +693,7 @@ class BotConfig(BaseModel):
         merged = _deep_merge(base, overlay)
         if not merged:
             return cls()
+        _warn_removed_keys(overlay, user_file.name)
         return cls.model_validate(merged)
 
     def base_rates_path(self) -> Path:

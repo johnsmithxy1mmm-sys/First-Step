@@ -64,7 +64,7 @@ def _assert_ladder(subset, superset):
                           token_id=subset.clob_token_ids[1], ask=0.30, depth=100)
     pair = ChainPair(
         event_id="ev", event_title="t", kind="date",
-        subset=subset_leg, superset=superset_leg, taker_fee=0.0)
+        subset=subset_leg, superset=superset_leg, taker_coef=0.0)
     assert pair.payout_per_set == 1.0
 
 

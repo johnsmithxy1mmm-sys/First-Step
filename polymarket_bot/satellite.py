@@ -126,7 +126,9 @@ class BTC5mSatellite:
 
     def decide(self, p_up: float, implied_up: float) -> tuple[int, float] | None:
         """(outcome_index, p_model) to enter, or None. Edge is computed AFTER fee."""
-        fee = self._fees.taker_fee("crypto")
+        # theta * p * (1-p) is symmetric in p, so both sides of the same market
+        # cost the same per share -- one value covers UP and DOWN.
+        fee = self._fees.taker_fee_per_share("crypto", implied_up)
         edge_up = p_up - implied_up - fee
         edge_down = (1.0 - p_up) - (1.0 - implied_up) - fee
         if edge_up >= self._cfg.edge_threshold and edge_up >= edge_down:

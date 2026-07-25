@@ -186,8 +186,16 @@ risk:
   reconcile_interval_sec: 60
   ws_staleness_kill_sec: 10
 
-# Fee Structure V2 (March 2026): maker pays 0 and earns a rebate.
-# VERIFY it is current at docs.polymarket.com (Phase 0).
+# Polymarket fees. VERIFY they are current at docs.polymarket.com (Phase 0).
+#
+# `taker` holds per-category COEFFICIENTS (theta), NOT fractions of notional.
+# The official fee is   fee_usd = theta * shares * price * (1 - price)
+# so the same theta costs theta/4 per share at 50c but only ~theta/68 at 98.5c.
+# Only fees.FeeModel may turn a coefficient into money: treating theta as a flat
+# fraction overstates the fee by 1/(1-price) — 2x at 50c, 20x at 95c, 67x at
+# 98.5c — which silently kills every near-$1 strategy (resolution carry, ladder
+# and basket arbitrage).
+# Check: 100 shares at 50c in crypto = 100 * 0.07 * 0.5 * 0.5 = $1.75.
 fees:
   taker:
     crypto: 0.07
@@ -200,7 +208,13 @@ fees:
     weather: 0.05
     geopolitics: 0.0
     other: 0.04
-  maker_rebate_frac: 0.35
+  # Share of collected taker fees rebated to makers daily (makers pay 0).
+  # "default" covers any category not listed. Do NOT raise these: an inflated
+  # rebate lowers the MM break-even floor and makes the bot quote too tight.
+  maker_rebate_share:
+    default: 0.25
+    crypto: 0.20
+    sports: 0.15
 
 # WS order books: auto-reconnect, heartbeat, gap-detect (>10s -> pull quotes).
 ws:

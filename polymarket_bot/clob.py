@@ -10,6 +10,7 @@ import httpx
 from .config import BotConfig
 from .http_client import get_with_backoff, make_client
 from .models import BookLevel, OrderBook
+from .ratelimit import RateLimited, TokenBucket
 
 log = logging.getLogger(__name__)
 
@@ -20,8 +21,20 @@ class ClobReader:
     def __init__(self, cfg: BotConfig, client: httpx.Client | None = None):
         self._cfg = cfg
         self._client = client or make_client(cfg.runtime.request_timeout_sec)
+        # Self-throttle reads: a Cloudflare queue on overshoot is worse than
+        # waiting locally, and a throttled MM cannot pull its quotes.
+        self._reads = TokenBucket(cfg.ratelimit.reads_per_sec,
+                                  cfg.ratelimit.reads_burst)
+
+    def _throttle(self, what: str) -> bool:
+        if self._reads.acquire(1.0, timeout=self._cfg.runtime.request_timeout_sec):
+            return True
+        log.warning("rate limit: dropped read %s (local bucket exhausted)", what)
+        return False
 
     def order_book(self, token_id: str) -> OrderBook | None:
+        if not self._throttle(f"book {token_id[:16]}"):
+            return None
         try:
             resp = get_with_backoff(
                 self._client,
@@ -57,6 +70,8 @@ class ClobReader:
 
     def price_history(self, token_id: str, start_ts: int, end_ts: int) -> list[tuple[int, float]]:
         """Token price history (for backtests): [(unix_ts, price), ...]."""
+        if not self._throttle(f"history {token_id[:16]}"):
+            return []
         try:
             resp = get_with_backoff(
                 self._client,
@@ -132,11 +147,21 @@ class Trader:
         except Exception:
             signer = None
         self._funder = funder or signer
+        self._orders = TokenBucket(cfg.ratelimit.orders_per_sec,
+                                   cfg.ratelimit.orders_burst)
+        self._reads = TokenBucket(cfg.ratelimit.reads_per_sec,
+                                  cfg.ratelimit.reads_burst)
 
     def _limit_order(self, side, token_id: str, price: float, size: float,
                      neg_risk: bool, order_type: str = "GTC") -> dict:
         from py_clob_client.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
 
+        # A dropped order is safe (callers read a missing orderID as "no fill");
+        # a Cloudflare ban mid-session is not. So throttle placement hard.
+        if not self._orders.acquire(1.0, timeout=10.0):
+            log.error("rate limit: order NOT placed for %s (local bucket "
+                      "exhausted) — treated as no fill", token_id[:16])
+            return {}
         args = OrderArgs(price=price, size=size, side=side, token_id=token_id)
         options = PartialCreateOrderOptions(neg_risk=True) if neg_risk else None
         signed = self._client.create_order(args, options)
@@ -155,14 +180,30 @@ class Trader:
         return self._limit_order(SELL, token_id, price, size, neg_risk, order_type)
 
     def cancel(self, order_id: str) -> None:
+        # A cancel REDUCES risk: take a token if one is free, but never refuse to
+        # cancel because the bucket is dry — a live order left behind is worse.
+        if not self._orders.try_acquire(1.0):
+            log.warning("rate limit: cancel %s proceeding without a token "
+                        "(risk reduction is never throttled away)", order_id[:16])
         self._client.cancel(order_id)
 
     def cancel_all(self) -> None:
-        """Bulk-cancel all orders (emergency kill-switch action)."""
+        """Bulk-cancel all orders (emergency kill-switch action).
+
+        Deliberately NOT rate limited: this is the kill-switch. Throttling the
+        one call that flattens the book is how a safety system kills you.
+        """
+        self._orders.try_acquire(1.0)   # account for it, but never wait
         self._client.cancel_all()
+
+    def _throttle_read(self, what: str) -> None:
+        """Raise rather than return a degraded answer — see RateLimited."""
+        if not self._reads.acquire(1.0, timeout=10.0):
+            raise RateLimited(f"local read bucket exhausted for {what}")
 
     def order_status(self, order_id: str) -> dict:
         """{'status': 'LIVE'|'MATCHED'|'CANCELED'..., 'size_matched': float}."""
+        self._throttle_read(f"order_status {order_id[:16]}")
         raw = self._client.get_order(order_id) or {}
         return {
             "status": str(raw.get("status", "unknown")).lower(),
@@ -170,12 +211,14 @@ class Trader:
         }
 
     def open_orders(self) -> list[dict]:
+        self._throttle_read("open_orders")
         return self._client.get_orders() or []
 
     def api_positions(self) -> list[dict]:
         """Actual wallet positions from data-api (for idempotency reconcile)."""
         if not self._funder:
             return []
+        self._throttle_read("api_positions")
         client = make_client(15.0)
         try:
             resp = get_with_backoff(
