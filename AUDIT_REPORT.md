@@ -1,10 +1,96 @@
 # AUDIT REPORT
 
-Two passes, newest first: the **fee-model correction** (economics), then the
+Passes, newest first: **rewards + toxicity** (MM economics), **concurrency and
+order prices** (safety), the **fee-model correction** (economics), then the
 **chain/ladder arbitrage hardening** (correctness).
 
-**Current state:** `411 passed`, all 8 chaos drills PASS, `execute: false`
+**Current state:** `454 passed`, all 8 chaos drills PASS, `execute: false`
 everywhere, no risk cap or filter threshold weakened.
+
+---
+
+# PASS 4 — Rewards priced properly; cold-start adverse selection
+
+Both aimed at the only strategy the live board supports: a `--mode diagnose` run
+showed **63 of 65 liquid markets resolve 30d+ out**, which is core-MM territory
+and leaves sprint strategies with nothing to do.
+
+## Rewards were scored by a proxy, and the quote sat in the dead zone
+
+Verified against docs.polymarket.com (not inferred):
+
+    S(v, s) = ((v - s)/v)^2 * b        Q_min = max(min(Q1,Q2), max(Q1,Q2)/3)
+
+The score is **quadratic** in distance from the midpoint:
+
+| distance | score kept |
+|---|---|
+| 0.10·v | 81% |
+| 0.25·v | 56% |
+| 0.50·v | 25% |
+| **0.90·v** | **1%** |
+
+The MM capped its half-spread at exactly `0.9 * rewards_max_spread`, parking
+every clamped quote at 1% of the available score — inside the band, earning
+almost nothing, carrying full inventory risk.
+
+**Worse:** that cap could force `half` *below* `base_half`, which carries the
+learned markout multiplier and volatility widening. The existing guard checked
+only `min_half` (fee break-even), so a narrow reward band silently overrode the
+bot's own adverse-selection protection. The MM now quotes at that floor and
+refuses a market whose band cannot hold it — a **tightened** protection.
+
+`scorer.score()` now ranks by expected reward share under the real rule instead
+of `turnover * band / notional_depth`. Not cosmetic: notional depth reads a wall
+near the band *edge* as heavy competition, while the real rule scores it at a few
+percent — a market that looks crowded can be wide open near the midpoint. Pool
+dollars are **not** invented; everything is a relative share.
+
+## Toxicity could only be learned by losing money first
+
+`MarkoutFeedback` knows only markets we have already been filled in, so an
+untraded market sat at multiplier 1.0 however toxic its tape looked.
+`toxicity.py` scores the recorded quote tape instead, measuring the one thing a
+maker fears: whether a move keeps going.
+
+Scored by **efficiency ratio** (|net displacement| / path length) re-centred on
+the random-walk baseline — *not* lag-1 autocorrelation, which scores a steady
+one-way drift (the most toxic tape there is) at **0**, because identical moves
+have zero variance. Flat ticks are dropped first, or this venue's long
+motionless stretches would drag every market toward "benign".
+
+The estimate can only **widen** (multiplier ≥ 1.0) and defers to realized markout
+once fills accumulate: inference covers the cold start, it never argues with
+evidence.
+
+---
+
+# PASS 3 — Concurrency and order prices
+
+Three defects, one introduced by the rate-limiter work in Pass 2.
+
+1. **Self-inflicted kill-switch (mine).** `main.py:114` states "on_tick must
+   NEVER hit the DB or the network", but `on_tick -> react_to_tick -> _place ->
+   buy_limit` reached the order bucket's `acquire(timeout=10.0)` — exactly equal
+   to `ws_staleness_kill_sec`. A dry bucket would stall the recv loop until the
+   staleness kill pulled every quote. The wait is now derived structurally as
+   `ws_staleness_kill_sec / 20`, clamped to [0.1, 1.0].
+
+2. **WS fastlane starvation (pre-existing).** `cycle()` held the MM lock across
+   N sequential `order_book` fetches — worst case `max_markets * request_timeout`
+   = 5 x 30s = **150s** against a 10s staleness kill — while `react_to_tick`
+   blocked on that same lock from the recv thread. Book fetches now happen before
+   the lock, and `react_to_tick` takes it non-blocking, skipping the reprice when
+   busy. A skipped reprice is a non-event; a stalled stream is a self-inflicted
+   kill-switch.
+
+3. **Order prices could snap to 0 or 1 (one path mine).** `round_to_tick` did
+   plain rounding, so 0.0004 at a 0.001 tick became **0.0** and 0.9996 became
+   **1.0**. A SELL at 0.0 gives the position away; a BUY at 1.0 pays full face
+   for a $1 payout. MM guarded this itself; no taker path did. Now clamped to
+   `[tick, 1-tick]` at the source, and `chainarb._unwind_leg` tests the **raw**
+   bid against the tick so clamping cannot dress "nobody is bidding" as a
+   tradable exit.
 
 ---
 
@@ -206,7 +292,7 @@ the build. Verified against a real `ChainPair` built from real `ChainLeg` legs
 
 ## Verification
 ```
-python -m pytest polymarket_bot/tests -q      # 411 passed
+python -m pytest polymarket_bot/tests -q      # 454 passed
 python -m polymarket_bot.main --mode chaos    # 8/8 drills PASS
 python -m polymarket_bot.main --mode sync-config   # config layering intact
 ```
