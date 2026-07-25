@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from .config import BotConfig
 from .models import Market, OrderBook
 from .portfolio import classify_category
+from .rewards import reward_share
 
 log = logging.getLogger(__name__)
 
@@ -74,18 +75,41 @@ class MarketScorer:
         return self.reject_reason(m, now) is None
 
     def score(self, m: Market, book: OrderBook | None) -> float:
-        """rewards attractiveness / maker competition around the midpoint."""
+        """Expected share of this market's reward pool, times a category boost.
+
+        The competition term is no longer notional depth inside a flat band but
+        the actual Q_min resting in the book under the published quadratic
+        scoring rule (see rewards.py). That distinction decides where a small
+        quote is worth placing: notional depth treats a wall sitting near the
+        band EDGE as heavy competition, while the real rule scores it at a few
+        percent — so a market that looks crowded can in fact be wide open to a
+        quote placed near the midpoint.
+
+        Turnover still enters, but only as a tie-break: reward share is the
+        thing being maximised, and volume proxies how much spread income and
+        fill flow rides along with it.
+        """
         category = classify_category(m.question, m.category)
         boost = CATEGORY_BOOST.get(category, 1.0)
-        # Proxy for the market's rewards pool: turnover * reward-band width.
-        attractiveness = m.volume_24h_usd * max(m.rewards_max_spread, 0.01)
-        competition_usd = 1.0
-        if book is not None and book.mid > 0:
-            band = max(m.rewards_max_spread, 0.02)
-            lo, hi = book.mid - band, book.mid + band
-            competition_usd += sum(l.price * l.size for l in book.bids if l.price >= lo)
-            competition_usd += sum(l.price * l.size for l in book.asks if l.price <= hi)
-        return boost * attractiveness / competition_usd
+        mid = book.mid if book is not None else 0.0
+        if mid <= 0 or m.rewards_max_spread <= 0:
+            # Not scoreable for rewards (no book or not in the program): fall
+            # back to turnover alone so such markets rank below real candidates.
+            return boost * m.volume_24h_usd * 1e-9
+        size = self._cfg.quote_size_usd / max(mid, 0.01)
+        half = self._reward_half_spread(m)
+        share = reward_share(size=size, half_spread=half,
+                             max_spread=m.rewards_max_spread, mid=mid, book=book)
+        # Tie-break on turnover: among equal reward shares prefer the market
+        # that also pays spread and fills.
+        return boost * share * (1.0 + m.volume_24h_usd * 1e-6)
+
+    def _reward_half_spread(self, m: Market) -> float:
+        """Distance from mid we would realistically quote at, for scoring."""
+        half = self._cfg.half_spread
+        if m.rewards_max_spread > 0:
+            half = min(half, m.rewards_max_spread * 0.9)
+        return max(half, m.tick_size)
 
     def top_markets(self, markets: list[Market],
                     books: dict[str, OrderBook | None]) -> list[Market]:

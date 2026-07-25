@@ -48,6 +48,7 @@ from .scanner import Scanner
 from .smartmoney import SmartMoneySignal, SmartMoneyTracker
 from .telegram_control import TelegramControl
 from .tickstore import TickStore
+from .toxicity import ToxicityModel
 from .ws_feed import WSFeed
 
 log = logging.getLogger(__name__)
@@ -141,6 +142,11 @@ class Bot:
         self.fill_calibrator = FillCalibrator()
         self.mm.fill_calibrator = self.fill_calibrator
         self.sprint.fill_calibrator = self.fill_calibrator
+        # Cold-start adverse-selection cover for markets we have never been
+        # filled in (markout feedback is blind there). Needs the tick tape.
+        if self.ticks is not None:
+            self.mm.toxicity = ToxicityModel()
+            self.sprint.toxicity = ToxicityModel()
         self.allocator = StrategyAllocator(cfg)
         self._longshot_scale = 1.0
         # Two-way Telegram: control from the phone (started in the run path only).
@@ -851,9 +857,26 @@ class Bot:
                     set_learned_correlation(self.corr_learner.learned)
                     log.info("calibration: %d learned category correlations active",
                              len(self.corr_learner.learned))
+                self._refit_toxicity()
             self.fill_calibrator.fit(self.ledger.quote_outcomes(self.mode))
         except Exception:
             log.exception("calibration job")
+
+    def _refit_toxicity(self) -> None:
+        """Re-score adverse selection from the recorded quote tape.
+
+        Keyed by MARKET ID, not token: the MM blends this with markout feedback,
+        which is per market. The tick store records per token, so the YES token's
+        tape stands for the market (the NO side is its mirror).
+        """
+        if self.ticks is None or self.mm.toxicity is None:
+            return
+        quoted = [m for m in self.markets_cache if m.clob_token_ids]
+        if not quoted:
+            return
+        by_token = self.ticks.token_book_series([m.clob_token_ids[0] for m in quoted])
+        self.mm.toxicity.fit({m.id: by_token[m.clob_token_ids[0]]
+                              for m in quoted if m.clob_token_ids[0] in by_token})
 
     def digest_job(self) -> None:
         """Telegram digest: PnL, inventory, attribution, Sharpe allocation hint."""

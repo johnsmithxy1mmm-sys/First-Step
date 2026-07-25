@@ -339,3 +339,87 @@ def test_cycle_fetches_books_before_taking_the_lock(cfg, ledger):
          mock.patch.object(mm._scorer, "top_markets", return_value=[]):
         mm.cycle([m])
     assert seen and all(seen), "order_book was called while holding the MM lock"
+
+
+# --- rewards-aware spread placement ---
+
+def test_never_quotes_tighter_than_the_adverse_selection_floor(cfg, ledger):
+    """The old cap at 0.9 * rewards_max_spread could force `half` BELOW
+    base_half — the learned-markout / volatility floor — so a narrow reward band
+    silently overrode our own toxicity protection. Now such a market is refused.
+    """
+    cfg.market_maker.half_spread = 0.02          # our floor, before any widening
+    cfg.risk.min_edge_after_fees = 0.0           # isolate: no fee floor in play
+    mm = make_mm(cfg, ledger)
+    # Reward band far narrower than the floor we need.
+    m = mm_market(rewards_max_spread=0.004)
+    assert mm.compute_quote(m, top()) is None
+
+
+def test_quotes_at_the_floor_when_the_band_allows(cfg, ledger):
+    """Score is quadratic in distance from mid, so the tightest placement our
+    protections permit is also the best-scoring one we may legitimately take."""
+    cfg.market_maker.half_spread = 0.005
+    cfg.risk.min_edge_after_fees = 0.0
+    mm = make_mm(cfg, ledger)
+    m = mm_market(rewards_max_spread=0.03)
+    quote = mm.compute_quote(m, top())
+    assert quote is not None
+    # Placed at the floor, not parked out at 0.9 * band where score ~ 1%.
+    assert quote.captured_spread / 2 <= 0.005 + m.tick_size + 1e-9
+    from polymarket_bot.rewards import score_fraction
+    assert score_fraction(quote.captured_spread / 2, m.rewards_max_spread) > 0.5
+
+
+def test_fee_floor_still_wins_over_the_reward_band(cfg, ledger):
+    """Break-even is never traded away for reward eligibility."""
+    cfg.market_maker.half_spread = 0.001
+    cfg.risk.min_edge_after_fees = 0.05          # forces a very wide floor
+    mm = make_mm(cfg, ledger)
+    m = mm_market(rewards_max_spread=0.01)       # band cannot hold that floor
+    assert mm.compute_quote(m, top()) is None
+
+
+# --- cold-start adverse selection ---
+
+def test_toxic_tape_widens_a_market_we_never_traded(cfg, ledger):
+    """Markout feedback is blind to a market we have never been filled in. The
+    tape estimate must cover that gap, or the only way to learn a market is
+    dangerous is to lose money in it first."""
+    from polymarket_bot.toxicity import ToxicityModel
+
+    cfg.market_maker.half_spread = 0.004
+    cfg.risk.min_edge_after_fees = 0.0
+    mm = make_mm(cfg, ledger)
+    m = mm_market(rewards_max_spread=0.05)
+
+    baseline = mm.compute_quote(m, top())
+    assert baseline is not None
+
+    drift = [(1000.0 + i, 0.40 + 0.002 * i - 0.005, 0.40 + 0.002 * i + 0.005,
+              100.0, 100.0) for i in range(60)]
+    mm.toxicity = ToxicityModel()
+    mm.toxicity.fit({m.id: drift})
+    assert mm.toxicity.multiplier(m.id) > 1.0
+
+    widened = mm.compute_quote(m, top())
+    assert widened is not None
+    assert widened.captured_spread > baseline.captured_spread
+
+
+def test_measured_markout_supersedes_the_tape_estimate(cfg, ledger):
+    """Once a market has produced enough real fills, evidence wins."""
+    from polymarket_bot.toxicity import ToxicityModel
+
+    cfg.market_maker.half_spread = 0.004
+    cfg.risk.min_edge_after_fees = 0.0
+    mm = make_mm(cfg, ledger)
+    m = mm_market(rewards_max_spread=0.05)
+
+    drift = [(1000.0 + i, 0.40 + 0.002 * i - 0.005, 0.40 + 0.002 * i + 0.005,
+              100.0, 100.0) for i in range(60)]
+    mm.toxicity = ToxicityModel()
+    mm.toxicity.fit({m.id: drift})
+    mm._fill_counts = {m.id: 500}          # plenty of measurement
+    # Realized feedback says benign -> the alarming estimate is dropped.
+    assert mm._spread_mult(m.id) == pytest.approx(1.0)

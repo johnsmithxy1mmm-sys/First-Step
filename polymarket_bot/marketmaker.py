@@ -110,14 +110,27 @@ class MarketMaker:
         # apply after it — it tilts, never breaks a limit).
         self.fill_calibrator = None
         self.size_factor: float = 1.0
+        # Cold-start adverse-selection cover: markout feedback only knows markets
+        # we have already been filled in, so an untraded market starts at 1.0 no
+        # matter how toxic its tape looks. `toxicity` reads the recorded quote
+        # tape instead, and hands over to measurement once fills accumulate.
+        self.toxicity = None
+        self._fill_counts: dict[str, int] = {}
 
     def _spread_mult(self, market_id: str) -> float:
-        return self._feedback.multiplier(market_id) if self._feedback is not None else 1.0
+        realized = self._feedback.multiplier(market_id) if self._feedback is not None else 1.0
+        if self.toxicity is None:
+            return realized
+        return self.toxicity.blend(market_id, realized,
+                                   self._fill_counts.get(market_id, 0))
 
     def refresh_feedback(self, horizon_sec: int = 60) -> None:
         """Refit the markout feedback from the ledger (called by a job)."""
         if self._feedback is not None:
-            self._feedback.fit(self._ledger.markout_by_market(self._mode, horizon_sec))
+            by_market = self._ledger.markout_by_market(self._mode, horizon_sec)
+            self._feedback.fit(by_market)
+            # Fill counts decide when measurement supersedes the tape estimate.
+            self._fill_counts = {mid: n for mid, (_, n) in by_market.items()}
 
     # --- data sources ---
 
@@ -158,11 +171,21 @@ class MarketMaker:
         min_half = self._fees.mm_min_half_spread(
             category, fair, market.category, self._risk.min_edge_after_fees)
         base_half = c.half_spread * self._spread_mult(market.id) * (1.0 + c.vol_spread_k * sigma)
+        # Floor, never a target: base_half already carries the learned markout
+        # (adverse-selection) multiplier and the volatility widening, min_half is
+        # fee break-even. Quoting inside either is quoting at a known loss.
         half = max(base_half, min_half, tick)
         if market.in_rewards_program:
-            half = min(half, market.rewards_max_spread * 0.9)
-            if half < max(min_half, tick):
-                return None  # reward band narrower than fee break-even — do not quote
+            # Rewards score ((v - s)/v)^2 — QUADRATIC in the distance from mid,
+            # so the band's outer edge is nearly worthless (s = 0.9v earns 1% of
+            # what s = 0 earns). The old cap at 0.9 * max_spread parked us at
+            # exactly that dead zone AND could force `half` below base_half,
+            # quoting tighter than our own adverse-selection protection allows.
+            # Correct behaviour: quote at the floor (the tightest our protections
+            # permit, hence the best score we can legitimately earn) and refuse
+            # the market outright when even that does not fit inside the band.
+            if half >= market.rewards_max_spread - tick:
+                return None  # band narrower than our fee / adverse-selection floor
 
         yes_bid = round_to_tick(fair - half, tick)
         yes_ask = round_to_tick(fair + half, tick)

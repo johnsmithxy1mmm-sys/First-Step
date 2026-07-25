@@ -58,6 +58,31 @@ def test_scorer_prefers_sports_over_crypto(cfg):
     assert s.score(sports, None) > s.score(crypto, None)
 
 
+def test_score_uses_the_real_reward_share_not_notional_depth(cfg):
+    """A wall resting near the band EDGE is priced at a few percent by the
+    published quadratic rule, so a market that looks crowded by notional depth
+    can still be wide open to a quote placed near the midpoint. This path also
+    exercises the book branch of score(), which a None book skips entirely."""
+    from polymarket_bot.models import BookLevel, OrderBook
+
+    s = MarketScorer(cfg)
+    m = mm_market()                       # rewards_max_spread = 0.03, mid ~0.45
+    # Same notional size, different distance from the midpoint.
+    near = OrderBook(bids=[BookLevel(price=0.449, size=2000)],
+                     asks=[BookLevel(price=0.451, size=2000)])
+    edge = OrderBook(bids=[BookLevel(price=0.421, size=2000)],
+                     asks=[BookLevel(price=0.479, size=2000)])
+    assert s.score(m, edge) > s.score(m, near)
+    assert s.score(m, near) > 0
+
+
+def test_score_survives_a_market_with_no_rewards_band(cfg):
+    """Not in the program -> not scoreable for rewards; must not raise."""
+    s = MarketScorer(cfg)
+    m = mm_market(rewards_max_spread=0.0, rewards_min_size=0.0)
+    assert s.score(m, None) >= 0.0
+
+
 # --- satellite: deterministic slugs and timing ---
 
 def test_slug_deterministic_and_ts_multiple_of_300():
