@@ -235,3 +235,48 @@ def test_size_factor_scales_quote_budget(cfg, ledger):
     mm.size_factor = 2.0
     scaled = mm.compute_quote(m, tops["mm1-yes"]).size
     assert scaled > base                           # allocator tilt reaches sizing
+
+
+# --- fee break-even floor in a FEE-PAYING category (the case the old model missed) ---
+
+def test_fee_floor_active_in_a_fee_paying_category(cfg, ledger):
+    """The old rebate (a flat 35% of theta) drove min_half to 0.0 for politics at
+    EVERY price — the break-even floor was silently disabled and a too-tight
+    configured spread passed straight through. With the correct per-category
+    rebate priced at the quote, the floor is real and must lift the spread.
+    """
+    from polymarket_bot.fees import FeeModel
+    from polymarket_bot.portfolio import classify_category
+
+    cfg.risk.min_edge_after_fees = 0.01
+    cfg.market_maker.half_spread = 0.001          # deliberately below the floor
+    mm = make_mm(cfg, ledger)
+    m = mm_market()                               # elections, theta 0.04
+    fees = FeeModel(cfg.fees)
+    cat = classify_category(m.question, m.category)
+
+    quote = mm.compute_quote(m, top())            # microprice 0.45
+    assert quote is not None
+    floor = fees.mm_min_half_spread(cat, 0.45, m.category, 0.01)
+    assert floor > 0                              # the old model gave exactly 0
+    assert quote.captured_spread >= 2 * floor - 1e-9
+    # Strictly wider than the configured/tick spread -> the floor really bound.
+    assert quote.captured_spread > 2 * cfg.market_maker.half_spread
+
+
+def test_fee_floor_rises_toward_the_dollar(cfg, ledger):
+    """Rebate ~ theta*p*(1-p) collapses near $1, so the spread must carry more
+    of the edge itself. A price-independent floor could not express this.
+
+    Compared at 0.45 vs 0.95, where the floor gap (0.25c -> 0.45c) exceeds the
+    0.001 tick; nearer prices differ by less than one tick and quantize equal.
+    """
+    cfg.risk.min_edge_after_fees = 0.01
+    cfg.market_maker.half_spread = 0.001
+    mm = make_mm(cfg, ledger)
+
+    mid = mm.compute_quote(mm_market(), top(bid=0.43, ask=0.47))
+    high = mm.compute_quote(mm_market(id="mm2", outcome_prices=[0.95, 0.05]),
+                            top(bid=0.94, ask=0.96))
+    assert mid is not None and high is not None
+    assert high.captured_spread > mid.captured_spread
