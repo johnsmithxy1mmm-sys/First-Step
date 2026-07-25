@@ -92,9 +92,20 @@ class ClobReader:
 
 
 def round_to_tick(price: float, tick: float) -> float:
+    """Snap an ORDER price to the market's tick, clamped to a tradable price.
+
+    Every caller uses this for a price it is about to send to the exchange, and
+    0 or 1 is never a valid order price here. Plain rounding produces them from
+    ordinary inputs: 0.0004 at a 0.001 tick rounds to 0.0, and a SELL at 0.0
+    gives the position away for nothing; 0.9996 rounds to 1.0, and a BUY there
+    pays full face for a $1 payout. So clamp into [tick, 1 - tick] rather than
+    trusting each call site to re-check. Callers that need "there is no real
+    price here" must test the raw input (see chainarb._unwind_leg).
+    """
     if tick <= 0:
         return price
-    return round(round(price / tick) * tick, 6)
+    snapped = round(round(price / tick) * tick, 6)
+    return min(max(snapped, tick), round(1.0 - tick, 6))
 
 
 class Trader:
@@ -151,14 +162,24 @@ class Trader:
                                    cfg.ratelimit.orders_burst)
         self._reads = TokenBucket(cfg.ratelimit.reads_per_sec,
                                   cfg.ratelimit.reads_burst)
+        # HARD CONSTRAINT: the MM WS fastlane places orders from the websocket
+        # recv thread (main.on_tick -> react_to_tick -> _place -> buy_limit), and
+        # a stalled recv loop trips risk.ws_staleness_kill_sec. So the wait here
+        # must stay a small FRACTION of that kill threshold, never a match for
+        # it. A requote can issue a cancel plus two places, so budget for
+        # several waits inside one tick.
+        self._order_wait_sec = max(
+            0.1, min(1.0, cfg.risk.ws_staleness_kill_sec / 20.0))
 
     def _limit_order(self, side, token_id: str, price: float, size: float,
                      neg_risk: bool, order_type: str = "GTC") -> dict:
         from py_clob_client.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
 
         # A dropped order is safe (callers read a missing orderID as "no fill");
-        # a Cloudflare ban mid-session is not. So throttle placement hard.
-        if not self._orders.acquire(1.0, timeout=10.0):
+        # a Cloudflare ban mid-session is not. So shed rather than queue: with a
+        # 100-order burst allowance a dry bucket means genuine flooding, and
+        # waiting it out would stall the WS recv thread (see _order_wait_sec).
+        if not self._orders.acquire(1.0, timeout=self._order_wait_sec):
             log.error("rate limit: order NOT placed for %s (local bucket "
                       "exhausted) — treated as no fill", token_id[:16])
             return {}

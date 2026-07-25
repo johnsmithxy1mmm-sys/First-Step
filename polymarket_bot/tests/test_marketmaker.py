@@ -280,3 +280,62 @@ def test_fee_floor_rises_toward_the_dollar(cfg, ledger):
                             top(bid=0.94, ask=0.96))
     assert mid is not None and high is not None
     assert high.captured_spread > mid.captured_spread
+
+
+# --- WS recv thread must never block on the MM lock ---
+
+def test_react_to_tick_never_blocks_on_the_cycle_lock(cfg, ledger):
+    """react_to_tick runs on the websocket recv thread. cycle() holds the same
+    lock across order placement, so a blocking acquire there stalls the recv
+    loop, stops the last-message clock and trips ws_staleness_kill_sec — the bot
+    would kill its own quoting. A skipped reprice is the correct trade.
+    """
+    import threading
+    import time
+
+    tops = {"mm1-yes": top(bid=0.43, ask=0.47), "mm1-no": top(bid=0.53, ask=0.57)}
+    mm = make_mm(cfg, ledger, tops=tops)
+    m = mm_market()
+    mm._quoted = {"mm1-yes": m}
+
+    mm._lock.acquire()                     # stand in for a long-running cycle()
+    try:
+        done = threading.Event()
+        result = []
+
+        def ws_thread():
+            result.append(mm.react_to_tick("mm1-yes", top()))
+            done.set()
+
+        threading.Thread(target=ws_thread, daemon=True).start()
+        # Must return immediately, not wait for the lock.
+        assert done.wait(timeout=2.0), "react_to_tick blocked on the MM lock"
+        assert result == [False]
+    finally:
+        mm._lock.release()
+
+    # With the lock free it works normally again.
+    assert mm.react_to_tick("mm1-yes", top()) is not None
+
+
+def test_cycle_fetches_books_before_taking_the_lock(cfg, ledger):
+    """Book fetches are slow network reads; held under the lock they starve the
+    WS fastlane. Assert the lock is free while order_book is being called."""
+    from unittest import mock
+
+    mm = make_mm(cfg, ledger)
+    m = mm_market()
+    seen = []
+
+    def slow_book(token):
+        # If cycle() took the lock first, this would observe it held.
+        seen.append(mm._lock.acquire(blocking=False))
+        if seen[-1]:
+            mm._lock.release()
+        return None
+
+    mm._clob.order_book = slow_book
+    with mock.patch.object(mm._scorer, "eligible", return_value=True), \
+         mock.patch.object(mm._scorer, "top_markets", return_value=[]):
+        mm.cycle([m])
+    assert seen and all(seen), "order_book was called while holding the MM lock"

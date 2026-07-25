@@ -119,7 +119,17 @@ def _bare_trader() -> Trader:
     t._reads = TokenBucket(rate_per_sec=1000.0, burst=100.0)
     t._funder = "0xfunder"
     t._data_api = "https://data.example"
+    t._order_wait_sec = 0.1
     return t
+
+
+def test_order_wait_stays_well_under_the_staleness_kill(cfg):
+    """The MM WS fastlane places orders from the recv thread, so this wait must
+    be a small fraction of ws_staleness_kill_sec — a match would let the local
+    bucket stall the stream and trip the very kill-switch protecting us."""
+    wait = max(0.1, min(1.0, cfg.risk.ws_staleness_kill_sec / 20.0))
+    assert wait <= cfg.risk.ws_staleness_kill_sec / 5.0
+    assert wait <= 1.0
 
 
 def test_order_not_placed_when_bucket_is_dry():
@@ -248,3 +258,22 @@ def test_killswitch_global_exposure_gate(cfg, ledger):
     assert not ks.check_global_exposure(cfg.risk.max_global_exposure_usd - 1)
     assert ks.check_global_exposure(cfg.risk.max_global_exposure_usd)
     assert not ks.halted                                 # a gate, not an emergency
+
+
+# --- order prices must always be tradable ---
+
+def test_round_to_tick_never_yields_zero_or_one():
+    """0 and 1 are not valid order prices. A SELL snapped to 0.0 gives the
+    position away; a BUY snapped to 1.0 pays full face for a $1 payout."""
+    from polymarket_bot.clob import round_to_tick
+    for tick in (0.001, 0.01):
+        for price in (0.0, 0.00001, 0.0004, 0.5, 0.9996, 1.0, 1.5, -0.2):
+            out = round_to_tick(price, tick)
+            assert tick <= out <= 1.0 - tick, f"{price}@{tick} -> {out}"
+
+
+def test_round_to_tick_still_snaps_normally():
+    from polymarket_bot.clob import round_to_tick
+    assert round_to_tick(0.4567, 0.01) == pytest.approx(0.46)
+    assert round_to_tick(0.4567, 0.001) == pytest.approx(0.457)
+    assert round_to_tick(0.5, 0.0) == 0.5          # unknown tick: pass through

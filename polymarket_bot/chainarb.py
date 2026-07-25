@@ -377,9 +377,13 @@ class ChainArbitrage:
         crossing to whatever bid exists)."""
         book = self._clob.order_book(leg.token_id)
         bid = book.best_bid if book is not None else 0.0
-        if bid <= 0 or self._trader is None:
-            log.error("chain arb: could NOT unwind leg %s (no bid) — a "
-                      "directional position remains, intervene", leg.token_id[:16])
+        # Test the RAW bid, not the tick-snapped one: a sub-tick bid (0.0004 at a
+        # 0.001 tick) is not a real exit, and round_to_tick would clamp it up to
+        # one tick, dressing "nobody is bidding" as a tradable price.
+        if bid < leg.market.tick_size or self._trader is None:
+            log.error("chain arb: could NOT unwind leg %s (no real bid: %.6f) — a "
+                      "directional position remains, intervene",
+                      leg.token_id[:16], bid)
             return
         price = round_to_tick(bid, leg.market.tick_size)
         try:

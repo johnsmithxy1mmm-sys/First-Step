@@ -381,13 +381,17 @@ class MarketMaker:
     def cycle(self, markets: list[Market]) -> list[Quote]:
         if not self._cfg.enabled:
             return []
+        # Book fetches are slow network READS that touch no shared state, so do
+        # them BEFORE taking the lock. Held inside, N sequential fetches at the
+        # request timeout could pin the lock for minutes, and react_to_tick on
+        # the WS thread would be starved behind it.
+        books = {m.clob_token_ids[0]: self._clob.order_book(m.clob_token_ids[0])
+                 for m in markets if self._scorer.eligible(m)}
         with self._lock:
             self._sync_live_fills()
             if self._mode == "paper":
                 self._paper_fills()
 
-            books = {m.clob_token_ids[0]: self._clob.order_book(m.clob_token_ids[0])
-                     for m in markets if self._scorer.eligible(m)}
             selected = self._scorer.top_markets(markets, books)
             self._size_map = self._rewards_weighted_sizes(selected, books)
             selected_ids = {m.id for m in selected}
@@ -448,10 +452,23 @@ class MarketMaker:
         return quote
 
     def react_to_tick(self, token: str, top: TopOfBook) -> bool:
-        """WS fastlane: instantly reprice the quoted market this token belongs to."""
+        """WS fastlane: instantly reprice the quoted market this token belongs to.
+
+        NEVER blocks: this runs on the websocket recv thread (main.on_tick), and
+        a stalled recv loop stops advancing the last-message timestamp, which
+        trips risk.ws_staleness_kill_sec and pulls every quote. cycle() can hold
+        this lock across order placement, so take it non-blocking and skip the
+        reprice when busy — the cycle we are contending with is itself requoting,
+        and the next tick will catch anything it missed. A skipped reprice is a
+        non-event; a stalled stream is a self-inflicted kill-switch.
+        """
         if not self._cfg.enabled or top.bid <= 0 or top.ask <= 0:
             return False
-        with self._lock:
+        if not self._lock.acquire(blocking=False):
+            log.debug("mm: skipped WS reprice of %s (cycle holds the lock)",
+                      token[:16])
+            return False
+        try:
             market = self._quoted.get(token)
             if market is None:
                 return False
@@ -467,6 +484,8 @@ class MarketMaker:
             if yes_top is None:
                 return False
             return self._requote_market(market, yes_top, anchor=False) is not None
+        finally:
+            self._lock.release()
 
     def local_order_ids(self) -> set[str]:
         with self._lock:
