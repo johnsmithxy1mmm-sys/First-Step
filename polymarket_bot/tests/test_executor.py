@@ -139,3 +139,30 @@ def test_execute_sell_respects_min_price(cfg, ledger):
     result = ex.execute_sell(plan, size=500, min_price=0.04)
     assert result.status == "filled"
     assert result.avg_price == pytest.approx(0.05)
+
+
+def test_execute_sell_with_known_bid_skips_the_book_fetch(cfg, ledger):
+    """The WS fastlane passes the tick's own bid: a REST re-fetch (with backoff
+    retries) on the recv thread could stall the stream into the staleness kill."""
+    from unittest import mock
+
+    from polymarket_bot.executor import Executor
+    from polymarket_bot.models import Candidate, Estimate
+    from polymarket_bot.main import est_to_plan
+
+    from .conftest import make_market
+
+    clob = mock.Mock()
+    ex = Executor(cfg, ledger, clob=clob, trader=None, mode="paper")
+    m = make_market(id="x1", clob_token_ids=["x1-y", "x1-n"])
+    est = Estimate(candidate=Candidate(market=m, outcome_index=0,
+                                       token_id="x1-y", p_mkt=0.5),
+                   p_mkt=0.5, p_est=0.5, signals=[])
+    result = ex.execute_sell(est_to_plan(est, "other"), size=10.0,
+                             min_price=0.4, known_bid=0.48)
+    assert result.status == "filled"
+    clob.order_book.assert_not_called()          # no REST from the fastlane
+    # And the thin-bid refusal still applies to the known bid.
+    result2 = ex.execute_sell(est_to_plan(est, "other"), size=10.0,
+                              min_price=0.6, known_bid=0.48)
+    assert result2.status == "skipped"

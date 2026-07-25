@@ -152,8 +152,17 @@ class Executor:
                 self._trader.cancel(order_id)
             except Exception:
                 pass
+            # Late-fill window: the order can match between our last poll and the
+            # cancel landing on the exchange. Re-read once after the cancel —
+            # shares owned but never recorded would silently desync the ledger
+            # (reconcile catches ghost ORDERS, not ghost FILLS).
+            try:
+                matched = max(matched, float(
+                    self._trader.order_status(order_id).get("size_matched", 0.0)))
+            except Exception:
+                pass
             if matched > 0:
-                return matched, price, order_id  # record the partial fill
+                return matched, price, order_id  # record the (partial) fill
             log.info("reprice %d/%d for %s", attempt + 1, self._cfg.max_reprices,
                      c.token_id[:16])
         return None
@@ -174,13 +183,25 @@ class Executor:
 
     # --- exit (take-profit) ---
 
-    def execute_sell(self, plan: TradePlan, size: float, min_price: float) -> ExecutionResult:
-        """Sell part of a position at best bid (not below min_price)."""
+    def execute_sell(self, plan: TradePlan, size: float, min_price: float,
+                     known_bid: float | None = None) -> ExecutionResult:
+        """Sell part of a position at best bid (not below min_price).
+
+        `known_bid`: a bid the CALLER already holds (e.g. the WS tick that
+        triggered this exit). When given, the REST book fetch is skipped — the
+        WS fastlane runs on the recv thread, and get_with_backoff's retries
+        there could stall the stream past ws_staleness_kill_sec. The tick's bid
+        is also FRESHER than a round-trip re-fetch.
+        """
         c = plan.estimate.candidate
-        book = self._clob.order_book(c.token_id)
-        if book is None or book.best_bid <= 0 or book.best_bid < min_price:
+        if known_bid is not None:
+            best_bid = known_bid
+        else:
+            book = self._clob.order_book(c.token_id)
+            best_bid = book.best_bid if book is not None else 0.0
+        if best_bid <= 0 or best_bid < min_price:
             return ExecutionResult(status="skipped", detail="bid too thin for take-profit")
-        price = round_to_tick(book.best_bid, c.market.tick_size)
+        price = round_to_tick(best_bid, c.market.tick_size)
 
         order_id = None
         if self._trader is not None:

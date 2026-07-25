@@ -277,16 +277,34 @@ class MarketMaker:
 
     def _cancel_market(self, market_id: str) -> None:
         quote = self._quotes.pop(market_id, None)
-        if quote is not None and quote.p_fill_pred >= 0:
-            # The quote died unfilled — a labeled outcome for the calibrator.
-            self._ledger.record_quote_outcome(self._mode, market_id,
-                                              quote.p_fill_pred, filled=False)
         for order in self._orders.pop(market_id, []):
             if self._trader is not None:
                 try:
                     self._trader.cancel(order.order_id)
                 except Exception:
                     pass
+                # Final read AFTER the cancel: any fill that landed since the
+                # last _sync_live_fills poll would otherwise vanish with the
+                # order — shares owned, never recorded. The MM cancels quotes
+                # constantly (requote churn), so this window is hit routinely,
+                # and reconcile catches ghost ORDERS, not ghost FILLS.
+                try:
+                    matched = float(self._trader.order_status(order.order_id)
+                                    .get("size_matched", 0.0))
+                except Exception:
+                    continue
+                late = matched - order.matched_recorded
+                if late > 0:
+                    self._record_fill(order.market, order.outcome_index,
+                                      order.price, late, order.order_id, "filled")
+                    if quote is not None:
+                        self._record_quote_filled(quote)   # marks p_fill_pred spent
+        # Quote outcome LAST, so a late fill flips the label to filled=True
+        # above rather than double-recording (False here, then True).
+        if quote is not None and quote.p_fill_pred >= 0:
+            # The quote died unfilled — a labeled outcome for the calibrator.
+            self._ledger.record_quote_outcome(self._mode, market_id,
+                                              quote.p_fill_pred, filled=False)
 
     def _record_fill(self, market: Market, outcome_index: int, price: float,
                      size: float, order_id: str | None, status: str) -> None:

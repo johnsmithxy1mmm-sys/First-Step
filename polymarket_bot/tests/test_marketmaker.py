@@ -423,3 +423,51 @@ def test_measured_markout_supersedes_the_tape_estimate(cfg, ledger):
     mm._fill_counts = {m.id: 500}          # plenty of measurement
     # Realized feedback says benign -> the alarming estimate is dropped.
     assert mm._spread_mult(m.id) == pytest.approx(1.0)
+
+
+# --- late fills must never vanish with a cancelled order ---
+
+def test_cancel_market_captures_a_late_partial_fill(cfg, ledger):
+    """A fill landing between the last _sync_live_fills poll and the cancel
+    used to vanish with the order — shares owned, never recorded. The final
+    post-cancel status read must record it and label the quote filled=True."""
+    from polymarket_bot.marketmaker import TrackedOrder
+
+    mm = make_mm(cfg, ledger)
+    m = mm_market()
+    trader = mock.Mock()
+    trader.order_status.return_value = {"status": "canceled", "size_matched": 15.0}
+    mm._trader = trader
+
+    quote = mm.compute_quote(m, top())
+    quote.p_fill_pred = 0.4
+    mm._quotes[m.id] = quote
+    mm._orders[m.id] = [TrackedOrder(order_id="o1", market=m, outcome_index=0,
+                                     price=0.44, size=50.0, matched_recorded=0.0)]
+    mm._cancel_market(m.id)
+
+    trader.cancel.assert_called_once_with("o1")
+    positions = ledger.open_positions("dry-run")
+    assert len(positions) == 1 and positions[0].size == pytest.approx(15.0)
+    # The calibrator label flipped to filled, not double-recorded False+True.
+    outcomes = ledger.quote_outcomes("dry-run")
+    assert [o for o in outcomes if o[1]] and not [o for o in outcomes if not o[1]]
+
+
+def test_cancel_market_with_no_late_fill_labels_unfilled(cfg, ledger):
+    from polymarket_bot.marketmaker import TrackedOrder
+
+    mm = make_mm(cfg, ledger)
+    m = mm_market()
+    trader = mock.Mock()
+    trader.order_status.return_value = {"status": "canceled", "size_matched": 0.0}
+    mm._trader = trader
+    quote = mm.compute_quote(m, top())
+    quote.p_fill_pred = 0.4
+    mm._quotes[m.id] = quote
+    mm._orders[m.id] = [TrackedOrder(order_id="o1", market=m, outcome_index=0,
+                                     price=0.44, size=50.0)]
+    mm._cancel_market(m.id)
+    assert ledger.open_positions("dry-run") == []
+    outcomes = ledger.quote_outcomes("dry-run")
+    assert [o for o in outcomes if not o[1]] and not [o for o in outcomes if o[1]]

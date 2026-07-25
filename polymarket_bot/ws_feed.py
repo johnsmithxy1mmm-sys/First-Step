@@ -74,6 +74,10 @@ class BookStore:
                         side = str(ch.get("side", "")).upper()
                     except (KeyError, TypeError, ValueError):
                         continue
+                    if side not in ("BUY", "SELL"):
+                        # Never guess a side: `else asks` would let one malformed
+                        # message silently corrupt the ask book.
+                        continue
                     levels = bids if side == "BUY" else asks
                     if size <= 0:
                         levels.pop(price, None)

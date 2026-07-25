@@ -433,7 +433,7 @@ class Bot:
             return True
         return False
 
-    def _exit_one(self, position, mark: float) -> bool:
+    def _exit_one(self, position, mark: float, from_ws: bool = False) -> bool:
         """Take-profit a single position at `mark` (used by the cycle and WS fastlane)."""
         exit_plan = self.portfolio.exit_plan(position, mark)
         if exit_plan is None:
@@ -447,7 +447,11 @@ class Bot:
                 outcome_index=0, token_id=position.token_id, p_mkt=mark),
             p_mkt=mark, p_est=mark, signals=[],
         )
-        result = self.executor.execute_sell(est_to_plan(est, position.category), size, min_price)
+        # From the WS thread the tick's own bid is the price — a REST re-fetch
+        # (with retries) would stall the recv loop toward the staleness kill.
+        result = self.executor.execute_sell(est_to_plan(est, position.category),
+                                            size, min_price,
+                                            known_bid=mark if from_ws else None)
         if result.status == "filled":
             msg = (f"TAKE-PROFIT [{self.mode}] sold {size:,.0f} at {result.avg_price:.4f} "
                    f"(entry {position.avg_price:.4f}) — {position.question[:60]}")
@@ -486,7 +490,7 @@ class Bot:
             # Exits (risk REDUCTION) run even in observe-only — only new risk
             # (MM quoting) is frozen by the drawdown brake below.
             if position is not None and top.bid > 0:
-                if self._exit_one(position, top.bid):
+                if self._exit_one(position, top.bid, from_ws=True):
                     self._positions_by_token.pop(token, None)
             # Arbitrage fastlane: flag the structure this token belongs to
             # (set-add only — the re-check runs in the worker thread, and its

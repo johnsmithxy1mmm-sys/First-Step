@@ -115,3 +115,18 @@ def test_ws_watch_union_includes_arb_tokens(tmp_path):
     assert {"mm-tok", "arb-tok", "chain-tok"} <= watched
     bot.ws = None
     bot.close()
+
+
+def test_cooldown_defers_instead_of_dropping():
+    """A tick's re-check request must survive the cooldown: with no further
+    tick the arb window would otherwise never be examined again."""
+    from polymarket_bot.arb_fastlane import ArbFastlane
+
+    seen = []
+    lane = ArbFastlane(check=seen.append, min_recheck_sec=5.0)
+    lane.flag("basket-1")
+    assert lane.drain(now=100.0) == 1            # first check runs
+    lane.flag("basket-1")                        # tick during cooldown
+    assert lane.drain(now=102.0) == 0            # deferred, not dropped
+    assert lane.drain(now=106.0) == 1            # retried after cooldown
+    assert seen == ["basket-1", "basket-1"]

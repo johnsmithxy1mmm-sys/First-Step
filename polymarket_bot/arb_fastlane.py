@@ -62,15 +62,24 @@ class ArbFastlane(threading.Thread):
             keys, self._dirty = self._dirty, set()
         now = time.time() if now is None else now
         checked = 0
+        deferred: set[Hashable] = set()
         for key in keys:
             if now - self._last_checked.get(key, 0.0) < self._min_recheck:
-                continue          # cooling down; coalesced with a later tick
+                # Cooling down: DEFER, do not drop. A tick asked for this
+                # re-check; with no further tick the window would never be
+                # looked at again. run() wakes at least every second, so the
+                # key simply retries right after its cooldown expires.
+                deferred.add(key)
+                continue
             self._last_checked[key] = now
             checked += 1
             try:
                 self._check(key)
             except Exception:
                 log.exception("arb fastlane check %r", key)
+        if deferred:
+            with self._lock:
+                self._dirty |= deferred
         # Prune stale cooldown entries so the map cannot grow unbounded.
         if len(self._last_checked) > 10_000:
             cutoff = now - self._min_recheck
