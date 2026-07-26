@@ -1,60 +1,56 @@
 /**
- * Reproducer: hl_polymarket_divergence fabricates a large, top-ranked "edge"
- * from a Polymarket question that is not a USD price threshold at all.
+ * Reproducer F-01: hl_polymarket_divergence must not fabricate an opportunity
+ * from a question that is not a USD price threshold.
  *
- * Runs the REAL tool against a local mock Gamma API + a stub Hyperliquid
- * client. No network to Hyperliquid or Polymarket.
+ * Before the fix, "Will Bitcoin dominance rise above 60%?" parsed as a $60 BTC
+ * threshold. Against $90,000 spot that gives P=1.0 and a -50pp "edge" which
+ * ranked FIRST and went into the summary as "Top". Structural, not incidental:
+ * the more absurd the misparse, the further the threshold from spot, the closer
+ * the probability to 0 or 1, and the higher it sorts — because the ranking is
+ * by |edge| descending. The worst readings were promoted to the top.
+ *
+ * Runs the REAL tool against a local mock Gamma API and a stub Hyperliquid
+ * client. No outbound network.
  */
 import http from "node:http";
 
 const BASE = "/home/user/Polymarket-Mint-Bot/hypersignal-mcp/dist";
 
-// --- mock Polymarket Gamma API -------------------------------------------
+const mk = (question, yesProb, liq) => ({
+  question,
+  slug: question.toLowerCase().replace(/\W+/g, "-").slice(0, 40),
+  endDate: "2026-12-31T00:00:00Z",
+  active: true,
+  closed: false,
+  outcomes: '["Yes","No"]',
+  outcomePrices: `["${yesProb}","${(1 - yesProb).toFixed(2)}"]`,
+  liquidityNum: liq,
+  volumeNum: liq * 5,
+});
+
 const MARKETS = [
-  {
-    question: "Will Bitcoin dominance rise above 60%?",
-    slug: "btc-dominance-60",
-    endDate: "2026-12-31T00:00:00Z",
-    active: true,
-    closed: false,
-    outcomes: '["Yes","No"]',
-    outcomePrices: '["0.50","0.50"]',
-    liquidityNum: 900000,
-    volumeNum: 5000000,
-  },
-  {
-    question: "Will BTC be above $150,000 on Dec 31 2026?",
-    slug: "btc-150k",
-    endDate: "2026-12-31T00:00:00Z",
-    active: true,
-    closed: false,
-    outcomes: '["Yes","No"]',
-    outcomePrices: '["0.25","0.75"]',
-    liquidityNum: 800000,
-    volumeNum: 4000000,
-  },
+  mk("Will Bitcoin dominance rise above 60%?", 0.5, 900000), // not a price
+  mk("Will BTC market cap exceed 2 trillion?", 0.5, 850000), // not a price
+  mk("Will BTC reach $500 or ETH reach $10000?", 0.5, 840000), // two assets
+  mk("Will BTC be above $90,000 and below $100,000?", 0.5, 830000), // a range
+  mk("Will BTC be above $150,000 on Dec 31 2026?", 0.25, 800000), // legitimate
 ];
 
-const srv = http.createServer((req, res) => {
+const srv = http.createServer((_req, res) => {
   res.writeHead(200, { "content-type": "application/json" });
   res.end(JSON.stringify(MARKETS));
 });
 await new Promise((r) => srv.listen(0, "127.0.0.1", r));
-const port = srv.address().port;
-process.env.POLYMARKET_GAMMA_URL = `http://127.0.0.1:${port}`;
+const gammaUrl = `http://127.0.0.1:${srv.address().port}`;
 
-// --- stub Hyperliquid: BTC at $90,000, flat candles => modest vol ---------
 const closes = [];
 let px = 90000;
 for (let i = 0; i < 40; i++) {
-  px *= 1 + (i % 2 === 0 ? 0.01 : -0.0098); // ~mild oscillation
+  px *= 1 + (i % 2 === 0 ? 0.01 : -0.0098);
   closes.push(px);
 }
 const ctx = {
-  config: {
-    polymarket: { gammaUrl: process.env.POLYMARKET_GAMMA_URL },
-    requestTimeoutMs: 5000,
-  },
+  config: { polymarket: { gammaUrl }, requestTimeoutMs: 5000 },
   hl: {
     metaAndAssetCtxs: async () => [
       { universe: [{ name: "BTC", szDecimals: 5, maxLeverage: 50 }] },
@@ -67,29 +63,35 @@ const ctx = {
 
 const { polymarketDivergence } = await import(`${BASE}/tools/premium/polymarketDivergence.js`);
 const out = await polymarketDivergence.run({ coin: "BTC", minEdge: 0.05, limit: 10 }, ctx);
+srv.close();
 
+console.log("Spot: $90,000. Five markets offered, only ONE is a real price threshold.");
+console.log("");
 console.log("SUMMARY THE AGENT RECEIVES:");
 console.log("  " + out.summary);
 console.log("");
-console.log("RANKED DIVERGENCES (order = what the agent acts on first):");
-out.data.divergences.forEach((d, i) => {
-  console.log(`  #${i + 1}  edge=${(d.edge * 100).toFixed(1)}pp  threshold=$${d.thresholdUsd}  mode=${d.mode}`);
-  console.log(`      HL implied=${d.hlImpliedProb}  Polymarket=${d.polymarketYesProb}`);
-  console.log(`      "${d.question}"`);
-});
-
-const top = out.data.divergences[0];
-console.log("");
-console.log("ASSERTION: the #1 ranked opportunity is a non-price market misread as a $60 threshold");
-console.log("  top question :", JSON.stringify(top?.question));
-console.log("  parsed as    : $" + top?.thresholdUsd + " threshold on BTC (spot $90,000)");
-console.log("  HL says P =", top?.hlImpliedProb, "(certainty, because BTC is trivially above $60)");
-console.log("  reported edge:", (top?.edge * 100).toFixed(1) + "pp  <-- fabricated");
-console.log("");
-console.log(
-  top && top.thresholdUsd === 60 && Math.abs(top.edge) > 0.4
-    ? "RESULT: REPRODUCED — fabricated edge ranks first"
-    : "RESULT: not reproduced",
+console.log("RANKED OUTPUT:");
+if (out.data.divergences.length === 0) console.log("  (none)");
+out.data.divergences.forEach((d, i) =>
+  console.log(`  #${i + 1} edge=${(d.edge * 100).toFixed(1)}pp threshold=$${d.thresholdUsd} "${d.question}"`),
 );
 
-srv.close();
+const qs = out.data.divergences.map((d) => d.question);
+let pass = 0;
+let total = 0;
+const check = (label, cond) => {
+  total++;
+  if (cond) pass++;
+  console.log(`  ${cond ? "PASS" : "FAIL"} ${label}`);
+};
+
+console.log("");
+check("dominance question not priced", !qs.some((q) => /dominance/i.test(q)));
+check("market cap question not priced", !qs.some((q) => /market cap/i.test(q)));
+check("two-asset question not priced", !qs.some((q) => /or ETH/i.test(q)));
+check("range question not priced", !qs.some((q) => /and below/i.test(q)));
+check("legitimate threshold still surfaced", qs.some((q) => /\$150,000/.test(q)));
+check("no threshold implausible vs spot survived", out.data.divergences.every((d) => d.thresholdUsd / 90000 <= 20 && 90000 / d.thresholdUsd <= 20));
+
+console.log("");
+console.log(`${pass}/${total} checks pass`);

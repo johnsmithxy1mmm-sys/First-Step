@@ -29,7 +29,7 @@ import { scoreTrader, labelTrader } from "../src/smartmoney/score.js";
 import type { TraderProfile } from "../src/smartmoney/profile.js";
 import { cosineSimilarity, detectCoordination, type WalletVector } from "../src/smartmoney/coordination.js";
 import { normCdf, annualizedVol, probAboveAtExpiry, probTouchAbove, probTouchBelow, impliedProbForMode } from "../src/polymarket/pricing.js";
-import { parseThresholdMarket, parseThresholdUsd, yearsToExpiry } from "../src/polymarket/parse.js";
+import { parseThresholdMarket, parseThresholdUsd, yearsToExpiry, isPlausibleThreshold } from "../src/polymarket/parse.js";
 import BetterSqlite3 from "better-sqlite3";
 import { collectAdminStats, currentPeriod } from "../src/admin/stats.js";
 import { rankCohort, pnlForWindow } from "../src/hl/cohortRank.js";
@@ -364,6 +364,38 @@ test("parseThresholdMarket extracts asset, threshold, and mode", () => {
   assert.equal(c?.coin, "SOL");
   assert.equal(c?.mode, "below");
   assert.equal(parseThresholdMarket("Who wins the 2028 election?"), null);
+});
+
+test("parseThresholdMarket refuses questions that are not single USD price thresholds", () => {
+  // These are the misparses that hurt most: they yield a probability of exactly
+  // 0 or 1, therefore the largest possible |edge|, and the tool ranks by |edge|
+  // — so a misread outranks every genuine opportunity and lands in the summary.
+  assert.equal(parseThresholdMarket("Will Bitcoin dominance rise above 60%?"), null);
+  assert.equal(parseThresholdMarket("Will BTC market cap exceed 2 trillion?"), null);
+  assert.equal(parseThresholdMarket("Will Bitcoin hashrate exceed 800 EH/s?"), null);
+  assert.equal(parseThresholdMarket("Will ETH staked supply pass 40 million?"), null);
+  // Two assets: we cannot tell which the threshold belongs to.
+  assert.equal(parseThresholdMarket("Will SOL reach $500 or ETH reach $10000?"), null);
+  // A range is not a single-threshold event.
+  assert.equal(parseThresholdMarket("Will BTC be above $90k and below $100k?"), null);
+
+  // Genuine thresholds must still parse — the guard must not be a blanket ban.
+  assert.equal(parseThresholdMarket("Will BTC be above $150,000 on Dec 31 2026?")?.thresholdUsd, 150000);
+  assert.equal(parseThresholdMarket("Will ETH reach $10k by June?")?.mode, "touch");
+});
+
+test("isPlausibleThreshold rejects thresholds orders of magnitude from spot", () => {
+  // $60 against $90,000 spot is the dominance misparse; P collapses to 1.0.
+  assert.equal(isPlausibleThreshold(60, 90_000), false);
+  assert.equal(isPlausibleThreshold(2_000_000, 90_000), false);
+  // Real threshold markets sit within a few multiples of spot, either side.
+  assert.equal(isPlausibleThreshold(150_000, 90_000), true);
+  assert.equal(isPlausibleThreshold(45_000, 90_000), true);
+  assert.equal(isPlausibleThreshold(1_500_000, 90_000, 20), true); // exactly at the bound
+  // Degenerate inputs are not plausible.
+  assert.equal(isPlausibleThreshold(0, 90_000), false);
+  assert.equal(isPlausibleThreshold(100, 0), false);
+  assert.equal(isPlausibleThreshold(NaN, 90_000), false);
 });
 
 test("parseThresholdUsd honors suffixes", () => {
