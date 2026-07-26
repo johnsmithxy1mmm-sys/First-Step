@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+import threading
 
 from .clob import ClobReader, Trader, round_to_tick
 from .config import BotConfig
@@ -30,6 +31,33 @@ class Executor:
         self._clob = clob
         self._trader = trader          # None = dry-run: virtual orders
         self._mode = mode
+        # Orders believed live on the exchange, for reconcile. Touched from the
+        # scheduler cycle AND the WS fastlane (exits), hence the lock.
+        self._live_order_ids: set[str] = set()
+        self._order_lock = threading.Lock()
+
+    # --- reconcile support ---
+
+    def local_order_ids(self) -> set[str]:
+        """Order ids this executor currently believes are live on the exchange.
+
+        `KillSwitch.reconcile` HALTs on any exchange order it cannot account for.
+        Without this the normal state between placing an order and its fill — a
+        resting entry, or a take-profit sell — was read as a ghost and tripped a
+        terminal halt, which also erodes trust in the real desync signal.
+        """
+        with self._order_lock:
+            return set(self._live_order_ids)
+
+    def _track(self, order_id: str | None) -> None:
+        if order_id:
+            with self._order_lock:
+                self._live_order_ids.add(order_id)
+
+    def _untrack(self, order_id: str | None) -> None:
+        if order_id:
+            with self._order_lock:
+                self._live_order_ids.discard(order_id)
 
     # --- idempotency ---
 
@@ -143,9 +171,11 @@ class Executor:
             order_id = (resp or {}).get("orderID")
             if not order_id:
                 return None
+            self._track(order_id)
 
             matched = self._wait_fill(order_id)
             if matched >= size * 0.99:
+                self._untrack(order_id)
                 return matched, price, order_id
             # No fill within the timeout: cancel and decide — reprice or give up.
             try:
@@ -161,6 +191,7 @@ class Executor:
                     self._trader.order_status(order_id).get("size_matched", 0.0)))
             except Exception:
                 pass
+            self._untrack(order_id)             # cancelled: no longer on the book
             if matched > 0:
                 return matched, price, order_id  # record the (partial) fill
             log.info("reprice %d/%d for %s", attempt + 1, self._cfg.max_reprices,
@@ -204,6 +235,7 @@ class Executor:
         price = round_to_tick(best_bid, c.market.tick_size)
 
         order_id = None
+        sold = size
         if self._trader is not None:
             try:
                 resp = self._trader.sell_limit(c.token_id, price, size,
@@ -211,11 +243,37 @@ class Executor:
                 order_id = (resp or {}).get("orderID")
             except Exception as exc:
                 return ExecutionResult(status="failed", detail=str(exc))
+            if not order_id:
+                return ExecutionResult(status="canceled", detail="sell not accepted")
+            self._track(order_id)
+            # CONFIRM the fill before booking it. A limit sell RESTS; recording it
+            # as done would drop a still-held position out of `open_positions`, so
+            # the guardian and take-profit stop watching it, while phantom profit
+            # enters realized PnL. The buy path always waited for its fill — this
+            # mirror image did not, which is the more dangerous of the two since
+            # exits are the risk-REDUCTION path.
+            sold = self._wait_fill(order_id)
+            if sold <= 0:
+                try:
+                    self._trader.cancel(order_id)
+                except Exception:
+                    pass
+                # Late fill between the last poll and the cancel landing.
+                try:
+                    sold = float(self._trader.order_status(order_id)
+                                 .get("size_matched", 0.0))
+                except Exception:
+                    sold = 0.0
+            self._untrack(order_id)
+            if sold <= 0:
+                return ExecutionResult(status="canceled",
+                                       detail="sell did not fill — position retained",
+                                       order_ids=[order_id])
 
         self._ledger.record_trade(
             mode=self._mode, estimate=plan.estimate, category=plan.category,
-            side="SELL", price=price, size=size, order_id=order_id,
+            side="SELL", price=price, size=sold, order_id=order_id,
             status="filled" if self._trader else "sim-filled",
         )
-        return ExecutionResult(status="filled", filled_size=size, avg_price=price,
+        return ExecutionResult(status="filled", filled_size=sold, avg_price=price,
                                order_ids=[order_id] if order_id else [])

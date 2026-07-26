@@ -51,6 +51,7 @@ def test_execute_sell_confirms_the_fill_before_recording(cfg, ledger):
     # The exchange accepts the sell and it RESTS: nothing is matched.
     trader.sell_limit.return_value = {"orderID": "sell-1"}
     trader.order_status.return_value = {"status": "live", "size_matched": 0.0}
+    trader.matched_size.return_value = 0.0
 
     ex = Executor(cfg, ledger, clob=mock.Mock(), trader=trader, mode="live")
     plan = est_to_plan(_est(m, "s1-y"), "other")
@@ -75,6 +76,7 @@ def test_unfilled_exit_does_not_erase_the_position(cfg, ledger):
     trader = mock.Mock()
     trader.sell_limit.return_value = {"orderID": "sell-1"}
     trader.order_status.return_value = {"status": "live", "size_matched": 0.0}
+    trader.matched_size.return_value = 0.0
 
     ex = Executor(cfg, ledger, clob=mock.Mock(), trader=trader, mode="live")
     ex.execute_sell(est_to_plan(_est(m, "s2-y"), "other"), size=100.0,
@@ -109,7 +111,9 @@ def test_basket_arb_legs_are_fok_not_resting_gtc(cfg, ledger):
 
     trader = mock.Mock()
     trader.buy_limit.return_value = {"orderID": "L"}
+    trader.matched_size.side_effect = lambda oid, requested: float(requested)
     cfg.arbitrage.execute = True
+    cfg.arbitrage.spoof_screen = False
     ArbitrageScanner(cfg, ledger, mock.Mock(), trader, "live").execute(arb)
 
     order_types = [kw.get("order_type") for _, kw in trader.buy_limit.call_args_list]
@@ -136,8 +140,9 @@ def test_basket_arb_does_not_book_an_unmatched_leg_as_filled(cfg, ledger):
     trader = mock.Mock()
     trader.buy_limit.return_value = {"orderID": "L"}
     # Nothing ever matches — every leg merely rests on the book.
-    trader.order_status.return_value = {"status": "live", "size_matched": 0.0}
+    trader.matched_size.return_value = 0.0
     cfg.arbitrage.execute = True
+    cfg.arbitrage.spoof_screen = False
     ArbitrageScanner(cfg, ledger, mock.Mock(), trader, "live").execute(arb)
 
     assert ledger.open_positions("live") == [], (
@@ -161,7 +166,7 @@ def test_resolution_checks_matched_size_not_just_an_order_id(cfg, ledger):
     trader = mock.Mock()
     # FOK killed: an id comes back, nothing matched.
     trader.buy_limit.return_value = {"orderID": "fok-1"}
-    trader.order_status.return_value = {"status": "canceled", "size_matched": 0.0}
+    trader.matched_size.return_value = 0.0
 
     engine = ResolutionAlpha(cfg, ledger, clob, trader, "live")
     from polymarket_bot.resolution import ResolutionCandidate

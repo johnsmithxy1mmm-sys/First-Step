@@ -127,6 +127,7 @@ class ResolutionAlpha:
         if size < m.min_order_size:
             return 0.0
         order_id = None
+        filled = size
         if self._trader is not None:
             try:
                 resp = self._trader.buy_limit(token, price, size,
@@ -135,12 +136,20 @@ class ResolutionAlpha:
             except Exception as exc:
                 log.error("resolution execute failed %s: %s", token[:16], exc)
                 return 0.0
+            # A killed FOK still returns an order id, so confirm what matched.
+            # Recording the request would put shares in the ledger that the
+            # account does not hold.
+            filled = self._trader.matched_size(order_id, size)
+            if filled <= 0:
+                log.info("resolution: FOK did not fill for %s — nothing recorded",
+                         token[:16])
+                return 0.0
         self._ledger.record_trade(
             mode=self._mode, estimate=simple_estimate(m, cand.outcome_index, price),
-            category="resolution", side="BUY", price=price, size=size,
+            category="resolution", side="BUY", price=price, size=filled,
             order_id=order_id, status="filled" if self._trader else f"{self._mode}-filled",
             strategy="resolution")
-        return price * size
+        return price * filled
 
     def cycle(self, markets: list[Market],
               allow_execute: bool = True) -> list[ResolutionCandidate]:

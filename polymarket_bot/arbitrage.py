@@ -100,6 +100,7 @@ class BasketArb(BaseModel):
 class ArbitrageScanner:
     def __init__(self, cfg: BotConfig, ledger: Ledger, clob: ClobReader,
                  trader: Trader | None, mode: str):
+        self._live_order_ids: set[str] = set()
         self._cfg = cfg.arbitrage
         self._fees = FeeModel(cfg.fees)
         self._ledger = ledger
@@ -177,6 +178,10 @@ class ArbitrageScanner:
                         side=side, legs=legs, taker_coef=taker_coef)
         return arb if arb.profit_per_set > 0 else None
 
+    def local_order_ids(self) -> set[str]:
+        """Legs currently in flight — see KillSwitch.reconcile."""
+        return set(self._live_order_ids)
+
     # --- execution ---
 
     def _legs_look_painted(self, legs) -> bool:
@@ -219,24 +224,40 @@ class ArbitrageScanner:
         for leg in arb.legs:
             price = round_to_tick(leg.ask, leg.market.tick_size)
             order_id = None
+            filled = float(sets)
             if self._trader is not None:
                 try:
+                    # FOK, like chainarb: a basket leg that RESTS is not a basket
+                    # leg. A GTC leg could sit unfilled while the ledger booked
+                    # the structure complete, turning a "riskless" set into a
+                    # directional bet nobody could see.
                     resp = self._trader.buy_limit(leg.token_id, price, float(sets),
-                                                  neg_risk=True)
+                                                  neg_risk=True, order_type="FOK")
                     order_id = (resp or {}).get("orderID")
                 except Exception as exc:
                     log.error("arb leg failed %s: %s - other legs will not overpay",
                               leg.token_id[:16], exc)
                     continue
+                # Visible to reconcile while its fate is unknown, so a leg in
+                # flight is never mistaken for an unknown exchange order.
+                if order_id:
+                    self._live_order_ids.add(order_id)
+                # Confirm, never assume: an id means accepted, not filled.
+                filled = self._trader.matched_size(order_id, sets)
+                self._live_order_ids.discard(order_id)
+                if filled <= 0:
+                    log.warning("arb leg %s did not fill — not recorded",
+                                leg.token_id[:16])
+                    continue
             self._ledger.record_trade(
                 mode=self._mode,
                 estimate=simple_estimate(leg.market, leg.outcome_index, price),
-                category="arb", side="BUY", price=price, size=float(sets),
+                category="arb", side="BUY", price=price, size=filled,
                 order_id=order_id,
                 status="filled" if self._trader else "sim-filled",
                 strategy="arb",
             )
-            spent += price * sets
+            spent += price * filled
         return spent
 
     # --- cycle ---

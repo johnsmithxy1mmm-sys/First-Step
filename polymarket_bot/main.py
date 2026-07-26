@@ -567,13 +567,30 @@ class Bot:
 
     # --- extra-strategy jobs (own intervals, isolated errors) ---
 
+    def _global_room(self) -> bool:
+        """False = the configured $ exposure ceiling is reached: no NEW risk.
+
+        `risk.max_global_exposure_usd` used to be enforced nowhere — the check
+        existed with no callers, while `portfolio.max_total_exposure_pct` capped
+        only the longshot/fade path. Two disagreeing ceilings meant MM inventory
+        could sit above the number the operator had configured. This is now the
+        one gate every entry passes; exits are deliberately NOT gated by it,
+        since reducing risk must never be blocked by being over the limit.
+        """
+        if self.killswitch.check_global_exposure(self.ledger.total_exposure(self.mode)):
+            log.info("global exposure cap $%.0f reached — no new entries",
+                     self.cfg.risk.max_global_exposure_usd)
+            return False
+        return True
+
     def _may_execute(self, strategy: str) -> bool:
         """Common execution gate for detect+alert strategies: the kill-switch,
         the observe-only drawdown brake and the per-strategy circuit breaker
         block ORDERS, while detection/alerts keep running for the human."""
         return (self.killswitch.trading_allowed
                 and not self.portfolio.observe_only()
-                and self.breaker.allows(strategy))
+                and self.breaker.allows(strategy)
+                and self._global_room())
 
     def arb_job(self) -> None:
         """#1: neg-risk baskets. Prices are checked against live order books.
@@ -703,7 +720,7 @@ class Bot:
             if self.ws is not None and self.ws.healthy:
                 self.killswitch.on_ws_recovered()
             if not self.killswitch.trading_allowed or self.portfolio.observe_only() \
-                    or not self.breaker.allows("mm"):
+                    or not self.breaker.allows("mm") or not self._global_room():
                 self.mm.shutdown()
                 return
             quotes = self.mm.cycle(self.markets_cache)
@@ -735,7 +752,7 @@ class Bot:
             if self.ws is not None and self.ws.healthy:
                 self.killswitch.on_ws_recovered()
             if not self.killswitch.trading_allowed or self.portfolio.observe_only() \
-                    or not self.breaker.allows("sprint_mm"):
+                    or not self.breaker.allows("sprint_mm") or not self._global_room():
                 self.sprint.shutdown()
                 return
             quotes = self.sprint.cycle(self.markets_cache)
@@ -788,9 +805,25 @@ class Bot:
                 exchange_ids = {str(o.get("id") or o.get("orderID") or "")
                                 for o in self.trader.open_orders()}
                 exchange_ids.discard("")
+                # EVERY component that can leave an order on the book must be
+                # in the local set: reconcile HALTs on whatever it cannot
+                # account for, so an omission turns normal operation (a resting
+                # entry or take-profit) into a false terminal halt.
                 self.killswitch.reconcile(
-                    self.mm.local_order_ids() | self.sprint.local_order_ids(),
+                    self.mm.local_order_ids()
+                    | self.sprint.local_order_ids()
+                    | self.executor.local_order_ids()
+                    | self.arb.local_order_ids(),
                     exchange_ids)
+            # Impossible accounting (sold more than ever bought) means our books
+            # no longer describe reality — every downstream number, including the
+            # risk limits themselves, is then untrustworthy.
+            drift = self.ledger.accounting_drift(self.mode)
+            if drift:
+                token, qty = next(iter(drift.items()))
+                self.killswitch.trip_halt(
+                    f"accounting drift: {len(drift)} token(s) oversold "
+                    f"(first {token[:16]} by {qty:.4f})")
             # Per-strategy circuit breaker: a losing streak disables that strategy.
             was = set(self.breaker.disabled)
             self.breaker.update(self.ledger.realized_pnl_by_strategy(self.mode))

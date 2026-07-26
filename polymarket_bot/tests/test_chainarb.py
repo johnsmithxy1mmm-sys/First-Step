@@ -454,6 +454,8 @@ def test_leg_unwind_when_second_leg_killed(cfg, ledger):
     trader = mock.Mock()
     # superset buy fills (orderID); subset buy is FOK-killed (no orderID).
     trader.buy_limit.side_effect = [{"orderID": "sup"}, {}]
+    # The leg's matched size is now CONFIRMED, not assumed from the id.
+    trader.matched_size.side_effect = lambda oid, requested: float(requested)
     chain = make_chain(cfg, ledger, clob=clob)
     chain._trader = trader
     spent = chain.execute(pair)

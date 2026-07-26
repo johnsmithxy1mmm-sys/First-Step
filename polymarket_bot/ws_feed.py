@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import threading
 import time
 from typing import Callable
@@ -53,6 +54,18 @@ class BookStore:
         self._asks: dict[str, dict[float, float]] = {}
         self._lock = threading.Lock()
 
+    @staticmethod
+    def _valid_level(price: float, size: float) -> bool:
+        """A tradable level: finite, price strictly inside (0, 1), size >= 0.
+
+        Second line of defence behind the JSON parser — a non-finite price that
+        reached the book would make top-of-book order-dependent and flow into
+        quoting, exits and the ledger.
+        """
+        if not (math.isfinite(price) and math.isfinite(size)):
+            return False
+        return 0.0 < price < 1.0 and size >= 0.0
+
     def handle(self, msg: dict) -> str | None:
         """Handles one message; returns token_id if the book changed."""
         token = str(msg.get("asset_id") or msg.get("market") or "")
@@ -78,6 +91,8 @@ class BookStore:
                         # Never guess a side: `else asks` would let one malformed
                         # message silently corrupt the ask book.
                         continue
+                    if not self._valid_level(price, size):
+                        continue
                     levels = bids if side == "BUY" else asks
                     if size <= 0:
                         levels.pop(price, None)
@@ -95,7 +110,7 @@ class BookStore:
                 price, size = float(level["price"]), float(level["size"])
             except (KeyError, TypeError, ValueError):
                 continue
-            if size > 0:
+            if size > 0 and BookStore._valid_level(price, size):
                 out[price] = size
         return out
 
@@ -150,7 +165,11 @@ class WSFeed(threading.Thread):
 
     @property
     def healthy(self) -> bool:
-        return bool(self._last_msg_ts) and (time.time() - self._last_msg_ts) < self._staleness
+        # MONOTONIC, not wall clock: an NTP correction stepping time backwards
+        # would make the gap negative and mask a real outage, while a forward
+        # step would fake one. Staleness is an elapsed-time question.
+        return bool(self._last_msg_ts) and \
+            (time.monotonic() - self._last_msg_ts) < self._staleness
 
     def stop(self) -> None:
         self._stop.set()
@@ -187,7 +206,7 @@ class WSFeed(threading.Thread):
                                       close_timeout=5) as ws:
             await ws.send(json.dumps({"type": "market", "assets_ids": tokens}))
             log.info("ws_feed: subscribed to %d tokens", len(tokens))
-            self._last_msg_ts = time.time()
+            self._last_msg_ts = time.monotonic()
             self._outage_reported = False
             while not self._stop.is_set() and not self._resubscribe.is_set():
                 try:
@@ -195,14 +214,23 @@ class WSFeed(threading.Thread):
                 except asyncio.TimeoutError:
                     self._check_outage()
                     continue
-                self._last_msg_ts = time.time()
+                self._last_msg_ts = time.monotonic()
                 self._outage_reported = False
                 self._dispatch(raw)
 
+    @staticmethod
+    def _reject_constant(token: str):
+        # json.loads accepts bare NaN/Infinity/-Infinity by default. They must
+        # never enter a price book: NaN keys are unremovable (per-object hash, so
+        # the size:0 delete never matches) and poison max()/min(), while inf
+        # passes every `> 0` gate and becomes a fabricated take-profit mark.
+        raise ValueError(f"non-finite JSON constant in feed: {token}")
+
     def _dispatch(self, raw) -> None:
         try:
-            payload = json.loads(raw)
-        except (TypeError, ValueError):
+            payload = json.loads(raw, parse_constant=self._reject_constant)
+        except (TypeError, ValueError) as exc:
+            log.warning("ws_feed: dropped unparseable frame (%s)", exc)
             return
         messages = payload if isinstance(payload, list) else [payload]
         for msg in messages:
@@ -219,7 +247,7 @@ class WSFeed(threading.Thread):
 
     def _check_outage(self) -> None:
         """Gap-detect: stream dead beyond threshold — notify kill-switch once."""
-        gap = time.time() - self._last_msg_ts if self._last_msg_ts else 0.0
+        gap = time.monotonic() - self._last_msg_ts if self._last_msg_ts else 0.0
         if gap >= self._staleness and not self._outage_reported:
             self._outage_reported = True
             log.error("ws_feed: no data for %.0fs — quotes must be pulled", gap)

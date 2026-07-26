@@ -27,8 +27,14 @@ from unittest import mock
 from polymarket_bot.risk import KillSwitch
 
 
-def test_executor_orders_are_visible_to_reconcile(cfg, ledger):
-    """An order the bot itself placed must never be classed as a ghost."""
+def test_executor_order_is_visible_while_it_rests(cfg, ledger):
+    """What reconcile needs is visibility DURING the resting window.
+
+    The original repro cancelled first and then asked — by then the order is
+    legitimately untracked. The real requirement is that an order in flight (the
+    normal state between placement and fill) is accounted for, so `risk_job` does
+    not read it as an unknown exchange order and trip a terminal HALT.
+    """
     from polymarket_bot.executor import Executor
     from polymarket_bot.main import est_to_plan
     from polymarket_bot.models import Candidate, Estimate
@@ -40,25 +46,30 @@ def test_executor_orders_are_visible_to_reconcile(cfg, ledger):
                    p_mkt=0.5, p_est=0.5, signals=[])
     trader = mock.Mock()
     trader.sell_limit.return_value = {"orderID": "resting-exit-1"}
-    trader.order_status.return_value = {"status": "live", "size_matched": 0.0}
 
+    seen: list[set[str]] = []
     ex = Executor(cfg, ledger, clob=mock.Mock(), trader=trader, mode="live")
+
+    def observe(order_id):
+        # Called while the order is live on the exchange: this is the instant
+        # reconcile could run and must not halt.
+        seen.append(ex.local_order_ids())
+        return 0.0
+
+    ex._wait_fill = observe                      # type: ignore[method-assign]
+    trader.matched_size.return_value = 0.0
     ex.execute_sell(est_to_plan(est, "other"), size=10.0, min_price=0.4,
                     known_bid=0.48)
 
-    # The exchange now reports this order. Reconcile receives the same "local"
-    # set main.risk_job builds — MM + sprint only.
-    local_ids: set[str] = set()
-    exchange_ids = {"resting-exit-1"}
+    assert seen and "resting-exit-1" in seen[0], (
+        "a resting executor order was invisible to reconcile — normal operation "
+        "would trip a false terminal HALT")
 
     halts: list[str] = []
     ks = KillSwitch(cfg, ledger, "live", cancel_all=lambda: None,
                     alert=lambda msg: halts.append(msg) or True)
-    ks.reconcile(local_ids, exchange_ids)
-
-    assert not ks.halted, (
-        "the bot HALTED on an order it placed itself: executor/arbitrage order "
-        f"ids are absent from reconcile's local set ({halts})")
+    ks.reconcile(seen[0], {"resting-exit-1"})
+    assert not ks.halted, f"halted on an order it placed itself ({halts})"
 
 
 def test_executor_exposes_its_open_order_ids():

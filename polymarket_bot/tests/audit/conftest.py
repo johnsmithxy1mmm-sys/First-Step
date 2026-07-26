@@ -30,7 +30,11 @@ def make_market(**kw):
 @pytest.fixture()
 def cfg():
     from polymarket_bot.config import BotConfig
-    return BotConfig()
+    cfg = BotConfig()
+    # Reproducers must not spend the production 90s fill timeout per call.
+    cfg.executor.fill_timeout_sec = 0.05
+    cfg.executor.poll_interval_sec = 0.01
+    return cfg
 
 
 @pytest.fixture()

@@ -77,6 +77,8 @@ def test_arb_execute_proceeds_on_clean_book(cfg, ledger):
     clean = book(asks=[(0.30, 100), (0.31, 120), (0.32, 90)], bids=[(0.29, 100)])
     trader = mock.Mock()
     trader.buy_limit.return_value = {"orderID": "x"}
+    # Legs now confirm their matched size instead of trusting the id.
+    trader.matched_size.side_effect = lambda oid, requested: float(requested)
     scanner = make_scanner(cfg, ledger, {"a": clean, "b": clean}, trader)
     assert scanner.execute(arb) > 0.0
     assert trader.buy_limit.called
@@ -95,5 +97,7 @@ def test_spoof_screen_can_be_disabled(cfg, ledger):
     painted = book(asks=[(0.30, 5000), (0.31, 5)], bids=[(0.29, 50)])
     trader = mock.Mock()
     trader.buy_limit.return_value = {"orderID": "x"}
+    # Legs now confirm their matched size instead of trusting the id.
+    trader.matched_size.side_effect = lambda oid, requested: float(requested)
     scanner = make_scanner(cfg, ledger, {"a": painted, "b": painted}, trader)
     assert scanner.execute(arb) > 0.0                # screen off -> proceeds

@@ -231,6 +231,26 @@ class Trader:
             "size_matched": float(raw.get("size_matched") or 0),
         }
 
+    def matched_size(self, order_id: str | None, requested: float) -> float:
+        """Shares actually matched for `order_id`. Never trusts the request.
+
+        An order id coming back means "accepted", not "filled": a GTC order can
+        rest untouched and a killed FOK still returns a response. Booking the
+        requested size on the strength of an id creates shares the account does
+        not hold — phantom PnL, and for a basket a structure booked complete
+        while a leg is missing. On an unreadable status we return 0: claiming
+        nothing filled is recoverable, claiming a fill that did not happen is not.
+        """
+        if order_id is None:
+            return 0.0
+        try:
+            matched = float(self.order_status(order_id).get("size_matched", 0.0))
+        except Exception as exc:
+            log.warning("could not confirm fill for %s: %s — assuming 0",
+                        order_id[:16], exc)
+            return 0.0
+        return max(0.0, min(matched, float(requested)))
+
     def open_orders(self) -> list[dict]:
         self._throttle_read("open_orders")
         return self._client.get_orders() or []

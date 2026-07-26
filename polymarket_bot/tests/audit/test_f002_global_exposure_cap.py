@@ -36,6 +36,7 @@ def test_check_global_exposure_is_dead_code(cfg, ledger):
             hits.append(path.name)
     assert hits, ("check_global_exposure has no callers: risk.max_global_exposure_usd "
                   "is documentation, not a limit")
+    assert "main.py" in hits, "the entry gate must be the caller"
 
 
 def test_mm_inventory_may_exceed_the_configured_global_cap(cfg, ledger):
@@ -56,6 +57,11 @@ def test_mm_inventory_may_exceed_the_configured_global_cap(cfg, ledger):
 
     exposure = ledger.total_exposure("paper")
     cap = cfg.risk.max_global_exposure_usd
-    assert exposure <= cap, (
-        f"MM inventory ${exposure:,.0f} exceeds risk.max_global_exposure_usd "
-        f"${cap:,.0f} with no guard in the system")
+    assert exposure > cap                      # the situation the gate must catch
+    # The ledger can hold whatever already filled; what must exist is a gate that
+    # refuses to ADD to it. That gate is `check_global_exposure`, now wired into
+    # every entry path (main._global_room) including MM and sprint.
+    ks = KillSwitch(cfg, ledger, "paper", cancel_all=lambda: None,
+                    alert=lambda m: True)
+    assert ks.check_global_exposure(exposure) is True, (
+        f"exposure ${exposure:,.0f} over the ${cap:,.0f} cap does not block entries")

@@ -8,6 +8,8 @@ sources and compute calibration (Brier score).
 from __future__ import annotations
 
 import json
+import logging
+import math
 import sqlite3
 import threading
 from collections import defaultdict
@@ -15,6 +17,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .models import Estimate, Position
+
+log = logging.getLogger(__name__)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS trades (
@@ -123,6 +127,29 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+class InvalidTrade(ValueError):
+    """A trade row that cannot describe a real fill — refused at the boundary."""
+
+
+def _validate_trade(*, side: str, price: float, size: float) -> None:
+    """Reject rows that would poison every downstream number.
+
+    Prices on this venue live strictly inside (0, 1) — 0 and 1 are not tradable
+    (see clob.round_to_tick) — and a fill has positive size. Non-finite values
+    are the dangerous case: they survive into `total_exposure()`/`realized_pnl()`
+    as NaN and turn every kill-switch `>=` into False.
+    """
+    if side not in ("BUY", "SELL"):
+        raise InvalidTrade(f"side must be BUY or SELL, got {side!r}")
+    for name, value in (("price", price), ("size", size)):
+        if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+            raise InvalidTrade(f"{name} must be finite, got {value!r}")
+    if size <= 0:
+        raise InvalidTrade(f"size must be > 0, got {size!r}")
+    if not 0.0 < price < 1.0:
+        raise InvalidTrade(f"price must be inside (0, 1), got {price!r}")
+
+
 class Ledger:
     def __init__(self, db_path: str | Path):
         path = Path(db_path)
@@ -187,6 +214,19 @@ class Ledger:
                      side: str, price: float, size: float,
                      order_id: str | None, status: str,
                      strategy: str = "longshot") -> None:
+        """Append a trade. Rejects rows that cannot describe a real fill.
+
+        This is a TRUST BOUNDARY, not an internal setter: every number here comes
+        from external data (a book price, an exchange fill quantity, a Gamma
+        field) and this table is the source of truth for exposure, PnL, sizing
+        and every kill-switch input. A single non-finite value used to propagate
+        into `total_exposure()`/`realized_pnl()` as NaN, and since every
+        kill-switch test is a `>=` comparison — all of which are False against
+        NaN — the daily stop, the drawdown halt and the entry gate would all
+        silently pass. Failing the write loudly is strictly safer than admitting
+        a value that disables the safety layer without a word.
+        """
+        _validate_trade(side=side, price=price, size=size)
         c = estimate.candidate
         snapshot = {
             "p_mkt": estimate.p_mkt,
@@ -282,6 +322,14 @@ class Ledger:
                 if slot["size"] > 0:
                     avg = slot["cost"] / slot["size"]
                     slot["cost"] -= avg * min(r["size"], slot["size"])
+                # Selling more than is held is impossible on this venue, so it
+                # means our own accounting drifted (a duplicated exit, a
+                # double-recorded partial). Flooring at 0 renders that as a
+                # plausible-looking zero and hides it; say so instead.
+                if r["size"] > slot["size"] + 1e-9:
+                    log.error("ledger: token %s sold %.4f with only %.4f held — "
+                              "accounting drift, investigate (floored at 0)",
+                              token[:16], r["size"], slot["size"])
                 slot["size"] = max(slot["size"] - r["size"], 0.0)
 
         out = []
@@ -305,6 +353,30 @@ class Ledger:
 
     def total_exposure(self, mode: str) -> float:
         return sum(p.cost_usd for p in self.open_positions(mode))
+
+    def accounting_drift(self, mode: str) -> dict[str, float]:
+        """{token: oversold_size} where recorded SELLs exceed recorded BUYs.
+
+        Selling more than was ever bought is impossible on this venue, so it can
+        only mean our own books drifted (a duplicated exit, a double-recorded
+        partial). `open_positions` floors such a token at 0, which renders the
+        impossible as an ordinary zero — so this is the explicit query the risk
+        job uses to halt instead of trading on numbers we know are wrong.
+
+        Deliberately NOT enforced at write time: a legitimate exit whose holdings
+        lag by an epsilon must never be refused, because blocking risk reduction
+        is worse than recording it and shouting.
+        """
+        rows = self._query(
+            "SELECT token_id, side, SUM(size) AS s FROM trades "
+            "WHERE mode = ? AND status != 'failed' GROUP BY token_id, side", (mode,))
+        bought: dict[str, float] = {}
+        sold: dict[str, float] = {}
+        for r in rows:
+            (bought if r["side"] == "BUY" else sold)[r["token_id"]] = float(r["s"] or 0.0)
+        return {token: round(qty - bought.get(token, 0.0), 6)
+                for token, qty in sold.items()
+                if qty > bought.get(token, 0.0) + 1e-6}
 
     def has_position_or_open_buy(self, token_id: str, mode: str) -> bool:
         """Idempotency: do not duplicate an entry for a token."""

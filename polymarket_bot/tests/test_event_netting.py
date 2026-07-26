@@ -92,9 +92,11 @@ def test_size_usd_uses_netted_category_room(cfg, ledger):
         m = make_market(id=f"m{i}", clob_token_ids=[f"y{i}", f"n{i}"],
                         event_id="ev", event_neg_risk=True, category="other",
                         question="Will player X win the award?")
-        est = simple_estimate(m, 1, 1.0)
+        # $200 of exposure per leg, priced 0.50 x 400 rather than 1.0 x 200:
+        # 1.0 is not a tradable price here and the ledger now refuses it.
+        est = simple_estimate(m, 1, 0.50)
         ledger.record_trade(mode="dry-run", estimate=est, category="other",
-                            side="BUY", price=1.0, size=200, order_id=None,
+                            side="BUY", price=0.50, size=400, order_id=None,
                             status="sim-filled", strategy="fade")
     assert event_netted_exposure(ledger.open_positions("dry-run"))["other"] == 200.0
     # Netted exposure $200 < $500 cap -> room remains, so a new size is allowed.

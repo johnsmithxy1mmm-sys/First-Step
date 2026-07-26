@@ -356,17 +356,26 @@ class ChainArbitrage:
         so we never end up half-filled on one side. In paper/dry-run there is no
         trader — the fill is simulated."""
         order_id = None
+        filled = float(sets)
         if self._trader is not None:
             resp = self._trader.buy_limit(leg.token_id, price, float(sets),
                                           neg_risk=leg.market.neg_risk,
                                           order_type="FOK")
             order_id = (resp or {}).get("orderID")
             if not order_id:
-                return None             # FOK killed — this leg did not fill
+                return None             # not even accepted
+            # A KILLED FOK still returns an id, so confirm the matched size
+            # rather than trusting the id. Anything short of the full set is not
+            # this construction: record nothing and let the caller unwind.
+            filled = self._trader.matched_size(order_id, sets)
+            if filled < float(sets):
+                log.warning("chain arb leg %s filled %.0f/%d — treating as no fill",
+                            leg.token_id[:16], filled, sets)
+                return None
         self._ledger.record_trade(
             mode=self._mode,
             estimate=simple_estimate(leg.market, leg.outcome_index, price),
-            category="chain_arb", side="BUY", price=price, size=float(sets),
+            category="chain_arb", side="BUY", price=price, size=filled,
             order_id=order_id, status="filled" if self._trader else "sim-filled",
             strategy="chain_arb")
         return order_id or "sim"

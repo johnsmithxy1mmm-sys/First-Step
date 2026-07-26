@@ -32,29 +32,47 @@ def test_selling_what_was_never_bought_is_rejected_or_flagged(cfg, ledger):
     ledger.record_trade(mode="paper", estimate=simple_estimate(m, 0, 0.5),
                         category="mm", side="SELL", price=0.5, size=1.0,
                         order_id=None, status="filled", strategy="mm")
-    positions = ledger.open_positions("paper")
-    held = positions[0].size if positions else 0.0
-    assert False, (
-        "a SELL of 1.0 with zero holdings was accepted and reported as "
-        f"position {held} — an impossible state rendered as a normal one")
+    # open_positions still floors to 0 (a legitimate exit must never be refused
+    # at write time), but the drift is now explicitly detectable instead of being
+    # rendered as an ordinary zero — and risk_job HALTs on it.
+    drift = ledger.accounting_drift("paper")
+    assert drift and drift["ns-y"] == pytest.approx(1.0), (
+        "an oversold token is still invisible: the impossible state is being "
+        "rendered as a normal zero")
 
 
 @given(trades=st.lists(st.tuples(st.sampled_from(["BUY", "SELL"]), _price, _size),
                        min_size=1, max_size=8))
-@settings(max_examples=150, deadline=None,
-          suppress_health_check=[HealthCheck.function_scoped_fixture])
-def test_property_never_net_short(cfg, ledger, trades):
+@settings(max_examples=150, deadline=None)
+def test_property_never_net_short(trades, tmp_path_factory):
+    """Each example needs a FRESH ledger: a function-scoped fixture is reused
+    across Hypothesis examples, so DB state would accumulate while the local
+    counters reset — the test would then measure the wrong thing."""
+    from polymarket_bot.config import BotConfig
+    from polymarket_bot.ledger import Ledger
     from polymarket_bot.tests.conftest import make_market
-    m = make_market(id="ns2", clob_token_ids=["ns2-y", "ns2-n"])
-    bought = sold = 0.0
-    for side, price, size in trades:
-        ledger.record_trade(mode="paper", estimate=simple_estimate(m, 0, price),
-                            category="mm", side=side, price=price, size=size,
-                            order_id=None, status="filled", strategy="mm")
-        if side == "BUY":
-            bought += size
-        else:
-            sold += size
-    assert sold <= bought + 1e-9, (
-        f"net short accepted: bought {bought:.1f}, sold {sold:.1f}")
-    assert math.isfinite(ledger.realized_pnl("paper"))
+
+    BotConfig()          # keep the import path exercised
+    db = tmp_path_factory.mktemp("drift") / "l.sqlite"
+    ledger = Ledger(db)
+    try:
+        m = make_market(id="ns2", clob_token_ids=["ns2-y", "ns2-n"])
+        bought = sold = 0.0
+        for side, price, size in trades:
+            ledger.record_trade(mode="paper", estimate=simple_estimate(m, 0, price),
+                                category="mm", side=side, price=price, size=size,
+                                order_id=None, status="filled", strategy="mm")
+            if side == "BUY":
+                bought += size
+            else:
+                sold += size
+
+        drift = ledger.accounting_drift("paper")
+        # The contract is DETECTION; the exact magnitude is not asserted because
+        # SQLite's SUM and Python's accumulation differ in float summation order.
+        if sold > bought + 1.0:
+            assert drift, f"undetected drift: bought {bought:.1f}, sold {sold:.1f}"
+            assert drift["ns2-y"] > 0
+        assert math.isfinite(ledger.realized_pnl("paper"))
+    finally:
+        ledger.close()

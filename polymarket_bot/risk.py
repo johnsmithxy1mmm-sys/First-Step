@@ -15,6 +15,7 @@ Two levels:
 from __future__ import annotations
 
 import logging
+import math
 from datetime import datetime, timezone
 from typing import Callable
 
@@ -83,9 +84,27 @@ class KillSwitch:
 
     # --- checks (called every cycle) ---
 
+    def _guard_finite(self, name: str, value: float) -> bool:
+        """Fail CLOSED on a non-finite input: halt instead of comparing.
+
+        Every check here is a `>=` comparison and every comparison against NaN is
+        False, so one NaN would let the daily stop, the drawdown halt AND the
+        entry gate all pass in silence. A number we cannot reason about means the
+        accounting is broken, which is itself grounds to stop trading.
+        """
+        if math.isfinite(value):
+            return True
+        self.trip_halt(f"{name} is not finite ({value!r}) — accounting is "
+                       "unreliable, refusing to trade on it")
+        return False
+
     def check_daily_loss(self, equity_now: float) -> None:
         """Daily stop: drawdown from equity at the start of the UTC day."""
+        if not self._guard_finite("equity", equity_now):
+            return
         day_start = self._day_start_equity(equity_now)
+        if not self._guard_finite("day-start equity", day_start):
+            return
         loss = day_start - equity_now
         if loss >= self._cfg.max_daily_loss_usd:
             self.trip_halt(f"daily loss ${loss:,.2f} >= "
@@ -97,12 +116,24 @@ class KillSwitch:
         return row if row is not None else fallback
 
     def check_drawdown(self, equity_now: float, hwm: float) -> None:
+        if not self._guard_finite("equity", equity_now):
+            return
+        if not self._guard_finite("high-water mark", hwm):
+            return
         if hwm > 0 and (hwm - equity_now) / hwm >= self._cfg.max_drawdown_pct:
             self.trip_halt(f"drawdown {((hwm - equity_now) / hwm) * 100:.1f}% "
                            f">= {self._cfg.max_drawdown_pct * 100:.0f}% from HWM")
 
     def check_global_exposure(self, exposure_usd: float) -> bool:
-        """True = total exposure limit reached (new entries forbidden)."""
+        """True = total exposure limit reached (new entries forbidden).
+
+        Non-finite exposure counts as "limit reached": if we cannot measure what
+        is at risk, we do not add to it.
+        """
+        if not math.isfinite(exposure_usd):
+            log.error("exposure is not finite (%r) — treating the global cap as "
+                      "reached and blocking new entries", exposure_usd)
+            return True
         return exposure_usd >= self._cfg.max_global_exposure_usd
 
     def reconcile(self, local_order_ids: set[str], exchange_order_ids: set[str]) -> None:

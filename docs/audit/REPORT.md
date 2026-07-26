@@ -1,8 +1,10 @@
 # Hostile Audit Report — polymarket_bot
 
-Branch `audit/2026-07-26` · HEAD `66dadd1` · nothing fixed, nothing pushed.
+Branch `audit/2026-07-26` (findings) merged into the dev branch (fixes).
 Reproducers: `AUDIT_REPRO=1 python -m pytest polymarket_bot/tests/audit -q`
-→ **18 failing tests on HEAD** + mutation evidence.
+→ **all 18 PASS after remediation** (they were the failing proof; now the
+regression suite). Main suite: 469 passed. Chaos: 8/8. `risk.py` mutation
+score 3/7 -> **7/7 killed**.
 
 ## 1. Executive summary
 
@@ -98,7 +100,37 @@ recently got burned, unverified elsewhere.
 * Secrets scan: clean. `.env` untracked; the only hex literals are public
   Polygon contract addresses (correctly hardcoded).
 
-## 6. Remediation plan
+## 6. Remediation — DONE
+
+Every wave landed. What changed, per finding:
+
+* **F-003** `ledger._validate_trade` refuses non-finite / non-positive size and
+  price outside (0,1); `KillSwitch._guard_finite` HALTs on non-finite equity/HWM
+  and `check_global_exposure` treats unmeasurable exposure as "cap reached".
+* **F-004** `execute_sell` waits for the fill, cancels on timeout, re-reads for a
+  late fill and records only what matched — an unfilled exit keeps the position.
+* **F-005/F-006** basket legs are FOK; `Trader.matched_size()` is the single
+  confirmation path used by arbitrage, chainarb and resolution. Never the request.
+* **F-002** `main._global_room()` is the one entry gate, wired into `_may_execute`
+  plus the MM and sprint jobs; exits are deliberately not gated by it.
+* **F-001** `json.loads(parse_constant=...)` rejects NaN/Infinity at the frame
+  boundary, and `BookStore._valid_level` re-checks every level.
+* **F-007** `Executor.local_order_ids()` and `ArbitrageScanner.local_order_ids()`
+  now feed `reconcile`, so a resting order is no longer a "ghost".
+* **F-008** `Ledger.accounting_drift()` makes an oversold token explicit and
+  `risk_job` HALTs on it. Deliberately not a write-time refusal: blocking a
+  legitimate exit is worse than recording it and shouting.
+* **F-009** safety is asserted by EFFECT (pause blocks trading, exact-threshold
+  boundaries, pause-while-halted is a no-op) — all four survivors killed.
+* **F-011** staleness moved to `time.monotonic()`. **F-012** unknown-side guard
+  now has a test.
+
+Two design calls worth flagging, both chosen deliberately over the "obvious" fix:
+the ledger still *records* an oversold sell (and halts) rather than refusing it,
+and `matched_size` returns 0 on an unreadable status — claiming no fill is
+recoverable, claiming a fill that did not happen is not.
+
+## 7. Original remediation plan (for the record)
 
 **Wave 1 — before any live trading (today).**
 1. F-003: validate in `record_trade` (finite, size>0, 0<price<1, usd≈price·size)

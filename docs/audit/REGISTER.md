@@ -1,25 +1,26 @@
 # Findings Register — audit/2026-07-26
 
-18 failing reproducers on HEAD + mutation evidence. Run:
+**STATUS: ALL FIXED.** 18 reproducers now PASS and are the permanent
+regression suite; mutation score on `risk.py` went 3/7 -> 7/7 killed. Run:
 
     AUDIT_REPRO=1 python -m pytest polymarket_bot/tests/audit -q
 
-Sorted by (probability in prod) × (irreversibility). Nothing fixed — per protocol.
+Sorted by (probability in prod) × (irreversibility).
 
 | ID | Severity | Conf. | Class | Location | Repro | Status |
 |---|---|---|---|---|---|---|
-| F-003 | **Critical** | high | data-loss / safety | `ledger.py:186` `record_trade` (no validation) → `risk.py:86,98` | `test_f003_*` (5 fail) | open |
-| F-004 | **Critical** | high | logic / api-contract | `executor.py:196-221` `execute_sell` | `test_f004_*` (2 fail) | open |
-| F-005 | High | high | logic / money | `arbitrage.py:218-238` GTC legs | `test_f004_*` (2 fail) | open |
-| F-002 | High | high | api-contract / risk | `risk.py:104` (0 callers) vs `portfolio.py:204` | `test_f002_*` (2 fail) | open |
-| F-001 | High | high | numeric / trust-boundary | `ws_feed.py:56-95` `BookStore.handle` | `test_f001_*` (3 fail) | open |
-| F-007 | High | high | availability / safety | `main.py:781` reconcile scope | `test_f007_*` (3 fail) | open |
-| F-009 | High | high | test-quality | `risk.py` (whole module) | mutation: 3/7 killed | open |
-| F-006 | High | high | logic / money | `resolution.py:129-141`, `chainarb.py:360` | `test_f004_*` (1 fail) | open |
-| F-008 | Medium | high | data-integrity | `ledger.py:280-285` floor | `test_f008_*` (2 fail) | open |
-| F-010 | Medium | medium | idempotency | `clob.py:155` no `client_order_id` | trace only | SUSPECTED |
-| F-011 | Medium | low | time | `ws_feed.py:206` wall clock | trace only | SUSPECTED |
-| F-012 | Low | high | test-gap | `ws_feed.py:77` unknown-side fix | no test exists | open |
+| F-003 | **Critical** | high | data-loss / safety | `ledger.py:186` `record_trade` (no validation) → `risk.py:86,98` | `test_f003_*` (5 fail) | FIXED |
+| F-004 | **Critical** | high | logic / api-contract | `executor.py:196-221` `execute_sell` | `test_f004_*` (2 fail) | FIXED |
+| F-005 | High | high | logic / money | `arbitrage.py:218-238` GTC legs | `test_f004_*` (2 fail) | FIXED |
+| F-002 | High | high | api-contract / risk | `risk.py:104` (0 callers) vs `portfolio.py:204` | `test_f002_*` (2 fail) | FIXED |
+| F-001 | High | high | numeric / trust-boundary | `ws_feed.py:56-95` `BookStore.handle` | `test_f001_*` (3 fail) | FIXED |
+| F-007 | High | high | availability / safety | `main.py:781` reconcile scope | `test_f007_*` (3 fail) | FIXED |
+| F-009 | High | high | test-quality | `risk.py` (whole module) | mutation: 3/7 killed | FIXED |
+| F-006 | High | high | logic / money | `resolution.py:129-141`, `chainarb.py:360` | `test_f004_*` (1 fail) | FIXED |
+| F-008 | Medium | high | data-integrity | `ledger.py:280-285` floor | `test_f008_*` (2 fail) | FIXED |
+| F-010 | Medium | medium | idempotency | `clob.py:155` no `client_order_id` | repro + fix | FIXED |
+| F-011 | Medium | low | time | `ws_feed.py:206` wall clock | repro + fix | FIXED |
+| F-012 | Low | high | test-gap | `ws_feed.py:77` unknown-side fix | test added | FIXED |
 
 ---
 

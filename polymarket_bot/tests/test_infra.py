@@ -277,3 +277,52 @@ def test_round_to_tick_still_snaps_normally():
     assert round_to_tick(0.4567, 0.01) == pytest.approx(0.46)
     assert round_to_tick(0.4567, 0.001) == pytest.approx(0.457)
     assert round_to_tick(0.5, 0.0) == 0.5          # unknown tick: pass through
+
+
+# --- F-012: malformed WS side must never touch a book (fix had no test) ---
+
+def test_price_change_with_unknown_side_is_ignored():
+    store = BookStore()
+    store.handle({"event_type": "book", "asset_id": "tok",
+                  "bids": [{"price": "0.44", "size": "100"}],
+                  "asks": [{"price": "0.46", "size": "80"}]})
+    before = store.top("tok")
+    for side in (None, "", "buy_side", "SELLL", 7):
+        store.handle({"event_type": "price_change", "asset_id": "tok",
+                      "changes": [{"price": "0.50", "size": "999", "side": side}]})
+    after = store.top("tok")
+    assert (after.bid, after.ask) == (before.bid, before.ask)
+    assert after.ask_size == before.ask_size      # `else asks` would have grown
+
+
+def test_book_rejects_untradable_and_non_finite_levels():
+    store = BookStore()
+    store.handle({"event_type": "book", "asset_id": "t3",
+                  "bids": [{"price": "0.0", "size": "10"},      # untradable
+                           {"price": "1.0", "size": "10"},      # untradable
+                           {"price": "0.44", "size": "100"}],
+                  "asks": [{"price": "0.46", "size": "80"}]})
+    top = store.top("t3")
+    assert top.bid == pytest.approx(0.44)
+    assert set(store._bids["t3"]) == {0.44}
+
+
+# --- F-011: staleness is an elapsed-time question, not a wall-clock one ---
+
+def test_staleness_uses_a_monotonic_clock(monkeypatch):
+    """A backwards NTP step must not be able to mask an outage."""
+    from polymarket_bot import ws_feed as wf
+
+    feed = wf.WSFeed("ws://x", staleness_kill_sec=10.0)
+    fake = {"mono": 1000.0}
+    monkeypatch.setattr(wf.time, "monotonic", lambda: fake["mono"])
+    feed._last_msg_ts = wf.time.monotonic()
+    assert feed.healthy
+
+    fake["mono"] += 11.0                     # 11s of real elapsed time
+    assert not feed.healthy                  # outage seen regardless of wall clock
+
+    gaps: list[float] = []
+    feed._on_disconnect = gaps.append
+    feed._check_outage()
+    assert gaps and gaps[0] >= 10.0
