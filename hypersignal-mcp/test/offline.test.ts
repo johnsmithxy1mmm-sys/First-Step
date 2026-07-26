@@ -714,6 +714,49 @@ test("self-serve free key: one active key per fingerprint, re-issue is not a quo
   assert.equal(getKey(db, "hash2")?.disabled, 0, "another requester must not revoke this one");
 });
 
+test("track record excludes late-scored signals and classifies legacy rows", async () => {
+  const { SignalStore } = await import("../src/store/signalStore.js");
+  const DAY = 86_400_000;
+  const t0 = 1_780_272_000_000;
+
+  // A row scored on time and a row scored 30 days late, both written under the
+  // old schema. Lateness is recoverable from scored_at, so the migration can
+  // classify history precisely instead of discarding it.
+  const db = new BetterSqlite3(":memory:");
+  db.exec(`CREATE TABLE signals (
+    id TEXT PRIMARY KEY, type TEXT NOT NULL, coin TEXT NOT NULL, direction TEXT NOT NULL,
+    ref_px REAL NOT NULL, ts INTEGER NOT NULL, horizon_minutes INTEGER NOT NULL, signature TEXT,
+    scored_at INTEGER, scored_px REAL, forward_return REAL);`);
+  const ins = db.prepare(
+    `INSERT INTO signals (id,type,coin,direction,ref_px,ts,horizon_minutes,signature,scored_at,scored_px,forward_return)
+     VALUES (?,?,?,?,?,?,?,NULL,?,?,?)`,
+  );
+  ins.run("ontime", "whale_net_flip", "BTC", "long", 100_000, t0, 1440, t0 + DAY + 30_000, 102_000, 0.02);
+  ins.run("late", "whale_net_flip", "BTC", "long", 100_000, t0, 1440, t0 + 30 * DAY, 160_000, 0.6);
+
+  const store = new SignalStore(db);
+  const rec = store.trackRecord()[0];
+
+  // The +60% thirty-day drift must not be published as a 24h forward return.
+  assert.equal(rec.scored, 1);
+  assert.equal(rec.avgReturnPct, 2);
+  assert.equal(rec.excludedStale, 1);
+  assert.equal(rec.total, 2);
+  // History is preserved on disk, only demoted in the statistics.
+  assert.equal((db.prepare(`SELECT COUNT(*) c FROM signals`).get() as { c: number }).c, 2);
+
+  // markStale closes a row out without letting it into the numbers.
+  const id = store.record({
+    type: "price_move", coin: "ETH", direction: "long", refPx: 1000, horizonMinutes: 60, ts: t0,
+  });
+  store.markStale(id, t0 + 10 * DAY);
+  const eth = store.trackRecord().find((r) => r.type === "price_move");
+  assert.equal(eth?.scored, 0);
+  assert.equal(eth?.excludedStale, 1);
+  // ...and it is no longer retried forever.
+  assert.equal(store.dueForScoring(t0 + 20 * DAY).some((s) => s.id === id), false);
+});
+
 test("score store dedupes one observation per address per day", () => {
   const db = new BetterSqlite3(":memory:");
   const store = new ScoreStore(db);
