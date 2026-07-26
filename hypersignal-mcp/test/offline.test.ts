@@ -192,6 +192,47 @@ test("planMirror scales exposure to equity and preserves direction", () => {
   assert.ok(eth && !eth.isBuy); // short preserved
 });
 
+test("planMirror emits deltas so repeating a copy does not compound exposure", () => {
+  const target = [{ coin: "BTC", szi: 10, markPx: 100_000 }];
+  const desired = 0.1; // $10k mirroring a $1M whale at scale 1
+
+  // From flat: open the full mirror.
+  const first = planMirror(target, 10_000, 1_000_000, 1, []);
+  assert.equal(first.length, 1);
+  assert.equal(round(first[0].size, 8), desired);
+  assert.equal(first[0].isBuy, true);
+  assert.equal(first[0].reduceOnly, false);
+
+  // Already in sync: a repeat call must emit NOTHING. Before the fix this
+  // returned the full mirror again and doubled the position.
+  const held = [{ coin: "BTC", szi: desired, markPx: 100_000 }];
+  assert.deepEqual(planMirror(target, 10_000, 1_000_000, 1, held), []);
+
+  // Partially filled: trade only the remainder.
+  const partial = planMirror(target, 10_000, 1_000_000, 1, [{ coin: "BTC", szi: 0.04, markPx: 100_000 }]);
+  assert.equal(round(partial[0].size, 8), round(desired - 0.04, 8));
+  assert.equal(partial[0].isBuy, true);
+
+  // Overweight: shrink, and mark reduceOnly so it can never grow the position.
+  const over = planMirror(target, 10_000, 1_000_000, 1, [{ coin: "BTC", szi: 0.3, markPx: 100_000 }]);
+  assert.equal(over[0].isBuy, false);
+  assert.equal(round(over[0].size, 8), 0.2);
+  assert.equal(over[0].reduceOnly, true);
+
+  // Target exited: unwind our leg instead of stranding it.
+  const exited = planMirror([], 10_000, 1_000_000, 1, held);
+  assert.equal(exited.length, 1);
+  assert.equal(exited[0].isBuy, false);
+  assert.equal(round(exited[0].size, 8), desired);
+  assert.equal(exited[0].reduceOnly, true);
+
+  // Flip long -> short must NOT be reduceOnly, or the exchange rejects it.
+  const flip = planMirror([{ coin: "BTC", szi: -10, markPx: 100_000 }], 10_000, 1_000_000, 1, held);
+  assert.equal(flip[0].isBuy, false);
+  assert.equal(round(flip[0].size, 8), 0.2); // 0.1 long -> 0.1 short
+  assert.equal(flip[0].reduceOnly, false);
+});
+
 test("evaluateAlert funding_apr fires on rising edge only, with carry direction", () => {
   const base: AlertRecord = {
     id: "a", subject: "s", type: "funding_apr", params: { coin: "BTC", aprThreshold: 0.5 },
