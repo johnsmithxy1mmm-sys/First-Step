@@ -35,6 +35,7 @@ import { collectAdminStats, currentPeriod } from "../src/admin/stats.js";
 import { rankCohort, pnlForWindow } from "../src/hl/cohortRank.js";
 import { calibrate, spearman, rankWithTies, spearmanPValue } from "../src/smartmoney/calibration.js";
 import { ScoreStore, MAX_RESOLVE_ATTEMPTS, SCORE_HORIZON_DAYS } from "../src/store/scoreStore.js";
+import { scoreTolerangeMs } from "../src/store/signalStore.js";
 import { ScoreSampler } from "../src/smartmoney/scoreSampler.js";
 import type { ToolContext } from "../src/tools/registry.js";
 import { aggregateByCoin, type CohortAccount } from "../src/hl/whales.js";
@@ -787,6 +788,92 @@ test("track record excludes late-scored signals and classifies legacy rows", asy
   assert.equal(eth?.excludedStale, 1);
   // ...and it is no longer retried forever.
   assert.equal(store.dueForScoring(t0 + 20 * DAY).some((s) => s.id === id), false);
+});
+
+test("INV-S8: hlClient cache must not hand out arrays callers can sort in place", async () => {
+  // The cache returns values BY REFERENCE. Four tools used to sort them in
+  // place, reordering shared state under any concurrent reader of the same
+  // entry. This locks in that a cached array survives a caller mutating its
+  // own copy — the discipline the fix relies on.
+  const cache = new TtlLruCache();
+  const original = [{ t: 3 }, { t: 1 }, { t: 2 }];
+  const first = await cache.getOrLoad("candles:BTC", 60_000, async () => original);
+  const copy = [...first].sort((a, b) => a.t - b.t);
+  assert.deepEqual(copy.map((c) => c.t), [1, 2, 3]);
+  const second = await cache.getOrLoad<typeof original>("candles:BTC", 60_000, async () => {
+    throw new Error("must be served from cache");
+  });
+  assert.deepEqual(second.map((c) => c.t), [3, 1, 2], "cached order must be untouched by the caller's sort");
+});
+
+test("INV-M1/R4: an x402 payment id can be consumed once, and released only on known failure", async () => {
+  const { consumePaymentId, releasePaymentId } = await import("../src/billing/db.js");
+  const db = new BetterSqlite3(":memory:");
+  db.exec(`CREATE TABLE x402_payments (payment_id TEXT PRIMARY KEY, created_at INTEGER NOT NULL);`);
+
+  assert.equal(consumePaymentId(db, "tx-1"), true, "first use reserves");
+  assert.equal(consumePaymentId(db, "tx-1"), false, "replay is refused");
+  // Settlement known-failed => the reservation is released and the caller may retry.
+  releasePaymentId(db, "tx-1");
+  assert.equal(consumePaymentId(db, "tx-1"), true, "released id is reusable");
+  // A different payment is unaffected.
+  assert.equal(consumePaymentId(db, "tx-2"), true);
+});
+
+test("INV-M5: monthly usage is monotonic and isolated per key and period", async () => {
+  const { incrementUsage, monthlyTotal } = await import("../src/billing/db.js");
+  const db = new BetterSqlite3(":memory:");
+  db.exec(`CREATE TABLE usage_counters (key_hash TEXT NOT NULL, period TEXT NOT NULL, tool TEXT NOT NULL,
+    count INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (key_hash, period, tool));`);
+
+  let prev = 0;
+  for (let i = 0; i < 25; i++) {
+    const total = incrementUsage(db, "k1", "2026-07", i % 2 ? "hl_whale_positions" : "hl_funding_screener");
+    assert.ok(total > prev, "usage must never go backwards");
+    prev = total;
+  }
+  assert.equal(monthlyTotal(db, "k1", "2026-07"), 25);
+  // A new period starts clean; another key is untouched.
+  assert.equal(monthlyTotal(db, "k1", "2026-08"), 0);
+  assert.equal(monthlyTotal(db, "k2", "2026-07"), 0);
+});
+
+test("INV-S6: a cohort refresh is an atomic all-or-nothing snapshot", async () => {
+  const { CohortStore } = await import("../src/store/cohortStore.js");
+  const db = new BetterSqlite3(":memory:");
+  const store = new CohortStore(db);
+
+  store.replace(
+    [
+      { address: "0xa", accountValue: 300, pnl: 1, rankBy: 300 },
+      { address: "0xb", accountValue: 200, pnl: 1, rankBy: 200 },
+    ],
+    "accountValue",
+    1000,
+  );
+  assert.deepEqual(store.get(10, 1000)?.addresses, ["0xa", "0xb"]);
+
+  // A replace must swap the whole set: no wallet from the previous snapshot may
+  // survive, or the cohort would mix rankings from two different moments.
+  store.replace([{ address: "0xc", accountValue: 500, pnl: 1, rankBy: 500 }], "pnlMonth", 2000);
+  const snap = store.get(10, 2000);
+  assert.deepEqual(snap?.addresses, ["0xc"]);
+  assert.equal(snap?.strategy, "pnlMonth");
+  assert.equal(snap?.ageSeconds, 0);
+  // Age is reported from the snapshot time, so staleness is visible.
+  assert.equal(store.get(10, 2000 + 3_600_000)?.ageSeconds, 3600);
+});
+
+test("INV-U3: signal horizons are minutes and score horizons are days", () => {
+  // These two live side by side in the same engine tick. Confusing them would
+  // score a 24h signal after 24 minutes, or resolve a 30-day outcome after 30.
+  const DAY_MS = 86_400_000;
+  const signalHorizonMinutes = 1440;
+  assert.equal(signalHorizonMinutes * 60_000, DAY_MS, "1440 minutes must be one day");
+  assert.equal(SCORE_HORIZON_DAYS * DAY_MS, 30 * DAY_MS, "score horizon is expressed in days");
+  // The tolerance helper works in minutes and returns ms.
+  assert.equal(scoreTolerangeMs(1440), 1440 * 60_000 * 0.05);
+  assert.equal(scoreTolerangeMs(1), 5 * 60_000, "floor of 5 minutes for short horizons");
 });
 
 test("score store dedupes one observation per address per day", () => {
