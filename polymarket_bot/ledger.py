@@ -123,7 +123,16 @@ CREATE TABLE IF NOT EXISTS shadow_quotes (
     -- irrelevant. Constant gap + moving tape = we track the book at a fixed
     -- distance, and that distance is what keeps us unfilled.
     tape_range_yes REAL DEFAULT 0.0,
-    tape_range_no REAL DEFAULT 0.0
+    tape_range_no REAL DEFAULT 0.0,
+    -- The REWARDS side. With no fills, spread and rebate are exactly zero and the
+    -- liquidity-rewards score is the entire return, yet nothing recorded it: the
+    -- scoring functions were consulted only when ranking markets. reward_frac is
+    -- ((v - s) / v)^2 for our distance from the midpoint -- quadratic, so a quote
+    -- widened toward the band edge earns ~1% of the same size at the touch, and 0
+    -- outside the band. rested_sec x reward_frac is the accrual, since the pool is
+    -- shared by time-sampled score.
+    reward_frac REAL DEFAULT 0.0,
+    rested_sec REAL DEFAULT 0.0
 );
 CREATE INDEX IF NOT EXISTS idx_shadow_mode ON shadow_quotes(mode, market_id);
 -- Opportunity ledger: every DETECTED window (arb/chain/resolution), whether or
@@ -199,7 +208,8 @@ class Ledger:
         shadow = {r["name"]
                   for r in self._conn.execute("PRAGMA table_info(shadow_quotes)")}
         if shadow:                      # table exists from an earlier version
-            for col in ("tape_range_yes", "tape_range_no"):
+            for col in ("tape_range_yes", "tape_range_no",
+                        "reward_frac", "rested_sec"):
                 if col not in shadow:
                     self._conn.execute(
                         f"ALTER TABLE shadow_quotes ADD COLUMN {col} REAL DEFAULT 0.0")
@@ -609,15 +619,18 @@ class Ledger:
                             yes_bid: float, no_bid: float, min_gap_yes: float,
                             min_gap_no: float, looks: int, size: float,
                             tape_range_yes: float = 0.0,
-                            tape_range_no: float = 0.0) -> None:
+                            tape_range_no: float = 0.0,
+                            reward_frac: float = 0.0,
+                            rested_sec: float = 0.0) -> None:
         """How close the tape came to a quote over its life (one row per quote)."""
         self._execute(
             "INSERT INTO shadow_quotes (ts, mode, market_id, question, yes_bid, "
             "no_bid, min_gap_yes, min_gap_no, looks, size, tape_range_yes, "
-            "tape_range_no) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            "tape_range_no, reward_frac, rested_sec) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (_now(), mode, market_id, question[:200], yes_bid, no_bid,
              min_gap_yes, min_gap_no, int(looks), size,
-             tape_range_yes, tape_range_no))
+             tape_range_yes, tape_range_no, reward_frac, rested_sec))
 
     def shadow_quote_summary(self, mode: str, limit: int = 5000) -> list[dict]:
         """Per-market near-miss summary, closest first.
@@ -633,7 +646,10 @@ class Ledger:
             "SELECT market_id, question, COUNT(*) AS quotes, SUM(looks) AS looks, "
             "MIN(MIN(min_gap_yes, min_gap_no)) AS closest, "
             "AVG(MIN(min_gap_yes, min_gap_no)) AS avg_gap, "
-            "MAX(MAX(tape_range_yes, tape_range_no)) AS tape_range "
+            "MAX(MAX(tape_range_yes, tape_range_no)) AS tape_range, "
+            "AVG(reward_frac) AS reward_frac, "
+            "SUM(rested_sec) AS rested_sec, "
+            "SUM(rested_sec * reward_frac) AS score_seconds "
             "FROM (SELECT * FROM shadow_quotes WHERE mode = ? "
             "      ORDER BY id DESC LIMIT ?) GROUP BY market_id "
             "ORDER BY closest", (mode, limit))

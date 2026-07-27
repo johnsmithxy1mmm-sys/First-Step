@@ -37,6 +37,7 @@ Sorted by (probability in prod) × (irreversibility).
 | F-027 | High | high | attribution / capital | `realized_pnl_by_strategy` took the LAST row's label, so a fade loss was booked against idle longshot -- and it feeds the Sharpe allocator | `test_measurement.py` | FIXED |
 | SEAM | — | high | test-architecture | three escapes were seam defects, not wrong rules: unit tests, mutation and coverage are all structurally blind to them | `test_seams.py` (19) | ADDED |
 | F-028 | Medium | high | measurement validity | the shadow gap is constant by construction when the book's shape is stable, so it could not distinguish a dead market from one we track | `test_measurement.py` | FIXED |
+| F-029 | High | high | measurement / economics | with zero fills the rewards score is the MM's entire return, and no quote ever recorded what it earned; the score is quadratic, so widening silently zeroes it | `test_measurement.py` | FIXED |
 
 ---
 
@@ -715,3 +716,69 @@ The general lesson, recorded because it will recur: **an instrument's first real
 output must be read as evidence about the instrument, not only about the system.**
 Both F-026 and F-028 were found this way — by taking the bot's own output
 seriously enough to ask whether the number could mean what the label claimed.
+
+## F-029 — The market maker's only income in a no-flow market was never recorded
+
+```
+Severity: High | Confidence: high | Class: measurement / economics
+Found by: following F-028's own conclusion one step further
+Location: polymarket_bot/marketmaker.py `_record_shadow`, ledger `shadow_quotes`
+```
+F-028 established that three of four quoted markets have **no flow**. The natural
+next sentence — written in the previous session's reply — was that quoting them
+"burns the exposure limit". **That was wrong, and worth correcting in writing:** a
+resting bid holds no inventory, `total_exposure` sums `open_positions`, and an
+unfilled order is not a position. It ties up collateral, not risk.
+
+Following the correction to its end exposes the real gap. MM income is three
+streams: spread capture, maker rebate, liquidity rewards. The first two require
+fills. With no fills they are **exactly zero**, so in those markets the rewards
+score is the *entire* return — and nothing in the bot recorded it. `rewards.py`
+implements the published scoring faithfully, and `reward_share` was called in
+exactly one place: `scorer.py`, when RANKING which markets to quote. No record was
+ever kept of what a quote that actually rested went on to earn.
+
+Why this is more than a missing statistic: the score is **quadratic** in the
+distance from the midpoint.
+
+```
+s = 0.10v -> 81% of max      s = 0.50v -> 25%
+s = 0.25v -> 56%             s = 0.90v ->  1%      s >= v -> 0
+```
+
+The MM widens its half-spread for adverse selection (markout feedback, the
+toxicity model, realized vol). Every widening moves the quote outward along that
+curve. A quote pushed to 90% of the band earns one percent of what the same size
+earns at the touch, and one tick further earns nothing at all — while a report
+that counts only fills says "3 markets quoted" in every one of those cases. The
+strategy could be silently earning nothing, and the operator's evidence would look
+identical to it earning well.
+
+Each retired quote now records `reward_frac` (the score fraction its distance
+achieves) and `rested_sec`, so the report shows what was earned, not only what was
+missed, and calls out the one combination that IS waste:
+
+| flow | reward score | verdict |
+|---|---|---|
+| crossed us | — | crossed us — check fills |
+| none | >= 5% | no flow — rewards only |
+| none | < 5% | **no flow, unpaid** |
+| near | — | near miss — tighten? |
+
+"no flow — rewards only" is not a problem: zero fills means zero adverse selection
+and zero inventory risk, with the pool still accruing. "no flow, unpaid" is the
+one that deserves an action.
+
+Two columns added via `ALTER TABLE`, so an existing paper ledger keeps its rows.
+
+## A pattern worth naming
+
+F-026, F-028 and F-029 were each found by reading the bot's own output and asking
+whether the number could mean what its label claimed — not by a test, and not by
+reading code. F-029 in particular came from noticing that a sentence *this project
+had just written about its own results* was false.
+
+The suite is now good at "does the code do what it says". It has caught nothing in
+the class "does what it says actually mean anything". That second question seems to
+need a person reading a report, and the discipline that appears to work is to treat
+every new instrument's first real output as evidence about the instrument.

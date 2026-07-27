@@ -119,6 +119,10 @@ MUTANTS: list[tuple[str, str, str, str]] = [
     # Dropping the guard is what restores last-row-wins.
     ("ledger.py", 'if not slot["strategy"]:', 'if True:',
      "PnL attributed to whoever SOLD (a fade loss booked against longshot)"),
+    ("marketmaker.py",
+     "        frac = score_fraction(half, quote.market.rewards_max_spread)",
+     "        frac = 0.0",
+     "reward accrual unrecorded (a no-flow market's ONLY income is invisible)"),
     ("marketmaker.py", 'quote.observe_ask("yes", yes_top.ask)', "pass",
      "tape range unrecorded (a dead market reads like a too-wide spread)"),
     ("marketmaker.py", "self._paper_fills(ws_only=True)", "pass",

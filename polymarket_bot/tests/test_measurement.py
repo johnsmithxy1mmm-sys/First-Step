@@ -487,3 +487,57 @@ def test_the_shadow_table_migrates_without_losing_old_rows(cfg, tmp_path):
         assert len(fresh.shadow_quote_summary("paper")) == 2
     finally:
         fresh.close()
+
+
+# --- B1c: with no fills, the reward score IS the income ---
+
+def test_a_resting_quote_records_what_it_earned_not_only_what_it_missed(cfg, ledger):
+    """MM income is spread + rebate + rewards. With zero fills the first two are
+    exactly zero, so the reward score is the entire return — and nothing recorded
+    it: `reward_share` was consulted only when RANKING markets, never for a quote
+    that actually rested.
+    """
+    m = mm_market()
+    yes_tok, no_tok = m.clob_token_ids[0], m.clob_token_ids[1]
+    tops = {yes_tok: top(bid=0.43, ask=0.47), no_tok: top(bid=0.53, ask=0.57)}
+    with mock.patch("polymarket_bot.marketmaker.alert"):
+        mm = make_mm(cfg, ledger, mode="paper", tops=tops)
+        assert mm.cycle([m])
+        mm._paper_fills()
+        mm._cancel_market(m.id)
+    row = ledger.shadow_quote_summary("paper")[0]
+    assert row["reward_frac"] > 0.0, (
+        "a quote inside the rewards band recorded no earnings: on a no-flow "
+        "market the report shows zero income where the truth is the pool share")
+    assert row["rested_sec"] >= 0.0
+    assert row["score_seconds"] == pytest.approx(
+        row["reward_frac"] * row["rested_sec"], rel=1e-6)
+
+
+def test_a_quote_outside_the_band_is_recorded_as_earning_nothing(cfg, ledger):
+    """The quadratic is the point: the band edge is worth ~1%, outside it 0.
+
+    Adverse-selection widening (toxicity, markout feedback, vol) pushes the quote
+    outward. A report that counts only fills shows "3 markets quoted" either way.
+    """
+    from polymarket_bot.rewards import score_fraction
+    v = 0.03
+    assert score_fraction(0.0, v) == pytest.approx(1.0)
+    assert score_fraction(0.9 * v, v) == pytest.approx(0.01, abs=1e-9)
+    assert score_fraction(v, v) == 0.0
+    assert score_fraction(2 * v, v) == 0.0
+
+
+def test_the_verdict_separates_unpaid_idleness_from_paid_idleness(cfg):
+    """A resting quote holds no inventory, so 'no flow' is not by itself waste.
+
+    It is waste only when the quote also scores nothing. Those are different
+    verdicts because they call for different actions — leave it, versus stop
+    quoting that market or move the quote back inside the band.
+    """
+    from polymarket_bot.analytics import _shadow_verdict
+    paid = _shadow_verdict(closest=0.006, tape_range=0.0, reward_frac=0.8)
+    unpaid = _shadow_verdict(closest=0.006, tape_range=0.0, reward_frac=0.0)
+    assert "rewards only" in paid
+    assert "unpaid" in unpaid
+    assert paid != unpaid

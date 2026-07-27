@@ -43,6 +43,7 @@ from .microstructure import RealizedVol, fill_probability
 from .models import Market, simple_estimate
 from .monitor import alert
 from .portfolio import classify_category
+from .rewards import score_fraction
 from .scorer import MarketScorer
 from .ws_feed import TopOfBook
 
@@ -338,14 +339,27 @@ class MarketMaker:
         self._record_shadow(quote)
 
     def _record_shadow(self, quote: Quote | None) -> None:
-        """How close the tape came to this quote over its whole life.
+        """What this quote earned and how close the tape came, over its whole life.
 
         One row per retired quote (not per tick), so the volume stays bounded
         while still answering the question a zero-fill run cannot otherwise
         answer: is the spread the binding constraint, or is there simply no flow?
+
+        Also records the REWARDS side, which is the part a zero-fill market makes
+        decisive. MM income is spread + rebate + rewards; with no fills the first
+        two are exactly zero, so the liquidity-rewards score is the entire return
+        — and `reward_share` was only ever consulted when RANKING markets, never
+        recorded for a quote that actually rested. The score is quadratic in the
+        distance from the midpoint (rewards.py), so a quote pushed out toward the
+        band edge by the toxicity/markout widening earns ~1% of what the same size
+        earns at the touch, and nothing at all outside the band. That drift is
+        invisible in a report that only counts fills.
         """
         if quote is None or quote.looks <= 0:
             return
+        half = max(0.0, quote.fair - quote.yes_bid)
+        frac = score_fraction(half, quote.market.rewards_max_spread)
+        rested = max(0.0, time.time() - quote.ts) if quote.ts > 0 else 0.0
         try:
             self._ledger.record_shadow_quote(
                 mode=self._mode, market_id=quote.market.id,
@@ -354,7 +368,8 @@ class MarketMaker:
                 min_gap_yes=quote.min_gap_yes, min_gap_no=quote.min_gap_no,
                 tape_range_yes=quote.tape_range("yes"),
                 tape_range_no=quote.tape_range("no"),
-                looks=quote.looks, size=quote.size)
+                looks=quote.looks, size=quote.size,
+                reward_frac=frac, rested_sec=rested)
         except Exception:            # analytics must never break quoting
             log.debug("mm: shadow quote record failed", exc_info=True)
 

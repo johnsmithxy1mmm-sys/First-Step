@@ -48,16 +48,28 @@ def compute_report(ledger: Ledger, mode: str, fade_prior: float = 0.35) -> dict:
     }
 
 
-def _shadow_verdict(closest: float, tape_range: float, tick: float = 0.001) -> str:
-    """What the pair (closest gap, tape range) actually licenses us to conclude.
+def _hms(seconds: float) -> str:
+    if seconds <= 0:
+        return "-"
+    if seconds < 3600:
+        return f"{seconds / 60:.0f}m"
+    return f"{seconds / 3600:.1f}h"
 
-    Deliberately conservative: the point of this column is to stop "0 fills" being
-    read as "our spread is too wide" when the honest reading is "nothing traded".
+
+def _shadow_verdict(closest: float, tape_range: float, tick: float = 0.001,
+                    reward_frac: float = 0.0) -> str:
+    """What (closest gap, tape range, reward score) together license us to say.
+
+    Deliberately conservative: this column exists to stop "0 fills" being read as
+    "our spread is too wide" when the honest reading is "nothing traded" — and to
+    stop "nothing traded" being read as "wasted", since a resting quote holds no
+    inventory and still earns the rewards pool. The one combination that IS waste
+    is no flow AND no reward score, and it is named separately.
     """
     if closest <= 0:
         return "crossed us"
     if tape_range < tick:
-        return "no flow"
+        return "no flow — rewards only" if reward_frac >= 0.05 else "no flow, unpaid"
     if closest <= 2 * tick:
         return "near miss — tighten?"
     return "moves, stays away"
@@ -144,22 +156,31 @@ def print_report(report: dict) -> None:
         # Numbers must never be squeezed out by a long question: the market
         # text is the one thing that can safely be shortened.
         t.add_column("Market", justify="left", overflow="ellipsis")
-        for col in ("Quotes", "Looks", "Closest", "Avg gap", "Tape moved"):
+        for col in ("Quotes", "Closest", "Tape moved", "Reward score", "Rested"):
             t.add_column(col, justify="right")
         t.add_column("Verdict", justify="left", no_wrap=True)
         for s in shadows[:15]:
             closest = s["closest"] if s["closest"] is not None else 0.0
             moved = s.get("tape_range") or 0.0
+            frac = s.get("reward_frac") or 0.0
+            rested = s.get("rested_sec") or 0.0
             t.add_row((s["question"] or s["market_id"])[:32], str(s["quotes"]),
-                      str(s["looks"] or 0), f"{closest:+.4f}",
-                      f"{(s['avg_gap'] or 0.0):+.4f}", f"{moved:.4f}",
-                      _shadow_verdict(closest, moved))
+                      f"{closest:+.4f}", f"{moved:.4f}", f"{frac:.0%}",
+                      _hms(rested), _shadow_verdict(closest, moved, reward_frac=frac))
         c.print(t)
-        c.print("[dim]Our bid tracks the microprice, so it MOVES WITH the book and "
-                "the gap alone cannot be read: a constant gap looks the same for a "
-                "dead market and for one we follow at a fixed distance. 'Tape "
-                "moved' is the range the ask itself covered while we were quoting, "
-                "and it separates the two. closest <= 0 = the tape crossed us.[/dim]")
+        c.print("[dim]Our bid tracks the microprice, so the gap alone cannot be "
+                "read: a constant gap looks the same for a dead market and for one "
+                "we follow at a fixed distance. 'Tape moved' separates them. "
+                "'Reward score' is ((v-s)/v)^2 for our distance from the midpoint "
+                "and it is QUADRATIC — at 90% of the band it is 1%. With no fills, "
+                "spread and rebate are zero, so that percentage IS the income.[/dim]")
+        dead_and_unpaid = [s for s in shadows
+                           if (s.get("reward_frac") or 0.0) < 0.05
+                           and (s.get("rested_sec") or 0.0) > 0]
+        if dead_and_unpaid:
+            c.print(f"[yellow]  {len(dead_and_unpaid)} market(s) quoted at under 5% "
+                    "of the reward score AND took no fills — that capital is "
+                    "committed for effectively nothing[/yellow]")
 
     markouts = report["markouts"]
     if markouts:
