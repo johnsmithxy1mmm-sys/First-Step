@@ -35,6 +35,7 @@ Sorted by (probability in prod) × (irreversibility).
 | F-025 | Medium | high | observability | the report showed `avg edge 1.00` and could not distinguish 'no mispricing' from 'the estimator echoes the market' | `test_measurement.py` | FIXED |
 | F-026 | Medium | high | logic / money | the early take ignored the entry, so it closed legacy legs at a loss; entry and take thresholds were the same number | `test_fade_shape.py` | FIXED |
 | F-027 | High | high | attribution / capital | `realized_pnl_by_strategy` took the LAST row's label, so a fade loss was booked against idle longshot -- and it feeds the Sharpe allocator | `test_measurement.py` | FIXED |
+| SEAM | — | high | test-architecture | three escapes were seam defects, not wrong rules: unit tests, mutation and coverage are all structurally blind to them | `test_seams.py` (19) | ADDED |
 
 ---
 
@@ -449,7 +450,7 @@ the honest move is to let the first resolutions set it.
 
 ## Mutation coverage
 
-27 targeted mutants, all killed. Ten are new, covering the shape gate, the payoff
+29 targeted mutants, all killed. Ten are new, covering the shape gate, the payoff
 ratio arithmetic, the IRR floor, both exit rules, the exit direction guard, the MM
 reserve on both sides, tick-resolution fills and the REST-fallback ban.
 
@@ -593,3 +594,70 @@ FADE: 14 candidates -> 0 passed
 8 of 14 refused by F-021 and F-022. The fade is effectively dormant on the current
 board. That is the intended consequence, not a regression: the funnel yielding 0
 is information.
+
+
+---
+
+# Why three defects escaped a green suite — and the layer added because of them
+
+F-020, F-026 and F-027 were all found by a live paper run. At the moment each one
+shipped, the suite was green: 500+ tests, every targeted mutant killed, ~74% branch
+coverage, lint clean. That is a statement about the suite, not about luck.
+
+**None of the three was a wrong rule.** Each was a wrong *joint*:
+
+* **F-020** — a rule against its reachable RANGE. `mark / 0.976 >= 7.0` is correct
+  arithmetic over an unreachable domain; prices stop at 1.0, so the exit returned
+  None for the entire life of every position.
+* **F-026** — an old book against a new gate. The take was written for positions
+  the entry gate admits, then met twenty legs the gate would refuse, and closed
+  three of them at or below cost.
+* **F-027** — the component that opens against the component that closes. Two
+  ledger aggregations disagreed about who owned a token, and the wrong one fed the
+  capital allocator.
+
+Each existing layer was structurally blind to this class:
+
+* **Unit tests** ask "given these inputs, is the rule right?" — and the inputs are
+  chosen by whoever wrote the rule, so they are the inputs on which it works. No
+  one writing a take rule constructs the book that predates it.
+* **Mutation testing** asks "would the suite notice this code changing?" It cannot
+  ask "is there a scenario nobody wrote a test for?" A missing scenario has no line
+  to mutate. All 29 mutants were killed while all three bugs were live.
+* **Coverage** stayed near 74% throughout. Every line involved was executed. The
+  defects were in which lines ran *together*, and in what state.
+
+Worth recording plainly: F-027 was the *same* bug as one already fixed and tested
+one commit earlier. `open_positions` had been made first-row-wins with a test named
+`test_a_later_sell_cannot_relabel_the_leg`; the identical hazard in the sibling
+aggregation `realized_pnl_by_strategy` was simply not looked at. An example-based
+test fixes one call site. Only an invariant over all aggregations fixes the class.
+
+## The seam layer
+
+`polymarket_bot/tests/test_seams.py` — four invariants, written over generated
+ranges and whole lifecycles rather than as examples, so they survive a retune:
+
+1. **A take never realizes a loss; a stop never fires in profit.** Over an
+   entry x mark grid that deliberately includes entries the gate refuses.
+2. **Every rule must be satisfiable inside its domain.** For every position there
+   must EXIST a price in (0,1) at which it exits. The generic form of F-020.
+3. **Ownership is a property of the opening trade, in every aggregation.**
+   Parametrised over every strategy name.
+4. **No money path may inherit its identity from a default.** `record_trade` now
+   *requires* `strategy`, and an AST scan asserts every production entry/exit call
+   site states it explicitly, with zero exemptions.
+
+Every one was verified to FAIL against the reverted code. Diagnostics were written
+to name the defect rather than the assertion — reverting F-020 produces:
+
+```
+a fade position bought at 0.976 cannot be exited at ANY price in (0,1)
+  — its only exit is resolution, at full notional
+```
+
+## What this does not fix
+
+The seam layer reasons about joints *inside the process*. The largest untested
+joint in the system is still the one between the bot and the exchange, and it
+cannot be closed from a machine that has never placed an order.

@@ -14,10 +14,11 @@ def make_estimate(p_mkt=0.01, p_est=0.03, signals=None, **overrides):
     return combine(c, sigs, 1e-9)
 
 
-def buy(ledger, est, usd, mode="dry-run", category="nature"):
+def buy(ledger, est, usd, mode="dry-run", category="nature", strategy="longshot"):
     size = usd / est.p_mkt
     ledger.record_trade(mode=mode, estimate=est, category=category, side="BUY",
-                        price=est.p_mkt, size=size, order_id=None, status="sim-filled")
+                        price=est.p_mkt, size=size, order_id=None,
+                        status="sim-filled", strategy=strategy)
     return size
 
 
@@ -36,7 +37,8 @@ def test_sell_reduces_position_and_realizes_pnl(ledger):
     est = make_estimate()
     buy(ledger, est, 100.0)  # 10,000 sh at 0.01
     ledger.record_trade(mode="dry-run", estimate=est, category="nature", side="SELL",
-                        price=0.08, size=6000, order_id=None, status="sim-filled")
+                        price=0.08, size=6000, order_id=None, status="sim-filled",
+                        strategy="longshot")
     positions = ledger.open_positions("dry-run")
     assert positions[0].size == pytest.approx(4000)
     # Sold 6000 at 0.08 (entry 0.01): realized (0.08-0.01)*6000 = 420.

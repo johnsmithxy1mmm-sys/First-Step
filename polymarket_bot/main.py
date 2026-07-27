@@ -372,7 +372,7 @@ class Bot:
             plan = self.portfolio.size_trade(est, scale=self._longshot_scale)
             if plan is None:
                 continue
-            result = self.executor.execute(plan)
+            result = self.executor.execute(plan, strategy="longshot")
             if result.status == "filled":
                 entered += 1
                 c = est.candidate

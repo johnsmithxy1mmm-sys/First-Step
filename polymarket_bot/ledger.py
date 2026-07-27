@@ -232,8 +232,15 @@ class Ledger:
     def record_trade(self, *, mode: str, estimate: Estimate, category: str,
                      side: str, price: float, size: float,
                      order_id: str | None, status: str,
-                     strategy: str = "longshot") -> None:
+                     strategy: str) -> None:
         """Append a trade. Rejects rows that cannot describe a real fill.
+
+        `strategy` is REQUIRED. It used to default to "longshot", and that default
+        is what produced F-027: `execute_sell` never passed a label, so every exit
+        wrote a longshot row and a fade book's entire loss was attributed to a
+        strategy that had not traded — which then fed the Sharpe allocator. A money
+        path that forgets to say who it belongs to must not compile-by-default into
+        a plausible lie.
 
         This is a TRUST BOUNDARY, not an internal setter: every number here comes
         from external data (a book price, an exchange fill quantity, a Gamma

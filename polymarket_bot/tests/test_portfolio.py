@@ -20,7 +20,7 @@ def record_buy(ledger, est, category, usd):
     size = usd / est.p_mkt
     ledger.record_trade(mode="dry-run", estimate=est, category=category,
                         side="BUY", price=est.p_mkt, size=size,
-                        order_id=None, status="sim-filled")
+                        order_id=None, status="sim-filled", strategy="longshot")
 
 
 # --- Kelly ---
