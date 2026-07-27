@@ -22,6 +22,8 @@ B3  `size_usd` handed out max_total_exposure_pct first-come-first-served. The
 
 from unittest import mock
 
+import pytest
+
 from polymarket_bot.models import simple_estimate
 from polymarket_bot.portfolio import Portfolio
 
@@ -385,3 +387,103 @@ def test_the_sell_row_itself_carries_the_opening_strategy(cfg, ledger):
     row = ledger._conn.execute(
         "SELECT strategy FROM trades WHERE side='SELL'").fetchone()
     assert row["strategy"] == "fade"
+
+
+# --- B1b: a gap is only readable next to the tape's own movement ---
+
+def _quote_a_market(cfg, ledger, tops, m):
+    with mock.patch("polymarket_bot.marketmaker.alert"):
+        mm = make_mm(cfg, ledger, mode="paper", tops=tops)
+        quotes = mm.cycle([m])
+        assert quotes, "fixture failed to produce a quote"
+        return mm, quotes[0]
+
+
+def test_a_dead_market_is_distinguishable_from_one_we_merely_track(cfg, ledger):
+    """The defect in the instrument itself, caught by reading its own output.
+
+    `yes_bid` comes from the microprice, so our bid moves WITH the book and
+    `ask - our_bid` is constant whenever the book's shape is stable. The first
+    live run showed closest == avg_gap to four decimals on three of four markets,
+    which reads identically for "nothing trades here" and "the book moves and we
+    follow it a fixed distance away" — opposite conclusions. Only the tape's own
+    range separates them.
+    """
+    m = mm_market()
+    yes_tok, no_tok = m.clob_token_ids[0], m.clob_token_ids[1]
+
+    # Market A: the book never moves at all.
+    tops = {yes_tok: top(bid=0.43, ask=0.47), no_tok: top(bid=0.53, ask=0.57)}
+    mm, _ = _quote_a_market(cfg, ledger, tops, m)
+    for _ in range(5):
+        mm._paper_fills()
+    mm._cancel_market(m.id)
+    dead = ledger.shadow_quote_summary("paper")[0]
+    assert dead["tape_range"] == pytest.approx(0.0, abs=1e-9), dead
+
+    # Market B: same closing gap, but the ask travels 3 cents while we quote.
+    ledger._execute("DELETE FROM shadow_quotes")
+    m2 = mm_market(id="mm2", clob_token_ids=["mm2-yes", "mm2-no"])
+    y2, n2 = m2.clob_token_ids[0], m2.clob_token_ids[1]
+    tops2 = {y2: top(bid=0.43, ask=0.47), n2: top(bid=0.53, ask=0.57)}
+    mm2, _ = _quote_a_market(cfg, ledger, tops2, m2)
+    for ask in (0.47, 0.48, 0.50, 0.49, 0.47):
+        tops2[y2] = top(bid=ask - 0.04, ask=ask)
+        mm2._paper_fills()
+    mm2._cancel_market(m2.id)
+    alive = ledger.shadow_quote_summary("paper")[0]
+    assert alive["tape_range"] >= 0.02, alive
+
+    assert dead["tape_range"] < alive["tape_range"], (
+        "a flat book and a 3-cent-range book produced the same measurement — "
+        "the gap column on its own cannot support a widen/tighten decision")
+
+
+def test_the_verdict_never_blames_our_spread_when_nothing_traded(cfg):
+    """The conclusion the column exists to prevent."""
+    from polymarket_bot.analytics import _shadow_verdict
+    assert "no flow" in _shadow_verdict(closest=0.006, tape_range=0.0)
+    assert "no flow" in _shadow_verdict(closest=0.010, tape_range=0.0005)
+    # A moving tape that stays away is a different diagnosis.
+    assert "no flow" not in _shadow_verdict(closest=0.010, tape_range=0.03)
+    # And a genuine near miss is called out as actionable.
+    assert "tighten" in _shadow_verdict(closest=0.001, tape_range=0.03)
+    assert "crossed" in _shadow_verdict(closest=-0.001, tape_range=0.03)
+
+
+def test_the_shadow_table_migrates_without_losing_old_rows(cfg, tmp_path):
+    """An existing DB must gain the columns, not crash or start over.
+
+    The user's paper ledger already has shadow_quotes rows from the previous
+    version; CREATE TABLE IF NOT EXISTS will not add a column to it.
+    """
+    from polymarket_bot.ledger import Ledger
+    path = str(tmp_path / "old.sqlite")
+    old = Ledger(path)
+    old._conn.execute("DROP TABLE shadow_quotes")
+    old._conn.execute(
+        "CREATE TABLE shadow_quotes (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "ts TEXT NOT NULL, mode TEXT NOT NULL, market_id TEXT NOT NULL, "
+        "question TEXT, yes_bid REAL NOT NULL, no_bid REAL NOT NULL, "
+        "min_gap_yes REAL NOT NULL, min_gap_no REAL NOT NULL, "
+        "looks INTEGER NOT NULL, size REAL NOT NULL)")
+    old._conn.execute(
+        "INSERT INTO shadow_quotes (ts, mode, market_id, question, yes_bid, "
+        "no_bid, min_gap_yes, min_gap_no, looks, size) "
+        "VALUES ('t','paper','legacy','Q?',0.44,0.54,0.006,0.011,78,200)")
+    old._conn.commit()
+    old.close()
+
+    fresh = Ledger(path)                      # _migrate runs here
+    try:
+        rows = fresh.shadow_quote_summary("paper")
+        assert len(rows) == 1 and rows[0]["market_id"] == "legacy"
+        assert rows[0]["tape_range"] == pytest.approx(0.0)
+        assert rows[0]["looks"] == 78
+        fresh.record_shadow_quote(
+            mode="paper", market_id="new", question="Q2?", yes_bid=0.4,
+            no_bid=0.5, min_gap_yes=0.01, min_gap_no=0.02, looks=3, size=100.0,
+            tape_range_yes=0.03, tape_range_no=0.0)
+        assert len(fresh.shadow_quote_summary("paper")) == 2
+    finally:
+        fresh.close()

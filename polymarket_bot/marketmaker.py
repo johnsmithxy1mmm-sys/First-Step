@@ -64,6 +64,29 @@ class Quote(BaseModel):
     min_gap_yes: float = 1.0
     min_gap_no: float = 1.0
     looks: int = 0
+    # Range the TAPE itself covered while this quote was live. Without it the gap
+    # above is uninterpretable: `yes_bid` is derived from the microprice, so our
+    # bid MOVES WITH the book and `ask - our_bid` stays constant whenever the
+    # book's shape is stable. A constant gap therefore reads identically for
+    # "nothing trades here" and "the book moves and we track it a fixed distance
+    # away" — and those call for opposite actions. -1 = not yet observed.
+    ask_lo_yes: float = -1.0
+    ask_hi_yes: float = -1.0
+    ask_lo_no: float = -1.0
+    ask_hi_no: float = -1.0
+
+    def observe_ask(self, side: str, ask: float) -> None:
+        lo, hi = f"ask_lo_{side}", f"ask_hi_{side}"
+        if getattr(self, lo) < 0:
+            setattr(self, lo, ask)
+            setattr(self, hi, ask)
+        else:
+            setattr(self, lo, min(getattr(self, lo), ask))
+            setattr(self, hi, max(getattr(self, hi), ask))
+
+    def tape_range(self, side: str) -> float:
+        lo, hi = getattr(self, f"ask_lo_{side}"), getattr(self, f"ask_hi_{side}")
+        return max(0.0, hi - lo) if lo >= 0 else 0.0
 
     @property
     def implied_yes_ask(self) -> float:
@@ -329,6 +352,8 @@ class MarketMaker:
                 question=quote.market.question,
                 yes_bid=quote.yes_bid, no_bid=quote.no_bid,
                 min_gap_yes=quote.min_gap_yes, min_gap_no=quote.min_gap_no,
+                tape_range_yes=quote.tape_range("yes"),
+                tape_range_no=quote.tape_range("no"),
                 looks=quote.looks, size=quote.size)
         except Exception:            # analytics must never break quoting
             log.debug("mm: shadow quote record failed", exc_info=True)
@@ -406,8 +431,10 @@ class MarketMaker:
             quote.looks += 1
             if yes_top is not None and yes_top.ask > 0:
                 quote.min_gap_yes = min(quote.min_gap_yes, yes_top.ask - quote.yes_bid)
+                quote.observe_ask("yes", yes_top.ask)
             if no_top is not None and no_top.ask > 0:
                 quote.min_gap_no = min(quote.min_gap_no, no_top.ask - quote.no_bid)
+                quote.observe_ask("no", no_top.ask)
             if yes_top is not None and 0 < yes_top.ask <= quote.yes_bid:
                 size = (self.fill_model(quote, 0, yes_top)
                         if self.fill_model is not None else quote.size)

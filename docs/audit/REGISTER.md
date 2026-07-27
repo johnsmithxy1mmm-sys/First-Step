@@ -36,6 +36,7 @@ Sorted by (probability in prod) × (irreversibility).
 | F-026 | Medium | high | logic / money | the early take ignored the entry, so it closed legacy legs at a loss; entry and take thresholds were the same number | `test_fade_shape.py` | FIXED |
 | F-027 | High | high | attribution / capital | `realized_pnl_by_strategy` took the LAST row's label, so a fade loss was booked against idle longshot -- and it feeds the Sharpe allocator | `test_measurement.py` | FIXED |
 | SEAM | — | high | test-architecture | three escapes were seam defects, not wrong rules: unit tests, mutation and coverage are all structurally blind to them | `test_seams.py` (19) | ADDED |
+| F-028 | Medium | high | measurement validity | the shadow gap is constant by construction when the book's shape is stable, so it could not distinguish a dead market from one we track | `test_measurement.py` | FIXED |
 
 ---
 
@@ -661,3 +662,56 @@ a fade position bought at 0.976 cannot be exited at ANY price in (0,1)
 The seam layer reasons about joints *inside the process*. The largest untested
 joint in the system is still the one between the bot and the exchange, and it
 cannot be closed from a machine that has never placed an order.
+
+## F-028 — The shadow gap was unreadable on its own
+
+```
+Severity: Medium | Confidence: high | Class: measurement validity
+Found by: reading the instrument's OWN first real output
+Location: polymarket_bot/marketmaker.py `Quote`, ledger `shadow_quotes`
+```
+The second live report showed the shadow table working — and immediately showed
+that its central number could not be interpreted:
+
+```
+Will JB Pritzker win the 2028 US Presidential   12 quotes  78 looks  closest +0.0060  avg +0.0060
+Will Fabian Ruiz win the 2026 Ballon d'Or?      10 quotes  60 looks  closest +0.0090  avg +0.0092
+Will Pete Buttigieg win the 2028 Democratic pr  12 quotes  78 looks  closest +0.0100  avg +0.0100
+Will 2 Fed rate cuts happen in 2026?             3 quotes  18 looks  closest +0.0100  avg +0.0100
+```
+
+`closest == avg_gap` to four decimals on three of four markets: the gap did not
+move across 78 observations. The obvious reading is "a completely static book" —
+but `compute_quote` derives `yes_bid` from the **microprice**, so our bid moves
+*with* the book, and `ask - our_bid` stays constant whenever the book's *shape*
+is stable, however far the book itself travels.
+
+So the number reads identically for two situations with opposite remedies:
+
+* nothing trades in this market — our spread is irrelevant, quoting here is a
+  waste of exposure;
+* the book moves and we follow it at a fixed distance — our offset is precisely
+  what keeps us unfilled, and tightening would get fills.
+
+F-023 was built so that a zero-fill run would still yield a verdict. It yielded a
+number that cannot support one. That is a subtler failure than a wrong value and
+it would have been acted on: the report's own footnote invited exactly the wrong
+inference ("a large positive closest means the flow never came near us").
+
+Each retired quote now also records the **range the ask itself covered** while it
+was live, and the report prints a verdict from the pair:
+
+| closest | tape moved | verdict |
+|---|---|---|
+| <= 0 | any | crossed us |
+| > 0 | < 1 tick | no flow — spread irrelevant |
+| <= 2 ticks | >= 1 tick | near miss — tighten? |
+| > 2 ticks | >= 1 tick | moves, stays away |
+
+`shadow_quotes` gains two columns through an `ALTER TABLE` migration, so an
+existing paper ledger keeps its rows (tested).
+
+The general lesson, recorded because it will recur: **an instrument's first real
+output must be read as evidence about the instrument, not only about the system.**
+Both F-026 and F-028 were found this way — by taking the bot's own output
+seriously enough to ask whether the number could mean what the label claimed.

@@ -48,6 +48,21 @@ def compute_report(ledger: Ledger, mode: str, fade_prior: float = 0.35) -> dict:
     }
 
 
+def _shadow_verdict(closest: float, tape_range: float, tick: float = 0.001) -> str:
+    """What the pair (closest gap, tape range) actually licenses us to conclude.
+
+    Deliberately conservative: the point of this column is to stop "0 fills" being
+    read as "our spread is too wide" when the honest reading is "nothing traded".
+    """
+    if closest <= 0:
+        return "crossed us"
+    if tape_range < tick:
+        return "no flow"
+    if closest <= 2 * tick:
+        return "near miss — tighten?"
+    return "moves, stays away"
+
+
 def _stress(positions) -> dict:
     from .risk2 import portfolio_stress
     return portfolio_stress(positions)
@@ -126,20 +141,25 @@ def print_report(report: dict) -> None:
     shadows = report.get("shadow_quotes") or []
     if shadows:
         t = Table(title="Shadow quotes — how close the tape came to our MM bids")
-        for col, just in (("Market", "left"), ("Quotes", "right"),
-                          ("Looks", "right"), ("Closest", "right"),
-                          ("Avg gap", "right")):
-            t.add_column(col, justify=just)
+        # Numbers must never be squeezed out by a long question: the market
+        # text is the one thing that can safely be shortened.
+        t.add_column("Market", justify="left", overflow="ellipsis")
+        for col in ("Quotes", "Looks", "Closest", "Avg gap", "Tape moved"):
+            t.add_column(col, justify="right")
+        t.add_column("Verdict", justify="left", no_wrap=True)
         for s in shadows[:15]:
             closest = s["closest"] if s["closest"] is not None else 0.0
-            t.add_row((s["question"] or s["market_id"])[:46], str(s["quotes"]),
+            moved = s.get("tape_range") or 0.0
+            t.add_row((s["question"] or s["market_id"])[:32], str(s["quotes"]),
                       str(s["looks"] or 0), f"{closest:+.4f}",
-                      f"{(s['avg_gap'] or 0.0):+.4f}")
+                      f"{(s['avg_gap'] or 0.0):+.4f}", f"{moved:.4f}",
+                      _shadow_verdict(closest, moved))
         c.print(t)
-        c.print("[dim]closest <= 0 = the tape crossed our quote at least once. A "
-                "large positive closest with many looks means the flow never came "
-                "near us — widen/narrow decisions should be made on this, not on "
-                "an empty fill count.[/dim]")
+        c.print("[dim]Our bid tracks the microprice, so it MOVES WITH the book and "
+                "the gap alone cannot be read: a constant gap looks the same for a "
+                "dead market and for one we follow at a fixed distance. 'Tape "
+                "moved' is the range the ask itself covered while we were quoting, "
+                "and it separates the two. closest <= 0 = the tape crossed us.[/dim]")
 
     markouts = report["markouts"]
     if markouts:

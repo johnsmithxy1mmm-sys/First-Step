@@ -115,7 +115,15 @@ CREATE TABLE IF NOT EXISTS shadow_quotes (
     min_gap_yes REAL NOT NULL,        -- best ask minus our bid, at its closest
     min_gap_no REAL NOT NULL,
     looks INTEGER NOT NULL,           -- how many times the quote was evaluated
-    size REAL NOT NULL
+    size REAL NOT NULL,
+    -- How far the TAPE itself travelled while the quote was live. The gap alone
+    -- is uninterpretable: our bid is derived from the microprice, so it moves
+    -- WITH the book and the gap stays constant whenever the book's shape is
+    -- stable. Constant gap + flat tape = nothing trades here, our spread is
+    -- irrelevant. Constant gap + moving tape = we track the book at a fixed
+    -- distance, and that distance is what keeps us unfilled.
+    tape_range_yes REAL DEFAULT 0.0,
+    tape_range_no REAL DEFAULT 0.0
 );
 CREATE INDEX IF NOT EXISTS idx_shadow_mode ON shadow_quotes(mode, market_id);
 -- Opportunity ledger: every DETECTED window (arb/chain/resolution), whether or
@@ -188,6 +196,13 @@ class Ledger:
         cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(trades)")}
         if "neg_risk" not in cols:
             self._conn.execute("ALTER TABLE trades ADD COLUMN neg_risk INTEGER DEFAULT 0")
+        shadow = {r["name"]
+                  for r in self._conn.execute("PRAGMA table_info(shadow_quotes)")}
+        if shadow:                      # table exists from an earlier version
+            for col in ("tape_range_yes", "tape_range_no"):
+                if col not in shadow:
+                    self._conn.execute(
+                        f"ALTER TABLE shadow_quotes ADD COLUMN {col} REAL DEFAULT 0.0")
 
     def backfill_neg_risk(self, market_ids: list[str]) -> int:
         """Mark legacy trade rows as neg-risk from live market metadata.
@@ -592,24 +607,33 @@ class Ledger:
 
     def record_shadow_quote(self, *, mode: str, market_id: str, question: str,
                             yes_bid: float, no_bid: float, min_gap_yes: float,
-                            min_gap_no: float, looks: int, size: float) -> None:
+                            min_gap_no: float, looks: int, size: float,
+                            tape_range_yes: float = 0.0,
+                            tape_range_no: float = 0.0) -> None:
         """How close the tape came to a quote over its life (one row per quote)."""
         self._execute(
             "INSERT INTO shadow_quotes (ts, mode, market_id, question, yes_bid, "
-            "no_bid, min_gap_yes, min_gap_no, looks, size) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "no_bid, min_gap_yes, min_gap_no, looks, size, tape_range_yes, "
+            "tape_range_no) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (_now(), mode, market_id, question[:200], yes_bid, no_bid,
-             min_gap_yes, min_gap_no, int(looks), size))
+             min_gap_yes, min_gap_no, int(looks), size,
+             tape_range_yes, tape_range_no))
 
     def shadow_quote_summary(self, mode: str, limit: int = 5000) -> list[dict]:
         """Per-market near-miss summary, closest first.
 
-        `closest` is the smallest observed (best ask - our bid) on either side.
-        <= 0 means the tape actually crossed us at least once.
+        `closest` is the smallest observed (best ask - our bid) on either side;
+        <= 0 means the tape actually crossed us at least once. `tape_range` is how
+        far the ask itself travelled, and it is what makes `closest` readable: our
+        bid tracks the microprice, so a constant gap on a FLAT tape means nothing
+        trades here, while a constant gap on a MOVING tape means our offset is the
+        thing keeping us unfilled.
         """
         rows = self._query(
             "SELECT market_id, question, COUNT(*) AS quotes, SUM(looks) AS looks, "
             "MIN(MIN(min_gap_yes, min_gap_no)) AS closest, "
-            "AVG(MIN(min_gap_yes, min_gap_no)) AS avg_gap "
+            "AVG(MIN(min_gap_yes, min_gap_no)) AS avg_gap, "
+            "MAX(MAX(tape_range_yes, tape_range_no)) AS tape_range "
             "FROM (SELECT * FROM shadow_quotes WHERE mode = ? "
             "      ORDER BY id DESC LIMIT ?) GROUP BY market_id "
             "ORDER BY closest", (mode, limit))
