@@ -1,0 +1,59 @@
+# Tooling config only — the package itself is run as `python -m polymarket_bot.main`.
+
+[tool.pytest.ini_options]
+testpaths = ["polymarket_bot/tests"]
+# Audit reproducers are gated behind AUDIT_REPRO=1 (see tests/audit/conftest.py)
+# so a normal run stays fast; CI runs them explicitly.
+addopts = "-q"
+markers = [
+    "slow: excluded from the fast pre-commit run",
+]
+
+[tool.coverage.run]
+source = ["polymarket_bot"]
+branch = true
+omit = [
+    "polymarket_bot/tests/*",
+    "polymarket_bot/phase0_smoke.py",   # operator smoke script, needs the live API
+    "polymarket_bot/__main__.py",
+]
+
+[tool.coverage.report]
+# Lines that cannot be exercised offline, or that exist to be unreachable.
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "pragma: no cover",
+    "def __repr__",
+]
+show_missing = true
+skip_covered = true
+# BRANCH coverage is on, so this number is lower than the line-coverage figure
+# people usually quote (73% branch vs 84% line) — that gap is the honest one:
+# it counts untaken error paths, which is exactly where this project's audit
+# findings lived.
+#
+# The floor sits just BELOW the current value on purpose. A gate that ratchets
+# up on every commit gets disabled the first time it is inconvenient, and a
+# floor set to an aspiration fails CI on day one. Raise it deliberately, when a
+# module is genuinely finished.
+fail_under = 70
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+# Bug-catching rules only. The full ALL set is 900+ assert-in-test complaints
+# and missing docstrings, which drown the findings that matter — see
+# qa/QA-PROCEDURES.md for the reasoning.
+select = ["E", "F", "B", "PLE", "RUF", "DTZ", "ASYNC", "S", "PLW"]
+ignore = [
+    "E501",     # line length is checked by the formatter, not the linter
+    "S101",     # assert is the point of a test
+    "S311",     # random is used for jitter/simulation, never for secrets
+    "B008",     # pydantic Field(...) in defaults is idiomatic
+]
+
+[tool.ruff.lint.per-file-ignores]
+"polymarket_bot/tests/*" = ["S105", "S106", "S107", "SLF001", "B017"]

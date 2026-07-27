@@ -14,7 +14,6 @@ the system objects. Worse, the two caps disagree by 5x, so tightening the one
 in `risk:` has no effect on the strategy that carries most of the capital.
 """
 
-import pytest
 
 from polymarket_bot.models import simple_estimate
 from polymarket_bot.risk import KillSwitch

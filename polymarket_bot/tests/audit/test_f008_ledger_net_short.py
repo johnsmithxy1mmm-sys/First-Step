@@ -14,7 +14,7 @@ confirmation) this is precisely the state that would hide a real desync.
 import math
 
 import pytest
-from hypothesis import HealthCheck, given, settings
+from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from polymarket_bot.models import simple_estimate

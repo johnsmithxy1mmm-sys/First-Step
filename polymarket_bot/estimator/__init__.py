@@ -38,13 +38,18 @@ class Estimator:
         estimates: list[Estimate] = []
         for c in candidates:
             signals = []
+            # `c=c` binds the loop variable explicitly. These lambdas are
+            # invoked within this same iteration so late binding does not bite
+            # today — but the next line already binds `s=s`, and an asymmetry
+            # like that is exactly what a later refactor (deferring the calls)
+            # turns into a silent bug.
             producers = [
-                lambda: coherence.evaluate(c),          # priority #1
-                lambda: self._base_rates.evaluate(c),
-                lambda: self._momentum.evaluate(c),
-                lambda: self._llm.evaluate(c),
+                lambda c=c: coherence.evaluate(c),      # priority #1
+                lambda c=c: self._base_rates.evaluate(c),
+                lambda c=c: self._momentum.evaluate(c),
+                lambda c=c: self._llm.evaluate(c),
             ]
-            producers += [(lambda s=s: s.evaluate(c)) for s in self._extra]
+            producers += [(lambda s=s, c=c: s.evaluate(c)) for s in self._extra]
             for producer in producers:
                 try:
                     signal = producer()

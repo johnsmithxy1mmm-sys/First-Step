@@ -23,6 +23,8 @@ Sorted by (probability in prod) × (irreversibility).
 | F-012 | Low | high | test-gap | `ws_feed.py:77` unknown-side fix | test added | FIXED |
 | F-014 | High | high | numeric / trust-boundary | `models.py:_num/from_gamma` (never fuzzed) | `test_gamma_boundary.py` (20) | FIXED |
 | F-015 | Medium | high | numeric | `clob.py:round_to_tick` tick >= 1 inverts the clamp | property test | FIXED |
+| F-016 | High | high | numeric / trust-boundary | LLM cache bypasses the response schema -> unbounded `Signal.p_est` -> Kelly 520% | `test_llm_boundary.py` (21) | FIXED |
+| F-017 | Medium | high | numeric | denormal tick (2.2e-313) overflows `round()` | property test | FIXED |
 
 ---
 
@@ -202,3 +204,43 @@ upper bound `1 - tick` is **-1.0**, so the clamp returns a NEGATIVE order price
 (`round_to_tick(0.0, 2.0) == -1.0`). A tick is a price increment on a 0..1
 probability, so only `(0, 1)` is meaningful; that is now enforced in both the
 parser and the function.
+
+
+## F-016 — The LLM cache bypassed the response schema, and p_est sizes positions
+
+```
+Severity: High | Confidence: high | Class: numeric / trust-boundary
+Location: estimator/llm.py `_cached`, models.py `Signal`
+```
+Live responses go through `messages.parse` with a pydantic schema, so p_est and
+confidence are guaranteed probabilities. The on-disk cache did not: a plain JSON
+file read with `json.loads` (which accepts bare NaN/Infinity), stale,
+hand-editable, truncatable by a crash mid-write.
+
+`Signal.p_est` was an unbounded `float | None`, so a poisoned entry flowed
+straight into sizing:
+
+    cache p_est=5.0 -> Signal(p_est=5.0) -> combine -> Estimate.p_est
+                    -> portfolio.size_usd -> kelly_fraction(5.0, 0.05) = 5.21
+                    -> 521% of the Kelly base
+
+Two layered defences: `Signal` now bounds p_est/confidence at the TYPE level
+(protecting every signal source, not just the LLM), and `_cached` re-validates
+entries, dropping a poisoned one with a warning instead of raising deep inside a
+strategy.
+
+Notable: five test files passed `confidence=1e9` to overpower the market anchor
+— an out-of-contract value (confidence is documented as a 0..1 weight) that
+worked only because nothing enforced the range. Those tests now use legal values
+or build the Estimate directly.
+
+## F-017 — A denormal tick size overflows int conversion
+
+```
+Severity: Medium | Confidence: high | Class: numeric
+Found by: the property test from F-014 (third finding it produced)
+```
+`2.2250738585e-313` is finite and inside `(0, 1)`, so it passed every guard —
+but `price / tick` is then ~4.5e312 and `round()` raises OverflowError on int
+conversion. Real venue ticks are 0.001-0.01; `MIN_TICK = 1e-6` is now enforced
+in both the parser and `round_to_tick`.

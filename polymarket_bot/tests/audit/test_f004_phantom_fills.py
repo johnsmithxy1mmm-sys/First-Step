@@ -25,7 +25,6 @@ F-006  FOK sites trust the order id, not the fill. `resolution.execute` and
        killed FOK still yields a response; neither checks `size_matched`.
 """
 
-import pytest
 from unittest import mock
 
 from polymarket_bot.models import BookLevel, OrderBook

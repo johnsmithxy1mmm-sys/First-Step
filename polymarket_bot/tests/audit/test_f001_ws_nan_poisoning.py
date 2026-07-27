@@ -15,7 +15,6 @@ no numeric validation. Consequences proven here:
 import json
 import math
 
-import pytest
 
 from polymarket_bot.ws_feed import BookStore
 

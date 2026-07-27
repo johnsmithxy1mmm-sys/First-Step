@@ -291,7 +291,6 @@ def test_react_to_tick_never_blocks_on_the_cycle_lock(cfg, ledger):
     would kill its own quoting. A skipped reprice is the correct trade.
     """
     import threading
-    import time
 
     tops = {"mm1-yes": top(bid=0.43, ask=0.47), "mm1-no": top(bid=0.53, ask=0.57)}
     mm = make_mm(cfg, ledger, tops=tops)

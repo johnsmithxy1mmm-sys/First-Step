@@ -13,7 +13,7 @@ from .conftest import make_candidate
 def make_estimate(p_mkt=0.01, p_est=0.03, **overrides):
     c = make_candidate(outcome_prices=[p_mkt, 1 - p_mkt], **overrides)
     # One signal with a huge weight sets p_est exactly.
-    return combine(c, [Signal(name="s", p_est=p_est, confidence=1e9)], 1e-9)
+    return combine(c, [Signal(name="s", p_est=p_est, confidence=1.0)], 1e-9)
 
 
 def record_buy(ledger, est, category, usd):

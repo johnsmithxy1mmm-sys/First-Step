@@ -78,7 +78,7 @@ def test_compute_report_smoke(ledger):
 
     # Populate: bank, longshot with resolution, mm fill with markout, estimate.
     ledger.snapshot_bank(cash=5000, exposure=0)
-    est = combine(make_candidate(), [Signal(name="s", p_est=0.05, confidence=1e9)], 1e-9)
+    est = combine(make_candidate(), [Signal(name="s", p_est=0.05, confidence=1.0)], 1e-9)
     ledger.record_estimate(est, qualifies=True)
     ledger.record_trade(mode="paper", estimate=est, category="nature", side="BUY",
                         price=0.01, size=1000, order_id=None, status="paper-filled",

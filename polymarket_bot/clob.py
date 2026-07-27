@@ -92,6 +92,10 @@ class ClobReader:
         return out
 
 
+# Smallest tick we will do arithmetic with — see round_to_tick.
+MIN_TICK = 1e-6
+
+
 def round_to_tick(price: float, tick: float) -> float:
     """Snap an ORDER price to the market's tick, clamped to a tradable price.
 
@@ -112,7 +116,11 @@ def round_to_tick(price: float, tick: float) -> float:
     # meaningful. tick >= 1 is not merely useless — it INVERTS the clamp, since
     # `1 - tick` goes negative and `min(..., negative)` then returns a negative
     # order price (found by the property test, not by reading the code).
-    if not (math.isfinite(price) and math.isfinite(tick)) or not 0 < tick < 1:
+    # MIN_TICK is not cosmetic: a denormal like 2.2e-313 is finite and inside
+    # (0, 1), but `price / tick` then overflows int conversion inside round()
+    # and raises OverflowError. Real venue ticks are 0.001-0.01; anything below
+    # a millionth is a corrupt field, not a fine-grained market.
+    if not (math.isfinite(price) and math.isfinite(tick)) or not MIN_TICK <= tick < 1:
         return min(max(price, 0.0), 1.0) if math.isfinite(price) else 0.0
     snapped = round(round(price / tick) * tick, 6)
     return min(max(snapped, tick), round(1.0 - tick, 6))

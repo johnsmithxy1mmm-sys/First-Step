@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import time
 from pathlib import Path
@@ -88,12 +89,37 @@ class LLMSignal:
         return self._client
 
     def _cached(self, key: str) -> dict | None:
+        """A cached result, or None. Re-validated — the cache is a TRUST BOUNDARY.
+
+        Live responses go through `messages.parse` and a pydantic schema, so
+        p_est/confidence are guaranteed to be probabilities. The cache does NOT:
+        it is a plain JSON file, read with `json.loads` (which happily accepts
+        bare NaN and Infinity), and it can be stale, hand-edited, or truncated
+        by a crash mid-write. Trusting it re-introduces exactly what the schema
+        prevents, and p_est is what sizes a position.
+        """
         entry = self._cache.get(key)
-        if not entry:
+        if not isinstance(entry, dict):
             return None
         if time.time() - entry.get("ts", 0) > self._cfg.cache_ttl_hours * 3600:
             return None
-        return entry.get("result")
+        result = entry.get("result")
+        if not isinstance(result, dict):
+            return None
+        try:
+            p_est = float(result["p_est"])
+            confidence = float(result["confidence"])
+        except (KeyError, TypeError, ValueError):
+            log.warning("llm cache: dropping malformed entry for %s", key)
+            return None
+        if not (math.isfinite(p_est) and math.isfinite(confidence)):
+            log.warning("llm cache: dropping non-finite entry for %s", key)
+            return None
+        if not (0.0 <= p_est <= 1.0 and 0.0 <= confidence <= 1.0):
+            log.warning("llm cache: dropping out-of-range entry for %s "
+                        "(p_est=%s, confidence=%s)", key, p_est, confidence)
+            return None
+        return result
 
     def _store(self, key: str, result: dict) -> None:
         self._cache[key] = {"ts": time.time(), "result": result}

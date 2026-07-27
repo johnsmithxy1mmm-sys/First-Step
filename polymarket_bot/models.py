@@ -47,7 +47,8 @@ def _num(raw: dict, *keys: str) -> float:
     return 0.0
 
 
-def _positive(value: float, default: float, upper: float | None = None) -> float:
+def _positive(value: float, default: float, upper: float | None = None,
+              lower: float = 0.0) -> float:
     """A strictly-positive quantity, or `default`.
 
     Tick sizes and order minimums are physical quantities: zero or negative
@@ -56,7 +57,7 @@ def _positive(value: float, default: float, upper: float | None = None) -> float
     0..1 probability, so a "tick" of 2 is nonsense that would otherwise invert
     the clamp in clob.round_to_tick.
     """
-    if not math.isfinite(value) or value <= 0:
+    if not math.isfinite(value) or value <= lower:
         return default
     if upper is not None and value >= upper:
         return default
@@ -155,7 +156,8 @@ class Market(BaseModel):
             end_date=_parse_dt(raw.get("endDate")),
             neg_risk=bool(raw.get("negRisk", False)),
             enable_order_book=bool(raw.get("enableOrderBook", True)),
-            tick_size=_positive(_num(raw, "orderPriceMinTickSize"), 0.001, upper=1.0),
+            tick_size=_positive(_num(raw, "orderPriceMinTickSize"), 0.001,
+                                upper=1.0, lower=1e-6),
             min_order_size=_positive(_num(raw, "orderMinSize"), 5.0),
             resolution_source=raw.get("resolutionSource") or "",
             closed=bool(raw.get("closed", False)),
@@ -240,11 +242,20 @@ class Candidate(BaseModel):
 
 
 class Signal(BaseModel):
-    """Result from a single probability-estimation source."""
+    """Result from a single probability-estimation source.
+
+    `p_est` and `confidence` are BOUNDED at the type level, not by convention.
+    A signal is the one place an external opinion (an LLM response, a cached
+    file, a third-party feed) becomes a number that sizes a position: an
+    unbounded p_est of 5.0 makes `kelly_fraction` return 5.2, i.e. 520% of the
+    Kelly base, and NaN propagates into the sizing arithmetic. Probabilities
+    live in [0, 1] — anything else is not a probability and must not be
+    representable here.
+    """
 
     name: str
-    p_est: float | None = None        # None = the signal abstained
-    confidence: float = 0.0           # 0..1, used as the weight in the ensemble
+    p_est: float | None = Field(default=None, ge=0.0, le=1.0)  # None = abstained
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)     # ensemble weight
     rationale: str = ""
 
 

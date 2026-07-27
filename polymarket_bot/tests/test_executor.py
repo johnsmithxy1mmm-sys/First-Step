@@ -13,7 +13,7 @@ from .conftest import make_book, make_candidate
 
 def make_plan(size_usd=50.0, cap=0.02, **overrides) -> TradePlan:
     c = make_candidate(**overrides)
-    est = combine(c, [Signal(name="s", p_est=0.04, confidence=1e9)], 1e-9)
+    est = combine(c, [Signal(name="s", p_est=0.04, confidence=1.0)], 1e-9)
     return TradePlan(estimate=est, category="nature", size_usd=size_usd,
                      limit_price_cap=cap)
 

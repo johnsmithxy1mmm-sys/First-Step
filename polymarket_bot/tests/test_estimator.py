@@ -44,7 +44,7 @@ def test_ensemble_ignores_abstaining_signals():
 def test_edge_filter_threshold(cfg):
     estimator = Estimator(cfg)
     c = make_candidate()
-    strong = combine(c, [Signal(name="s", p_est=0.2, confidence=2.0)], 0.5)
+    strong = combine(c, [Signal(name="s", p_est=0.2, confidence=1.0)], 0.5)
     weak = combine(c, [Signal(name="s", p_est=0.012, confidence=0.5)], 0.85)
     assert estimator.qualifies(strong)
     assert not estimator.qualifies(weak)
@@ -53,7 +53,7 @@ def test_edge_filter_threshold(cfg):
 def test_edge_filter_rejects_expensive_market(cfg):
     estimator = Estimator(cfg)
     c = make_candidate(outcome_prices=[0.20, 0.80])  # p_mkt > max_p_mkt
-    est = combine(c, [Signal(name="s", p_est=0.9, confidence=5.0)], 0.5)
+    est = combine(c, [Signal(name="s", p_est=0.9, confidence=1.0)], 0.5)
     assert not estimator.qualifies(est)
 
 

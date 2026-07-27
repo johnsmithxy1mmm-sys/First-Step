@@ -2,7 +2,6 @@
 
 from polymarket_bot.capacity import (READINESS, learning_progress,
                                      opportunity_persistence)
-from polymarket_bot.config import BotConfig
 
 
 def test_persistence_computes_lifetime_and_capacity():

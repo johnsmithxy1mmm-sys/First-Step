@@ -1124,7 +1124,7 @@ def main(argv: list[str] | None = None) -> None:
 
     stop_event = threading.Event()
 
-    def shutdown(signum, frame):  # noqa: ARG001
+    def shutdown(signum, frame):
         log.info("received signal %s — shutting down", signum)
         stop_event.set()
 
@@ -1132,7 +1132,7 @@ def main(argv: list[str] | None = None) -> None:
     signal.signal(signal.SIGTERM, shutdown)
 
     if hasattr(signal, "SIGHUP"):
-        def reload_cfg(signum, frame):  # noqa: ARG001
+        def reload_cfg(signum, frame):
             changed = reload_config_inplace(bot.cfg, args.config)
             log.info("SIGHUP: config reloaded, changed: %s", changed or "nothing")
         signal.signal(signal.SIGHUP, reload_cfg)

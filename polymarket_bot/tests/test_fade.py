@@ -7,18 +7,29 @@ import pytest
 from polymarket_bot.estimator.ensemble import combine
 from polymarket_bot.executor import Executor
 from polymarket_bot.fade import FadeStrategy
-from polymarket_bot.models import Signal
+from polymarket_bot.models import Estimate, Signal
 from polymarket_bot.portfolio import Portfolio
 
-from .conftest import make_book, make_candidate, make_market
+from .conftest import make_book, make_candidate
 
 
 def make_estimate(p_mkt=0.05, p_est=None, signals=None, **market_over):
-    """Estimate for a YES tail. p_est=None -> no signal (p_est=p_mkt via anchor)."""
+    """Estimate for a YES tail. p_est=None -> no signal (p_est=p_mkt).
+
+    Builds the Estimate DIRECTLY rather than through `combine`. These tests ask
+    "given an estimate with this edge ratio, what does fade decide?", which is
+    independent of how the ensemble arrived at it. Going through `combine` used
+    to require `confidence=1e9` to overpower the market anchor and pin p_est
+    exactly — an out-of-contract value (confidence is a 0..1 weight) that the
+    Signal model now rejects outright.
+    """
     c = make_candidate(outcome_prices=[p_mkt, 1 - p_mkt], **market_over)
-    if signals is None:
-        signals = [] if p_est is None else [Signal(name="s", p_est=p_est, confidence=1e9)]
-    return combine(c, signals, market_anchor_confidence=1e-9 if signals else 0.85)
+    if signals is not None:
+        return combine(c, signals, market_anchor_confidence=0.85)
+    return Estimate(candidate=c, p_mkt=p_mkt,
+                    p_est=p_mkt if p_est is None else p_est,
+                    signals=[] if p_est is None
+                    else [Signal(name="s", p_est=p_est, confidence=1.0)])
 
 
 def make_fade(cfg, ledger, trader=None):

@@ -68,7 +68,7 @@ class MetricsServer:
                 self.end_headers()
                 self.wfile.write(body)
 
-            def do_GET(self):  # noqa: N802
+            def do_GET(self):
                 try:
                     snap = fn()
                 except Exception:

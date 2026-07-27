@@ -1,6 +1,5 @@
 """Two-way Telegram control: command dispatch, chat gating, bot handlers."""
 
-from unittest import mock
 
 from polymarket_bot.telegram_control import TelegramControl
 
