@@ -49,12 +49,28 @@ class TelegramControl(threading.Thread):
 
         Ignores anything not from the configured chat, and anything that is not
         a known slash command.
+
+        Every field is shape-checked before use. This is an EXTERNAL payload:
+        the previous version called `.get()` on whatever sat in `message` and
+        `chat`, and `.strip()` on whatever sat in `text`, so a non-object there
+        raised AttributeError — and the caller treats a raised update as an
+        unprocessable batch, which stalls the whole control channel.
         """
+        if not isinstance(update, dict):
+            return None
         msg = update.get("message") or update.get("edited_message") or {}
-        chat = str((msg.get("chat") or {}).get("id", ""))
+        if not isinstance(msg, dict):
+            return None
+        chat_obj = msg.get("chat")
+        if not isinstance(chat_obj, dict):
+            return None
+        chat = str(chat_obj.get("id", ""))
         if not chat or chat != str(self._chat_id):
             return None                       # not our owner — ignore silently
-        text = (msg.get("text") or "").strip()
+        raw_text = msg.get("text")
+        if not isinstance(raw_text, str):
+            return None
+        text = raw_text.strip()
         if not text.startswith("/"):
             return None
         parts = text[1:].split()
@@ -72,8 +88,40 @@ class TelegramControl(threading.Thread):
             return f"/{cmd} failed: {exc}"
 
     def _advance_offset(self, updates: list[dict]) -> None:
+        """Acknowledge a batch. MUST make forward progress, always.
+
+        Telegram replays every update until the offset moves past it, so a
+        single unreadable `update_id` used to wedge the control channel
+        permanently: `int("abc")` raised, the run loop swallowed it, the offset
+        stayed put, and the next poll returned the same poisoned batch — for
+        ever. Commands after it in the batch were never dispatched, which means
+        /pause, the operator's remote kill, became unreachable.
+
+        Note this runs BEFORE the chat-id check in handle_update, so it must
+        survive payloads from anyone, not just the owner.
+        """
+        if not updates:
+            return
+        highest: int | None = None
         for u in updates:
-            self._offset = max(self._offset, int(u.get("update_id", 0)) + 1)
+            raw = u.get("update_id") if isinstance(u, dict) else None
+            try:
+                update_id = int(raw)          # type: ignore[arg-type]
+            except (TypeError, ValueError, OverflowError):
+                # OverflowError is int(inf) — a float that survives every other
+                # check. Caught by this module's own property test.
+                log.warning("telegram: unreadable update_id %r — skipping it", raw)
+                continue
+            highest = update_id if highest is None else max(highest, update_id)
+        if highest is not None:
+            self._offset = max(self._offset, highest + 1)
+        else:
+            # Nothing in the batch was readable. Step past it anyway: replaying
+            # an unreadable batch for ever is strictly worse than losing it.
+            self._offset += 1
+            log.error("telegram: no readable update_id in a batch of %d — "
+                      "advancing the offset to keep control responsive",
+                      len(updates))
 
     # --- network ---
 

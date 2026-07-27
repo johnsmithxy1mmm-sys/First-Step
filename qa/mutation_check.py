@@ -69,6 +69,13 @@ MUTANTS: list[tuple[str, str, str, str]] = [
      "ledger accepts a non-positive size"),
     ("models.py", "if any(not math.isfinite(p) or not 0.0 <= p <= 1.0 for p in prices):",
      "if False:", "Gamma parser accepts NaN / out-of-range prices"),
+    # --- control channel: the operator's remote kill must stay reachable ---
+    ("telegram_control.py", "            self._offset += 1", "            pass",
+     "unreadable batch no longer advances the offset (channel wedges)"),
+    ("telegram_control.py", "if not isinstance(chat_obj, dict):", "if False:",
+     "chat shape unchecked (AttributeError costs the rest of the batch)"),
+    ("telegram_control.py", "if not chat or chat != str(self._chat_id):",
+     "if False:", "AUTH REMOVED: any chat can drive /pause"),
 ]
 
 TEST_PATHS = ["polymarket_bot/tests"]

@@ -25,6 +25,8 @@ Sorted by (probability in prod) × (irreversibility).
 | F-015 | Medium | high | numeric | `clob.py:round_to_tick` tick >= 1 inverts the clamp | property test | FIXED |
 | F-016 | High | high | numeric / trust-boundary | LLM cache bypasses the response schema -> unbounded `Signal.p_est` -> Kelly 520% | `test_llm_boundary.py` (21) | FIXED |
 | F-017 | Medium | high | numeric | denormal tick (2.2e-313) overflows `round()` | property test | FIXED |
+| F-018 | High | high | availability / safety | `telegram_control._advance_offset` wedges the control channel forever | `test_telegram_boundary.py` (24) | FIXED |
+| F-019 | Medium | high | robustness | `handle_update` raises on any non-object field | same file | FIXED |
 
 ---
 
@@ -244,3 +246,46 @@ Found by: the property test from F-014 (third finding it produced)
 but `price / tick` is then ~4.5e312 and `round()` raises OverflowError on int
 conversion. Real venue ticks are 0.001-0.01; `MIN_TICK = 1e-6` is now enforced
 in both the parser and `round_to_tick`.
+
+
+## F-018 — One unreadable update_id wedged the operator's remote kill, forever
+
+```
+Severity: High | Confidence: high | Class: availability / safety
+Location: polymarket_bot/telegram_control.py `_advance_offset`
+Repro: test_control_channel_survives_a_poisoned_batch_end_to_end
+```
+Telegram replays every update until the offset moves past it. `int("abc")`
+raised, `run()`'s broad `except Exception` swallowed it, the offset never
+advanced — so the next poll returned the SAME poisoned batch, for ever. Proven
+end-to-end: after five polls the offset was still 0 and no command had been
+dispatched.
+
+Two things make this worse than a stuck poller:
+
+* Commands **after** the poisoned entry in the batch are never dispatched, so
+  `/pause` — the operator's remote kill-switch — becomes unreachable while the
+  bot keeps trading.
+* `_advance_offset` runs BEFORE the chat-id check in `handle_update`, so it
+  processes payloads from **anyone** who messages the bot, not just the owner.
+
+Fixed by making the function always make forward progress: unreadable ids are
+skipped with a warning, and a batch with no readable id at all still advances
+(replaying an unreadable batch for ever is strictly worse than losing it).
+`int(inf)` raises OverflowError rather than ValueError — that gap in the first
+version of the fix was caught by this module's own property test.
+
+## F-019 — Any non-object field raised instead of being ignored
+
+```
+Severity: Medium | Confidence: high | Class: robustness
+Location: polymarket_bot/telegram_control.py `handle_update`
+```
+`.get()` was called on whatever sat in `message`/`chat` and `.strip()` on
+whatever sat in `text`, so a non-object raised AttributeError and cost the rest
+of the batch. Every field is now shape-checked; a malformed update is a silent
+non-answer. A Hypothesis property asserts that no JSON payload of any shape can
+make either entry point raise.
+
+Mutation coverage added for this module, including **"AUTH REMOVED: any chat can
+drive /pause"** — the tests kill it.
