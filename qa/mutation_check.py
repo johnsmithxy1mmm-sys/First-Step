@@ -119,6 +119,11 @@ MUTANTS: list[tuple[str, str, str, str]] = [
     # Dropping the guard is what restores last-row-wins.
     ("ledger.py", 'if not slot["strategy"]:', 'if True:',
      "PnL attributed to whoever SOLD (a fade loss booked against longshot)"),
+    ("ledger.py", 'f"ALTER TABLE shadow_quotes ADD COLUMN {col} REAL")',
+     'f"ALTER TABLE shadow_quotes ADD COLUMN {col} REAL DEFAULT 0.0")',
+     "migration fabricates a measurement for every pre-existing row"),
+    ("ledger.py", '"WHERE rested_sec = 0.0")', '"WHERE 0")',
+     "already-fabricated rows are left reading as a measured zero"),
     ("marketmaker.py",
      "        frac = score_fraction(half, quote.market.rewards_max_spread)",
      "        frac = 0.0",

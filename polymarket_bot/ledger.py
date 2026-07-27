@@ -122,8 +122,13 @@ CREATE TABLE IF NOT EXISTS shadow_quotes (
     -- stable. Constant gap + flat tape = nothing trades here, our spread is
     -- irrelevant. Constant gap + moving tape = we track the book at a fixed
     -- distance, and that distance is what keeps us unfilled.
-    tape_range_yes REAL DEFAULT 0.0,
-    tape_range_no REAL DEFAULT 0.0,
+    -- NO DEFAULT on any of these four, deliberately. `ALTER TABLE ADD COLUMN
+    -- ... DEFAULT 0.0` back-fills every pre-existing row with a value that was
+    -- never measured, and the report then renders "flat tape, zero rewards" as a
+    -- finding. NULL is the honest representation of "this row predates the
+    -- measurement", and the report must say so rather than conclude from it.
+    tape_range_yes REAL,
+    tape_range_no REAL,
     -- The REWARDS side. With no fills, spread and rebate are exactly zero and the
     -- liquidity-rewards score is the entire return, yet nothing recorded it: the
     -- scoring functions were consulted only when ranking markets. reward_frac is
@@ -131,8 +136,8 @@ CREATE TABLE IF NOT EXISTS shadow_quotes (
     -- widened toward the band edge earns ~1% of the same size at the touch, and 0
     -- outside the band. rested_sec x reward_frac is the accrual, since the pool is
     -- shared by time-sampled score.
-    reward_frac REAL DEFAULT 0.0,
-    rested_sec REAL DEFAULT 0.0
+    reward_frac REAL,
+    rested_sec REAL
 );
 CREATE INDEX IF NOT EXISTS idx_shadow_mode ON shadow_quotes(mode, market_id);
 -- Opportunity ledger: every DETECTED window (arb/chain/resolution), whether or
@@ -211,8 +216,22 @@ class Ledger:
             for col in ("tape_range_yes", "tape_range_no",
                         "reward_frac", "rested_sec"):
                 if col not in shadow:
+                    # No DEFAULT: pre-existing rows must read NULL ("not
+                    # measured"), not 0.0 ("measured, and it was zero").
                     self._conn.execute(
-                        f"ALTER TABLE shadow_quotes ADD COLUMN {col} REAL DEFAULT 0.0")
+                        f"ALTER TABLE shadow_quotes ADD COLUMN {col} REAL")
+            # Repair databases where an earlier build of this migration DID
+            # supply DEFAULT 0.0 and so fabricated a measurement for every legacy
+            # row. `_record_shadow` always writes a positive rested_sec (it is
+            # now - the quote's placement timestamp), so rested_sec = 0 marks a
+            # row the new code cannot have written. The single false positive is
+            # a quote retired in the same instant it was placed; losing its
+            # reward columns is preferable to reporting four fabricated ones.
+            if "rested_sec" in shadow:
+                self._conn.execute(
+                    "UPDATE shadow_quotes SET tape_range_yes = NULL, "
+                    "tape_range_no = NULL, reward_frac = NULL, rested_sec = NULL "
+                    "WHERE rested_sec = 0.0")
 
     def backfill_neg_risk(self, market_ids: list[str]) -> int:
         """Mark legacy trade rows as neg-risk from live market metadata.
@@ -649,7 +668,8 @@ class Ledger:
             "MAX(MAX(tape_range_yes, tape_range_no)) AS tape_range, "
             "AVG(reward_frac) AS reward_frac, "
             "SUM(rested_sec) AS rested_sec, "
-            "SUM(rested_sec * reward_frac) AS score_seconds "
+            "SUM(rested_sec * reward_frac) AS score_seconds, "
+            "SUM(CASE WHEN rested_sec IS NOT NULL THEN 1 ELSE 0 END) AS measured "
             "FROM (SELECT * FROM shadow_quotes WHERE mode = ? "
             "      ORDER BY id DESC LIMIT ?) GROUP BY market_id "
             "ORDER BY closest", (mode, limit))

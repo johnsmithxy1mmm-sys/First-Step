@@ -478,8 +478,15 @@ def test_the_shadow_table_migrates_without_losing_old_rows(cfg, tmp_path):
     try:
         rows = fresh.shadow_quote_summary("paper")
         assert len(rows) == 1 and rows[0]["market_id"] == "legacy"
-        assert rows[0]["tape_range"] == pytest.approx(0.0)
         assert rows[0]["looks"] == 78
+        # NOT 0.0. A row written before the measurement existed must read as
+        # unknown; back-filling a default turns silence into a finding, and the
+        # verdict column then reports "no flow, unpaid" about a quote nobody
+        # ever measured. This assertion previously encoded the bug.
+        assert rows[0]["tape_range"] is None
+        assert rows[0]["reward_frac"] is None
+        assert rows[0]["rested_sec"] is None
+        assert rows[0]["measured"] == 0
         fresh.record_shadow_quote(
             mode="paper", market_id="new", question="Q2?", yes_bid=0.4,
             no_bid=0.5, min_gap_yes=0.01, min_gap_no=0.02, looks=3, size=100.0,
@@ -541,3 +548,59 @@ def test_the_verdict_separates_unpaid_idleness_from_paid_idleness(cfg):
     assert "rewards only" in paid
     assert "unpaid" in unpaid
     assert paid != unpaid
+
+
+def test_a_database_with_fabricated_defaults_is_repaired(cfg, tmp_path):
+    """The DB shipped by the first version of this migration must be healed.
+
+    An earlier build added the columns with `DEFAULT 0.0`, which SQLite writes
+    into every pre-existing row. The live report then showed four markets at
+    "Reward score 0%, Rested -, no flow, unpaid" while each had 10-12 recorded
+    quotes — a conclusion drawn entirely from a migration default.
+    """
+    from polymarket_bot.ledger import Ledger
+    path = str(tmp_path / "fabricated.sqlite")
+    led = Ledger(path)
+    led._conn.execute("DELETE FROM shadow_quotes")
+    # Exactly what the bad migration left behind: zeros, with real look counts.
+    led._conn.execute(
+        "INSERT INTO shadow_quotes (ts, mode, market_id, question, yes_bid, "
+        "no_bid, min_gap_yes, min_gap_no, looks, size, tape_range_yes, "
+        "tape_range_no, reward_frac, rested_sec) "
+        "VALUES ('t','paper','pritzker','Will JB Pritzker win?',0.44,0.54,"
+        "0.006,0.011,78,200,0.0,0.0,0.0,0.0)")
+    # A genuinely measured row must survive untouched.
+    led._conn.execute(
+        "INSERT INTO shadow_quotes (ts, mode, market_id, question, yes_bid, "
+        "no_bid, min_gap_yes, min_gap_no, looks, size, tape_range_yes, "
+        "tape_range_no, reward_frac, rested_sec) "
+        "VALUES ('t','paper','real','Measured market',0.44,0.54,"
+        "0.002,0.011,40,200,0.0,0.0,0.81,3600.0)")
+    led._conn.commit()
+    led.close()
+
+    healed = Ledger(path)                       # _migrate repairs on open
+    try:
+        by_id = {r["market_id"]: r for r in healed.shadow_quote_summary("paper")}
+        fabricated = by_id["pritzker"]
+        assert fabricated["reward_frac"] is None, fabricated
+        assert fabricated["tape_range"] is None, fabricated
+        assert fabricated["measured"] == 0
+
+        measured = by_id["real"]
+        assert measured["reward_frac"] == pytest.approx(0.81)
+        assert measured["tape_range"] == pytest.approx(0.0)   # a REAL flat tape
+        assert measured["measured"] == 1
+    finally:
+        healed.close()
+
+
+def test_an_unmeasured_row_produces_no_verdict_about_rewards(cfg):
+    """Silence must not be reported as a finding."""
+    from polymarket_bot.analytics import _shadow_verdict
+    assert _shadow_verdict(closest=0.006, tape_range=None) == "not measured"
+    assert "not measured" in _shadow_verdict(closest=0.006, tape_range=0.0,
+                                             reward_frac=None)
+    # A measured zero still says what it means.
+    assert _shadow_verdict(closest=0.006, tape_range=0.0,
+                           reward_frac=0.0) == "no flow, unpaid"

@@ -38,6 +38,7 @@ Sorted by (probability in prod) × (irreversibility).
 | SEAM | — | high | test-architecture | three escapes were seam defects, not wrong rules: unit tests, mutation and coverage are all structurally blind to them | `test_seams.py` (19) | ADDED |
 | F-028 | Medium | high | measurement validity | the shadow gap is constant by construction when the book's shape is stable, so it could not distinguish a dead market from one we track | `test_measurement.py` | FIXED |
 | F-029 | High | high | measurement / economics | with zero fills the rewards score is the MM's entire return, and no quote ever recorded what it earned; the score is quadratic, so widening silently zeroes it | `test_measurement.py` | FIXED |
+| F-030 | High | high | measurement validity | `ALTER TABLE ... DEFAULT 0.0` back-filled unmeasured rows with zeros, and the report condemned four markets as unpaid on numbers nobody took | `test_measurement.py` | FIXED |
 
 ---
 
@@ -782,3 +783,60 @@ The suite is now good at "does the code do what it says". It has caught nothing 
 the class "does what it says actually mean anything". That second question seems to
 need a person reading a report, and the discipline that appears to work is to treat
 every new instrument's first real output as evidence about the instrument.
+
+## F-030 — The migration fabricated the measurement it was added to record
+
+```
+Severity: High | Confidence: high | Class: measurement validity / data integrity
+Found by: the very next report — the fix's own output
+Location: polymarket_bot/ledger.py `_migrate`
+Introduced by: F-028 and F-029, one and two commits earlier
+```
+The report that came back after F-029 shipped:
+
+```
+Market                            Quotes  Closest  Tape moved  Reward score  Rested  Verdict
+Will JB Pritzker win the 2028 US      12  +0.0060      0.0000            0%       -  no flow, unpaid
+Will Fabian Ruiz win the 2026 Ba      10  +0.0090      0.0000            0%       -  no flow, unpaid
+Will Pete Buttigieg win the 2028      12  +0.0100      0.0000            0%       -  no flow, unpaid
+Will 2 Fed rate cuts happen in 2       3  +0.0100      0.0000            0%       -  no flow, unpaid
+```
+
+Four markets condemned as earning nothing. **Not one of those numbers was
+measured.** `ALTER TABLE ... ADD COLUMN <c> REAL DEFAULT 0.0` writes the default
+into every pre-existing row, so all four columns were back-filled with zeros on
+rows recorded before the measurement existed. The verdict column then drew a
+confident conclusion from them.
+
+The output contradicts itself in plain sight: a quote retired **twelve** times
+cannot have rested for zero seconds. That inconsistency is the tell.
+
+This is the F-028 defect repeated by the hand that fixed it. F-028 was "the number
+cannot mean what the label claims"; this is the same failure one layer down, in
+the schema. Adding `DEFAULT 0.0` felt like defensive programming — no NULLs to
+handle downstream — and defensiveness against NULL is precisely what converts *we
+did not look* into *we looked and found zero*.
+
+Fixed on three levels:
+
+* the four columns carry **no default**, so a legacy row reads NULL;
+* `_migrate` **repairs databases the bad version already touched**, nulling the
+  columns wherever `rested_sec = 0.0` — a value `_record_shadow` cannot produce,
+  since it writes `now - placement_ts`. The one false positive is a quote retired
+  in the same instant it was placed; losing its columns beats reporting four
+  fabricated ones;
+* the report renders `n/a`, returns the verdict `not measured`, excludes such rows
+  from the "unpaid" warning, and states plainly: *they are not a zero — they are
+  silence*.
+
+The migration test had asserted `tape_range == 0.0` for a legacy row. It was
+passing, and it was encoding the bug: written from the implementation rather than
+from what the value should mean. Rewritten to assert NULL, with the reason in the
+test. Two mutants added — one restoring the `DEFAULT 0.0`, one disabling the
+repair — and both are killed.
+
+**The running count of this class is now four** (F-026, F-028, F-029, F-030), all
+found by reading output rather than by testing. F-030 is the sharpest instance:
+the flawed output was produced by the fix for the previous instance. Whatever
+review this project applies to a measurement change, it has to include reading the
+first report the change produces, on a database that predates it.

@@ -48,7 +48,9 @@ def compute_report(ledger: Ledger, mode: str, fade_prior: float = 0.35) -> dict:
     }
 
 
-def _hms(seconds: float) -> str:
+def _hms(seconds: float | None) -> str:
+    if seconds is None:
+        return "n/a"
     if seconds <= 0:
         return "-"
     if seconds < 3600:
@@ -56,8 +58,8 @@ def _hms(seconds: float) -> str:
     return f"{seconds / 3600:.1f}h"
 
 
-def _shadow_verdict(closest: float, tape_range: float, tick: float = 0.001,
-                    reward_frac: float = 0.0) -> str:
+def _shadow_verdict(closest: float, tape_range: float | None, tick: float = 0.001,
+                    reward_frac: float | None = None) -> str:
     """What (closest gap, tape range, reward score) together license us to say.
 
     Deliberately conservative: this column exists to stop "0 fills" being read as
@@ -68,7 +70,12 @@ def _shadow_verdict(closest: float, tape_range: float, tick: float = 0.001,
     """
     if closest <= 0:
         return "crossed us"
+    if tape_range is None:
+        # No tape measurement: the only thing this row supports is the gap.
+        return "not measured"
     if tape_range < tick:
+        if reward_frac is None:
+            return "no flow (rewards not measured)"
         return "no flow — rewards only" if reward_frac >= 0.05 else "no flow, unpaid"
     if closest <= 2 * tick:
         return "near miss — tighten?"
@@ -161,12 +168,18 @@ def print_report(report: dict) -> None:
         t.add_column("Verdict", justify="left", no_wrap=True)
         for s in shadows[:15]:
             closest = s["closest"] if s["closest"] is not None else 0.0
-            moved = s.get("tape_range") or 0.0
-            frac = s.get("reward_frac") or 0.0
-            rested = s.get("rested_sec") or 0.0
+            # None means the row predates the measurement, NOT that the measured
+            # value was zero. Rendering the two the same is how a migration
+            # default turns into a finding.
+            moved = s.get("tape_range")
+            frac = s.get("reward_frac")
+            rested = s.get("rested_sec")
             t.add_row((s["question"] or s["market_id"])[:32], str(s["quotes"]),
-                      f"{closest:+.4f}", f"{moved:.4f}", f"{frac:.0%}",
-                      _hms(rested), _shadow_verdict(closest, moved, reward_frac=frac))
+                      f"{closest:+.4f}",
+                      "n/a" if moved is None else f"{moved:.4f}",
+                      "n/a" if frac is None else f"{frac:.0%}",
+                      _hms(rested),
+                      _shadow_verdict(closest, moved, reward_frac=frac))
         c.print(t)
         c.print("[dim]Our bid tracks the microprice, so the gap alone cannot be "
                 "read: a constant gap looks the same for a dead market and for one "
@@ -175,8 +188,14 @@ def print_report(report: dict) -> None:
                 "and it is QUADRATIC — at 90% of the band it is 1%. With no fills, "
                 "spread and rebate are zero, so that percentage IS the income.[/dim]")
         dead_and_unpaid = [s for s in shadows
-                           if (s.get("reward_frac") or 0.0) < 0.05
+                           if s.get("reward_frac") is not None
+                           and s["reward_frac"] < 0.05
                            and (s.get("rested_sec") or 0.0) > 0]
+        unmeasured = [s for s in shadows if s.get("measured") in (0, None)]
+        if unmeasured:
+            c.print(f"[dim]  {len(unmeasured)} market(s) show n/a: those quotes "
+                    "were recorded before the rewards/tape measurement existed. "
+                    "They are not a zero — they are silence.[/dim]")
         if dead_and_unpaid:
             c.print(f"[yellow]  {len(dead_and_unpaid)} market(s) quoted at under 5% "
                     "of the reward score AND took no fills — that capital is "
