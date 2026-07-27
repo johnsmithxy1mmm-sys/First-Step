@@ -99,6 +99,25 @@ CREATE TABLE IF NOT EXISTS quote_outcomes (
     p_pred REAL NOT NULL,             -- fill probability predicted at placement
     filled INTEGER NOT NULL           -- 1 = filled before cancel, 0 = cancelled
 );
+-- Shadow quotes: one row per RETIRED market-maker quote, recording how close the
+-- tape came to lifting it. A paper run that fills nothing produces no trades, no
+-- markouts and no verdict — "zero fills" reads identically whether our spread was
+-- one tick too wide or the market simply never traded. This table separates the
+-- two, so the MM can be judged before it has ever been filled.
+CREATE TABLE IF NOT EXISTS shadow_quotes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    market_id TEXT NOT NULL,
+    question TEXT,
+    yes_bid REAL NOT NULL,
+    no_bid REAL NOT NULL,
+    min_gap_yes REAL NOT NULL,        -- best ask minus our bid, at its closest
+    min_gap_no REAL NOT NULL,
+    looks INTEGER NOT NULL,           -- how many times the quote was evaluated
+    size REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_shadow_mode ON shadow_quotes(mode, market_id);
 -- Opportunity ledger: every DETECTED window (arb/chain/resolution), whether or
 -- not it was taken, with its lifecycle. Measures the realizable capacity of
 -- each strategy (edge x depth x how long the window lived) from real data,
@@ -313,6 +332,11 @@ class Ledger:
                 "question": r["question"], "outcome": r["outcome"],
                 "category": r["category"], "event_id": r["event_id"] or "",
                 "neg_risk": bool(r["neg_risk"] if "neg_risk" in r.keys() else 0),
+                # The OPENING strategy: set once by the first row for this token
+                # and never overwritten, so a later exit (recorded by whichever
+                # component sold) cannot relabel the leg and send the next exit
+                # down the wrong rule.
+                "strategy": (r["strategy"] if "strategy" in r.keys() else "") or "",
             })
             if r["side"] == "BUY":
                 slot["size"] += r["size"]
@@ -342,6 +366,7 @@ class Ledger:
                 category=slot["category"] or "other",
                 size=slot["size"], avg_price=slot["cost"] / slot["size"],
                 event_id=slot["event_id"], neg_risk=slot["neg_risk"],
+                strategy=slot["strategy"],
             ))
         return out
 
@@ -351,8 +376,16 @@ class Ledger:
             exposure[p.category] += p.cost_usd
         return dict(exposure)
 
-    def total_exposure(self, mode: str) -> float:
-        return sum(p.cost_usd for p in self.open_positions(mode))
+    def total_exposure(self, mode: str, strategies: set[str] | None = None) -> float:
+        """Open cost, optionally only for `strategies`.
+
+        The filtered form exists so the directional book (longshot + fade) can be
+        capped separately from the whole account: without it the first strategy
+        to run each cycle consumes the shared exposure room, which is how a paper
+        run ended with $1,891 of fade and $0 of market making.
+        """
+        return sum(p.cost_usd for p in self.open_positions(mode)
+                   if strategies is None or p.strategy in strategies)
 
     def accounting_drift(self, mode: str) -> dict[str, float]:
         """{token: oversold_size} where recorded SELLs exceed recorded BUYs.
@@ -538,6 +571,31 @@ class Ledger:
             "VALUES (?,?,?,?,?)",
             (_now(), mode, market_id, p_pred, 1 if filled else 0))
 
+    def record_shadow_quote(self, *, mode: str, market_id: str, question: str,
+                            yes_bid: float, no_bid: float, min_gap_yes: float,
+                            min_gap_no: float, looks: int, size: float) -> None:
+        """How close the tape came to a quote over its life (one row per quote)."""
+        self._execute(
+            "INSERT INTO shadow_quotes (ts, mode, market_id, question, yes_bid, "
+            "no_bid, min_gap_yes, min_gap_no, looks, size) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (_now(), mode, market_id, question[:200], yes_bid, no_bid,
+             min_gap_yes, min_gap_no, int(looks), size))
+
+    def shadow_quote_summary(self, mode: str, limit: int = 5000) -> list[dict]:
+        """Per-market near-miss summary, closest first.
+
+        `closest` is the smallest observed (best ask - our bid) on either side.
+        <= 0 means the tape actually crossed us at least once.
+        """
+        rows = self._query(
+            "SELECT market_id, question, COUNT(*) AS quotes, SUM(looks) AS looks, "
+            "MIN(MIN(min_gap_yes, min_gap_no)) AS closest, "
+            "AVG(MIN(min_gap_yes, min_gap_no)) AS avg_gap "
+            "FROM (SELECT * FROM shadow_quotes WHERE mode = ? "
+            "      ORDER BY id DESC LIMIT ?) GROUP BY market_id "
+            "ORDER BY closest", (mode, limit))
+        return [dict(r) for r in rows]
+
     def quote_outcomes(self, mode: str, limit: int = 5000) -> list[tuple[float, bool]]:
         """(p_pred, filled) pairs, newest first — FillCalibrator input."""
         rows = self._query(
@@ -600,10 +658,27 @@ class Ledger:
         return [dict(r) for r in self._query(
             "SELECT ts, equity, hwm FROM bank ORDER BY id")]
 
-    def estimates_summary(self) -> dict:
+    def estimates_summary(self, fade_bias: float = 0.30) -> dict:
+        """Estimate counts plus how often the estimator changes any decision.
+
+        avg_edge alone is misleading: a mean edge_ratio of 1.00 over tens of
+        thousands of rows can mean "no systematic mispricing" or "the estimator
+        is echoing the market price", and those have very different consequences
+        for whether the LLM is worth paying for. Two extra counts separate them:
+
+          binding      p_est < p_mkt * (1 - fade_bias) — the only case where the
+                       fade's min() picks the estimate over the bias prior, i.e.
+                       the only case where the model moved the trade at all.
+          informative  |edge_ratio - 1| > 0.05 — the estimate differed from the
+                       market by more than rounding, whichever direction.
+        """
+        threshold = max(0.0, 1.0 - fade_bias)
         row = self._query(
             "SELECT COUNT(*) AS total, SUM(qualifies) AS qualifying, "
-            "AVG(edge_ratio) AS avg_edge FROM estimates")[0]
+            "AVG(edge_ratio) AS avg_edge, "
+            "SUM(CASE WHEN edge_ratio < ? THEN 1 ELSE 0 END) AS binding, "
+            "SUM(CASE WHEN ABS(edge_ratio - 1.0) > 0.05 THEN 1 ELSE 0 END) "
+            "AS informative FROM estimates", (threshold,))[0]
         return dict(row)
 
     def high_water_mark(self) -> float:

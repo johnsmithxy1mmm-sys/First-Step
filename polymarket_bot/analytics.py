@@ -37,8 +37,9 @@ def compute_report(ledger: Ledger, mode: str, fade_prior: float = 0.35) -> dict:
         "bank_points": len(bank),
         "pnl_by_strategy": ledger.realized_pnl_by_strategy(mode),
         "longshot": ledger.metrics(mode),
-        "estimates": ledger.estimates_summary(),
+        "estimates": ledger.estimates_summary(fade_prior),
         "markouts": ledger.markout_stats(mode),
+        "shadow_quotes": ledger.shadow_quote_summary(mode),
         "positions": ledger.open_positions(mode),
         "learned_bias": _learned_bias(ledger, mode, fade_prior),
         "stress": _stress(ledger.open_positions(mode)),
@@ -109,8 +110,36 @@ def print_report(report: dict) -> None:
 
     est = report["estimates"]
     if est.get("total"):
-        c.print(f"Estimates recorded: {est['total']} | passed edge threshold: "
+        total = est["total"]
+        c.print(f"Estimates recorded: {total} | passed edge threshold: "
                 f"{est['qualifying'] or 0} | avg edge: {est['avg_edge']:.2f}")
+        binding = est.get("binding") or 0
+        informative = est.get("informative") or 0
+        c.print(f"  estimator moved the fade in {binding}/{total} "
+                f"({100.0 * binding / total:.1f}%) | differed from market by >5% "
+                f"in {informative}/{total} ({100.0 * informative / total:.1f}%)")
+        if binding == 0:
+            c.print("[yellow]  the estimator changed no fade decision: every "
+                    "trade rested on the bias_discount prior, so the LLM is "
+                    "currently being paid for nothing[/yellow]")
+
+    shadows = report.get("shadow_quotes") or []
+    if shadows:
+        t = Table(title="Shadow quotes — how close the tape came to our MM bids")
+        for col, just in (("Market", "left"), ("Quotes", "right"),
+                          ("Looks", "right"), ("Closest", "right"),
+                          ("Avg gap", "right")):
+            t.add_column(col, justify=just)
+        for s in shadows[:15]:
+            closest = s["closest"] if s["closest"] is not None else 0.0
+            t.add_row((s["question"] or s["market_id"])[:46], str(s["quotes"]),
+                      str(s["looks"] or 0), f"{closest:+.4f}",
+                      f"{(s['avg_gap'] or 0.0):+.4f}")
+        c.print(t)
+        c.print("[dim]closest <= 0 = the tape crossed our quote at least once. A "
+                "large positive closest with many looks means the flow never came "
+                "near us — widen/narrow decisions should be made on this, not on "
+                "an empty fill count.[/dim]")
 
     markouts = report["markouts"]
     if markouts:

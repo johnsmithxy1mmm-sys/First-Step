@@ -76,6 +76,47 @@ MUTANTS: list[tuple[str, str, str, str]] = [
      "chat shape unchecked (AttributeError costs the rest of the batch)"),
     ("telegram_control.py", "if not chat or chat != str(self._chat_id):",
      "if False:", "AUTH REMOVED: any chat can drive /pause"),
+    # --- payoff shape and the fade exit ---
+    # Each of these mutants restores a state the code was actually in, and the
+    # paper run that state produced booked $846 of worst case against $37 of
+    # maximum upside, with no rule anywhere that could refuse or unwind it.
+    ("fade.py", "if payoff_ratio(entry_no) < cfg.min_payoff_ratio:",
+     "if False:", "shape gate removed (a 99-wins-per-loss leg is enterable)"),
+    ("fade.py", "return (1.0 - entry_price) / entry_price",
+     "return 1.0 - entry_price",
+     "payoff ratio drops its denominator (shape gate silently loosened)"),
+    ("fade.py",
+     "if cfg.min_edge_per_day > 0 and edge / max(days, 0.5) < cfg.min_edge_per_day:",
+     "if False:", "IRR floor removed (capital locked for months at ~1%)"),
+    ("fade.py", "if (1.0 - mark) >= tail_entry * cfg.tail_stop_multiple:",
+     "if (1.0 - mark) >= tail_entry:",
+     "tail stop fires on any adverse tick (churns the book on noise)"),
+    ("fade.py", "if payoff_ratio(mark) < cfg.min_payoff_ratio:",
+     "if False:", "early take removed (capital sits out the last cent)"),
+    ("fade.py", "if not 0.5 <= entry < 1.0 or not 0.0 < mark < 1.0:",
+     "if False:",
+     "exit direction guard removed (tail logic runs on cheap longshot legs)"),
+    # --- capital allocation and fill measurement ---
+    # NOT mutated: `if directional_room <= 0: return None`. Deleting it is an
+    # EQUIVALENT mutant — a negative room flows into `min(size, room)` and the
+    # `size < min_order_notional` floor below returns None anyway. No test can
+    # kill it because the behaviour is identical, so counting it as a survivor
+    # would be reporting a test gap that does not exist. The reserve itself is
+    # mutated instead, which does change behaviour:
+    ("portfolio.py",
+     "reserve = max(0.0, min(cfg.reserve_for_mm_pct, cfg.max_total_exposure_pct))",
+     "reserve = 0.0",
+     "MM reserve set to zero (directional book eats the whole account)"),
+    ("portfolio.py",
+     "- self._ledger.total_exposure(self._mode, DIRECTIONAL_STRATEGIES))",
+     "- self._ledger.total_exposure(self._mode))",
+     "reserve charges MM inventory against itself (locks the MM out)"),
+    ("marketmaker.py", "self._paper_fills(ws_only=True)", "pass",
+     "fills sampled per cycle again (crossings between cycles go unrecorded)"),
+    ("marketmaker.py",
+     "            return self._top_source(token) if self._top_source is not None else None",
+     "            return self._top(token)",
+     "WS fill path may fall back to blocking REST (stalls the recv loop)"),
 ]
 
 TEST_PATHS = ["polymarket_bot/tests"]

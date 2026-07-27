@@ -1,5 +1,6 @@
 """Fading overpriced tails: condition, bias correction, NO side, caps."""
 
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 import pytest
@@ -22,7 +23,14 @@ def make_estimate(p_mkt=0.05, p_est=None, signals=None, **market_over):
     to require `confidence=1e9` to overpower the market anchor and pin p_est
     exactly — an out-of-contract value (confidence is a 0..1 weight) that the
     Signal model now rejects outright.
+
+    The horizon defaults to 10 days rather than the shared fixture's 30, so each
+    test isolates the variable it names. At 30 days a p_mkt=0.05 tail lands
+    exactly on min_edge_per_day (0.015 / 30 = 0.0005) and would pass or fail on
+    floating-point dust; the horizon and IRR gates have their own tests below.
     """
+    market_over.setdefault(
+        "end_date", datetime.now(timezone.utc) + timedelta(days=10))
     c = make_candidate(outcome_prices=[p_mkt, 1 - p_mkt], **market_over)
     if signals is not None:
         return combine(c, signals, market_anchor_confidence=0.85)

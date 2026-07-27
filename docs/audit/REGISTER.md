@@ -27,6 +27,12 @@ Sorted by (probability in prod) × (irreversibility).
 | F-017 | Medium | high | numeric | denormal tick (2.2e-313) overflows `round()` | property test | FIXED |
 | F-018 | High | high | availability / safety | `telegram_control._advance_offset` wedges the control channel forever | `test_telegram_boundary.py` (24) | FIXED |
 | F-019 | Medium | high | robustness | `handle_update` raises on any non-object field | same file | FIXED |
+| F-020 | **Critical** | high | logic / money | `portfolio.exit_plan` take_profit_multiple=7.0 is unreachable above price 1.0 -> fade legs had NO exit | `test_fade_shape.py` (21) | FIXED |
+| F-021 | High | high | risk-shape | no filter looked at (max gain / max loss); a leg needing 99 wins to repay one loss passed every gate | `test_fade_shape.py`, `shape.feature` | FIXED |
+| F-022 | High | high | logic / capital | `_irr_score` ranked by edge-per-day but never rejected, so the ranking was inert while caps were slack | `test_fade_shape.py` | FIXED |
+| F-023 | High | high | measurement | `_paper_fills` sampled only at the MM cycle; crossings between cycles were invisible -> 0 fills, 0 markouts in a multi-day run | `test_measurement.py` (16) | FIXED |
+| F-024 | Medium | high | capital allocation | `size_usd` gave total exposure first-come-first-served: fade held $1,891, MM $0 | `test_measurement.py` | FIXED |
+| F-025 | Medium | high | observability | the report showed `avg edge 1.00` and could not distinguish 'no mispricing' from 'the estimator echoes the market' | `test_measurement.py` | FIXED |
 
 ---
 
@@ -289,3 +295,163 @@ make either entry point raise.
 
 Mutation coverage added for this module, including **"AUTH REMOVED: any chat can
 drive /pause"** — the tests kill it.
+
+---
+
+# Second pass — findings from a live paper report
+
+Source: a `--mode report` from a multi-day paper run, not from reading code. The
+numbers that started it:
+
+```
+Equity $5,000.00 -> $4,989.08 | Realized PnL: fade +0.00
+Estimates recorded: 23063 | passed edge threshold: 0 | avg edge: 1.00
+No markout data yet
+Open positions (20)  gross $1,891 -> true worst-case $846
+```
+
+Arithmetic on that book: maximum possible upside **$37.27**; expected loss at the
+same prices **$36.34**. Those are equal because "the market price is the fair
+probability" *means* EV zero — so the entire book's profitability rested on one
+hardcoded constant, `fade.bias_discount = 0.40`, and a single adverse resolution
+(-$124.93) would net **-$91** across all twenty positions.
+
+None of this was a crash, an exception or a failing test. Every module behaved
+exactly as written. That is what makes these findings worth recording.
+
+## F-020 — The fade's take-profit could never fire
+
+```
+Severity: Critical | Confidence: high | Class: logic / money
+Location: polymarket_bot/portfolio.py `exit_plan` (used by main.py `_exit_one`)
+```
+`exit_plan` triggers on `current_price / avg_price >= take_profit_multiple`,
+default **7.0**. A fade leg is a NO bought high — 0.976 in the observed book — so
+the trigger needs price **6.83**. Venue prices stop at 1.0, and the largest
+multiple such a position can ever reach is **1.024**.
+
+So `exit_plan` returned `None` on every call for the entire life of all twenty
+positions. Not "rarely fired" — *could not* fire. The machinery was written for
+longshots (buy 0.03, sell 0.21 = 7x) and the fade inherited it wholesale.
+
+The second layer was also inert: `PositionGuardian` does match these legs
+(`min_entry_price: 0.5`) but ships `auto_reduce: false`, so it emitted an alert
+saying "a sold tail is materializing" and took no action. Net effect: a fade
+position had exactly one exit, resolution, at the full notional.
+
+Fixed with `fade.fade_exit_plan` — two rules in price space, where the arithmetic
+is reachable:
+
+* **tail-stop** — out when the implied tail probability has multiplied by
+  `tail_stop_multiple` (2.4% -> 7.2%). Caps the per-leg loss at a few cents
+  rather than ~98, which moves the required hit rate from ~97.6% to ~67%.
+* **payoff-exhausted** — out when the *remaining* payoff ratio falls below the
+  entry floor. At 0.995 the leg risks 99.5c to earn 0.5c; a position we would
+  refuse to open is not one to keep holding.
+
+Honest limitation stated in the code: a stop does **not** add EV. It pays the
+spread and converts some spikes-that-revert into realized losses. It buys
+survivability so the strategy lives long enough to be measured. Whether it is
+net positive here is an empirical question the next paper run answers.
+
+## F-021 — No filter looked at the shape of the payoff
+
+```
+Severity: High | Confidence: high | Class: risk-shape
+Location: polymarket_bot/fade.py `reject_reason`
+```
+The gates were price band, binary-market, horizon, longshot-veto and
+edge-after-fees. All correct, and jointly they admitted legs at 0.99 whose
+(max gain / max loss) is **0.0101** — 99 wins to repay one loss.
+
+Shape is a third axis, independent of time and of edge: a 4-day tail at 0.995
+passes every other filter and is still unrecoverable. `min_payoff_ratio` (0.02,
+i.e. at most ~50 wins per loss) is now checked *before* the edge gate on purpose
+— a 1c tail fails both, and if the edge gate reported first an operator would
+"fix" it by lowering `min_edge_after_fees`, which cannot make the shape sound.
+
+## F-022 — The IRR planner ranked but never refused
+
+```
+Severity: High | Confidence: high | Class: logic / capital
+Location: polymarket_bot/fade.py `_irr_score` / `cycle`
+```
+`_irr_score` computes edge-per-day and `cycle` sorts by it, with the comment "so
+the best opportunities get capital before the portfolio caps fill". True — but
+ranking only decides *order*. While the caps are slack (they usually are) every
+candidate is entered regardless, so a leg earning 0.4c over 90 days was opened
+next to one earning 2.2c over 4. `min_edge_per_day` (0.0005, ~20%/yr on a 0.98
+leg) makes the same quantity a refusal, not just a sort key.
+
+## F-023 — Paper fills were sampled per cycle, so the MM produced no data
+
+```
+Severity: High | Confidence: high | Class: measurement
+Location: polymarket_bot/marketmaker.py `_paper_fills`, `react_to_tick`
+```
+`_paper_fills` was called only from `cycle()`. The cycle samples the book at its
+interval; the tape moves at tick rate. A crossing that opened and closed between
+two cycles was never observed — which is why a multi-day run reported **zero MM
+fills and zero markouts**, leaving the only strategy with a mechanical edge
+completely unmeasured while the fade accumulated twenty positions.
+
+Fills are now evaluated on every WS tick. One hazard came with that and is fixed
+in the same change: `_paper_fills` used `_top`, which falls back to a **blocking**
+`clob.order_book` call. On the receive thread that stalls the recv loop, stops
+the last-message timestamp advancing and trips `ws_staleness_kill_sec` — the bot
+killing its own quoting to collect a paper fill. The tick path takes `ws_only`
+and skips a token the WS store cannot serve. `test_the_tick_path_never_makes_a_rest_call`
+pins it.
+
+Separately, zero fills was *unreadable*: it looks identical whether our spread
+was one tick too wide or the market never traded. The new `shadow_quotes` table
+records, per retired quote, the closest the tape ever came to lifting it — so the
+MM can be judged before it has ever been filled.
+
+## F-024 — Exposure was handed out first-come-first-served
+
+```
+Severity: Medium | Confidence: high | Class: capital allocation
+Location: polymarket_bot/portfolio.py `size_usd`
+```
+`max_total_exposure_pct` was a single shared pool. The fade runs every cycle over
+hundreds of candidates and took $1,891 while the market maker held $0 — not by
+decision, but by asking first. `reserve_for_mm_pct` (0.15) is subtracted from the
+*directional* room only, as a second check beside the account-wide one, using
+`total_exposure(mode, DIRECTIONAL_STRATEGIES)`. This required `Position.strategy`,
+which is taken from the opening trade and never overwritten by a later sell —
+otherwise a partially-sold fade leg would be routed through the wrong exit rule.
+
+## F-025 — `avg edge 1.00` was unreadable
+
+```
+Severity: Medium | Confidence: high | Class: observability
+Location: polymarket_bot/ledger.py `estimates_summary`, analytics.py
+```
+23,063 estimates, mean edge ratio 1.00, zero qualifying. That single number
+cannot distinguish "there is no systematic mispricing to find" from "the
+estimator is echoing the market price" — and only the second means the LLM is
+being paid for nothing. The summary now also counts **binding** estimates
+(`p_est < p_mkt * (1 - bias)`, the only case where the fade's `min()` picks the
+model over the prior) and **informative** ones (`|edge_ratio - 1| > 0.05`), with
+the threshold derived from the configured bias rather than hardcoded. `FadeStrategy`
+counts the same thing live. If binding is 0, the report says so in plain words.
+
+**Not fixed, deliberately:** `bias_discount = 0.40` itself. It carries the entire
+expected return of the strategy and it is a guess — the config comment even reads
+"AGGR: assume tails overpriced by 40% (was 30%)". `TailBiasCalibrator` exists to
+replace it with a measured value and has never fired, because nothing has
+resolved. Changing the number by hand would substitute one guess for another;
+the honest move is to let the first resolutions set it.
+
+## Mutation coverage
+
+27 targeted mutants, all killed. Ten are new, covering the shape gate, the payoff
+ratio arithmetic, the IRR floor, both exit rules, the exit direction guard, the MM
+reserve on both sides, tick-resolution fills and the REST-fallback ban.
+
+One mutant was **removed rather than counted**: deleting
+`if directional_room <= 0: return None` is an *equivalent* mutant — a negative
+room flows into `min(size, room)` and the `size < min_order_notional` floor
+returns `None` anyway. No test can kill it because behaviour is identical, so
+reporting it as a survivor would invent a test gap that does not exist.

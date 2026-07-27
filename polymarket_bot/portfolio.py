@@ -12,6 +12,12 @@ from .models import Estimate, Position, TradePlan
 
 log = logging.getLogger(__name__)
 
+# Strategies that take a VIEW and hold inventory until an outcome is known. They
+# share one exposure budget, kept apart from the market maker's, because they are
+# the ones that can quietly consume the whole account between two MM cycles.
+# "" covers legacy rows written before the strategy column carried a value.
+DIRECTIONAL_STRATEGIES = {"longshot", "fade", ""}
+
 
 def risk_group_key(p: Position) -> tuple[str, str]:
     """Positions that cannot lose simultaneously share a key (netted worst-case).
@@ -204,6 +210,20 @@ class Portfolio:
         if total_room <= 0:
             return None
         size = min(size, total_room)
+
+        # Directional book (longshot + fade) gets the total cap MINUS the market
+        # maker's reserve. Two separate checks on purpose: the one above is the
+        # account-wide safety limit and still counts MM inventory, this one only
+        # stops the directional strategies from eating the room the MM needs when
+        # a quotable market finally appears.
+        reserve = max(0.0, min(cfg.reserve_for_mm_pct, cfg.max_total_exposure_pct))
+        if reserve > 0:
+            directional_room = (
+                (cfg.max_total_exposure_pct - reserve) * bankroll
+                - self._ledger.total_exposure(self._mode, DIRECTIONAL_STRATEGIES))
+            if directional_room <= 0:
+                return None
+            size = min(size, directional_room)
 
         if size < max(min_order_notional, 1.0):
             return None

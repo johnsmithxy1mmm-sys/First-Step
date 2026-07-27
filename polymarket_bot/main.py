@@ -434,8 +434,23 @@ class Bot:
         return False
 
     def _exit_one(self, position, mark: float, from_ws: bool = False) -> bool:
-        """Take-profit a single position at `mark` (used by the cycle and WS fastlane)."""
-        exit_plan = self.portfolio.exit_plan(position, mark)
+        """Exit a single position at `mark` (used by the cycle and WS fastlane).
+
+        Two rule sets, chosen by the strategy that OPENED the leg. The generic
+        take-profit multiple is reachable only for a cheap entry; on a fade leg
+        bought near 1.0 it can never fire, so those positions get the fade's own
+        price-space stop/take instead of silently having no exit at all.
+        """
+        from .fade import fade_exit_plan
+        label = "TAKE-PROFIT"
+        exit_plan = None
+        if position.strategy == "fade":
+            fade_plan = fade_exit_plan(position, mark, self.cfg.fade)
+            if fade_plan is not None:
+                exit_plan = (fade_plan.size, fade_plan.min_price)
+                label = f"FADE-EXIT ({fade_plan.reason})"
+        if exit_plan is None:
+            exit_plan = self.portfolio.exit_plan(position, mark)
         if exit_plan is None:
             return False
         size, min_price = exit_plan
@@ -453,7 +468,7 @@ class Bot:
                                             size, min_price,
                                             known_bid=mark if from_ws else None)
         if result.status == "filled":
-            msg = (f"TAKE-PROFIT [{self.mode}] sold {size:,.0f} at {result.avg_price:.4f} "
+            msg = (f"{label} [{self.mode}] sold {size:,.0f} at {result.avg_price:.4f} "
                    f"(entry {position.avg_price:.4f}) — {position.question[:60]}")
             log.info(msg)
             alert(msg)

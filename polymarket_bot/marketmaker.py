@@ -57,6 +57,13 @@ class Quote(BaseModel):
     size: float
     ts: float = 0.0
     p_fill_pred: float = -1.0   # fill probability predicted at placement (<0 = none)
+    # Shadow measurement: the CLOSEST the tape ever came to lifting this quote,
+    # in dollars of price, plus how many times it was evaluated. A run that fills
+    # nothing still answers "were we 4 ticks away or 40?" — without it, zero fills
+    # is indistinguishable from zero opportunity and the MM cannot be judged.
+    min_gap_yes: float = 1.0
+    min_gap_no: float = 1.0
+    looks: int = 0
 
     @property
     def implied_yes_ask(self) -> float:
@@ -305,6 +312,26 @@ class MarketMaker:
             # The quote died unfilled — a labeled outcome for the calibrator.
             self._ledger.record_quote_outcome(self._mode, market_id,
                                               quote.p_fill_pred, filled=False)
+        self._record_shadow(quote)
+
+    def _record_shadow(self, quote: Quote | None) -> None:
+        """How close the tape came to this quote over its whole life.
+
+        One row per retired quote (not per tick), so the volume stays bounded
+        while still answering the question a zero-fill run cannot otherwise
+        answer: is the spread the binding constraint, or is there simply no flow?
+        """
+        if quote is None or quote.looks <= 0:
+            return
+        try:
+            self._ledger.record_shadow_quote(
+                mode=self._mode, market_id=quote.market.id,
+                question=quote.market.question,
+                yes_bid=quote.yes_bid, no_bid=quote.no_bid,
+                min_gap_yes=quote.min_gap_yes, min_gap_no=quote.min_gap_no,
+                looks=quote.looks, size=quote.size)
+        except Exception:            # analytics must never break quoting
+            log.debug("mm: shadow quote record failed", exc_info=True)
 
     def _record_fill(self, market: Market, outcome_index: int, price: float,
                      size: float, order_id: str | None, status: str) -> None:
@@ -344,17 +371,43 @@ class MarketMaker:
                     if quote is not None:
                         self._record_quote_filled(quote)
 
-    def _paper_fills(self) -> None:
+    def _fill_top(self, token: str, ws_only: bool) -> TopOfBook | None:
+        """Top of book for fill evaluation. `ws_only` forbids the REST fallback.
+
+        `_top` falls back to `clob.order_book` when the WS store has nothing, and
+        that is a blocking HTTP call. On the receive thread it would stall the
+        recv loop, stop the last-message timestamp advancing and trip
+        risk.ws_staleness_kill_sec — pulling every quote. A skipped evaluation is
+        a non-event; a self-inflicted kill-switch is not.
+        """
+        if ws_only:
+            return self._top_source(token) if self._top_source is not None else None
+        return self._top(token)
+
+    def _paper_fills(self, ws_only: bool = False) -> None:
         """Paper mode: a bid fills if the market traded through it.
 
         fill_model (callable(quote, outcome_index, top) -> size), when set,
         decides the filled size (e.g. the replay's queue-aware simulator);
         otherwise the classic optimistic full-size fill applies.
+
+        Called from cycle() AND from the WS fastlane on every tick. Cycle-only
+        sampling was the reason a multi-day paper run produced zero fills and
+        zero markouts: a crossing that opens and closes between two cycles was
+        never observed, so the only strategy with a mechanical edge generated no
+        data at all. Ticks are the resolution the real book moves at.
         """
         for quote in list(self._quotes.values()):
             m = quote.market
-            yes_top = self._top(m.clob_token_ids[0])
-            no_top = self._top(m.clob_token_ids[1])
+            yes_top = self._fill_top(m.clob_token_ids[0], ws_only)
+            no_top = self._fill_top(m.clob_token_ids[1], ws_only)
+            # Record the approach BEFORE deciding on a fill, so the near-misses
+            # of a quote that never fills are still measured.
+            quote.looks += 1
+            if yes_top is not None and yes_top.ask > 0:
+                quote.min_gap_yes = min(quote.min_gap_yes, yes_top.ask - quote.yes_bid)
+            if no_top is not None and no_top.ask > 0:
+                quote.min_gap_no = min(quote.min_gap_no, no_top.ask - quote.no_bid)
             if yes_top is not None and 0 < yes_top.ask <= quote.yes_bid:
                 size = (self.fill_model(quote, 0, yes_top)
                         if self.fill_model is not None else quote.size)
@@ -362,6 +415,7 @@ class MarketMaker:
                     self._record_fill(m, 0, quote.yes_bid, size, None, "paper-filled")
                     self._record_quote_filled(quote)
                     self._quotes.pop(m.id, None)
+                    self._record_shadow(quote)
                     log.info("MM paper fill: Yes %.3f x %.0f (%s)",
                              quote.yes_bid, size, m.question[:40])
             elif no_top is not None and 0 < no_top.ask <= quote.no_bid:
@@ -371,6 +425,7 @@ class MarketMaker:
                     self._record_fill(m, 1, quote.no_bid, size, None, "paper-filled")
                     self._record_quote_filled(quote)
                     self._quotes.pop(m.id, None)
+                    self._record_shadow(quote)
                     log.info("MM paper fill: No %.3f x %.0f (%s)",
                              quote.no_bid, size, m.question[:40])
 
@@ -524,6 +579,10 @@ class MarketMaker:
                 return False
             if yes_top is None:
                 return False
+            # Evaluate fills at TICK resolution, not cycle resolution — WS store
+            # only, since a REST fallback here would stall the recv loop.
+            if self._mode == "paper":
+                self._paper_fills(ws_only=True)
             return self._requote_market(market, yes_top, anchor=False) is not None
         finally:
             self._lock.release()

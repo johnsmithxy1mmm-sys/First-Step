@@ -21,15 +21,88 @@ Positions are held to resolution (the win is small and frequent).
 from __future__ import annotations
 
 import logging
+import math
+from typing import NamedTuple
 
-from .config import BotConfig
+from .config import BotConfig, FadeConfig
 from .executor import Executor
 from .ledger import Ledger
-from .models import Candidate, Estimate, TradePlan
+from .models import Candidate, Estimate, Position, TradePlan
 from .monitor import alert
 from .portfolio import Portfolio, classify_category
 
 log = logging.getLogger(__name__)
+
+
+def payoff_ratio(entry_price: float) -> float:
+    """Max gain / max loss for a leg bought at `entry_price` and paid $1 or $0.
+
+    (1 - entry) / entry. This is the number that says how many wins it takes to
+    repay one loss: 0.02 -> 50, 0.0101 (an entry at 0.99) -> 99.
+    """
+    if not 0.0 < entry_price < 1.0:
+        return 0.0
+    return (1.0 - entry_price) / entry_price
+
+
+class FadeExit(NamedTuple):
+    size: float
+    min_price: float
+    reason: str          # "tail-stop" | "payoff-exhausted"
+
+
+def fade_exit_plan(position: Position, mark: float,
+                   cfg: FadeConfig) -> FadeExit | None:
+    """The fade's real exit; None = keep holding.
+
+    portfolio.exit_plan is unusable here. It triggers on
+    `mark / avg_price >= take_profit_multiple` (7.0 by default), and a fade leg
+    bought at 0.976 would have to reach 6.83 — prices stop at 1.0, so the most it
+    can ever reach is 1.024 and the plan returns None on every call for the life
+    of the position. That machinery was written for longshots (0.03 -> 0.21) and
+    the fade inherited it wholesale, which left these legs with exactly one exit:
+    resolution, at the full notional.
+
+    Two rules, both in price space where the arithmetic is reachable:
+
+      tail-stop         the implied tail probability has multiplied by
+                        `tail_stop_multiple` (2.4% -> 7.2%). Caps the loss at a
+                        few cents instead of ~98. This does NOT add edge — it
+                        pays the spread and turns some spikes-that-revert into
+                        realized losses. It buys survivability, so the strategy
+                        lives long enough to be measured.
+
+      payoff-exhausted  the REMAINING payoff ratio has fallen below the same
+                        floor we demand at entry. At mark 0.995 the position
+                        risks 99.5c to earn 0.5c; we would refuse to open that,
+                        so we do not keep holding it either — and the capital
+                        goes back to work instead of sitting out the last cent.
+    """
+    entry = position.avg_price
+    # Guard the direction of the arithmetic: a fade leg is a NO bought high (the
+    # YES tail is <= fade_max_price, so entry > 0.9 by construction). Anything
+    # cheap here is not a fade and must not be routed through tail logic.
+    if not 0.5 <= entry < 1.0 or not 0.0 < mark < 1.0:
+        return None
+
+    reason: str | None = None
+    tail_entry = 1.0 - entry
+    if cfg.tail_stop_multiple > 0 and tail_entry > 0:
+        if (1.0 - mark) >= tail_entry * cfg.tail_stop_multiple:
+            reason = "tail-stop"
+    if reason is None and cfg.early_take_enabled:
+        if payoff_ratio(mark) < cfg.min_payoff_ratio:
+            reason = "payoff-exhausted"
+    if reason is None:
+        return None
+
+    size = math.floor(position.size * max(0.0, min(cfg.exit_fraction, 1.0)))
+    if size <= 0:
+        return None
+    # A stop must actually get out, so it accepts slippage; a take is selling
+    # into strength near 1.0 and should not dump.
+    min_price = mark * 0.9 if reason == "tail-stop" else mark * 0.99
+    return FadeExit(float(size), round(max(min_price, 0.01), 4), reason)
 
 
 class FadeStrategy:
@@ -43,6 +116,12 @@ class FadeStrategy:
         self._calibrator = calibrator     # TailBiasCalibrator | None
         # Sharpe allocator tilt (set by the bot); caps still apply after it.
         self.size_scale: float = 1.0
+        # Does the estimator change any decision here? p_est only moves the fade
+        # when it is BELOW the bias-corrected price, i.e. when the min() picks it
+        # — otherwise the whole trade rests on the bias_discount prior and the
+        # LLM is being paid for nothing. Counted, not assumed.
+        self.est_seen = 0
+        self.est_binding = 0
 
     def _bias(self, category: str, p_mkt_yes: float) -> float:
         """Learned bias_discount for this bucket, or the config prior."""
@@ -68,6 +147,13 @@ class FadeStrategy:
             return f"tail price outside [{cfg.min_tail_price}, {cfg.fade_max_price}]"
         if c.outcome_index not in (0, 1) or len(c.market.clob_token_ids) < 2:
             return "not a binary market"
+        # Payoff SHAPE, independent of time and of edge: buying NO at (1 - tail)
+        # risks that price to earn `tail`. At a 1c tail it takes 99 wins to repay
+        # one loss, which is not a book you can run — one adverse resolution wipes
+        # out the maximum upside of twenty positions and half as much again.
+        entry_no = 1.0 - p_mkt_yes
+        if payoff_ratio(entry_no) < cfg.min_payoff_ratio:
+            return f"payoff ratio below {cfg.min_payoff_ratio}"
         # Near-term only: the fade edge is fixed per bet, so a distant resolution
         # means a tiny IRR (capital locked for months). Recycle capital fast.
         days = c.market.days_to_resolution()
@@ -78,10 +164,20 @@ class FadeStrategy:
         if estimate.p_est >= p_mkt_yes * cfg.longshot_veto_ratio:
             return "estimator sees a real longshot"
         category = classify_category(c.market.question, c.market.category)
-        p_fair_yes = min(estimate.p_est, p_mkt_yes * (1.0 - self._bias(category, p_mkt_yes)))
+        bias_fair = p_mkt_yes * (1.0 - self._bias(category, p_mkt_yes))
+        p_fair_yes = min(estimate.p_est, bias_fair)
+        self.est_seen += 1
+        if estimate.p_est < bias_fair:
+            self.est_binding += 1        # the LLM, not the prior, set fair value
         edge = (1.0 - p_fair_yes) - (1.0 - p_mkt_yes)   # = p_mkt_yes - p_fair_yes
         if edge < cfg.min_edge_after_fees:
             return "edge below min after fees"
+        # Hard IRR floor. _irr_score already computes this quantity, but it only
+        # RANKS by it — and ranking alone changes nothing while the portfolio caps
+        # are not binding, which is why a leg earning 0.4c over 90 days was
+        # entered alongside one earning 2.2c over 4.
+        if cfg.min_edge_per_day > 0 and edge / max(days, 0.5) < cfg.min_edge_per_day:
+            return f"edge per day below {cfg.min_edge_per_day}"
         return None
 
     def plan(self, estimate: Estimate) -> TradePlan | None:
@@ -158,4 +254,9 @@ class FadeStrategy:
                       f"— {m.question[:60]}")
         if entered:
             log.info("fades this cycle: %d", entered)
+        if self.est_seen:
+            log.info("fade: estimator set fair value in %d/%d scored tails "
+                     "(%.1f%%) — the rest ran on the bias_discount prior",
+                     self.est_binding, self.est_seen,
+                     100.0 * self.est_binding / self.est_seen)
         return entered

@@ -226,6 +226,14 @@ class PortfolioConfig(BaseModel):
     # markups. Clamped so a drawdown can't shrink the base below compound_floor.
     compounding: bool = False
     compound_floor: float = 0.5        # effective bankroll >= this x static bankroll
+    # Capital held back from the DIRECTIONAL strategies (longshot, fade) so the
+    # market maker still has room when quotable markets appear. size_usd hands
+    # out max_total_exposure_pct first-come-first-served, and the fade runs every
+    # cycle over hundreds of candidates: in the observed paper run it held $1,891
+    # while the MM held $0. Expressed as a fraction of bankroll subtracted from
+    # the directional total-exposure room only — the MM's own sizing does not go
+    # through size_usd, so this is a floor for it, not a cap on it.
+    reserve_for_mm_pct: float = 0.15
 
     @field_validator("kelly_fraction")
     @classmethod
@@ -265,6 +273,39 @@ class FadeConfig(BaseModel):
     # (~bias) is fixed per bet, so a distant resolution means a tiny IRR (capital
     # locked for months to earn a few %). Near-term tails recycle capital fast.
     max_days_to_resolution: float = 45.0
+
+    # --- payoff shape (entry gates) ---
+    # Minimum (max gain / max loss) on the NO leg = (1 - entry) / entry. A fade
+    # bought at 0.99 has ratio 0.0101: it takes 99 wins to repay one loss, and a
+    # book of them earns a few dollars while risking hundreds. The horizon cap
+    # above bounds TIME; this bounds SHAPE, a different axis — a 4-day tail at
+    # 0.995 passes every other filter and is still a bet you cannot win back.
+    # 0.02 = at most ~50 wins to repay one loss.
+    min_payoff_ratio: float = 0.02
+    # Hard IRR floor: edge per day, the same quantity _irr_score ranks by. The
+    # ranking alone only decides WHO gets capital first; while the caps are not
+    # binding (usually) every candidate is entered regardless of how slowly it
+    # earns. 0.0005/day on a ~0.98 NO leg is roughly 20%/yr before losses.
+    min_edge_per_day: float = 0.0005
+
+    # --- exits (a fade is NOT held blindly to resolution) ---
+    # portfolio.take_profit_multiple cannot fire on a fade: an entry at 0.976
+    # would have to reach 6.83 and prices stop at 1.0, so exit_plan returns None
+    # forever. The two rules below are the fade's actual exit, in price space
+    # where the arithmetic is reachable. 0 / False disables either one.
+    #
+    # Stop: exit once the implied tail probability has multiplied by this much
+    # (entered at 2.4% -> out at 7.2%). Caps the per-leg loss at a few cents
+    # rather than the whole notional. This trades EV for shape: a tail that
+    # spikes and reverts becomes a realized loss. It is here to make the strategy
+    # survivable long enough to MEASURE, not because it adds edge.
+    tail_stop_multiple: float = 3.0
+    # Take: exit once the REMAINING payoff ratio (1 - mark) / mark drops below
+    # min_payoff_ratio — the entry standard applied to holding. At mark 0.995 you
+    # risk 99.5c to earn 0.5c; we would refuse to open that, so we do not keep it.
+    early_take_enabled: bool = True
+    # Fraction of the leg sold when either rule fires (1.0 = exit fully).
+    exit_fraction: float = 1.0
 
 
 class ResolutionConfig(BaseModel):

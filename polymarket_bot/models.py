@@ -323,6 +323,11 @@ class Position(BaseModel):
     avg_price: float
     event_id: str = ""
     neg_risk: bool = False       # part of a mutually-exclusive (neg-risk) event
+    # Which strategy opened the leg. Exits are strategy-specific — a fade bought
+    # at 0.976 and a longshot bought at 0.03 need different rules, and routing on
+    # price alone would be a guess. Defaults to "" so a Position built by hand
+    # (tests, stubs) is unchanged and simply gets the generic exit.
+    strategy: str = ""
 
     @property
     def cost_usd(self) -> float:

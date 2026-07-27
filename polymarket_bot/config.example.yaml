@@ -298,6 +298,22 @@ fade:
                               # the fade is not dormant when only far-dated cheap tails
                               # exist. Empirically 14 gave 0 fadeable; lower it only if
                               # `--mode diagnose` shows the FADE funnel still PASSES > 0.
+  # --- payoff shape ---
+  # (1 - entry) / entry on the NO leg: how many wins repay one loss, inverted.
+  # 0.02 -> at most ~50 wins per loss. A paper book of legs bought at 0.986-0.99
+  # (ratio 0.010-0.014) had a maximum upside of $37 against a worst case of $846.
+  # Every other filter passed it, because none of them looks at shape.
+  min_payoff_ratio: 0.02
+  # Hard IRR floor, in edge-dollars per day. _irr_score ranks by this, but ranking
+  # is inert while the caps are slack, so far-dated legs were entered alongside
+  # near ones. 0.0005/day on a ~0.98 NO leg is roughly 20%/yr before losses.
+  min_edge_per_day: 0.0005
+  # --- exits ---
+  # portfolio.take_profit_multiple (7.0) is UNREACHABLE for a fade: an entry at
+  # 0.976 would need price 6.83 and prices stop at 1.0. These are the real exits.
+  tail_stop_multiple: 3.0   # implied tail tripled (2.4% -> 7.2%) -> cut the leg
+  early_take_enabled: true  # remaining payoff ratio below min_payoff_ratio -> out
+  exit_fraction: 1.0        # how much of the leg to sell when either rule fires
 
 # Resolution alpha: buy a near-decided side (top outcome ~0.95-0.985, at/near its
 # end date) for a small near-riskless carry until on-chain settlement pays out.
