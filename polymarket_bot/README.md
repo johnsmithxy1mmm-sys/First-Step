@@ -6,10 +6,11 @@ additional strategies (see [STRATEGIES.md](STRATEGIES.md)):
 
 | # | Strategy | Module | Default mode |
 |---|---|---|---|
-| **CORE** | **MM + liquidity rewards farming** (microprice, inventory skew, requote hysteresis, rewards band from Gamma, fee-aware spread) | `marketmaker.py` + `scorer.py` | off — enable after the dry-run → paper phases |
+| **CORE** | **MM + liquidity rewards farming** (microprice, inventory skew, requote hysteresis, quadratic reward-scoring model implemented from Polymarket's published formula, fee-aware spread) | `marketmaker.py` + `scorer.py` + `rewards.py` | off — enable after the dry-run → paper phases |
 | satellite | T-10s TA on 5-min BTC up/down (deterministic slugs, quarter-Kelly, FOK) | `satellite.py` | **off** (`satellite.enabled: false`) |
-| 1 | Structural arbitrage of neg-risk baskets | `arbitrage.py` | detect + alert (the naive sum-to-one over REST is documented as eaten — execution not recommended) |
+| 1 | Structural arbitrage of neg-risk baskets (FOK legs, matched-size confirmed) | `arbitrage.py` | detect + alert by default; execution FOK-only |
 | 2 | Cross-platform divergences (Kalshi) | `crossmarket.py` | alerts only — a human reconciles the resolution rules |
+| chain | Chain (ladder) arbitrage across logically-nested sibling markets | `chainarb.py` | detect + alert by default; exhaustive payoff-matrix tested |
 | 5 | Niche watchlists + longshot barbell | `niche.py`, `scanner.py`+`estimator/` | alerts; longshots in dry-run |
 
 Infrastructure (master prompt 2026): `ws_feed.py` — WS order books with
@@ -184,6 +185,8 @@ faster, learn from itself, and understand its own risk:
 | Risk 2.0 | `risk2.py` | portfolio stress + VaR, market-data anomaly guard, per-strategy circuit breaker |
 | Research | `research.py` | realistic queue/trade-through fill sim, Sharpe allocation, walk-forward tuning (`--mode autotune`, proposal only) |
 | Ops | `ops.py`, `Dockerfile` | Prometheus `/metrics` + `/health`, SIGHUP config hot-reload, docker-compose (bot + Prometheus) |
+| Adverse-selection cover | `toxicity.py` | estimates fill toxicity from the recorded quote tape (efficiency ratio vs random walk) for markets with no realized-fill history yet; hands off to measured markout once fills accumulate |
+| Rewards | `rewards.py` | Polymarket's published quadratic reward-scoring formula, used to rank markets by expected pool share and to place the MM quote where the score is actually earned |
 
 All of these default OFF or to the prior behavior; the aggressive
 `config.example.yaml` profile enables the sound ones. Extra CLI modes:
@@ -193,7 +196,14 @@ All of these default OFF or to the prior behavior; the aggressive
 ## Tests
 
 ```bash
-pytest polymarket_bot/tests/ -q     # 177 offline tests: edge filter, Kelly,
+pytest polymarket_bot/tests/ -q     # 469 offline tests: edge filter, Kelly,
                                     # coherence, idempotency, ledger, fade, MM,
                                     # calibration, netting, resolution, risk2, ...
+
+AUDIT_REPRO=1 pytest polymarket_bot/tests/audit -q   # 18 more: permanent
+                                    # regressions for every finding from the
+                                    # adversarial audit in docs/audit/
 ```
+
+The audit itself — methodology, every finding with a reproducer, and what was
+deliberately left unchecked — is in [`docs/audit/`](../docs/audit/REPORT.md).
