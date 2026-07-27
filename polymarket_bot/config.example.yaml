@@ -312,7 +312,11 @@ fade:
   # portfolio.take_profit_multiple (7.0) is UNREACHABLE for a fade: an entry at
   # 0.976 would need price 6.83 and prices stop at 1.0. These are the real exits.
   tail_stop_multiple: 3.0   # implied tail tripled (2.4% -> 7.2%) -> cut the leg
-  early_take_enabled: true  # remaining payoff ratio below min_payoff_ratio -> out
+  # Fraction of THIS trade's max gain, (mark - entry) / (1 - entry), that banks
+  # the position. Keyed to the entry so it can never fire at a loss — an earlier
+  # remaining-ratio form did exactly that on legacy legs, closing three of them
+  # at or below cost in the first live cycle.
+  early_take_captured: 0.75
   exit_fraction: 1.0        # how much of the leg to sell when either rule fires
 
 # Resolution alpha: buy a near-decided side (top outcome ~0.95-0.985, at/near its

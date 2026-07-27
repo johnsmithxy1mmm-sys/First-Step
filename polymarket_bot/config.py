@@ -300,10 +300,23 @@ class FadeConfig(BaseModel):
     # spikes and reverts becomes a realized loss. It is here to make the strategy
     # survivable long enough to MEASURE, not because it adds edge.
     tail_stop_multiple: float = 3.0
-    # Take: exit once the REMAINING payoff ratio (1 - mark) / mark drops below
-    # min_payoff_ratio — the entry standard applied to holding. At mark 0.995 you
-    # risk 99.5c to earn 0.5c; we would refuse to open that, so we do not keep it.
-    early_take_enabled: bool = True
+    # Take: exit once this fraction of THIS trade's maximum gain is realized,
+    # (mark - entry) / (1 - entry). At entry 0.976 the whole prize is 2.4c, so
+    # 0.75 means out at 0.994 with 1.8c banked and the capital freed instead of
+    # waiting months for the last 0.6c.
+    #
+    # An earlier version keyed this off the REMAINING payoff ratio against
+    # min_payoff_ratio — "the entry standard applied to holding". Elegant and
+    # wrong, for two reasons the first live cycle exposed:
+    #   * both thresholds were the same number, so a position entered at the gate
+    #     boundary (0.9804) had ZERO holding room and would exit on the next tick;
+    #   * it does not look at the entry, so on a leg whose shape was never
+    #     acceptable it fired immediately at whatever mark existed. In that cycle
+    #     three positions were closed at or below cost (Caiado -$0.50, two at
+    #     exactly break-even) — liquidations dressed up as profit-taking.
+    # A captured fraction cannot fire at a loss and scales with the entry.
+    # 0 disables.
+    early_take_captured: float = 0.75
     # Fraction of the leg sold when either rule fires (1.0 = exit fully).
     exit_fraction: float = 1.0
 

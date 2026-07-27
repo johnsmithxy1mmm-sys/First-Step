@@ -120,10 +120,38 @@ def _tail_triples(world):
     world.exit = fade_exit_plan(world.position, world.mark, world.cfg.fade)
 
 
-@when("the price reaches 0.995")
-def _price_995(world):
-    world.mark = 0.995
+@given("a fade leg bought at 0.986")
+def _fade_leg_986(world):
+    world.position = Position(
+        token_id="bdd-no2", market_id="bdd2", question="Will Y happen?",
+        outcome="No", category="other", size=126.0, avg_price=0.986,
+        strategy="fade")
+
+
+@when("three quarters of the possible gain is realised")
+def _three_quarters(world):
+    entry = world.position.avg_price
+    world.mark = round(entry + 0.75 * (1.0 - entry) + 1e-4, 4)
     world.exit = fade_exit_plan(world.position, world.mark, world.cfg.fade)
+
+
+@when("the price drifts below the entry")
+def _price_below_entry(world):
+    world.mark = 0.982                  # Caiado's real exit mark, at a loss
+    world.exit = fade_exit_plan(world.position, world.mark, world.cfg.fade)
+
+
+@then("the sale is a profit")
+def _sale_is_profit(world):
+    gain = (world.mark - world.position.avg_price) * world.position.size
+    assert gain > 0, gain
+
+
+@then("the leg is held")
+def _leg_held(world):
+    assert world.exit is None, (
+        f"a take fired at {world.mark} on a leg bought at "
+        f"{world.position.avg_price} — that realizes a loss, not a profit")
 
 
 @then("the leg is sold")

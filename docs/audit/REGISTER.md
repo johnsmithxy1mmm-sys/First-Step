@@ -345,9 +345,10 @@ is reachable:
 * **tail-stop** — out when the implied tail probability has multiplied by
   `tail_stop_multiple` (2.4% -> 7.2%). Caps the per-leg loss at a few cents
   rather than ~98, which moves the required hit rate from ~97.6% to ~67%.
-* **payoff-exhausted** — out when the *remaining* payoff ratio falls below the
-  entry floor. At 0.995 the leg risks 99.5c to earn 0.5c; a position we would
-  refuse to open is not one to keep holding.
+* **edge-captured** — out once `early_take_captured` (0.75) of *this trade's*
+  maximum gain is banked. At entry 0.976 the whole prize is 2.4c, so the leg is
+  sold near 0.994 with 1.8c realized and the capital recycled rather than waiting
+  months for the last 0.6c.
 
 Honest limitation stated in the code: a stop does **not** add EV. It pays the
 spread and converts some spikes-that-revert into realized losses. It buys
@@ -455,3 +456,55 @@ One mutant was **removed rather than counted**: deleting
 room flows into `min(size, room)` and the `size < min_order_notional` floor
 returns `None` anyway. No test can kill it because behaviour is identical, so
 reporting it as a survivor would invent a test gap that does not exist.
+
+
+## F-026 — The early take could close a position at a loss, and left a marginal entry no room
+
+```
+Severity: Medium | Confidence: high | Class: logic / money
+Found by: the first live paper cycle after F-020 shipped — not by the test suite
+Location: polymarket_bot/fade.py `fade_exit_plan` (the take branch)
+```
+The take shipped in F-020 fired when the **remaining** payoff ratio dropped below
+`min_payoff_ratio` — "the entry standard applied to holding". Elegant, and wrong
+in two ways that only a real book exposed.
+
+**It ignores what was paid.** The condition is a statement about the mark alone,
+so on a leg whose shape was never acceptable — which is every position opened
+before the entry gate existed — it was already true at the moment of entry. The
+rule therefore fired at whatever mark happened to exist. In the first cycle it
+closed three positions at or below cost and logged all three as takes:
+
+```
+Ronaldo Caiado   entry 0.986  exit 0.982   -$0.50
+Jair Bolsonaro   entry 0.989  exit 0.989    $0.00
+Putin out by Aug entry 0.982  exit 0.982    $0.00
+```
+
+**Both thresholds were the same number.** The entry gate admits
+`payoff_ratio >= 0.02`, i.e. entry <= 1/1.02 = 0.98039; the take fired below the
+same ratio, i.e. mark > 0.98039. A position opened at the boundary had *zero*
+holding room and would be liquidated on the next upward tick — buy 0.98039, sell
+0.98040, pay the spread twice for nothing.
+
+Replaced with a captured fraction of the trade's own maximum gain,
+`(mark - entry) / (1 - entry) >= early_take_captured`. It requires `mark > entry`,
+so a take can no longer realize a loss; it scales with the entry, so a marginal
+position has real room; and it is the actual IRR argument — 75% of the prize
+banked, capital recycled.
+
+Applied to that same cycle it fires on 8 of the 16 exits instead of 16, and every
+one of the 8 is a profit. Both stops are unaffected: they are the two exits that
+mattered.
+
+A mutant reverting the take to the remaining-ratio form is now in the suite and
+is killed, so this cannot come back quietly.
+
+**What the cycle also confirmed, in one line:**
+
+```
+fade: estimator set fair value in 0/2 scored tails (0.0%)
+      — the rest ran on the bias_discount prior
+```
+F-025's instrumentation answered on its first run. Two tails is not a sample, but
+the direction is the one the 23,063-estimate average edge of 1.00 predicted.

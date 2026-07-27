@@ -41,10 +41,16 @@ Feature: A position's payoff shape must be survivable
     Then the leg is sold
     And the realised loss is a fraction of the notional
 
-  Scenario: A position with no upside left releases its capital
+  Scenario: A position that has banked most of its prize releases its capital
     Given a fade leg bought at 0.976
-    When the price reaches 0.995
+    When three quarters of the possible gain is realised
     Then the leg is sold
+    And the sale is a profit
+
+  Scenario: A take never closes a position at a loss
+    Given a fade leg bought at 0.986
+    When the price drifts below the entry
+    Then the leg is held
 
   Scenario: The market maker keeps room the directional book cannot take
     Given the fade already holds its full reserve-adjusted budget

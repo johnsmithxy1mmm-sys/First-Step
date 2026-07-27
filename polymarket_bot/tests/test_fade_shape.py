@@ -168,26 +168,57 @@ def test_the_stop_caps_the_loss_far_below_the_notional(cfg, ledger):
     assert stopped_loss < held_loss / 10
 
 
-def test_payoff_exhausted_take_fires_near_one(cfg, ledger):
-    """At 0.995 the leg risks 99.5c to earn 0.5c — a shape we would refuse."""
-    plan = fade_exit_plan(fade_position(0.976), 0.995, cfg.fade)
+def test_take_fires_once_most_of_the_prize_is_banked(cfg, ledger):
+    """Entry 0.976, prize 2.4c: at 0.994 that is 75% captured — bank it."""
+    plan = fade_exit_plan(fade_position(0.976), 0.994, cfg.fade)
     assert plan is not None
-    assert plan.reason == "payoff-exhausted"
-    assert plan.min_price == pytest.approx(round(0.995 * 0.99, 4))
+    assert plan.reason == "edge-captured"
+    assert plan.min_price == pytest.approx(round(0.994 * 0.99, 4))
 
 
-def test_take_and_entry_gate_use_one_standard(cfg, ledger):
-    """A mark we would not enter at is a mark we do not hold at.
+def test_take_waits_while_most_of_the_prize_is_unbanked(cfg, ledger):
+    """At 0.985 only 37.5% of the 2.4c is realized — keep holding."""
+    assert fade_exit_plan(fade_position(0.976), 0.985, cfg.fade) is None
 
-    Same threshold on both sides, so the two rules cannot disagree.
+
+def test_a_take_can_never_realize_a_loss(cfg, ledger):
+    """The defect the first live cycle exposed, pinned.
+
+    The take used to compare the REMAINING payoff ratio against the entry floor,
+    which ignores what was paid. On a leg whose shape was never acceptable — the
+    whole legacy book — that condition held from the moment of entry, so the rule
+    fired at whatever mark existed and closed three positions at or below cost
+    (Caiado -$0.50, two at exactly break-even) while logging them as takes.
     """
-    cfg.fade.min_payoff_ratio = 0.02
-    mark = 0.995
-    assert payoff_ratio(mark) < cfg.fade.min_payoff_ratio
-    assert fade_exit_plan(fade_position(0.976), mark, cfg.fade) is not None
-    # And a mark whose remaining shape is still acceptable is held.
-    assert payoff_ratio(0.97) > cfg.fade.min_payoff_ratio
-    assert fade_exit_plan(fade_position(0.95), 0.97, cfg.fade) is None
+    for entry, mark in ((0.986, 0.982),      # Caiado: below cost
+                        (0.989, 0.989),      # Jair Bolsonaro: flat
+                        (0.982, 0.982)):     # Putin Aug 31: flat
+        pos = fade_position(entry)
+        plan = fade_exit_plan(pos, mark, cfg.fade)
+        assert plan is None, (
+            f"take fired at {mark} on a leg bought at {entry}: "
+            f"{(mark - entry) * pos.size:+.2f} is not a profit to take")
+
+
+def test_a_marginal_entry_still_has_room_to_hold(cfg, ledger):
+    """Entry and take thresholds must not be the same number.
+
+    The entry gate admits anything with payoff_ratio >= min_payoff_ratio, i.e.
+    entry <= 0.9804. When the take also fired below that ratio, a position opened
+    at the boundary was liquidated on the next upward tick — buy 0.9804, sell
+    0.9805, pay the spread twice for nothing.
+    """
+    # (1 - e) / e >= r  <=>  e <= 1 / (1 + r). Computed, not written as a
+    # decimal: 0.9804 is a hair PAST the boundary and would silently make this
+    # test assert something else.
+    boundary = 1.0 / (1.0 + cfg.fade.min_payoff_ratio)
+    assert payoff_ratio(boundary) >= cfg.fade.min_payoff_ratio    # enterable
+    for mark in (0.9805, 0.982, 0.985, 0.99):
+        assert fade_exit_plan(fade_position(boundary), mark, cfg.fade) is None, (
+            f"a leg entered at the gate boundary was taken at {mark}")
+    # It banks only once the prize is genuinely mostly captured.
+    assert fade_exit_plan(fade_position(boundary), 0.9855, cfg.fade) is None
+    assert fade_exit_plan(fade_position(boundary), 0.9953, cfg.fade) is not None
 
 
 def test_exit_refuses_a_cheap_leg(cfg, ledger):
@@ -207,9 +238,9 @@ def test_partial_exit_fraction_is_honored(cfg, ledger):
 
 def test_both_rules_can_be_disabled(cfg, ledger):
     cfg.fade.tail_stop_multiple = 0.0
-    cfg.fade.early_take_enabled = False
+    cfg.fade.early_take_captured = 0.0
     assert fade_exit_plan(fade_position(0.976), 0.92, cfg.fade) is None
-    assert fade_exit_plan(fade_position(0.976), 0.995, cfg.fade) is None
+    assert fade_exit_plan(fade_position(0.976), 0.994, cfg.fade) is None
 
 
 def test_nonsense_marks_do_not_trigger_a_sale(cfg, ledger):

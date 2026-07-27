@@ -48,7 +48,7 @@ def payoff_ratio(entry_price: float) -> float:
 class FadeExit(NamedTuple):
     size: float
     min_price: float
-    reason: str          # "tail-stop" | "payoff-exhausted"
+    reason: str          # "tail-stop" | "edge-captured"
 
 
 def fade_exit_plan(position: Position, mark: float,
@@ -72,11 +72,11 @@ def fade_exit_plan(position: Position, mark: float,
                         realized losses. It buys survivability, so the strategy
                         lives long enough to be measured.
 
-      payoff-exhausted  the REMAINING payoff ratio has fallen below the same
-                        floor we demand at entry. At mark 0.995 the position
-                        risks 99.5c to earn 0.5c; we would refuse to open that,
-                        so we do not keep holding it either — and the capital
-                        goes back to work instead of sitting out the last cent.
+      edge-captured      `early_take_captured` of THIS trade's maximum gain has
+                        been realized. At entry 0.976 the whole prize is 2.4c, so
+                        0.75 means out at 0.994 with 1.8c banked and the capital
+                        recycled instead of waiting months for the last 0.6c.
+                        Keyed to the entry, so it can never fire at a loss.
     """
     entry = position.avg_price
     # Guard the direction of the arithmetic: a fade leg is a NO bought high (the
@@ -90,9 +90,12 @@ def fade_exit_plan(position: Position, mark: float,
     if cfg.tail_stop_multiple > 0 and tail_entry > 0:
         if (1.0 - mark) >= tail_entry * cfg.tail_stop_multiple:
             reason = "tail-stop"
-    if reason is None and cfg.early_take_enabled:
-        if payoff_ratio(mark) < cfg.min_payoff_ratio:
-            reason = "payoff-exhausted"
+    if reason is None and cfg.early_take_captured > 0 and tail_entry > 0:
+        # Fraction of THIS trade's prize that is already banked. Requires
+        # mark > entry, so a take can never realize a loss — the earlier
+        # remaining-ratio form could, and did, on a legacy book.
+        if (mark - entry) / tail_entry >= cfg.early_take_captured:
+            reason = "edge-captured"
     if reason is None:
         return None
 
@@ -100,7 +103,7 @@ def fade_exit_plan(position: Position, mark: float,
     if size <= 0:
         return None
     # A stop must actually get out, so it accepts slippage; a take is selling
-    # into strength near 1.0 and should not dump.
+    # into strength and should not dump.
     min_price = mark * 0.9 if reason == "tail-stop" else mark * 0.99
     return FadeExit(float(size), round(max(min_price, 0.01), 4), reason)
 
