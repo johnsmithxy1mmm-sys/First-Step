@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 
 import httpx
@@ -102,8 +103,17 @@ def round_to_tick(price: float, tick: float) -> float:
     trusting each call site to re-check. Callers that need "there is no real
     price here" must test the raw input (see chainarb._unwind_leg).
     """
-    if tick <= 0:
-        return price
+    # Defence in depth behind models._positive: an unusable tick must never
+    # reach the arithmetic. `round(price / nan)` raises ValueError, and a
+    # negative tick used to fall into the `<= 0` branch and return the price
+    # UNCLAMPED — quietly re-opening the 0/1 order-price hole this function
+    # exists to close. A non-finite price is equally unusable.
+    # A tick is a price increment on a 0..1 probability, so only (0, 1) is
+    # meaningful. tick >= 1 is not merely useless — it INVERTS the clamp, since
+    # `1 - tick` goes negative and `min(..., negative)` then returns a negative
+    # order price (found by the property test, not by reading the code).
+    if not (math.isfinite(price) and math.isfinite(tick)) or not 0 < tick < 1:
+        return min(max(price, 0.0), 1.0) if math.isfinite(price) else 0.0
     snapped = round(round(price / tick) * tick, 6)
     return min(max(snapped, tick), round(1.0 - tick, 6))
 

@@ -21,6 +21,8 @@ Sorted by (probability in prod) × (irreversibility).
 | F-010 | Medium | medium | idempotency | `clob.py:155` no `client_order_id` | repro + fix | FIXED |
 | F-011 | Medium | low | time | `ws_feed.py:206` wall clock | repro + fix | FIXED |
 | F-012 | Low | high | test-gap | `ws_feed.py:77` unknown-side fix | test added | FIXED |
+| F-014 | High | high | numeric / trust-boundary | `models.py:_num/from_gamma` (never fuzzed) | `test_gamma_boundary.py` (20) | FIXED |
+| F-015 | Medium | high | numeric | `clob.py:round_to_tick` tick >= 1 inverts the clamp | property test | FIXED |
 
 ---
 
@@ -161,3 +163,42 @@ impossible state into a plausible zero, hiding duplicated or over-sized exits.
 * `main.py` 1150 lines mixes orchestration, jobs and helpers.
 * `est_to_plan` lives in `main.py` while its collaborators live in `portfolio.py`.
 * `BookStore._bids/_asks` accessed directly by tests (private reach-in).
+
+
+## F-014 — The Gamma REST feed was never fuzzed (the other half of F-001)
+
+```
+Severity: High | Confidence: high | Class: numeric / trust-boundary
+Location: polymarket_bot/models.py (_num, _normalize_spread, from_gamma)
+Method: hand-built hostile payloads — all 9 accepted before the fix
+```
+F-001 hardened the websocket book against NaN/Infinity. The REST parser — the
+OTHER source of every price and tick size — kept accepting whatever it was
+handed: NaN and Infinity prices, prices outside [0,1], negative/NaN tick sizes,
+negative order minimums, infinite volumes.
+
+The sharpest consequence is in the order path, because `orderPriceMinTickSize`
+flows straight into `clob.round_to_tick`:
+
+| poisoned tick | effect before the fix |
+|---|---|
+| `NaN` | `round(price / tick)` **raises ValueError**, killing the strategy job mid-execution |
+| negative | falls into the `tick <= 0` early return, which hands back the price **UNCLAMPED** — silently re-opening the 0/1 order-price hole that clamp exists to close |
+
+Fix: non-finite numerics are treated as ABSENT at the boundary (`_num`), prices
+outside a finite [0,1] reject the whole market row, and sizes/ticks fall back to
+their defaults instead of being trusted (`_positive`). `round_to_tick` also
+became defensive rather than relying on its callers.
+
+## F-015 — A tick size >= 1 inverts the order-price clamp
+
+```
+Severity: Medium | Confidence: high | Class: numeric
+Location: polymarket_bot/clob.py round_to_tick
+Found by: the property test written for F-014, not by reading the code
+```
+`min(max(snapped, tick), 1 - tick)` assumes `tick < 1`. At `tick = 2.0` the
+upper bound `1 - tick` is **-1.0**, so the clamp returns a NEGATIVE order price
+(`round_to_tick(0.0, 2.0) == -1.0`). A tick is a price increment on a 0..1
+probability, so only `(0, 1)` is meaningful; that is now enforced in both the
+parser and the function.

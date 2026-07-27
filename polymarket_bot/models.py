@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from datetime import datetime, timezone
 from typing import Any
 
@@ -23,19 +24,49 @@ def _json_list(value: Any) -> list:
 
 
 def _num(raw: dict, *keys: str) -> float:
+    """First parseable numeric field, or 0.0.
+
+    Non-finite values count as ABSENT: `float("nan")` and `inf` parse happily
+    but are not numbers anything downstream can act on, and Gamma is a TRUST
+    BOUNDARY — the same class of hole that let NaN into the websocket book.
+    Concretely, a NaN `orderPriceMinTickSize` makes `clob.round_to_tick` raise
+    on `round(price / tick)`, and a negative one makes it skip its
+    tradable-range clamp and return an unclamped order price.
+    """
     for key in keys:
         value = raw.get(key)
         if value is None:
             continue
         try:
-            return float(value)
+            number = float(value)
         except (TypeError, ValueError):
             continue
+        if not math.isfinite(number):
+            continue
+        return number
     return 0.0
+
+
+def _positive(value: float, default: float, upper: float | None = None) -> float:
+    """A strictly-positive quantity, or `default`.
+
+    Tick sizes and order minimums are physical quantities: zero or negative
+    means the field is unusable, not that the market is unusual. `upper` bounds
+    the ones that also have a ceiling — a tick size is a price increment on a
+    0..1 probability, so a "tick" of 2 is nonsense that would otherwise invert
+    the clamp in clob.round_to_tick.
+    """
+    if not math.isfinite(value) or value <= 0:
+        return default
+    if upper is not None and value >= upper:
+        return default
+    return value
 
 
 def _normalize_spread(value: float) -> float:
     """Gamma returns rewardsMaxSpread in cents (3.5) — normalize to a probability."""
+    if not math.isfinite(value) or value <= 0:
+        return 0.0
     return value / 100.0 if value > 1.0 else value
 
 
@@ -98,6 +129,11 @@ class Market(BaseModel):
             prices = [float(p) for p in prices_raw]
         except (TypeError, ValueError):
             return None
+        # A probability that is not a finite number in [0, 1] is not a price.
+        # Skipping the market is right: it is one row of a feed, and acting on
+        # an unusable price is worse than not seeing the market at all.
+        if any(not math.isfinite(p) or not 0.0 <= p <= 1.0 for p in prices):
+            return None
         if not (len(outcomes) == len(prices) == len(token_ids)) or not outcomes:
             return None
         event = event or {}
@@ -119,8 +155,8 @@ class Market(BaseModel):
             end_date=_parse_dt(raw.get("endDate")),
             neg_risk=bool(raw.get("negRisk", False)),
             enable_order_book=bool(raw.get("enableOrderBook", True)),
-            tick_size=_num(raw, "orderPriceMinTickSize") or 0.001,
-            min_order_size=_num(raw, "orderMinSize") or 5.0,
+            tick_size=_positive(_num(raw, "orderPriceMinTickSize"), 0.001, upper=1.0),
+            min_order_size=_positive(_num(raw, "orderMinSize"), 5.0),
             resolution_source=raw.get("resolutionSource") or "",
             closed=bool(raw.get("closed", False)),
             uma_resolution_status=str(raw.get("umaResolutionStatus") or "").lower(),
