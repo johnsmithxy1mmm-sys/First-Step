@@ -33,6 +33,8 @@ Sorted by (probability in prod) × (irreversibility).
 | F-023 | High | high | measurement | `_paper_fills` sampled only at the MM cycle; crossings between cycles were invisible -> 0 fills, 0 markouts in a multi-day run | `test_measurement.py` (16) | FIXED |
 | F-024 | Medium | high | capital allocation | `size_usd` gave total exposure first-come-first-served: fade held $1,891, MM $0 | `test_measurement.py` | FIXED |
 | F-025 | Medium | high | observability | the report showed `avg edge 1.00` and could not distinguish 'no mispricing' from 'the estimator echoes the market' | `test_measurement.py` | FIXED |
+| F-026 | Medium | high | logic / money | the early take ignored the entry, so it closed legacy legs at a loss; entry and take thresholds were the same number | `test_fade_shape.py` | FIXED |
+| F-027 | High | high | attribution / capital | `realized_pnl_by_strategy` took the LAST row's label, so a fade loss was booked against idle longshot -- and it feeds the Sharpe allocator | `test_measurement.py` | FIXED |
 
 ---
 
@@ -508,3 +510,86 @@ fade: estimator set fair value in 0/2 scored tails (0.0%)
 ```
 F-025's instrumentation answered on its first run. Two tails is not a sample, but
 the direction is the one the 23,063-estimate average edge of 1.00 predicted.
+
+## F-027 — Realized PnL was charged to whoever SOLD, not whoever opened
+
+```
+Severity: High | Confidence: high | Class: attribution / capital allocation
+Found by: the report printed after F-026 shipped — again not by the test suite
+Location: polymarket_bot/ledger.py `realized_pnl_by_strategy`
+```
+The report said:
+
+```
+Realized PnL by strategy
+  fade      +0.00
+  longshot  -3.52
+```
+
+Every one of those dollars was the fade's. Longshot has not opened a position in
+23,091 estimates.
+
+Two causes stacked. `realized_pnl_by_strategy` folded rows per token with
+`slot["strategy"] = r["strategy"] or slot["strategy"]` — **last row wins** — and
+`Executor.execute_sell` never passed a strategy, so every exit fell through to
+`record_trade`'s `"longshot"` default. Whichever component sold therefore owned
+the whole trade's result.
+
+The report is the smaller half. `realized_pnl_by_strategy` feeds
+`research.sharpe_allocation`, whose weights become `fade.size_scale` and the
+longshot scale through `StrategyAllocator`. So a losing book's losses were being
+charged to an idle strategy: the allocator would have throttled longshot, which
+traded nothing, and left the fade at full size. A capital allocator driven by
+inverted attribution is worse than no allocator.
+
+Attribution now follows the **opening** trade, the same invariant already enforced
+in `open_positions` — where a test (`test_a_later_sell_cannot_relabel_the_leg`)
+had been added for exactly this hazard one commit earlier. The identical bug in
+the sibling aggregation was simply missed. `execute_sell` also takes and records
+the strategy now, so the rows themselves stop lying, though attribution no longer
+depends on them.
+
+Note on the mutant: mutating the assignment *inside* the new
+`if not slot["strategy"]` guard is equivalent — the guard already restricts it to
+the first row. The mutant drops the guard, which is what genuinely restores
+last-row-wins, and it is killed.
+
+## What the same report confirmed
+
+**The estimator's verdict, now on a real sample:**
+
+```
+Estimates recorded: 23091 | passed edge threshold: 0 | avg edge: 1.00
+  estimator moved the fade in 4/23091 (0.0%)
+  | differed from market by >5% in 997/23091 (4.3%)
+```
+The LLM produces a materially different number 4.3% of the time and changes a
+decision in 4 cases out of 23,091 — 0.017%. F-025 was built to answer exactly
+this and it did. Whether that is worth its cost is now a business decision with a
+number attached rather than an intuition.
+
+**The market maker, measured for the first time without a single fill:**
+
+```
+Will JB Pritzker win the 2028 US Presidential   2 quotes  12 looks  closest +0.0060
+Will Fabian Ruiz win the 2026 Ballon d'Or?      2 quotes  12 looks  closest +0.0100
+Will Pete Buttigieg win the 2028 Democratic pr  2 quotes  12 looks  closest +0.0100
+```
+The tape never came within 0.6-1.0c of our bid. Before F-023 this run would have
+reported "0 fills" and been indistinguishable from "our spread is one tick too
+wide". The sample is small (6 evaluations per quote), but the instrument works and
+the quantity it reports — distance to the touch versus the fee break-even floor —
+is the one the widen/tighten decision actually turns on.
+
+**The new gates are now the dominant reject reason for the fade:**
+
+```
+FADE: 14 candidates -> 0 passed
+  payoff ratio below 0.02          6
+  tail price outside [0.005, 0.1]  5
+  edge per day below 0.0005        2
+  resolution too far out           1
+```
+8 of 14 refused by F-021 and F-022. The fade is effectively dormant on the current
+board. That is the intended consequence, not a regression: the funnel yielding 0
+is information.

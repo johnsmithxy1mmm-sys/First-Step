@@ -215,7 +215,8 @@ class Executor:
     # --- exit (take-profit) ---
 
     def execute_sell(self, plan: TradePlan, size: float, min_price: float,
-                     known_bid: float | None = None) -> ExecutionResult:
+                     known_bid: float | None = None,
+                     strategy: str = "longshot") -> ExecutionResult:
         """Sell part of a position at best bid (not below min_price).
 
         `known_bid`: a bid the CALLER already holds (e.g. the WS tick that
@@ -223,6 +224,11 @@ class Executor:
         WS fastlane runs on the recv thread, and get_with_backoff's retries
         there could stall the stream past ws_staleness_kill_sec. The tick's bid
         is also FRESHER than a round-trip re-fetch.
+
+        `strategy`: the label of the strategy that OPENED the position. Every
+        sell used to fall through to `record_trade`'s "longshot" default, so an
+        exited fade book wrote longshot rows. Attribution no longer trusts these
+        rows, but writing the truth costs nothing and keeps ad-hoc SQL honest.
         """
         c = plan.estimate.candidate
         if known_bid is not None:
@@ -274,6 +280,7 @@ class Executor:
             mode=self._mode, estimate=plan.estimate, category=plan.category,
             side="SELL", price=price, size=sold, order_id=order_id,
             status="filled" if self._trader else "sim-filled",
+            strategy=strategy,
         )
         return ExecutionResult(status="filled", filled_size=sold, avg_price=price,
                                order_ids=[order_id] if order_id else [])

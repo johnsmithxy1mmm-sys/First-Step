@@ -423,7 +423,8 @@ class Bot:
             p_mkt=mark, p_est=mark, signals=[])
         min_price = round(max(mark * 0.9, 0.01), 4)   # accept slippage to actually exit
         result = self.executor.execute_sell(
-            est_to_plan(est, position.category), float(size), min_price)
+            est_to_plan(est, position.category), float(size), min_price,
+            strategy=position.strategy or "longshot")
         if result.status == "filled":
             msg = (f"GUARDIAN reduce [{self.mode}] sold {size:,.0f} at "
                    f"{result.avg_price:.4f} (entry {position.avg_price:.4f}) — "
@@ -466,7 +467,8 @@ class Bot:
         # (with retries) would stall the recv loop toward the staleness kill.
         result = self.executor.execute_sell(est_to_plan(est, position.category),
                                             size, min_price,
-                                            known_bid=mark if from_ws else None)
+                                            known_bid=mark if from_ws else None,
+                                            strategy=position.strategy or "longshot")
         if result.status == "filled":
             msg = (f"{label} [{self.mode}] sold {size:,.0f} at {result.avg_price:.4f} "
                    f"(entry {position.avg_price:.4f}) — {position.question[:60]}")

@@ -114,6 +114,11 @@ MUTANTS: list[tuple[str, str, str, str]] = [
      "- self._ledger.total_exposure(self._mode, DIRECTIONAL_STRATEGIES))",
      "- self._ledger.total_exposure(self._mode))",
      "reserve charges MM inventory against itself (locks the MM out)"),
+    # Mutate the GUARD, not the assignment inside it: with the guard intact the
+    # assignment only ever runs on the first row, so changing it is equivalent.
+    # Dropping the guard is what restores last-row-wins.
+    ("ledger.py", 'if not slot["strategy"]:', 'if True:',
+     "PnL attributed to whoever SOLD (a fade loss booked against longshot)"),
     ("marketmaker.py", "self._paper_fills(ws_only=True)", "pass",
      "fills sampled per cycle again (crossings between cycles go unrecorded)"),
     ("marketmaker.py",

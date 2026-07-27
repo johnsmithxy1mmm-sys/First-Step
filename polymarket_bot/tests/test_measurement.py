@@ -306,3 +306,82 @@ def test_a_later_sell_cannot_relabel_the_leg(cfg, ledger):
                         order_id="sell-s3", status="filled", strategy="guardian")
     pos = [p for p in ledger.open_positions("paper") if p.token_id == "s3"]
     assert pos and pos[0].strategy == "fade"
+
+
+# --- F-027: PnL attribution must follow the OPENING strategy ---
+
+def test_realized_pnl_is_charged_to_the_strategy_that_opened_the_trade(cfg, ledger):
+    """The bug a live report showed as `fade +0.00 | longshot -3.52`.
+
+    Attribution took the LAST trade row's label, so whichever component sold owned
+    the result. main._exit_one sells through the generic executor path, which fell
+    through to record_trade's "longshot" default — so a fade book that was exited
+    reported its entire loss against a strategy that made no trades at all.
+    """
+    m = make_market(id="attr", clob_token_ids=["at-y", "at-n"])
+    ledger.record_trade(mode="paper", estimate=simple_estimate(m, 1, 0.976),
+                        category="other", side="BUY", price=0.976, size=100.0,
+                        order_id="b", status="filled", strategy="fade")
+    # The exit, mislabelled the way the generic path used to label it.
+    ledger.record_trade(mode="paper", estimate=simple_estimate(m, 1, 0.946),
+                        category="other", side="SELL", price=0.946, size=100.0,
+                        order_id="s", status="filled", strategy="longshot")
+
+    by_strategy = ledger.realized_pnl_by_strategy("paper")
+    assert by_strategy.get("fade", 0.0) < 0, (
+        f"the loss was not charged to fade: {by_strategy}")
+    assert "longshot" not in by_strategy or by_strategy["longshot"] == 0.0, (
+        f"longshot was charged for a trade it never made: {by_strategy}")
+
+
+def test_misattribution_would_have_misdirected_the_capital_allocator(cfg, ledger):
+    """Why this is more than a cosmetic report defect.
+
+    realized_pnl_by_strategy feeds research.sharpe_allocation, which sets
+    fade.size_scale. Charging a losing book's losses to an idle strategy makes the
+    allocator throttle the wrong one — and leave the loser at full size.
+    """
+    from polymarket_bot.research import sharpe_allocation
+
+    m = make_market(id="alloc", clob_token_ids=["al-y", "al-n"])
+    for i, (entry, exit_price) in enumerate([(0.976, 0.94), (0.970, 0.93)]):
+        tok = f"al-{i}"
+        mk = make_market(id=f"alloc{i}", clob_token_ids=[tok, f"{tok}-b"])
+        ledger.record_trade(mode="paper", estimate=simple_estimate(mk, 0, entry),
+                            category="other", side="BUY", price=entry, size=100.0,
+                            order_id=f"b{i}", status="filled", strategy="fade")
+        ledger.record_trade(mode="paper", estimate=simple_estimate(mk, 0, exit_price),
+                            category="other", side="SELL", price=exit_price,
+                            size=100.0, order_id=f"s{i}", status="filled",
+                            strategy="longshot")
+    del m
+
+    pnl = ledger.realized_pnl_by_strategy("paper")
+    assert pnl.get("fade", 0.0) < 0
+    weights = sharpe_allocation({k: [v] for k, v in pnl.items()})
+    # Whatever the weighting scheme, the LOSER must not outrank the idle strategy.
+    assert weights.get("fade", 0.0) <= weights.get("longshot", 1.0), weights
+
+
+def test_the_sell_row_itself_carries_the_opening_strategy(cfg, ledger):
+    """Belt and braces: write the truth, so ad-hoc SQL is not a trap either."""
+    from unittest import mock
+
+    from polymarket_bot.executor import Executor
+    from polymarket_bot.main import est_to_plan
+    from polymarket_bot.models import BookLevel, OrderBook, Candidate, Estimate
+
+    m = make_market(id="sellrow", clob_token_ids=["sr-y", "sr-n"])
+    clob = mock.Mock()
+    clob.order_book.return_value = OrderBook(
+        bids=[BookLevel(price=0.95, size=500)],
+        asks=[BookLevel(price=0.96, size=500)])
+    ex = Executor(cfg, ledger, clob, None, "paper")
+    est = Estimate(candidate=Candidate(market=m, outcome_index=1,
+                                      token_id="sr-n", p_mkt=0.95),
+                   p_mkt=0.95, p_est=0.95, signals=[])
+    ex.execute_sell(est_to_plan(est, "other"), 50.0, 0.90, strategy="fade")
+
+    row = ledger._conn.execute(
+        "SELECT strategy FROM trades WHERE side='SELL'").fetchone()
+    assert row["strategy"] == "fade"

@@ -459,17 +459,29 @@ class Ledger:
         return float(rows[0]["equity"]) if rows else None
 
     def realized_pnl_by_strategy(self, mode: str) -> dict[str, float]:
-        """Realized PnL by strategy (for allocation and attribution)."""
+        """Realized PnL by strategy (for allocation and attribution).
+
+        Attribution follows the strategy that OPENED the token, never the one that
+        closed it. The previous form took the last row's label, so whichever
+        component sold owned the result: a fade book exited by the generic sell
+        path reported `fade +0.00, longshot -3.52` for trades longshot never made.
+
+        That is not only a cosmetic report bug. This function feeds
+        `research.sharpe_allocation`, which sets `fade.size_scale` — so a losing
+        strategy's losses were charged to an idle one, and the allocator would
+        have throttled the wrong book.
+        """
         rows = self._query(
             "SELECT t.token_id, t.side, t.size, t.usd, t.strategy, r.won "
             "FROM trades t LEFT JOIN resolutions r ON r.token_id = t.token_id "
             "WHERE t.mode = ? AND t.status != 'failed' ORDER BY t.id", (mode,))
         per_token: dict[str, dict] = defaultdict(
             lambda: {"buy_size": 0.0, "buy_usd": 0.0, "sell_usd": 0.0,
-                     "sell_size": 0.0, "won": None, "strategy": "longshot"})
+                     "sell_size": 0.0, "won": None, "strategy": ""})
         for r in rows:
             slot = per_token[r["token_id"]]
-            slot["strategy"] = r["strategy"] or slot["strategy"]
+            if not slot["strategy"]:            # first row for this token wins
+                slot["strategy"] = (r["strategy"] or "").strip() or "longshot"
             if r["side"] == "BUY":
                 slot["buy_size"] += r["size"]
                 slot["buy_usd"] += r["usd"]
