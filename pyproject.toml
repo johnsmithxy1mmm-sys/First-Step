@@ -1,7 +1,7 @@
 # Tooling config only — the package itself is run as `python -m polymarket_bot.main`.
 
 [tool.pytest.ini_options]
-testpaths = ["polymarket_bot/tests"]
+testpaths = ["polymarket_bot/tests", "risk_engine/tests"]
 # Audit reproducers are gated behind AUDIT_REPRO=1 (see tests/audit/conftest.py)
 # so a normal run stays fast; CI runs them explicitly.
 addopts = "-q"
@@ -57,3 +57,4 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "polymarket_bot/tests/*" = ["S105", "S106", "S107", "SLF001", "B017"]
+"risk_engine/tests/*" = ["S105", "S106", "S107", "SLF001", "B017"]
