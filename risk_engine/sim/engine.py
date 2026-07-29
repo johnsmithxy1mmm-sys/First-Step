@@ -75,12 +75,18 @@ class ModelBundle:
         missing = [c for c in coins if c not in self.marginals]
         if missing:
             raise KeyError(f"no fitted marginal for {missing}")
+        # Audit A-03: rho=0 under a t-copula is NOT independence -- the shared
+        # chi-square mixer still crashes every asset together (measured:
+        # 12.95% joint lower-tail frequency where independence gives 5%).
+        # §3.2's baseline B demands independent paths, and a Gaussian copula
+        # with an identity matrix is the elliptical copula for which
+        # uncorrelated actually means independent. Marginals are untouched.
         return PathSpec(
             coins=coins,
             step_vol=vol,
             corr=corr,
             marginal_df=tuple(self.marginals[c].df for c in coins),
-            copula_df=self.copula_df,
+            copula_df=None if independent else self.copula_df,
             drift=self.drift,
         )
 
@@ -127,20 +133,23 @@ class _RawOutcome:
     factor_return: np.ndarray = field(default_factory=lambda: np.empty(0))
 
 
-def simulate_paths(
+def simulate_paths_checkpointed(
     book: Book,
     specs: dict[str, AssetSpec],
     path_spec: PathSpec,
     spot: np.ndarray,
     base: BaseRandomness,
     funding_paths: np.ndarray | None,
+    horizons: tuple[int, ...],
     use_bridge: bool = True,
     factor_col: int | None = None,
-) -> _RawOutcome:
-    """One deterministic block of paths.
+) -> dict[int, _RawOutcome]:
+    """One deterministic block of paths, snapshotted at each horizon.
 
     Deterministic given `base`, which is what makes common random numbers
-    possible for the benchmarks in §3.1.
+    possible for the benchmarks in §3.1. All horizons come from the SAME
+    walk (audit A-10): alive sets only ever shrink, so the liquidation flags
+    at a longer horizon are a pathwise superset of a shorter one.
     """
     columns = {c: i for i, c in enumerate(path_spec.coins)}
     with Timer("generate_paths"):
@@ -153,23 +162,44 @@ def simulate_paths(
     # configurations too; drawing them here would break common random numbers.
     uniforms = (base.bridge_cross, base.bridge_iso) if use_bridge else None
     with Timer("liquidation_walk"):
-        out = sim.run(
-            prices, funding_paths=funding_paths, bridge=bridge, bridge_uniforms=uniforms
+        outs = sim.run_checkpointed(
+            prices, horizons, funding_paths=funding_paths, bridge=bridge,
+            bridge_uniforms=uniforms,
         )
-    factor = (
-        prices[:, -1, factor_col] / prices[:, 0, factor_col] - 1.0
-        if factor_col is not None
-        else np.empty(0)
-    )
-    return _RawOutcome(
-        cross_liq=out.cross_liquidated,
-        iso_liq=out.isolated_liquidated,
-        equity_change=out.equity_change,
-        funding_paid=out.funding_paid,
-        isolated_coins=out.isolated_coins,
-        start_equity=out.start_equity,
-        factor_return=factor,
-    )
+    result: dict[int, _RawOutcome] = {}
+    for h, out in outs.items():
+        factor = (
+            prices[:, h, factor_col] / prices[:, 0, factor_col] - 1.0
+            if factor_col is not None
+            else np.empty(0)
+        )
+        result[h] = _RawOutcome(
+            cross_liq=out.cross_liquidated,
+            iso_liq=out.isolated_liquidated,
+            equity_change=out.equity_change,
+            funding_paid=out.funding_paid,
+            isolated_coins=out.isolated_coins,
+            start_equity=out.start_equity,
+            factor_return=factor,
+        )
+    return result
+
+
+def simulate_paths(
+    book: Book,
+    specs: dict[str, AssetSpec],
+    path_spec: PathSpec,
+    spot: np.ndarray,
+    base: BaseRandomness,
+    funding_paths: np.ndarray | None,
+    use_bridge: bool = True,
+    factor_col: int | None = None,
+) -> _RawOutcome:
+    """Single-horizon convenience wrapper; the §3.1 benchmarks use this."""
+    n_steps = base.z.shape[1]
+    return simulate_paths_checkpointed(
+        book, specs, path_spec, spot, base, funding_paths, (n_steps,), use_bridge, factor_col
+    )[n_steps]
 
 
 class MonteCarloEngine:
@@ -199,8 +229,43 @@ class MonteCarloEngine:
         factor_coin: str | None = "BTC",
         now: datetime | None = None,
     ) -> RiskResult:
+        """Single horizon. For several horizons use `run_horizons`, which
+        walks them on shared paths."""
+        return self.run_horizons(
+            book, spot, (horizon_hours,), n_paths=n_paths, seed=seed,
+            independent=independent, include_funding=include_funding,
+            use_bridge=use_bridge, target_half_width=target_half_width,
+            max_paths=max_paths, chunk_paths=chunk_paths, factor_coin=factor_coin,
+            now=now,
+        )[horizon_hours]
+
+    def run_horizons(
+        self,
+        book: Book,
+        spot: dict[str, float],
+        horizons: tuple[int, ...],
+        n_paths: int = DEFAULT_PATHS,
+        seed: int | None = None,
+        independent: bool = False,
+        include_funding: bool = True,
+        use_bridge: bool = True,
+        target_half_width: float = DEFAULT_TARGET_HALF_WIDTH,
+        max_paths: int = MAX_PATHS,
+        chunk_paths: int = DEFAULT_CHUNK,
+        factor_coin: str | None = "BTC",
+        now: datetime | None = None,
+    ) -> dict[int, RiskResult]:
+        """Every horizon from one walk of shared paths (audit A-10).
+
+        Convergence is judged on the horizon with the widest interval, so
+        every returned result satisfies §2.5's 2 pp rule, and P(liq) is
+        pathwise monotone in the horizon rather than monotone in expectation.
+        """
         if not book.positions:
             raise ValueError("an empty book has no liquidation risk to estimate")
+        if not horizons or any(h < 1 for h in horizons):
+            raise ValueError(f"horizons must be positive step counts, got {horizons}")
+        horizons = tuple(sorted(set(int(h) for h in horizons)))
         now = now or datetime.now(timezone.utc)
         # §2.5: a random seed in production, a fixed one in tests, and it is
         # written next to the result either way.
@@ -235,61 +300,69 @@ class MonteCarloEngine:
 
         notes: list[str] = []
         target = n_paths
-        raw: _RawOutcome | None = None
+        raws: dict[int, _RawOutcome] = {}
         converged = False
         while True:
-            raw = self._accumulate(
-                book, spec, spot_vec, target, horizon_hours, seed, n_iso,
+            raws = self._accumulate(
+                book, spec, spot_vec, target, horizons, seed, n_iso,
                 include_funding, use_bridge, chunk_paths, factor_col,
             )
-            k = int(_any_liq(raw).sum())
-            if wilson_half_width(k, target) <= target_half_width:
+            widest = max(
+                wilson_half_width(int(_any_liq(r).sum()), target) for r in raws.values()
+            )
+            if widest <= target_half_width:
                 converged = True
                 break
-            needed = paths_needed_for_half_width(k / target, target_half_width)
+            # Size the next attempt on the horizon that is hardest to resolve.
+            worst_p = max(float(_any_liq(r).mean()) for r in raws.values())
+            needed = paths_needed_for_half_width(worst_p, target_half_width)
             nxt = min(max(needed, target * 2), max_paths)
             if nxt <= target:
                 notes.append(
                     f"path cap {max_paths} reached with interval half-width "
-                    f"{wilson_half_width(k, target):.4f} > {target_half_width}"
+                    f"{widest:.4f} > {target_half_width}"
                 )
                 self.metrics.incr("mc_non_convergence")
                 break
             self.metrics.incr("mc_path_escalations")
             target = nxt
 
-        assert raw is not None
-        return self._assemble(
-            raw, seed, target, horizon_hours, converged, now, tuple(notes), factor_coin
-        )
+        return {
+            h: self._assemble(
+                raws[h], seed, target, h, converged, now, tuple(notes), factor_coin
+            )
+            for h in horizons
+        }
 
     def _accumulate(
-        self, book, spec, spot_vec, n_paths, horizon_hours, seed, n_iso,
+        self, book, spec, spot_vec, n_paths, horizons, seed, n_iso,
         include_funding, use_bridge, chunk_paths, factor_col=None,
-    ) -> _RawOutcome:
+    ) -> dict[int, _RawOutcome]:
         rng = np.random.default_rng(seed)
         funding_models = self.bundle.funding_models(spec.coins) if include_funding else None
-        parts: list[_RawOutcome] = []
+        longest = max(horizons)
+        parts: dict[int, list[_RawOutcome]] = {h: [] for h in horizons}
         done = 0
         while done < n_paths:
             size = min(chunk_paths, n_paths - done)
             base = draw_base_randomness(
-                size, horizon_hours, spec.n_assets, n_iso, spec.copula_df, rng
+                size, longest, spec.n_assets, n_iso, spec.copula_df, rng
             )
             funding = (
                 simulate_funding(
-                    funding_models, self.bundle.funding_bounds, size, horizon_hours, rng
+                    funding_models, self.bundle.funding_bounds, size, longest, rng
                 )
                 if include_funding
                 else None
             )
-            parts.append(
-                simulate_paths(
-                    book, self.specs, spec, spot_vec, base, funding, use_bridge, factor_col
-                )
+            block = simulate_paths_checkpointed(
+                book, self.specs, spec, spot_vec, base, funding, horizons,
+                use_bridge, factor_col,
             )
+            for h in horizons:
+                parts[h].append(block[h])
             done += size
-        return _concat(parts)
+        return {h: _concat(v) for h, v in parts.items()}
 
     def _assemble(
         self, raw, seed, n_paths, horizon_hours, converged, now, notes, factor_coin=None

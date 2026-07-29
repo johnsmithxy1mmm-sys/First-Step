@@ -323,3 +323,135 @@ class TestCopula:
         assert lower_tail_dependence(4.0, 0.999999) == pytest.approx(1.0, abs=0.01)
         # Heavier copula tails mean more joint extremes at the same rho.
         assert lower_tail_dependence(3.0, 0.6) > lower_tail_dependence(20.0, 0.6)
+
+
+class TestShrinkageIntensityMagnitude:
+    """Audit A-05. The previous suite checked only the *direction* of
+    shrinkage (|shrunk| < |raw|) and that variances survive -- both true of a
+    degenerate estimator that always returns intensity 1.0. A live mutation
+    inverting `/n_eff` to `*n_eff`, which clips to full equicorrelation,
+    survived the entire suite. These pin the magnitude.
+
+    The fixture uses *heterogeneous* factor loadings on purpose: pairwise
+    correlations then differ widely, so the constant-correlation target is
+    genuinely wrong and the optimal intensity must decay with sample size.
+    With independent columns the target is exactly right and intensity 1.0 is
+    the correct answer -- which is why the naive fixture cannot tell a working
+    estimator from a broken one.
+    """
+
+    @staticmethod
+    def _hetero(n, a, seed):
+        rng = np.random.default_rng(seed)
+        f = rng.standard_normal(n)
+        loads = np.linspace(0.15, 0.95, a)
+        return np.column_stack([
+            (loads[i] * f + np.sqrt(1 - loads[i] ** 2) * rng.standard_normal(n))
+            * (0.01 + 0.001 * i)
+            for i in range(a)
+        ])
+
+    @classmethod
+    def _intensity(cls, n, a, seed):
+        x = cls._hetero(n, a, seed)
+        w = ewma_weights(n, half_life=10**9)  # ~flat weights: textbook LW regime
+        return ledoit_wolf_constant_correlation(x, w, effective_sample_size(w)).intensity
+
+    def test_intensity_vanishes_as_the_sample_grows(self):
+        """LW intensity is O(1/n) against a misspecified target: with abundant
+        data the sample estimate wins. A `*n_eff` mutant saturates at 1.0."""
+        assert self._intensity(40_000, 8, 4001) < 0.01
+
+    def test_intensity_is_interior_when_data_are_scarce(self):
+        """Few observations relative to dimension: shrinkage must be doing
+        real work, but must not have collapsed onto the target either."""
+        got = self._intensity(80, 12, 4002)
+        assert 0.02 < got < 0.95, got
+
+    def test_intensity_falls_monotonically_with_sample_size(self):
+        vals = [self._intensity(n, 8, 4003) for n in (100, 400, 1600, 6400)]
+        assert all(b < a for a, b in zip(vals, vals[1:])), vals
+
+    def test_intensity_saturates_when_the_target_is_exactly_right(self):
+        """The other end of the scale, and the reason the old fixture was
+        blind: for independent columns the equicorrelated target with r=0 IS
+        the truth, so full shrinkage is optimal and expected."""
+        rng = np.random.default_rng(4005)
+        x = rng.standard_normal((40_000, 5)) * 0.01
+        w = ewma_weights(40_000, half_life=10**9)
+        got = ledoit_wolf_constant_correlation(x, w, effective_sample_size(w)).intensity
+        assert got > 0.9
+
+    def test_full_shrinkage_would_erase_a_known_correlation(self):
+        """Guards the consequence, not just the coefficient: with plenty of
+        data and a misspecified target, the shrunk correlation must still
+        recover the true 0.7 rather than being pulled to the average."""
+        rng = np.random.default_rng(4004)
+        f = rng.standard_normal(30_000)
+        cols = [f * 0.01]
+        for load in (0.7, 0.15, 0.95):
+            cols.append((load * f + np.sqrt(1 - load**2) * rng.standard_normal(30_000)) * 0.01)
+        x = np.column_stack(cols)
+        w = ewma_weights(30_000, half_life=10**9)
+        res = ledoit_wolf_constant_correlation(x, w, effective_sample_size(w))
+        sd = np.sqrt(np.diag(res.cov))
+        assert res.cov[0, 1] / (sd[0] * sd[1]) == pytest.approx(0.7, abs=0.02)
+
+
+class TestImputedRowShape:
+    """Audit A-06. The gate's *level* was pinned but the *shape* of the
+    imputed row was not: a mutant assigning the same gate correlation to
+    every mature asset -- destroying the single-factor structure -- survived
+    the whole suite."""
+
+    @staticmethod
+    def _series(rng, n=MIN_HISTORY_HOURS * 2):
+        """One factor plus a deliberately anti-correlated asset, so that
+        `gate * rho(anchor, j)` and a flat `gate` differ in sign, not just
+        in magnitude."""
+        factor = rng.standard_normal(n)
+        out = {
+            "BTC": factor * 0.01,
+            "ETH": (0.9 * factor + 0.43 * rng.standard_normal(n)) * 0.012,
+            "SOL": (0.8 * factor + 0.6 * rng.standard_normal(n)) * 0.015,
+            # Moves against the market: a flat-gate imputation would claim a
+            # young listing is positively correlated with it.
+            "INVERSE": (-0.85 * factor + 0.52 * rng.standard_normal(n)) * 0.02,
+        }
+        return out
+
+    def test_imputed_row_follows_the_single_factor_through_the_anchor(self):
+        rng = np.random.default_rng(4101)
+        series = self._series(rng)
+        series["NEWCOIN"] = rng.standard_normal(300) * 0.03
+        m = build_global_matrix(series)
+
+        young = m.assets.index("NEWCOIN")
+        anchor = m.assets.index("BTC")
+        gate = m.diagnostics.gate_correlation
+        for name in ("ETH", "SOL", "INVERSE"):
+            j = m.assets.index(name)
+            assert m.corr[young, j] == pytest.approx(gate * m.corr[anchor, j], abs=0.02), name
+
+    def test_imputation_preserves_the_sign_of_the_anchor_relationship(self):
+        """The sharp end of A-06: an asset that moves against BTC must not be
+        handed a positive correlation with a new listing."""
+        rng = np.random.default_rng(4102)
+        series = self._series(rng)
+        series["NEWCOIN"] = rng.standard_normal(300) * 0.03
+        m = build_global_matrix(series)
+        young = m.assets.index("NEWCOIN")
+        inverse = m.assets.index("INVERSE")
+        anchor = m.assets.index("BTC")
+        assert m.corr[anchor, inverse] < 0
+        assert m.corr[young, inverse] < 0, "flat-gate imputation would put this above zero"
+
+    def test_two_young_assets_get_the_factor_product(self):
+        rng = np.random.default_rng(4103)
+        series = self._series(rng)
+        series["NEW1"] = rng.standard_normal(300) * 0.03
+        series["NEW2"] = rng.standard_normal(250) * 0.02
+        m = build_global_matrix(series)
+        i, j = m.assets.index("NEW1"), m.assets.index("NEW2")
+        gate = m.diagnostics.gate_correlation
+        assert m.corr[i, j] == pytest.approx(gate * gate, abs=0.02)

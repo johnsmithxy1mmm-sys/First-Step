@@ -58,12 +58,28 @@ CREATE TABLE IF NOT EXISTS calibration_outcomes (
     external_flow_usd    DOUBLE PRECISION NOT NULL,
     book_changed         BOOLEAN     NOT NULL,
     liquidated           BOOLEAN     NOT NULL,
+    -- RANDOMIZED probability integral transform. The predicted distribution
+    -- has an atom at total loss, because §1.6 writes a liquidated pool to
+    -- exactly zero equity. A plain CDF value maps every realised liquidation
+    -- to one identical number, and the KS test then rejects even a perfectly
+    -- calibrated model (audit A-02: p = 1e-104 on a by-construction-true
+    -- forecast). pit is drawn uniformly inside [F(x-), F(x)]; pit_u is the
+    -- uniform that was used, derived deterministically from the prediction
+    -- id so the row stays reproducible.
     pit                  DOUBLE PRECISION NOT NULL,
+    pit_u                DOUBLE PRECISION NOT NULL,
     crps                 DOUBLE PRECISION NOT NULL,
     var_95_breached      BOOLEAN     NOT NULL,
     -- The calendar day is the independent unit for clustered inference:
     -- addresses observed on the same day share one market (OPEN-QUESTIONS B1).
-    observation_day      DATE        NOT NULL
+    observation_day      DATE        NOT NULL,
+    -- How late the resolver ran against the prediction's own horizon. A 24h
+    -- forecast scored against a 72h realisation is not a model error, it is
+    -- an infrastructure gap, and scoring it silently corrupts the calibration
+    -- record (audit A-04). Stale rows are excluded from every cohort by
+    -- default and counted in observability.
+    resolution_lag_s     DOUBLE PRECISION NOT NULL,
+    stale_resolution     BOOLEAN     NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS calibration_outcomes_day_idx

@@ -133,6 +133,11 @@ class PredictiveDistribution:
     def __post_init__(self) -> None:
         if self.levels.shape != self.values.shape:
             raise ValueError("levels and values must have the same shape")
+        # Finiteness before monotonicity (audit A-07): NaN makes every
+        # comparison False, so a NaN quantile function would otherwise pass
+        # the non-decreasing check and poison the calibration journal.
+        if not np.isfinite(self.values).all():
+            raise ValueError("quantile values must be finite")
         if np.any(np.diff(self.values) < 0):
             raise ValueError("quantile function must be non-decreasing")
 
@@ -144,15 +149,49 @@ class PredictiveDistribution:
     def quantile(self, q: float | np.ndarray) -> float | np.ndarray:
         return np.interp(q, self.levels, self.values)
 
-    def cdf(self, x: float | np.ndarray) -> float | np.ndarray:
-        return np.interp(x, self.values, self.levels, left=0.0, right=1.0)
+    def cdf_interval(self, x: float) -> tuple[float, float]:
+        """(P(X < x), P(X <= x)) -- distinct exactly where the law has an atom.
 
-    def pit(self, actual: float) -> float:
-        """§3.3: run the realised value through the predicted CDF.
-
-        Under a correctly calibrated model these are uniform on [0, 1].
+        The liquidation model writes a wiped account to exactly zero equity
+        (§1.6), so the predicted equity-change distribution carries a mass
+        point at total loss. A single-valued CDF cannot represent that
+        honestly; both one-sided limits can.
         """
-        return float(self.cdf(actual))
+        v, lv = self.values, self.levels
+        il = int(np.searchsorted(v, x, side="left"))
+        ir = int(np.searchsorted(v, x, side="right"))
+        if il < ir:
+            # x sits on a flat run of the quantile function: an atom.
+            return float(lv[il]), float(lv[ir - 1])
+        if il == 0:
+            return 0.0, 0.0
+        if il == len(v):
+            return 1.0, 1.0
+        t = (x - v[il - 1]) / (v[il] - v[il - 1])
+        c = float(lv[il - 1] + t * (lv[il] - lv[il - 1]))
+        return c, c
+
+    def cdf(self, x: float) -> float:
+        """Midpoint CDF; for atom-aware work use `cdf_interval` or `pit`."""
+        lo, hi = self.cdf_interval(x)
+        return 0.5 * (lo + hi)
+
+    def pit(self, actual: float, u: float) -> float:
+        """§3.3: randomized probability integral transform.
+
+        Uniform on [0, 1] under a correctly calibrated model *including*
+        models whose predicted distribution carries atoms. The naive
+        `cdf(actual)` is not: every realised liquidation maps to the same
+        deterministic value, and the KS test then rejects a perfectly
+        calibrated model with certainty (audit A-02, reproduced at
+        p = 1e-104). `u` must be an independent U(0,1) draw; the resolver
+        derives it deterministically from the prediction id so every journal
+        row stays reproducible.
+        """
+        if not 0.0 <= u <= 1.0:
+            raise ValueError(f"u must be in [0, 1], got {u}")
+        lo, hi = self.cdf_interval(actual)
+        return lo + u * (hi - lo)
 
     def crps(self, actual: float) -> float:
         """Continuous ranked probability score, lower is better.

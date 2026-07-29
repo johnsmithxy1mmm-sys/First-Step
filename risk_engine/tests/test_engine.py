@@ -12,6 +12,7 @@ from risk_engine.observability.metrics import METRICS, Metrics
 from risk_engine.sim.engine import MonteCarloEngine
 from risk_engine.sim.stats import (
     PredictiveDistribution,
+    ks_uniformity,
     paths_needed_for_half_width,
     wilson_half_width,
     wilson_interval,
@@ -111,7 +112,9 @@ class TestEngine:
         indep = engine.run(book, spot, 24, n_paths=20_000, seed=9,
                            independent=True, now=now)
         assert full.p_liq_any.point > indep.p_liq_any.point
-        assert full.distinguishable(indep) if hasattr(full, "distinguishable") else True
+        # Audit A-12: the previous form was `assert ... if hasattr(...) else True`
+        # against an attribute RiskResult does not have, i.e. vacuously true.
+        assert full.p_liq_any.distinguishable_from(indep.p_liq_any)
 
     def test_funding_costs_money_over_a_week(self, bundle, specs, spot, now):
         engine = MonteCarloEngine(bundle, specs)
@@ -210,9 +213,57 @@ class TestStatistics:
     def test_pit_of_a_correct_forecast_is_uniform(self):
         rng = np.random.default_rng(1)
         dist = PredictiveDistribution.from_samples(rng.normal(0, 1, 100_000))
-        pits = np.array([dist.pit(x) for x in rng.normal(0, 1, 5_000)])
+        pits = np.array([dist.pit(x, rng.random()) for x in rng.normal(0, 1, 5_000)])
         assert abs(pits.mean() - 0.5) < 0.02
         assert abs(np.quantile(pits, 0.9) - 0.9) < 0.02
+
+    def test_randomized_pit_stays_uniform_when_the_forecast_has_an_atom(self):
+        """Audit A-02, the killer test.
+
+        The liquidation model writes a wiped account to exactly zero equity
+        (§1.6), so the predicted distribution carries a mass point. A plain
+        `F(x)` maps every realised liquidation to one identical value and KS
+        rejects a by-construction-perfect forecast at p ~ 1e-104. The
+        randomized transform must not.
+        """
+        rng = np.random.default_rng(11)
+
+        def draw(n):  # 20% atom at -1000, otherwise N(0, 100)
+            x = rng.normal(0, 100, n)
+            x[rng.random(n) < 0.20] = -1000.0
+            return x
+
+        dist = PredictiveDistribution.from_samples(draw(200_000))
+        actual = draw(3_000)
+        pits = np.array([dist.pit(x, rng.random()) for x in actual])
+
+        # The atom's PIT values must be spread, not a single point.
+        atom_pits = pits[actual == -1000.0]
+        assert atom_pits.std() > 0.01
+        assert len(np.unique(atom_pits)) > 100
+
+        stat, p = ks_uniformity(pits)
+        assert p > 0.01, f"KS rejected a perfectly calibrated forecast: p={p:.3g}"
+
+    def test_cdf_interval_exposes_the_atom(self):
+        dist = PredictiveDistribution.from_samples(
+            np.concatenate([np.full(2_000, -50.0), np.linspace(0.0, 100.0, 8_000)])
+        )
+        lo, hi = dist.cdf_interval(-50.0)
+        assert hi - lo > 0.15  # ~20% of mass sits on the atom
+        lo2, hi2 = dist.cdf_interval(50.0)
+        assert lo2 == pytest.approx(hi2)  # continuous region: no interval
+
+    def test_pit_rejects_an_out_of_range_uniform(self):
+        dist = PredictiveDistribution.from_samples(np.linspace(-1, 1, 1001))
+        with pytest.raises(ValueError, match=r"u must be in"):
+            dist.pit(0.0, 1.5)
+
+    def test_non_finite_quantiles_are_refused(self):
+        """Audit A-07: NaN passes the non-decreasing check, since every
+        comparison against NaN is False."""
+        with pytest.raises(ValueError, match="finite"):
+            PredictiveDistribution.from_samples(np.full(100, np.nan))
 
 
 class TestRiskEstimateContract:
@@ -240,3 +291,93 @@ class TestRiskEstimateContract:
     def test_age_is_always_available(self, now):
         est = RiskEstimate(0.1, 0.0, 0.2, "v", now)
         assert est.age_seconds(now + timedelta(seconds=90)) == 90.0
+
+
+class TestBaselineBIsActuallyIndependent:
+    """Audit A-03. rho=0 under a t-copula is not independence: the shared
+    chi-square mixer still drives every asset into its tail together. §3.2's
+    baseline B must remove dependence, not merely decorrelate it -- otherwise
+    the null hypothesis secretly contains the effect being tested, and §3.2's
+    prescribed conclusion ('B wins, so drop the correlation machinery') would
+    be drawn from a baseline built on that same machinery."""
+
+    def test_independent_paths_have_no_joint_tail_dependence(self, bundle, specs, now):
+        from risk_engine.sim.paths import draw_base_randomness, generate_log_returns
+
+        spec = bundle.path_spec(("BTC", "ETH", "SOL"), independent=True)
+        assert spec.copula_df is None, "a t-copula cannot express independence"
+
+        base = draw_base_randomness(200_000, 1, 3, 0, spec.copula_df,
+                                    np.random.default_rng(5))
+        r = generate_log_returns(spec, base)[:, 0, :]
+        for i, j in ((0, 1), (0, 2), (1, 2)):
+            qi = np.quantile(r[:, i], 0.05)
+            qj = np.quantile(r[:, j], 0.05)
+            in_i = r[:, i] <= qi
+            joint = float((in_i & (r[:, j] <= qj)).sum() / in_i.sum())
+            assert joint == pytest.approx(0.05, abs=0.01), f"pair {(i, j)}: {joint:.4f}"
+
+    def test_the_full_model_still_uses_the_t_copula(self, bundle):
+        assert bundle.path_spec(("BTC", "ETH"), independent=False).copula_df == bundle.copula_df
+
+    def test_marginals_are_untouched_by_the_independence_switch(self, bundle):
+        dep = bundle.path_spec(("BTC", "ETH", "SOL"), independent=False)
+        ind = bundle.path_spec(("BTC", "ETH", "SOL"), independent=True)
+        assert dep.marginal_df == ind.marginal_df
+        assert np.allclose(dep.step_vol, ind.step_vol)
+
+
+class TestHorizonMonotonicity:
+    """Audit A-10: two `run` calls with the same seed do NOT share paths --
+    the (paths, steps, assets) draw shape differs, so the streams diverge
+    after the first path and a 7d probability could land below the 24h one."""
+
+    def test_shared_walk_makes_liquidation_flags_nested(self, bundle, specs, spot, now):
+        results = MonteCarloEngine(bundle, specs).run_horizons(
+            levered_book(now, 18.0), spot, (24, 168), n_paths=8_000, seed=21, now=now
+        )
+        day, week = results[24], results[168]
+        assert week.p_liq_any.point >= day.p_liq_any.point
+        assert week.p_liq_cross.point >= day.p_liq_cross.point
+
+    def test_portfolio_risk_never_inverts_the_horizons(self, bundle, specs, spot, now):
+        for lev in (4.0, 8.0, 15.0, 22.0):
+            out = portfolio_risk(levered_book(now, lev), spot, bundle, specs,
+                                 n_paths=4_000, seed=23, now=now)
+            assert out.p_liq_7d_any.point >= out.p_liq_24h_any.point, lev
+
+    def test_separate_runs_do_not_share_paths(self):
+        """The fact the old comment got wrong, pinned so it cannot creep back."""
+        from risk_engine.sim.paths import draw_base_randomness
+
+        a = draw_base_randomness(4, 24, 1, 0, None, np.random.default_rng(7))
+        b = draw_base_randomness(4, 168, 1, 0, None, np.random.default_rng(7))
+        assert np.allclose(a.z[0, :24, 0], b.z[0, :24, 0])   # path 0 coincides
+        assert not np.allclose(a.z[1, :24, 0], b.z[1, :24, 0])  # everything after diverges
+
+
+class TestMetricsAreBounded:
+    """Audit A-11: this is a long-running service; unbounded sample lists are
+    a slow leak with no ceiling."""
+
+    def test_latency_samples_are_capped(self):
+        from risk_engine.observability.metrics import MAX_LATENCY_SAMPLES
+
+        m = Metrics()
+        for i in range(MAX_LATENCY_SAMPLES + 500):
+            m.observe_latency("stage", float(i))
+        assert len(m.latencies_ms["stage"]) == MAX_LATENCY_SAMPLES
+        # The window keeps the most recent samples, not the oldest.
+        assert m.percentiles("stage")["p99"] > MAX_LATENCY_SAMPLES
+
+    def test_event_lists_are_capped_but_counters_are_not(self):
+        from risk_engine.model.psd import project_to_correlation
+        from risk_engine.observability.metrics import MAX_EVENT_SAMPLES
+
+        m = Metrics()
+        bad = np.array([[1.0, 0.9, 0.9], [0.9, 1.0, -0.9], [0.9, -0.9, 1.0]])
+        for _ in range(MAX_EVENT_SAMPLES + 50):
+            project_to_correlation(bad, metrics=m)
+        assert len(m.psd_corrections) == MAX_EVENT_SAMPLES
+        # The lifetime tally survives even though the samples rolled over.
+        assert m.counters["psd_projection_corrections"] == MAX_EVENT_SAMPLES + 50

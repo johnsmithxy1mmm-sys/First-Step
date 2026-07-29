@@ -61,9 +61,12 @@ CREATE TABLE IF NOT EXISTS calibration_outcomes (
     book_changed         INTEGER NOT NULL,
     liquidated           INTEGER NOT NULL,
     pit                  REAL    NOT NULL,
+    pit_u                REAL    NOT NULL,
     crps                 REAL    NOT NULL,
     var_95_breached      INTEGER NOT NULL,
-    observation_day      TEXT    NOT NULL
+    observation_day      TEXT    NOT NULL,
+    resolution_lag_s     REAL    NOT NULL,
+    stale_resolution     INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS calibration_outcomes_day_idx
     ON calibration_outcomes (observation_day);
@@ -190,22 +193,34 @@ class CalibrationJournal:
         book_changed: bool,
         liquidated: bool,
         pit: float,
+        pit_u: float,
         crps: float,
         var_95_breached: bool,
         observation_day: date,
+        resolution_lag_s: float,
+        stale_resolution: bool,
     ) -> None:
+        """Write the realised outcome. Once, and only once.
+
+        A plain INSERT, not INSERT OR REPLACE (audit A-09): the public
+        calibration score is worth exactly as much as the guarantee that a
+        recorded outcome cannot be quietly rewritten after the fact. A second
+        attempt raises IntegrityError; correcting a genuinely wrong outcome
+        has to be a deliberate, visible operation.
+        """
         self.conn.execute(
             """
-            INSERT OR REPLACE INTO calibration_outcomes (
+            INSERT INTO calibration_outcomes (
                 prediction_id, resolved_at, actual_equity, actual_equity_change,
-                external_flow_usd, book_changed, liquidated, pit, crps,
-                var_95_breached, observation_day
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                external_flow_usd, book_changed, liquidated, pit, pit_u, crps,
+                var_95_breached, observation_day, resolution_lag_s, stale_resolution
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 prediction_id, _iso(resolved_at), actual_equity, actual_equity_change,
-                external_flow_usd, int(book_changed), int(liquidated), pit, crps,
+                external_flow_usd, int(book_changed), int(liquidated), pit, pit_u, crps,
                 int(var_95_breached), observation_day.isoformat(),
+                resolution_lag_s, int(stale_resolution),
             ),
         )
         self.conn.commit()
@@ -261,6 +276,7 @@ class CalibrationJournal:
             FROM calibration_outcomes o
             JOIN calibration_predictions p ON p.id = o.prediction_id
             WHERE p.distribution_version = ? AND p.variant = ?
+              AND o.stale_resolution = 0
             """,
             (distribution_version, VARIANT_MODEL),
         ).fetchone()

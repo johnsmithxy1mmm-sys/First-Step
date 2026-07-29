@@ -181,9 +181,31 @@ class LiquidationSimulator:
         bridge: BridgeContext | None = None,
         bridge_uniforms: tuple[np.ndarray, np.ndarray] | None = None,
     ) -> SimulationOutcome:
-        """Run every path.
+        """Run every path to the final step. See `run_checkpointed`."""
+        n_steps = price_paths.shape[1] - 1
+        return self.run_checkpointed(
+            price_paths, (n_steps,), funding_paths, bridge, bridge_uniforms
+        )[n_steps]
+
+    def run_checkpointed(
+        self,
+        price_paths: np.ndarray,
+        checkpoint_steps: tuple[int, ...],
+        funding_paths: np.ndarray | None = None,
+        bridge: BridgeContext | None = None,
+        bridge_uniforms: tuple[np.ndarray, np.ndarray] | None = None,
+    ) -> dict[int, SimulationOutcome]:
+        """Run every path once, snapshotting the outcome at each checkpoint.
 
         price_paths     (P, S+1, A) -- column 0 is the current price
+        checkpoint_steps steps (1..S) at which to record an outcome; a walk
+                        with checkpoints (24, 168) returns the 24h and 7d
+                        answers from the SAME paths. Because a path's alive
+                        set only ever shrinks, the liquidation flags at a
+                        later checkpoint are a superset of an earlier one --
+                        which is what makes P(liq, 7d) >= P(liq, 24h) hold
+                        pathwise instead of merely in expectation
+                        (audit A-10).
         funding_paths   (P, S, A)   -- hourly funding rate applied on each step
         bridge          within-step correction inputs; None disables it, which
                         is only correct for benchmarks that deliberately want
@@ -213,6 +235,11 @@ class LiquidationSimulator:
             want_iso = (n_paths, n_steps, len(self._iso))
             if u_iso.shape != want_iso:
                 raise ValueError(f"isolated bridge uniforms {u_iso.shape} != {want_iso}")
+        if not checkpoint_steps:
+            raise ValueError("need at least one checkpoint step")
+        cp_set = set(int(s) for s in checkpoint_steps)
+        if any(s < 1 or s > n_steps for s in cp_set):
+            raise ValueError(f"checkpoints {sorted(cp_set)} outside 1..{n_steps}")
 
         nc, ni = len(self._cross), len(self._iso)
 
@@ -231,6 +258,7 @@ class LiquidationSimulator:
         cross_alive &= cross_gap_prev > 0
         iso_alive &= iso_gap_prev > 0
 
+        outcomes: dict[int, SimulationOutcome] = {}
         for s in range(1, n_steps + 1):
             px = price_paths[:, s, :]
 
@@ -284,18 +312,22 @@ class LiquidationSimulator:
                 iso_alive &= ~dead
                 iso_gap_prev = gap
 
-        terminal = self._terminal_equity(
-            price_paths[:, -1, :], cross_cash, cross_alive, iso_margin, iso_alive
-        )
-        return SimulationOutcome(
-            cross_liquidated=~cross_alive,
-            isolated_liquidated=~iso_alive,
-            start_equity=start_equity,
-            terminal_equity=terminal,
-            funding_paid=funding_paid,
-            isolated_coins=tuple(p.coin for p in self._iso),
-            bridge_applied=bridge is not None,
-        )
+            if s in cp_set:
+                # `~alive` and `_terminal_equity` allocate fresh arrays;
+                # `funding_paid` keeps accumulating, so it is copied.
+                outcomes[s] = SimulationOutcome(
+                    cross_liquidated=~cross_alive,
+                    isolated_liquidated=~iso_alive,
+                    start_equity=start_equity,
+                    terminal_equity=self._terminal_equity(
+                        price_paths[:, s, :], cross_cash, cross_alive, iso_margin, iso_alive
+                    ),
+                    funding_paid=funding_paid.copy(),
+                    isolated_coins=tuple(p.coin for p in self._iso),
+                    bridge_applied=bridge is not None,
+                )
+
+        return outcomes
 
     # ---- pieces of the loop, kept separate so they can be tested ---------
 

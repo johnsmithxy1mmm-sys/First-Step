@@ -14,18 +14,33 @@ the shadow harness and are recorded there:
 from __future__ import annotations
 
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
+
+#: Every sample list here is bounded (audit A-11). This process is a
+#: long-running service whose matrix rebuild fires every five minutes, so an
+#: unbounded list of latency samples or PSD corrections is a slow memory leak
+#: with no upper bound. Bounded deques keep the most recent window, which is
+#: what percentiles and dashboards actually read; totals live in `counters`,
+#: which is bounded by the number of distinct metric names.
+MAX_LATENCY_SAMPLES = 4096
+MAX_EVENT_SAMPLES = 512
+
+
+def _bounded() -> deque:
+    return deque(maxlen=MAX_LATENCY_SAMPLES)
 
 
 @dataclass
 class Metrics:
     counters: dict[str, float] = field(default_factory=lambda: defaultdict(float))
-    latencies_ms: dict[str, list[float]] = field(default_factory=lambda: defaultdict(list))
+    latencies_ms: dict[str, deque] = field(default_factory=lambda: defaultdict(_bounded))
     #: Correction magnitudes from the PSD projection (§2.1 wants each logged).
-    psd_corrections: list[dict[str, float]] = field(default_factory=list)
+    #: Bounded window; `psd_projection_corrections` in `counters` keeps the
+    #: lifetime total so nothing is silently lost from the tally.
+    psd_corrections: deque = field(default_factory=lambda: deque(maxlen=MAX_EVENT_SAMPLES))
     #: Every df clamp, with the raw MLE value (§2.2 wants each logged).
-    df_clamps: list[dict[str, float | str]] = field(default_factory=list)
+    df_clamps: deque = field(default_factory=lambda: deque(maxlen=MAX_EVENT_SAMPLES))
 
     def incr(self, name: str, by: float = 1.0) -> None:
         self.counters[name] += by

@@ -240,3 +240,144 @@ class TestAlreadyLiquidatable:
         sim = LiquidationSimulator(book, specs, COLS)
         out = sim.run(ramp_paths(prices, {}, n_steps=2))
         assert out.cross_liquidated[0]
+
+
+class TestWithPositionConservesValue:
+    """Audit A-01. An order moves value between wallet, positions and
+    pockets; it never creates any. Evaluated at a spot equal to the execution
+    price, equity must be identical before and after. The original merge
+    fabricated $50k on a market-price flip by dropping the realized PnL of
+    the closed portion and letting the flipped side inherit the old entry."""
+
+    PRICES = {"BTC": 90_000.0, "ETH": 4_000.0, "SOL": 200.0}
+
+    @pytest.mark.parametrize("order_size", [-0.5, -1.0, -1.9, -2.0, -3.0, -5.0, 1.0])
+    def test_cross_order_at_market_conserves_equity(self, now, order_size):
+        book = Book("0x", 50_000.0,
+                    (Position("BTC", 2.0, 100_000.0, MarginMode.CROSS, 20.0),), now)
+        px = self.PRICES["BTC"]
+        after = book.with_position(
+            Position("BTC", order_size, px, MarginMode.CROSS, 20.0)
+        )
+        assert after.equity(self.PRICES) == pytest.approx(book.equity(self.PRICES), rel=1e-12)
+
+    @pytest.mark.parametrize("order_size", [-0.5, -1.0, -2.0, -3.0, 1.0])
+    def test_isolated_order_at_market_conserves_equity(self, now, order_size):
+        book = Book("0x", 50_000.0,
+                    (Position("BTC", 2.0, 100_000.0, MarginMode.ISOLATED, 5.0, 40_000.0),), now)
+        px = self.PRICES["BTC"]
+        iso = abs(order_size) * px / 5.0
+        after = book.with_position(
+            Position("BTC", order_size, px, MarginMode.ISOLATED, 5.0, iso)
+        )
+        assert after.equity(self.PRICES) == pytest.approx(book.equity(self.PRICES), rel=1e-12)
+
+    def test_opening_a_fresh_position_conserves_equity(self, now):
+        book = Book("0x", 50_000.0,
+                    (Position("BTC", 1.0, 100_000.0, MarginMode.CROSS, 20.0),), now)
+        for order in (
+            Position("ETH", 5.0, 4_000.0, MarginMode.CROSS, 10.0),
+            Position("SOL", -100.0, 200.0, MarginMode.ISOLATED, 4.0, 5_000.0),
+        ):
+            after = book.with_position(order)
+            assert after.equity(self.PRICES) == pytest.approx(
+                book.equity(self.PRICES), rel=1e-12
+            ), order.coin
+
+    def test_the_exact_case_the_audit_reproduced(self, now):
+        """PoC from the audit: +$10k on a reduce, +$50k on a flip."""
+        book = Book("0x", 50_000.0,
+                    (Position("BTC", 2.0, 100_000.0, MarginMode.CROSS, 20.0),), now)
+        assert book.equity(self.PRICES) == pytest.approx(30_000.0)
+        reduced = book.with_position(Position("BTC", -1.0, 90_000.0, MarginMode.CROSS, 20.0))
+        flipped = book.with_position(Position("BTC", -5.0, 90_000.0, MarginMode.CROSS, 20.0))
+        assert reduced.equity(self.PRICES) == pytest.approx(30_000.0)
+        assert flipped.equity(self.PRICES) == pytest.approx(30_000.0)
+        # The flipped remainder opens at the execution price, not the old entry.
+        assert flipped.positions[0].size == pytest.approx(-3.0)
+        assert flipped.positions[0].entry_price == pytest.approx(90_000.0)
+
+    def test_full_close_returns_pocket_and_pnl_to_the_wallet(self, now):
+        book = Book("0x", 10_000.0,
+                    (Position("SOL", 100.0, 200.0, MarginMode.ISOLATED, 4.0, 5_000.0),), now)
+        px = 180.0
+        after = book.with_position(Position("SOL", -100.0, px, MarginMode.ISOLATED, 4.0, 1.0))
+        assert after.positions == ()
+        # 5_000 pocket - 2_000 loss returns to the wallet on top of the 10k.
+        assert after.cross_collateral == pytest.approx(13_000.0)
+        assert after.equity({"SOL": px}) == pytest.approx(book.equity({"SOL": px}))
+
+    def test_a_reduce_that_would_empty_the_pocket_is_refused(self, now):
+        """Such a book is not constructible on the venue -- the pocket would
+        have been liquidated first -- and returning it would understate risk."""
+        book = Book("0x", 10_000.0,
+                    (Position("SOL", 100.0, 200.0, MarginMode.ISOLATED, 20.0, 1_000.0),), now)
+        # Closing 20 of the 100 units at half the entry realizes -2_000 into a
+        # 1_000 pocket: the venue would have wiped it long before this price.
+        with pytest.raises(ValueError, match="isolated pocket"):
+            book.with_position(Position("SOL", -20.0, 100.0, MarginMode.ISOLATED, 20.0, 1.0))
+
+    def test_same_side_add_uses_a_volume_weighted_entry(self, now):
+        book = Book("0x", 50_000.0,
+                    (Position("BTC", 1.0, 100_000.0, MarginMode.CROSS, 20.0),), now)
+        after = book.with_position(Position("BTC", 1.0, 90_000.0, MarginMode.CROSS, 20.0))
+        assert after.positions[0].entry_price == pytest.approx(95_000.0)
+
+
+class TestNonFiniteInputsAreRefused:
+    """Audit A-07: NaN evaluates False in every comparison, so an unguarded
+    validator waves it straight through into the risk numbers."""
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+    def test_position_fields(self, bad):
+        with pytest.raises(ValueError, match="finite"):
+            Position("BTC", bad, 100.0, MarginMode.CROSS, 5.0)
+        with pytest.raises(ValueError, match="finite"):
+            Position("BTC", 1.0, bad, MarginMode.CROSS, 5.0)
+
+    def test_cross_collateral(self, now):
+        with pytest.raises(ValueError, match="finite"):
+            Book("0x", float("nan"), (), now)
+
+
+class TestCheckpointedHorizons:
+    """Audit A-10: several horizons must come from one walk, so liquidation
+    at a longer horizon is a pathwise superset of a shorter one."""
+
+    def test_flags_are_nested_across_checkpoints(self, specs, now):
+        book = Book("0x", 6_000.0,
+                    (Position("BTC", 1.0, 100_000.0, MarginMode.CROSS, 20.0),), now)
+        sim = LiquidationSimulator(book, specs, COLS)
+        rng = np.random.default_rng(3)
+        n, steps = 400, 48
+        paths = np.empty((n, steps + 1, len(COLS)))
+        for coin, col in COLS.items():
+            base = {"BTC": 100_000.0, "ETH": 4_000.0, "SOL": 200.0}[coin]
+            shocks = rng.standard_normal((n, steps)) * 0.02
+            paths[:, 0, col] = base
+            paths[:, 1:, col] = base * np.exp(np.cumsum(shocks, axis=1))
+
+        outs = sim.run_checkpointed(paths, (12, 24, 48))
+        early, mid, late = outs[12], outs[24], outs[48]
+        assert np.all(late.cross_liquidated >= mid.cross_liquidated)
+        assert np.all(mid.cross_liquidated >= early.cross_liquidated)
+        assert late.cross_liquidated.mean() >= early.cross_liquidated.mean()
+
+    def test_final_checkpoint_equals_a_plain_run(self, specs, now):
+        book = Book("0x", 20_000.0,
+                    (Position("BTC", 1.0, 100_000.0, MarginMode.CROSS, 20.0),), now)
+        sim = LiquidationSimulator(book, specs, COLS)
+        prices = {"BTC": 100_000.0, "ETH": 4_000.0, "SOL": 200.0}
+        paths = ramp_paths(prices, {"BTC": 85_000.0}, n_steps=24)
+        assert np.array_equal(
+            sim.run(paths).cross_liquidated,
+            sim.run_checkpointed(paths, (24,))[24].cross_liquidated,
+        )
+
+    def test_checkpoint_outside_the_walk_is_refused(self, specs, now):
+        book = Book("0x", 20_000.0,
+                    (Position("BTC", 1.0, 100_000.0, MarginMode.CROSS, 20.0),), now)
+        sim = LiquidationSimulator(book, specs, COLS)
+        prices = {"BTC": 100_000.0, "ETH": 4_000.0, "SOL": 200.0}
+        with pytest.raises(ValueError, match="outside"):
+            sim.run_checkpointed(ramp_paths(prices, {}, n_steps=10), (99,))

@@ -8,6 +8,7 @@ looks smaller or safer than it is.
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 
 import numpy as np
@@ -16,10 +17,20 @@ from risk_engine.domain.types import AssetSpec, Book, MarginMode, MarginTier, Po
 
 
 def _f(value, field: str) -> float:
-    """Hyperliquid returns numbers as strings; refuse to guess about missing ones."""
+    """Hyperliquid returns numbers as strings; refuse to guess about missing ones.
+
+    Non-finite values are rejected here rather than downstream (audit A-07):
+    `float("NaN")` parses happily, and NaN then evaluates False in every
+    subsequent range check, so a single poisoned field would travel intact
+    through position validation, the simulator and into the calibration
+    journal. `float("inf")` is equally inadmissible as a price or a size.
+    """
     if value is None:
         raise ValueError(f"missing required numeric field {field!r}")
-    return float(value)
+    out = float(value)
+    if not math.isfinite(out):
+        raise ValueError(f"field {field!r} is not finite: {value!r}")
+    return out
 
 
 def parse_meta(meta: dict) -> dict[str, AssetSpec]:
@@ -113,9 +124,19 @@ def parse_clearinghouse_state(
             )
         )
 
-    cross_summary = state.get("crossMarginSummary") or state.get("marginSummary")
+    # No fallback to `marginSummary` (audit A-08). That field summarises the
+    # WHOLE account, isolated pockets included, so using it as the cross
+    # account value double-counts every isolated margin: once inside
+    # `cross_collateral` and again in each position's `isolated_margin`. The
+    # resulting equity is too high, which understates risk -- the one
+    # direction §10 prohibits. Every other field in this parser is strict;
+    # this one has no business being lenient either.
+    cross_summary = state.get("crossMarginSummary")
     if cross_summary is None:
-        raise ValueError("clearinghouseState has neither crossMarginSummary nor marginSummary")
+        raise ValueError(
+            "clearinghouseState has no crossMarginSummary; refusing to substitute "
+            "marginSummary, which includes isolated margin and would double-count it"
+        )
     cross_account_value = _f(cross_summary.get("accountValue"), "accountValue")
     return Book(
         address=address,

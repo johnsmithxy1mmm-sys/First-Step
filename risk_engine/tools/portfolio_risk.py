@@ -88,13 +88,16 @@ def portfolio_risk(
     now: datetime | None = None,
 ) -> PortfolioRisk:
     engine = MonteCarloEngine(bundle, specs)
-    day = engine.run(book, spot, DAY_HOURS, n_paths=n_paths, seed=seed,
-                     factor_coin=factor_coin, now=now)
-    # The 7-day horizon reuses the seed intentionally: the two horizons then
-    # share their early steps, so a user cannot see a 7d probability below
-    # the 24h one purely from sampling noise.
-    week = engine.run(book, spot, WEEK_HOURS, n_paths=n_paths,
-                      seed=day.provenance.seed, factor_coin=factor_coin, now=now)
+    # One walk, two checkpoints. Reusing a seed across two separate runs does
+    # NOT share the paths -- the (paths, steps, assets) draw shape differs, so
+    # the streams diverge after the first path, and a user could be shown a 7d
+    # probability below the 24h one (audit A-10). Checkpointing one walk makes
+    # the ordering pathwise.
+    results = engine.run_horizons(
+        book, spot, (DAY_HOURS, WEEK_HOURS), n_paths=n_paths, seed=seed,
+        factor_coin=factor_coin, now=now,
+    )
+    day, week = results[DAY_HOURS], results[WEEK_HOURS]
 
     version = bundle.model_version
     stamp = day.provenance.computed_at

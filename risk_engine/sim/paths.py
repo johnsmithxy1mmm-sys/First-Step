@@ -49,17 +49,6 @@ class PathSpec:
     def n_assets(self) -> int:
         return len(self.coins)
 
-    def independent(self) -> PathSpec:
-        """Baseline B (§3.2): identical marginals, dependence removed."""
-        return PathSpec(
-            coins=self.coins,
-            step_vol=self.step_vol,
-            corr=np.eye(self.n_assets),
-            marginal_df=self.marginal_df,
-            copula_df=self.copula_df,
-            drift=self.drift,
-        )
-
 
 @dataclass(frozen=True, slots=True)
 class BaseRandomness:

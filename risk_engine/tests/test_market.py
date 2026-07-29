@@ -178,3 +178,54 @@ class TestCandlesAndFunding:
         times, rates = parse_funding_history(history)
         assert list(times) == [1, 2]
         assert rates[0] == pytest.approx(1e-5)
+
+
+class TestParserStrictness:
+    """Audit A-07 and A-08: the two places the parser was lenient, both in
+    the direction of understating risk."""
+
+    @pytest.mark.parametrize("bad", ["NaN", "nan", "Infinity", "inf", "-inf"])
+    def test_non_finite_numbers_are_refused(self, bad):
+        """A NaN size sails through every later `<=` check, because NaN
+        compares False against everything, and lands in the journal."""
+        state = {
+            "crossMarginSummary": {"accountValue": "5000.0"},
+            "assetPositions": [{"position": {
+                "coin": "BTC", "szi": bad, "entryPx": "100000.0",
+                "unrealizedPnl": "0.0", "leverage": {"type": "cross", "value": 20},
+            }}],
+        }
+        with pytest.raises(ValueError, match="not finite"):
+            parse_clearinghouse_state(state, "0xpoisoned")
+
+    def test_non_finite_account_value_is_refused(self):
+        state = {"crossMarginSummary": {"accountValue": "NaN"}, "assetPositions": []}
+        with pytest.raises(ValueError, match="not finite"):
+            parse_clearinghouse_state(state, "0x")
+
+    def test_margin_summary_is_not_substituted_for_cross(self):
+        """`marginSummary` covers the WHOLE account including isolated
+        pockets. Using it as the cross account value double-counts every
+        isolated margin -- once in cross_collateral, again in the position --
+        which inflates equity and understates risk (§10)."""
+        state = {
+            "marginSummary": {"accountValue": "132000.0"},
+            "assetPositions": [{"position": {
+                "coin": "SOL", "szi": "-500.0", "entryPx": "210.0",
+                "unrealizedPnl": "5000.0", "marginUsed": "20000.0",
+                "leverage": {"type": "isolated", "value": 5, "rawUsd": "22000.0"},
+            }}],
+        }
+        with pytest.raises(ValueError, match="crossMarginSummary"):
+            parse_clearinghouse_state(state, "0x")
+
+    def test_non_finite_margin_tier_is_refused(self):
+        meta = {
+            "universe": [{"name": "X", "szDecimals": 2, "maxLeverage": 10,
+                          "marginTableId": 1}],
+            "marginTables": [[1, {"marginTiers": [
+                {"lowerBound": "0", "maxLeverage": "Infinity"},
+            ]}]],
+        }
+        with pytest.raises(ValueError, match="not finite"):
+            parse_meta(meta)

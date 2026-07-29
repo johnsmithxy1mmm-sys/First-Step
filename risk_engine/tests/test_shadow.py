@@ -269,6 +269,10 @@ class TestCalibrationMetrics:
     @staticmethod
     def _fill(journal, n_days=30, per_day=15, seed=0):
         rng = np.random.default_rng(seed)
+        # Separate stream for the randomized-PIT uniforms: drawing them from
+        # `rng` would shift the data stream and silently change what this
+        # fixture is testing.
+        u_rng = np.random.default_rng(seed + 7919)
         start = datetime(2026, 1, 1, tzinfo=timezone.utc)
         truth = PredictiveDistribution.from_samples(rng.normal(0, 1000, 200_000))
         wrong = PredictiveDistribution.from_samples(rng.normal(0, 4000, 200_000))
@@ -290,13 +294,16 @@ class TestCalibrationMetrics:
                         var_95=-dist.quantile(0.05), cvar_95=dist.cvar(0.95),
                         distribution=dist, book_snapshot={"fingerprint": "x"},
                     )
+                    u = u_rng.random()
                     journal.record_outcome(
                         prediction_id=pid, resolved_at=when + timedelta(days=1),
                         actual_equity=100_000.0 + actual, actual_equity_change=actual,
                         external_flow_usd=0.0, book_changed=False,
-                        liquidated=False, pit=dist.pit(actual), crps=dist.crps(actual),
+                        liquidated=False, pit=dist.pit(actual, u), pit_u=u,
+                        crps=dist.crps(actual),
                         var_95_breached=actual < dist.quantile(0.05),
                         observation_day=(when).date(),
+                        resolution_lag_s=0.0, stale_resolution=False,
                     )
 
     def test_model_beats_the_baselines_when_it_is_the_true_distribution(self):
@@ -379,3 +386,87 @@ class TestBaselines:
         assert out.size == 100 - 24 + 1  # overlapping windows, not disjoint
         assert out[0] == pytest.approx(r[:24].sum())
         assert out[-1] == pytest.approx(r[-24:].sum())
+
+
+class TestResolutionStaleness:
+    """Audit A-04: a 24h forecast scored against a 72h realisation measures
+    the resolver's punctuality, not the model."""
+
+    def test_a_late_resolution_is_flagged_and_excluded(
+        self, bundle, specs, spot, books, naive, now
+    ):
+        journal = CalibrationJournal()
+        provider = FakeProvider(books, spot, specs)
+        ShadowCron(provider, bundle, journal, naive, n_paths=1_000).run_once(now)
+
+        report = resolve_due(journal, provider, now + timedelta(hours=72))
+        assert report.resolved == 6
+        assert report.stale == 6
+        assert "flagged stale" in str(report)
+
+        rows = journal.scored(DISTRIBUTION_VERSION, VARIANT_MODEL)
+        assert all(r["stale_resolution"] for r in rows)
+        assert all(r["resolution_lag_s"] == pytest.approx(48 * 3600.0) for r in rows)
+
+        # Excluded from every cohort, and from the Phase-4 gate counters.
+        assert load_cohort(journal, DISTRIBUTION_VERSION, VARIANT_MODEL, COHORT_ALL).n == 0
+        assert load_cohort(
+            journal, DISTRIBUTION_VERSION, VARIANT_MODEL, COHORT_ALL, include_stale=True
+        ).n == 2
+        assert journal.progress(DISTRIBUTION_VERSION).resolved_observations == 0
+        journal.close()
+
+    def test_a_punctual_resolution_is_scored(
+        self, bundle, specs, spot, books, naive, now
+    ):
+        journal = CalibrationJournal()
+        provider = FakeProvider(books, spot, specs)
+        ShadowCron(provider, bundle, journal, naive, n_paths=1_000).run_once(now)
+        report = resolve_due(journal, provider, now + timedelta(hours=24, minutes=20))
+        assert report.stale == 0
+        assert load_cohort(journal, DISTRIBUTION_VERSION, VARIANT_MODEL, COHORT_ALL).n == 2
+        journal.close()
+
+    def test_the_randomized_pit_is_reproducible_from_the_journal(
+        self, bundle, specs, spot, books, naive, now
+    ):
+        """The uniform is derived from the prediction id, not drawn freshly:
+        a row can be re-derived, and the draw cannot be retried until it
+        flatters the model."""
+        from risk_engine.shadow.resolve import _pit_uniform
+
+        journal = CalibrationJournal()
+        provider = FakeProvider(books, spot, specs)
+        ShadowCron(provider, bundle, journal, naive, n_paths=1_000).run_once(now)
+        resolve_due(journal, provider, now + timedelta(hours=24))
+        for r in journal.scored(DISTRIBUTION_VERSION, VARIANT_MODEL):
+            assert r["pit_u"] == pytest.approx(_pit_uniform(r["prediction_id"]))
+        journal.close()
+
+
+class TestOutcomeImmutability:
+    """Audit A-09: the calibration record is only worth what the guarantee
+    that a written outcome cannot be quietly rewritten is worth."""
+
+    def test_a_second_outcome_for_the_same_prediction_is_refused(self, now):
+        import sqlite3
+
+        journal = CalibrationJournal()
+        dist = PredictiveDistribution.from_samples(np.linspace(-100, 100, 1001))
+        pid = journal.record_prediction(
+            address="0xa", variant=VARIANT_MODEL, predicted_at=now, horizon_hours=24,
+            model_version="v", distribution_version="0.1", seed=1, n_paths=10,
+            converged=True, start_equity=1000.0, p_liq=0.1, p_liq_ci=(0.05, 0.15),
+            var_95=50.0, cvar_95=70.0, distribution=dist, book_snapshot={},
+        )
+        kwargs = dict(
+            prediction_id=pid, resolved_at=now, actual_equity=900.0,
+            actual_equity_change=-100.0, external_flow_usd=0.0, book_changed=False,
+            liquidated=False, pit=0.4, pit_u=0.5, crps=1.0, var_95_breached=False,
+            observation_day=now.date(), resolution_lag_s=0.0, stale_resolution=False,
+        )
+        journal.record_outcome(**kwargs)
+        with pytest.raises(sqlite3.IntegrityError):
+            journal.record_outcome(**{**kwargs, "pit": 0.0, "crps": 999.0})
+        assert journal.scored("0.1", VARIANT_MODEL)[0]["pit"] == pytest.approx(0.4)
+        journal.close()

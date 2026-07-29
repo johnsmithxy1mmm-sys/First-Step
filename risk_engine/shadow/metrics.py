@@ -101,10 +101,24 @@ class CalibrationReport:
         return "\n".join(lines)
 
 
-def load_cohort(journal: CalibrationJournal, version: str, variant: str, cohort: str) -> Cohort:
+def load_cohort(
+    journal: CalibrationJournal,
+    version: str,
+    variant: str,
+    cohort: str,
+    include_stale: bool = False,
+) -> Cohort:
+    """Rows for one cohort. Stale resolutions are excluded from all of them.
+
+    A 24h forecast scored against a 72h realisation measures the resolver's
+    punctuality, not the model (audit A-04). `include_stale` exists so the
+    excluded rows can be inspected, not so they can be scored.
+    """
     rows = journal.scored(version, variant)
     keep = []
     for r in rows:
+        if not include_stale and r["stale_resolution"]:
+            continue
         if cohort == COHORT_NO_FLOW and r["external_flow_usd"] != 0.0:
             continue
         if cohort == COHORT_BOOK_UNCHANGED and r["book_changed"]:

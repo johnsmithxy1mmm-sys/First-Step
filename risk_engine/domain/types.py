@@ -12,10 +12,11 @@ the interval is positional and validated in `__post_init__`.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from itertools import pairwise
 from enum import Enum
+from itertools import pairwise
 
 import numpy as np
 
@@ -38,6 +39,13 @@ class MarginTier:
     max_leverage: float
 
     def __post_init__(self) -> None:
+        # Finiteness first (audit A-07): NaN passes every `<=` comparison
+        # below by evaluating False, and an infinite max leverage would give
+        # a maintenance rate of zero -- both silent risk-understatements.
+        if not (math.isfinite(self.lower_bound) and math.isfinite(self.max_leverage)):
+            raise ValueError(
+                f"tier fields must be finite, got ({self.lower_bound}, {self.max_leverage})"
+            )
         if self.lower_bound < 0:
             raise ValueError(f"tier lower_bound must be >= 0, got {self.lower_bound}")
         if self.max_leverage <= 1:
@@ -113,6 +121,14 @@ class Position:
     isolated_margin: float | None = None
 
     def __post_init__(self) -> None:
+        # Finiteness before sign checks (audit A-07): NaN evaluates False in
+        # every comparison below, so a NaN-poisoned position would otherwise
+        # sail through validation and silently corrupt every downstream number.
+        for name in ("size", "entry_price", "leverage"):
+            if not math.isfinite(getattr(self, name)):
+                raise ValueError(f"{self.coin}: {name} must be finite, got {getattr(self, name)}")
+        if self.isolated_margin is not None and not math.isfinite(self.isolated_margin):
+            raise ValueError(f"{self.coin}: isolated_margin must be finite")
         if self.size == 0:
             raise ValueError(f"{self.coin}: zero-size position is not a position")
         if self.entry_price <= 0:
@@ -152,6 +168,8 @@ class Book:
     captured_at: datetime
 
     def __post_init__(self) -> None:
+        if not math.isfinite(self.cross_collateral):
+            raise ValueError(f"cross_collateral must be finite, got {self.cross_collateral}")
         if self.captured_at.tzinfo is None:
             raise ValueError("captured_at must be timezone-aware")
         coins = [p.coin for p in self.positions]
@@ -186,37 +204,95 @@ class Book:
         )
 
     def with_position(self, position: Position) -> Book:
-        """Return a copy with `position` added, or merged into an existing one.
+        """Return the book as it stands the instant `position`'s order fills.
 
-        Used by `pre_trade_delta` (§4.2) and `max_safe_size` (§4.3).
+        `position.entry_price` is read as the execution price of the
+        hypothetical order. Used by `pre_trade_delta` (§4.2) and
+        `max_safe_size` (§4.3).
+
+        Conservation contract (audit A-01): an order moves value between the
+        cross wallet, positions and isolated pockets, but never creates or
+        destroys it, so evaluating the result at a spot equal to the
+        execution price leaves `equity` unchanged. That requires two things
+        the naive merge got wrong, fabricating $50k on a market-price flip:
+
+        - the realized PnL of any closed portion is credited somewhere real:
+          the cross wallet for cross positions, the pocket for a partial
+          isolated close, the wallet for a full isolated close;
+        - a flipped position opens at the execution price, not at the entry
+          price of the side it replaced.
+
+        An isolated order's `isolated_margin` is *transferred* from the cross
+        wallet into the pocket -- the wallet is debited by it, including on
+        reducing orders, where it models topping the pocket up.
+
+        Raises when a reducing isolated order would leave its pocket
+        non-positive: such a book is not constructible on the venue (the
+        pocket would have been liquidated first), and returning it anyway
+        would understate risk.
         """
-        existing = {p.coin: p for p in self.positions}
-        prior = existing.get(position.coin)
+        prior = next((p for p in self.positions if p.coin == position.coin), None)
+        others = tuple(p for p in self.positions if p.coin != position.coin)
+        cash = self.cross_collateral
+
         if prior is None:
-            merged = position
-        else:
-            if prior.mode is not position.mode:
-                raise ValueError(
-                    f"{position.coin}: cannot mix {prior.mode.value} and {position.mode.value}"
-                )
-            size = prior.size + position.size
-            if size == 0:
-                remaining = tuple(p for p in self.positions if p.coin != position.coin)
-                return Book(self.address, self.cross_collateral, remaining, self.captured_at)
-            # Volume-weighted entry when adding in the same direction; when
-            # reducing, the entry price of the remainder is unchanged.
-            if prior.side == position.side:
-                entry = (
-                    prior.size * prior.entry_price + position.size * position.entry_price
-                ) / size
-            else:
-                entry = prior.entry_price
+            if position.mode is MarginMode.ISOLATED:
+                cash -= position.isolated_margin or 0.0  # wallet -> new pocket
+            return Book(self.address, cash, (*others, position), self.captured_at)
+
+        if prior.mode is not position.mode:
+            raise ValueError(
+                f"{position.coin}: cannot mix {prior.mode.value} and {position.mode.value}"
+            )
+
+        exec_price = position.entry_price
+        size = prior.size + position.size
+
+        if prior.side == position.side:
+            # Same-side add: a volume-weighted entry conserves equity by
+            # construction, no cash movement beyond the pocket transfer.
+            entry = (prior.size * prior.entry_price + position.size * exec_price) / size
             iso = None
             if position.mode is MarginMode.ISOLATED:
                 iso = (prior.isolated_margin or 0.0) + (position.isolated_margin or 0.0)
+                cash -= position.isolated_margin or 0.0
             merged = Position(position.coin, size, entry, position.mode, position.leverage, iso)
-        others = tuple(p for p in self.positions if p.coin != position.coin)
-        return Book(self.address, self.cross_collateral, (*others, merged), self.captured_at)
+            return Book(self.address, cash, (*others, merged), self.captured_at)
+
+        # Opposite sides: |closed| units of the prior position close at the
+        # execution price and their PnL becomes real.
+        closed = min(abs(prior.size), abs(position.size)) * prior.side
+        realized = closed * (exec_price - prior.entry_price)
+
+        if size == 0:
+            # Full close: realized PnL and any pocket margin return to the wallet.
+            cash += realized + (prior.isolated_margin or 0.0)
+            return Book(self.address, cash, others, self.captured_at)
+
+        flipped = (size > 0) != (prior.size > 0)
+        if position.mode is MarginMode.ISOLATED:
+            if flipped:
+                # The old pocket closes entirely to the wallet; the order's
+                # margin funds the new pocket on the other side.
+                cash += (prior.isolated_margin or 0.0) + realized
+                cash -= position.isolated_margin or 0.0
+                iso = position.isolated_margin
+            else:
+                # Partial close: the venue realizes isolated PnL into the
+                # pocket; the order's margin tops it up from the wallet.
+                cash -= position.isolated_margin or 0.0
+                iso = (prior.isolated_margin or 0.0) + (position.isolated_margin or 0.0) + realized
+                if iso <= 0:
+                    raise ValueError(
+                        f"{position.coin}: hypothetical reduce leaves the isolated pocket "
+                        f"at {iso:.2f} <= 0; the venue would have liquidated it first"
+                    )
+        else:
+            cash += realized
+            iso = None
+        entry = exec_price if flipped else prior.entry_price
+        merged = Position(position.coin, size, entry, position.mode, position.leverage, iso)
+        return Book(self.address, cash, (*others, merged), self.captured_at)
 
 
 @dataclass(frozen=True, slots=True)
