@@ -360,7 +360,22 @@ class TestMetricsAreBounded:
     """Audit A-11: this is a long-running service; unbounded sample lists are
     a slow leak with no ceiling."""
 
-    def test_latency_samples_are_capped(self):
+    def test_the_latency_bound_is_declared_and_sane(self):
+        """Checked as a property of the container, not by overflowing it: a
+        mutant that sets the cap to 1e9 is still nominally 'bounded', and a
+        test that loops to the cap would hang rather than fail."""
+        from risk_engine.observability.metrics import MAX_EVENT_SAMPLES, MAX_LATENCY_SAMPLES
+
+        m = Metrics()
+        m.observe_latency("stage", 1.0)
+        assert m.latencies_ms["stage"].maxlen == MAX_LATENCY_SAMPLES
+        assert m.psd_corrections.maxlen == MAX_EVENT_SAMPLES
+        assert m.df_clamps.maxlen == MAX_EVENT_SAMPLES
+        # A bound large enough to be a leak in its own right is not a bound.
+        assert 0 < MAX_LATENCY_SAMPLES <= 100_000
+        assert 0 < MAX_EVENT_SAMPLES <= 100_000
+
+    def test_latency_window_discards_the_oldest_samples(self):
         from risk_engine.observability.metrics import MAX_LATENCY_SAMPLES
 
         m = Metrics()
