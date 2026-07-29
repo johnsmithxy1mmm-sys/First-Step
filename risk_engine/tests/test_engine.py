@@ -428,7 +428,7 @@ class TestParallelBlocks:
 
         a = [g.standard_normal(5) for g in spawn_streams(42, 4)]
         b = [g.standard_normal(5) for g in spawn_streams(42, 4)]
-        for x, y in zip(a, b):
+        for x, y in zip(a, b, strict=True):
             assert np.array_equal(x, y)
         # Distinct blocks must not replay the same numbers.
         assert not np.array_equal(a[0], a[1])
