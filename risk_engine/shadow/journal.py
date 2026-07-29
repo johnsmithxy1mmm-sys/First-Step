@@ -6,71 +6,31 @@ the integrity property the whole exercise depends on -- a schema where a
 prediction row could be edited after resolution would make the published
 calibration score worth nothing.
 
-SQLite here, Postgres in `schema.sql`. The two are kept structurally
-identical and `test_journal.py` asserts it; SQLite is what makes the shadow
-harness runnable in a test and on a laptop.
+One schema, two backends. `schema.sql` is canonical (Postgres); the SQLite
+form is *derived* from it rather than hand-maintained, because a second
+hand-written schema is a second thing to forget to update and the failure
+would surface years later as an unexplained discontinuity in a public score.
+Both are exercised against a real Postgres server in the test suite, not
+merely asserted to match.
+
+The two backends disagree about what they hand back -- Postgres returns
+`datetime`, `bool` and parsed JSON where SQLite returns strings and ints --
+so every read goes through the normalisers below. That is deliberately the
+only place the difference is allowed to exist.
 """
 
 from __future__ import annotations
 
 import json
-import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
+from risk_engine.shadow.backends import Backend, canonical_ddl, open_backend, sqlite_ddl
 from risk_engine.sim.stats import PredictiveDistribution
-
-_SQLITE_SCHEMA = """
-CREATE TABLE IF NOT EXISTS calibration_predictions (
-    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
-    address              TEXT    NOT NULL,
-    variant              TEXT    NOT NULL,
-    predicted_at         TEXT    NOT NULL,
-    horizon_hours        INTEGER NOT NULL,
-    resolves_at          TEXT    NOT NULL,
-    model_version        TEXT    NOT NULL,
-    distribution_version TEXT    NOT NULL,
-    seed                 INTEGER NOT NULL,
-    n_paths              INTEGER NOT NULL,
-    converged            INTEGER NOT NULL,
-    start_equity         REAL    NOT NULL,
-    p_liq                REAL    NOT NULL,
-    p_liq_ci_low         REAL    NOT NULL,
-    p_liq_ci_high        REAL    NOT NULL,
-    var_95               REAL    NOT NULL,
-    cvar_95              REAL    NOT NULL,
-    quantile_values      TEXT    NOT NULL,
-    n_quantile_levels    INTEGER NOT NULL,
-    book_snapshot        TEXT    NOT NULL,
-    UNIQUE (address, variant, predicted_at, distribution_version)
-);
-CREATE INDEX IF NOT EXISTS calibration_predictions_due_idx
-    ON calibration_predictions (resolves_at);
-CREATE INDEX IF NOT EXISTS calibration_predictions_version_idx
-    ON calibration_predictions (distribution_version, variant);
-
-CREATE TABLE IF NOT EXISTS calibration_outcomes (
-    prediction_id        INTEGER PRIMARY KEY REFERENCES calibration_predictions(id),
-    resolved_at          TEXT    NOT NULL,
-    actual_equity        REAL    NOT NULL,
-    actual_equity_change REAL    NOT NULL,
-    external_flow_usd    REAL    NOT NULL,
-    book_changed         INTEGER NOT NULL,
-    liquidated           INTEGER NOT NULL,
-    pit                  REAL    NOT NULL,
-    pit_u                REAL    NOT NULL,
-    crps                 REAL    NOT NULL,
-    var_95_breached      INTEGER NOT NULL,
-    observation_day      TEXT    NOT NULL,
-    resolution_lag_s     REAL    NOT NULL,
-    stale_resolution     INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS calibration_outcomes_day_idx
-    ON calibration_outcomes (observation_day);
-"""
 
 VARIANT_MODEL = "model"
 VARIANT_BASELINE_A = "baseline_a"
@@ -124,15 +84,55 @@ def _iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat()
 
 
+# -- backend normalisers ---------------------------------------------------
+# Postgres and SQLite return different Python types for the same column. The
+# journal's callers must not have to know which backend they are on, so every
+# read is normalised here and nowhere else.
+
+
+def as_dt(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    return datetime.fromisoformat(str(value))
+
+
+def as_bool(value: Any) -> bool:
+    return bool(value)
+
+
+def as_json(value: Any) -> Any:
+    return value if isinstance(value, (dict, list)) else json.loads(value)
+
+
+def as_date(value: Any) -> date:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return date.fromisoformat(str(value))
+
+
 class CalibrationJournal:
-    def __init__(self, path: str | Path = ":memory:") -> None:
-        self.conn = sqlite3.connect(str(path))
-        self.conn.row_factory = sqlite3.Row
-        self.conn.executescript(_SQLITE_SCHEMA)
-        self.conn.commit()
+    """`target` is a SQLite path, or a `postgresql://` DSN."""
+
+    def __init__(self, target: str | Path = ":memory:") -> None:
+        self.backend: Backend = open_backend(target)
+        self.backend.executescript(canonical_ddl() if self.is_postgres else sqlite_ddl())
+        self.backend.commit()
+
+    @property
+    def is_postgres(self) -> bool:
+        return self.backend.placeholder == "%s"
+
+    def _sql(self, sql: str) -> str:
+        """Rewrite `?` placeholders for the backend's paramstyle."""
+        return sql if self.backend.placeholder == "?" else sql.replace("?", "%s")
+
+    def _query(self, sql: str, params: tuple = ()) -> list[dict]:
+        return self.backend.rows(self.backend.execute(self._sql(sql), params))
 
     def close(self) -> None:
-        self.conn.close()
+        self.backend.close()
 
     def __enter__(self) -> CalibrationJournal:
         return self
@@ -162,7 +162,11 @@ class CalibrationJournal:
         book_snapshot: dict,
     ) -> int:
         resolves_at = predicted_at.timestamp() + horizon_hours * 3600
-        cur = self.conn.execute(
+        # RETURNING on both backends. SQLite has supported it since 3.35 and
+        # ships far newer with every Python this targets, so the id comes
+        # back the same way everywhere rather than through `lastrowid`,
+        # which Postgres does not have at all.
+        rows = self._query(
             """
             INSERT INTO calibration_predictions (
                 address, variant, predicted_at, horizon_hours, resolves_at,
@@ -170,18 +174,19 @@ class CalibrationJournal:
                 start_equity, p_liq, p_liq_ci_low, p_liq_ci_high, var_95, cvar_95,
                 quantile_values, n_quantile_levels, book_snapshot
             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            RETURNING id
             """,
             (
                 address, variant, _iso(predicted_at), horizon_hours,
                 _iso(datetime.fromtimestamp(resolves_at, timezone.utc)),
-                model_version, distribution_version, seed, n_paths, int(converged),
+                model_version, distribution_version, seed, n_paths, bool(converged),
                 start_equity, p_liq, p_liq_ci[0], p_liq_ci[1], var_95, cvar_95,
                 json.dumps([float(v) for v in distribution.values]),
                 len(distribution.levels), json.dumps(book_snapshot),
             ),
         )
-        self.conn.commit()
-        return int(cur.lastrowid)
+        self.backend.commit()
+        return int(rows[0]["id"])
 
     def record_outcome(
         self,
@@ -205,30 +210,32 @@ class CalibrationJournal:
         A plain INSERT, not INSERT OR REPLACE (audit A-09): the public
         calibration score is worth exactly as much as the guarantee that a
         recorded outcome cannot be quietly rewritten after the fact. A second
-        attempt raises IntegrityError; correcting a genuinely wrong outcome
-        has to be a deliberate, visible operation.
+        attempt raises an integrity error; correcting a genuinely wrong
+        outcome has to be a deliberate, visible operation.
         """
-        self.conn.execute(
-            """
-            INSERT INTO calibration_outcomes (
-                prediction_id, resolved_at, actual_equity, actual_equity_change,
-                external_flow_usd, book_changed, liquidated, pit, pit_u, crps,
-                var_95_breached, observation_day, resolution_lag_s, stale_resolution
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
+        self.backend.execute(
+            self._sql(
+                """
+                INSERT INTO calibration_outcomes (
+                    prediction_id, resolved_at, actual_equity, actual_equity_change,
+                    external_flow_usd, book_changed, liquidated, pit, pit_u, crps,
+                    var_95_breached, observation_day, resolution_lag_s, stale_resolution
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """
+            ),
             (
                 prediction_id, _iso(resolved_at), actual_equity, actual_equity_change,
-                external_flow_usd, int(book_changed), int(liquidated), pit, pit_u, crps,
-                int(var_95_breached), observation_day.isoformat(),
-                resolution_lag_s, int(stale_resolution),
+                external_flow_usd, bool(book_changed), bool(liquidated), pit, pit_u, crps,
+                bool(var_95_breached), observation_day.isoformat(),
+                resolution_lag_s, bool(stale_resolution),
             ),
         )
-        self.conn.commit()
+        self.backend.commit()
 
     # -- reading --------------------------------------------------------
 
     def due(self, as_of: datetime) -> list[PendingPrediction]:
-        rows = self.conn.execute(
+        rows = self._query(
             """
             SELECT p.* FROM calibration_predictions p
             LEFT JOIN calibration_outcomes o ON o.prediction_id = p.id
@@ -236,27 +243,28 @@ class CalibrationJournal:
             ORDER BY p.resolves_at
             """,
             (_iso(as_of),),
-        ).fetchall()
+        )
         return [self._to_pending(r) for r in rows]
 
     @staticmethod
-    def _to_pending(row: sqlite3.Row) -> PendingPrediction:
-        values = np.array(json.loads(row["quantile_values"]), dtype=np.float64)
+    def _to_pending(row: dict) -> PendingPrediction:
+        values = np.array(as_json(row["quantile_values"]), dtype=np.float64)
         levels = np.linspace(0.0, 1.0, row["n_quantile_levels"])
         return PendingPrediction(
-            id=row["id"],
+            id=int(row["id"]),
             address=row["address"],
             variant=row["variant"],
-            predicted_at=datetime.fromisoformat(row["predicted_at"]),
-            resolves_at=datetime.fromisoformat(row["resolves_at"]),
-            start_equity=row["start_equity"],
-            var_95=row["var_95"],
+            predicted_at=as_dt(row["predicted_at"]),
+            resolves_at=as_dt(row["resolves_at"]),
+            start_equity=float(row["start_equity"]),
+            var_95=float(row["var_95"]),
             distribution=PredictiveDistribution(levels=levels, values=values),
-            book_snapshot=json.loads(row["book_snapshot"]),
+            book_snapshot=as_json(row["book_snapshot"]),
         )
 
-    def scored(self, distribution_version: str, variant: str) -> list[sqlite3.Row]:
-        return self.conn.execute(
+    def scored(self, distribution_version: str, variant: str) -> list[dict]:
+        """Resolved rows, with the backend differences already normalised."""
+        rows = self._query(
             """
             SELECT p.address, p.variant, o.*
             FROM calibration_outcomes o
@@ -265,10 +273,16 @@ class CalibrationJournal:
             ORDER BY o.observation_day
             """,
             (distribution_version, variant),
-        ).fetchall()
+        )
+        for row in rows:
+            for flag in ("book_changed", "liquidated", "var_95_breached",
+                         "stale_resolution"):
+                row[flag] = as_bool(row[flag])
+            row["observation_day"] = as_date(row["observation_day"]).isoformat()
+        return rows
 
     def progress(self, distribution_version: str) -> ShadowProgress:
-        row = self.conn.execute(
+        row = self._query(
             """
             SELECT COUNT(*) AS n,
                    COUNT(DISTINCT o.observation_day) AS days,
@@ -276,13 +290,13 @@ class CalibrationJournal:
             FROM calibration_outcomes o
             JOIN calibration_predictions p ON p.id = o.prediction_id
             WHERE p.distribution_version = ? AND p.variant = ?
-              AND o.stale_resolution = 0
+              AND o.stale_resolution = ?
             """,
-            (distribution_version, VARIANT_MODEL),
-        ).fetchone()
+            (distribution_version, VARIANT_MODEL, False),
+        )[0]
         return ShadowProgress(
             distribution_version=distribution_version,
-            distinct_days=row["days"] or 0,
-            distinct_addresses=row["addrs"] or 0,
-            resolved_observations=row["n"] or 0,
+            distinct_days=int(row["days"] or 0),
+            distinct_addresses=int(row["addrs"] or 0),
+            resolved_observations=int(row["n"] or 0),
         )

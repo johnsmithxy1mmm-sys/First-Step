@@ -80,9 +80,22 @@ def naive(synthetic_returns):
 
 
 class TestJournalSchema:
-    def test_sqlite_and_postgres_schemas_have_the_same_columns(self):
-        """The published calibration score is only as good as the guarantee
-        that dev and production record the same thing."""
+    def test_the_sqlite_schema_is_derived_from_the_canonical_one(self):
+        """One schema, not two. A hand-maintained second copy is a second
+        thing to forget to update, and the failure surfaces years later as an
+        unexplained discontinuity in a published calibration score."""
+        from risk_engine.shadow.backends import canonical_ddl, sqlite_ddl
+
+        canonical = canonical_ddl()
+        derived = sqlite_ddl()
+        for table in ("calibration_predictions", "calibration_outcomes"):
+            assert f"CREATE TABLE IF NOT EXISTS {table}" in canonical
+            assert f"CREATE TABLE IF NOT EXISTS {table}" in derived
+        # Postgres-only spellings must not survive the translation.
+        for postgres_only in ("BIGSERIAL", "TIMESTAMPTZ", "JSONB", "DOUBLE PRECISION"):
+            assert postgres_only not in derived, postgres_only
+
+    def test_every_declared_column_exists_in_the_live_sqlite_schema(self):
         sql = SCHEMA_SQL.read_text()
         journal = CalibrationJournal()
         for table in ("calibration_predictions", "calibration_outcomes"):
@@ -96,7 +109,8 @@ class TestJournalSchema:
                 if (m := re.match(r"\s{4}(\w+)\s+\w", line))
             }
             live = {
-                r[1] for r in journal.conn.execute(f"PRAGMA table_info({table})").fetchall()
+                r["name"]
+                for r in journal._query(f"PRAGMA table_info({table})")
             }
             assert declared == live, f"{table}: {declared ^ live}"
         journal.close()
@@ -130,9 +144,9 @@ class TestShadowSweep:
 
         assert report.written == 2
         for variant in (VARIANT_MODEL, VARIANT_BASELINE_A, VARIANT_BASELINE_B):
-            rows = journal.conn.execute(
+            rows = journal._query(
                 "SELECT COUNT(*) c FROM calibration_predictions WHERE variant=?", (variant,)
-            ).fetchone()
+            )[0]
             assert rows["c"] == 2, variant
         journal.close()
 
