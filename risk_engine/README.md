@@ -10,7 +10,7 @@ decisions that depart from it — and the places where it cannot be
 implemented as literally written — are in
 [`docs/hl-risk/OPEN-QUESTIONS.md`](../docs/hl-risk/OPEN-QUESTIONS.md).
 
-## Status: Phase 1
+## Status: Phases 1-3 complete
 
 | Phase | Scope | State |
 |---|---|---|
