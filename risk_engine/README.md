@@ -15,10 +15,15 @@ implemented as literally written — are in
 | Phase | Scope | State |
 |---|---|---|
 | 1 | Liquidation model, risk engine, §3.1 benchmarks, calibration journal, shadow cron | **complete, gate passing** |
-| 2 | `pre_trade_delta` | not started |
-| 3 | Read-only frontend, degradation contract | not started |
-| 4 | `max_safe_size`, builder fee — gated on 21 days x 200 addresses of shadow validation | not started |
+| 2 | `pre_trade_delta` | **complete** |
+| 3 | Read-only frontend, backend, degradation contract | **complete, acceptance verified** |
+| 4 | `max_safe_size`, builder fee — gated on 21 days x 200 addresses of shadow validation | not started, gate closed |
 | 5 | `funding_drag`, observability, polish | partial (metrics exist) |
+
+Phases 2 and 3 added an internal REST service (`risk_engine/service/`), a
+Node backend (`services/backend/`) that enforces the §6 degradation
+contract, and a Next.js frontend (`apps/web/`). See
+[`docs/hl-risk/RUNNING.md`](../docs/hl-risk/RUNNING.md).
 
 ## Running the gate
 
@@ -30,6 +35,10 @@ pytest risk_engine/tests -q                          # excludes the slow gate
 pytest risk_engine/tests/test_benchmarks.py -q       # the gate itself, ~15s
 ```
 
+To run the whole read-only stack, see
+[`docs/hl-risk/RUNNING.md`](../docs/hl-risk/RUNNING.md) or
+`./scripts/run-stack.sh`.
+
 ## Layout
 
 ```
@@ -38,7 +47,8 @@ liquidation/  §1. Margin tiers, closed-form liquidation price, the simulator.
 model/        §2. EWMA, Ledoit-Wolf, PSD projection, Student-t marginals,
               t-copula fitting, funding AR(1), the global correlation matrix.
 sim/          §2.3/2.5. Path generation, Monte Carlo engine, interval estimation.
-tools/        §4. portfolio_risk (the rest arrive with their phases).
+tools/        §4. portfolio_risk, pre_trade_delta.
+service/      §8. Internal REST service the Node backend consumes.
 validation/   §3.1 benchmarks, §3.2 baselines, CLI.
 shadow/       §3.3/3.4. Calibration journal, snapshot cron, resolver, metrics.
 market/       §5.1. Info client and parsers.
