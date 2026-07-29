@@ -14,7 +14,16 @@ Format: MAJOR.MINOR.PATCH-tag
   PATCH        performance, logging, plumbing (does not reset)
 """
 
-MODEL_VERSION = "0.1.0-phase1"
+#: 0.2.0 — audit fixes. MINOR, not PATCH, because two of them change the
+#: predicted distribution and therefore reset the shadow window (§3.3):
+#:   - baseline B now uses a Gaussian copula, so its predicted distribution
+#:     genuinely differs (audit A-03);
+#:   - horizons are checkpointed on one shared walk, so the 7d paths are no
+#:     longer an independently drawn set (audit A-10).
+#: The randomized PIT (A-02) changes how outcomes are *scored*, not what the
+#: model predicts, but it invalidates every PIT value recorded under 0.1.x
+#: just as thoroughly, so those observations cannot be pooled either.
+MODEL_VERSION = "0.2.0-phase1"
 
 # Distribution-affecting prefix; the shadow counter keys on this, not on the
 # full string, so that PATCH releases keep accumulating validation days.

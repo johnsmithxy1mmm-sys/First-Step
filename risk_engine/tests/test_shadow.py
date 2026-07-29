@@ -470,3 +470,26 @@ class TestOutcomeImmutability:
             journal.record_outcome(**{**kwargs, "pit": 0.0, "crps": 999.0})
         assert journal.scored("0.1", VARIANT_MODEL)[0]["pit"] == pytest.approx(0.4)
         journal.close()
+
+
+class TestVersionGating:
+    """§3.3 anti-overfitting: a distribution-affecting change resets the
+    shadow window. The audit fixes changed baseline B's distribution and the
+    7d path set, so observations recorded under 0.1.x cannot be pooled with
+    0.2.x -- and neither can their PIT values, which were computed by the
+    non-randomized transform."""
+
+    def test_distribution_version_tracks_major_minor_only(self):
+        from risk_engine.version import DISTRIBUTION_VERSION, MODEL_VERSION
+
+        assert MODEL_VERSION.startswith(DISTRIBUTION_VERSION + ".")
+        assert DISTRIBUTION_VERSION.count(".") == 1
+
+    def test_the_audit_fixes_moved_the_distribution_version(self):
+        from risk_engine.version import DISTRIBUTION_VERSION
+
+        assert DISTRIBUTION_VERSION != "0.1", (
+            "baseline B's copula and the shared-walk horizons changed the "
+            "predicted distribution; pooling 0.1.x shadow days would be "
+            "exactly the overfitting §3.3 forbids"
+        )
