@@ -378,6 +378,9 @@ class TestMetricsAreBounded:
     def test_latency_window_discards_the_oldest_samples(self):
         from risk_engine.observability.metrics import MAX_LATENCY_SAMPLES
 
+        # Guard before the loop: without it, a mutant that raises the cap
+        # makes this test hang for a billion iterations instead of failing.
+        assert MAX_LATENCY_SAMPLES <= 100_000
         m = Metrics()
         for i in range(MAX_LATENCY_SAMPLES + 500):
             m.observe_latency("stage", float(i))
