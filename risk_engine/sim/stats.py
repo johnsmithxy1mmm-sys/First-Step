@@ -119,7 +119,7 @@ def conditional_value_at_risk(pnl: np.ndarray, level: float = 0.95) -> float:
 
 def tail_size(n: int, level: float = 0.95) -> int:
     """How many of `n` samples make up the worst (1 - level) tail."""
-    return max(1, int(round((1.0 - level) * n)))
+    return max(1, round((1.0 - level) * n))
 
 
 def conditional_value_at_risk_rows(pnl: np.ndarray, level: float = 0.95) -> np.ndarray:
