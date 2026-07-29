@@ -117,6 +117,35 @@ def conditional_value_at_risk(pnl: np.ndarray, level: float = 0.95) -> float:
     return float(-tail.mean())
 
 
+def tail_size(n: int, level: float = 0.95) -> int:
+    """How many of `n` samples make up the worst (1 - level) tail."""
+    return max(1, int(round((1.0 - level) * n)))
+
+
+def conditional_value_at_risk_rows(pnl: np.ndarray, level: float = 0.95) -> np.ndarray:
+    """CVaR of every row of a 2-D sample, as positive losses.
+
+    Exists for the bootstrap in `pre_trade_delta`, where the scalar version
+    called in a Python loop dominated the §2.6 latency budget: 200
+    replicates x 2 books was 166 ms of a 300 ms allowance, because each call
+    fully sorted 20 000 numbers. `np.partition` finds the tail in linear time
+    and does every replicate in one pass.
+
+    Selects exactly the `tail_size(n)` smallest values, so it can differ
+    marginally from the quantile-and-mask scalar version when the sample has
+    ties on the cutoff. `test_pre_trade_delta.py` pins the two together.
+    """
+    x = np.asarray(pnl)
+    if x.ndim != 2:
+        raise ValueError(f"expected a 2-D sample, got {x.shape}")
+    k = tail_size(x.shape[1], level)
+    part = np.partition(x, k - 1, axis=1)[:, :k]
+    # Accumulate in float64 even when the input is float32: the caller may
+    # narrow the sample to make the partition cheaper, but the tail mean
+    # itself should not lose digits.
+    return -part.mean(axis=1, dtype=np.float64)
+
+
 @dataclass(frozen=True, slots=True)
 class PredictiveDistribution:
     """A predicted distribution stored as a quantile function.

@@ -36,6 +36,10 @@ from scipy import stats
 #: decades of headroom before extrapolation is used at all.
 _MIN_TAIL_P = 1e-13
 _N_NODES = 3000
+#: Uniform resampling grid. Dense enough that linear interpolation in
+#: log-log space stays far inside the accuracy budget asserted in
+#: tests/test_quantile_map.py, and cheap because lookup is O(1).
+_N_GRID = 32768
 
 
 def _dist(df: float | None):
@@ -58,8 +62,15 @@ class QuantileMap:
     source_df: float | None
     target_df: float | None
     linear_slope: float | None  # set when the map is exactly linear
-    log_x: np.ndarray
-    log_y: np.ndarray
+    #: Uniformly spaced grid in log|x|. Uniform on purpose: `np.interp` on a
+    #: non-uniform grid costs a binary search per point, which measured at
+    #: 30 ms per asset per request -- a third of §2.6's entire online budget
+    #: spent looking up array indices. With constant spacing the index is
+    #: arithmetic, and the same interpolation costs a few milliseconds.
+    grid_u0: float
+    grid_inv_step: float
+    grid_log_y: np.ndarray
+    log_x_max: float
     small_slope: float
     #: Last tabulated -log(survival) and d(log y)/du there, for the tail.
     last_u: float
@@ -73,9 +84,11 @@ class QuantileMap:
             # that remains is the standardisation. Skipping the table here is
             # what makes the common case (one df for the whole book) free.
             return cls(source_df, target_df, 1.0 / tgt_scale,
-                       np.empty(0), np.empty(0), 0.0, 0.0, 0.0)
+                       0.0, 0.0, np.empty(0), 0.0, 0.0, 0.0, 0.0)
 
         src, tgt = _dist(source_df), _dist(target_df)
+        # Accurate nodes first, spaced by probability so the far tail is
+        # resolved; these are exact scipy quantiles.
         p = np.logspace(np.log10(0.4999), np.log10(_MIN_TAIL_P), _N_NODES)
         xs = src.isf(p)
         ys = tgt.isf(p) / tgt_scale
@@ -83,12 +96,21 @@ class QuantileMap:
             raise RuntimeError("quantile grid is not monotone; the table would be wrong")
         log_x, log_y = np.log(xs), np.log(ys)
         u = -np.log(p)  # -log S(x) at each node, exact by construction
+
+        # Resample onto a uniform grid in log|x|. log y is smooth and very
+        # nearly linear in log x, so the resampling error at this spacing is
+        # orders of magnitude below the 1e-5 the accuracy tests demand.
+        grid_u = np.linspace(log_x[0], log_x[-1], _N_GRID)
+        grid_log_y = np.interp(grid_u, log_x, log_y)
+        step = (log_x[-1] - log_x[0]) / (_N_GRID - 1)
         return cls(
             source_df=source_df,
             target_df=target_df,
             linear_slope=None,
-            log_x=log_x,
-            log_y=log_y,
+            grid_u0=float(log_x[0]),
+            grid_inv_step=float(1.0 / step),
+            grid_log_y=grid_log_y,
+            log_x_max=float(log_x[-1]),
             small_slope=float(ys[0] / xs[0]),
             last_u=float(u[-1]),
             tail_slope_u=float((log_y[-1] - log_y[-2]) / (u[-1] - u[-2])),
@@ -98,23 +120,31 @@ class QuantileMap:
         if self.linear_slope is not None:
             return x * self.linear_slope
         ax = np.abs(x)
-        out = np.empty_like(ax)
-        small = ax <= np.exp(self.log_x[0])
-        out[small] = ax[small] * self.small_slope
-        big = ~small
-        if big.any():
-            vals = ax[big]
-            la = np.log(vals)
-            ly = np.interp(la, self.log_x, self.log_y)
-            # np.interp clamps at the last node; continue in log-survival
-            # space, where the relationship is asymptotically linear for both
-            # source families. Reached with probability ~1e-13 per draw, so
-            # the cost of the exact logsf call here is irrelevant.
-            over = la > self.log_x[-1]
-            if over.any():
-                u = -_dist(self.source_df).logsf(vals[over])
-                ly[over] = self.log_y[-1] + self.tail_slope_u * (u - self.last_u)
-            out[big] = np.exp(ly)
+        x_min = np.exp(self.grid_u0)
+        # Branch-free over the whole array. Splitting out the near-zero and
+        # far-tail cases with boolean masks costs two gathers and a scatter
+        # over millions of elements, to serve regions that hold almost no
+        # draws; `np.where` on the result is materially cheaper.
+        la = np.log(np.maximum(ax, x_min))
+        t = (la - self.grid_u0) * self.grid_inv_step
+        np.clip(t, 0.0, self.grid_log_y.size - 1.000001, out=t)
+        i = t.astype(np.intp)
+        frac = t - i
+        lo = self.grid_log_y[i]
+        ly = lo + frac * (self.grid_log_y[i + 1] - lo)
+        out = np.exp(ly)
+        # Near zero the map is linear, with the slope of its first segment.
+        np.copyto(out, ax * self.small_slope, where=ax < x_min)
+        # Past the last node, continue in log-survival space, where the
+        # relationship is asymptotically linear for both source families.
+        # Reached with probability ~1e-13 per draw, so the exact logsf call
+        # here costs nothing in aggregate.
+        over = la > self.log_x_max
+        if over.any():
+            u = -_dist(self.source_df).logsf(ax[over])
+            out[over] = np.exp(
+                self.grid_log_y[-1] + self.tail_slope_u * (u - self.last_u)
+            )
         return np.copysign(out, x)
 
 

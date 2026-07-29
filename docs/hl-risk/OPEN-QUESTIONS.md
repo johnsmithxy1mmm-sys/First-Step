@@ -337,6 +337,34 @@ age carries its own longer threshold, exposed separately on the health
 endpoint as §6 requires. Confirmation wanted, since this is the one rule
 §6 says not to soften for conversion.
 
+### D6 `[BLOCKER]` §4.2's overlap rule is the wrong significance test
+
+§4.2 says that when the "before" and "after" intervals overlap, the UI must
+report statistical indistinguishability. Applied to the paired estimates this
+tool actually produces, that rule is wrong, and wrong in the dangerous
+direction.
+
+Both books are walked over identical price paths (common random numbers),
+because the effect of one order is far smaller than the Monte Carlo error on
+either side -- two independent runs would report mostly sampling noise. Under
+that pairing the concordant paths cancel exactly, and the interval on the
+*difference* is several times tighter than either marginal interval.
+Non-overlap implies significance; overlap does **not** imply insignificance.
+
+Measured on the reference book: an order of 40 SOL raises `P(liq)` by
+0.17 pp with a paired interval six times tighter than the marginal ones.
+The marginal intervals overlap heavily, so §4.2's rule would tell the user
+"no detectable change" about an order that provably increases their
+liquidation probability -- the §10-forbidden direction.
+
+Implemented: both answers are returned. `marginal_intervals_overlap` is
+exactly what §4.2 asks for; `change` is the paired interval and
+`distinguishable` is read off it. `distinguishable` is what the UI should
+act on, and `overlap_rule_would_mislead` fires (and is counted in
+observability) whenever the two disagree, so the discrepancy is visible
+rather than silently resolved. Confirmation wanted that the paired test is
+the intended one.
+
 ### D5 `[RESOLVED]` Full-liquidation modelling is not conservative in every metric
 
 §1.6 permits modelling full cross liquidation instead of partial, calling it

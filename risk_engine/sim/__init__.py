@@ -2,6 +2,7 @@ from risk_engine.sim.engine import (
     ModelBundle,
     MonteCarloEngine,
     RiskResult,
+    simulate_books_checkpointed,
     simulate_paths,
     simulate_paths_checkpointed,
 )
@@ -16,6 +17,7 @@ __all__ = [
     "PredictiveDistribution",
     "RiskResult",
     "draw_base_randomness",
+    "simulate_books_checkpointed",
     "simulate_paths",
     "simulate_paths_checkpointed",
     "wilson_interval",

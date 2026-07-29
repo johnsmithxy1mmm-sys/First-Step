@@ -16,6 +16,7 @@ is under-resolved.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -133,6 +134,77 @@ class _RawOutcome:
     factor_return: np.ndarray = field(default_factory=lambda: np.empty(0))
 
 
+def simulate_books_checkpointed(
+    books: Sequence[Book],
+    specs: dict[str, AssetSpec],
+    path_spec: PathSpec,
+    spot: np.ndarray,
+    base: BaseRandomness,
+    funding_paths: np.ndarray | None,
+    horizons: tuple[int, ...],
+    use_bridge: bool = True,
+    factor_col: int | None = None,
+) -> list[dict[int, _RawOutcome]]:
+    """Several books walked over ONE set of price paths.
+
+    This is what makes `pre_trade_delta` (§4.2) meaningful. The quantity the
+    user is shown is a *difference* between two books that overlap almost
+    entirely, and it is usually far smaller than the Monte Carlo error on
+    either side. Simulating the two books independently would report mostly
+    sampling noise. Walking both over identical prices makes the comparison
+    pathwise: the difference is exactly the effect of the order.
+
+    It is also half the work -- path generation dominates the online budget
+    in §2.6, and it happens once here rather than once per book.
+    """
+    columns = {c: i for i, c in enumerate(path_spec.coins)}
+    with Timer("generate_paths"):
+        prices = generate_price_paths(path_spec, spot, base)
+    bridge = (
+        BridgeContext(step_vol=path_spec.step_vol, corr=path_spec.corr) if use_bridge else None
+    )
+
+    results: list[dict[int, _RawOutcome]] = []
+    for book in books:
+        sim = LiquidationSimulator(book, specs, columns)
+        # The bridge uniforms come from `base`, so they are shared across
+        # books and configurations; drawing them here would break common
+        # random numbers. Each book takes as many isolated columns as it has
+        # pockets, from the same pool.
+        uniforms = None
+        if use_bridge:
+            n_iso = len(book.isolated_positions)
+            if base.bridge_iso.shape[2] < n_iso:
+                raise ValueError(
+                    f"randomness has {base.bridge_iso.shape[2]} isolated columns, "
+                    f"book needs {n_iso}"
+                )
+            uniforms = (base.bridge_cross, base.bridge_iso[:, :, :n_iso])
+        with Timer("liquidation_walk"):
+            outs = sim.run_checkpointed(
+                prices, horizons, funding_paths=funding_paths, bridge=bridge,
+                bridge_uniforms=uniforms,
+            )
+        per_horizon: dict[int, _RawOutcome] = {}
+        for h, out in outs.items():
+            factor = (
+                prices[:, h, factor_col] / prices[:, 0, factor_col] - 1.0
+                if factor_col is not None
+                else np.empty(0)
+            )
+            per_horizon[h] = _RawOutcome(
+                cross_liq=out.cross_liquidated,
+                iso_liq=out.isolated_liquidated,
+                equity_change=out.equity_change,
+                funding_paid=out.funding_paid,
+                isolated_coins=out.isolated_coins,
+                start_equity=out.start_equity,
+                factor_return=factor,
+            )
+        results.append(per_horizon)
+    return results
+
+
 def simulate_paths_checkpointed(
     book: Book,
     specs: dict[str, AssetSpec],
@@ -144,45 +216,17 @@ def simulate_paths_checkpointed(
     use_bridge: bool = True,
     factor_col: int | None = None,
 ) -> dict[int, _RawOutcome]:
-    """One deterministic block of paths, snapshotted at each horizon.
+    """One book, snapshotted at each horizon.
 
     Deterministic given `base`, which is what makes common random numbers
     possible for the benchmarks in §3.1. All horizons come from the SAME
     walk (audit A-10): alive sets only ever shrink, so the liquidation flags
     at a longer horizon are a pathwise superset of a shorter one.
     """
-    columns = {c: i for i, c in enumerate(path_spec.coins)}
-    with Timer("generate_paths"):
-        prices = generate_price_paths(path_spec, spot, base)
-    sim = LiquidationSimulator(book, specs, columns)
-    bridge = (
-        BridgeContext(step_vol=path_spec.step_vol, corr=path_spec.corr) if use_bridge else None
-    )
-    # The bridge uniforms come from `base`, so they are shared across
-    # configurations too; drawing them here would break common random numbers.
-    uniforms = (base.bridge_cross, base.bridge_iso) if use_bridge else None
-    with Timer("liquidation_walk"):
-        outs = sim.run_checkpointed(
-            prices, horizons, funding_paths=funding_paths, bridge=bridge,
-            bridge_uniforms=uniforms,
-        )
-    result: dict[int, _RawOutcome] = {}
-    for h, out in outs.items():
-        factor = (
-            prices[:, h, factor_col] / prices[:, 0, factor_col] - 1.0
-            if factor_col is not None
-            else np.empty(0)
-        )
-        result[h] = _RawOutcome(
-            cross_liq=out.cross_liquidated,
-            iso_liq=out.isolated_liquidated,
-            equity_change=out.equity_change,
-            funding_paid=out.funding_paid,
-            isolated_coins=out.isolated_coins,
-            start_equity=out.start_equity,
-            factor_return=factor,
-        )
-    return result
+    return simulate_books_checkpointed(
+        (book,), specs, path_spec, spot, base, funding_paths, horizons,
+        use_bridge, factor_col,
+    )[0]
 
 
 def simulate_paths(
