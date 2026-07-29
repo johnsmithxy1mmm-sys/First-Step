@@ -10,7 +10,7 @@ decisions that depart from it — and the places where it cannot be
 implemented as literally written — are in
 [`docs/hl-risk/OPEN-QUESTIONS.md`](../docs/hl-risk/OPEN-QUESTIONS.md).
 
-## Status: Phases 1-3 complete
+## Status: Phases 1-3 and 5 complete
 
 | Phase | Scope | State |
 |---|---|---|
@@ -18,12 +18,16 @@ implemented as literally written — are in
 | 2 | `pre_trade_delta` | **complete** |
 | 3 | Read-only frontend, backend, degradation contract | **complete, acceptance verified** |
 | 4 | `max_safe_size`, builder fee — gated on 21 days x 200 addresses of shadow validation | not started, gate closed |
-| 5 | `funding_drag`, observability, polish | partial (metrics exist) |
+| 5 | `funding_drag`, observability, champion/challenger | **complete** |
 
 Phases 2 and 3 added an internal REST service (`risk_engine/service/`), a
 Node backend (`services/backend/`) that enforces the §6 degradation
 contract, and a Next.js frontend (`apps/web/`). See
 [`docs/hl-risk/RUNNING.md`](../docs/hl-risk/RUNNING.md).
+
+Phase 5 is code-complete but Phase 4 does not follow from it. The gate is
+shadow validation, not features, and the shadow counter has not started —
+see "Before the shadow clock starts" below.
 
 ## Running the gate
 
@@ -39,6 +43,62 @@ To run the whole read-only stack, see
 [`docs/hl-risk/RUNNING.md`](../docs/hl-risk/RUNNING.md) or
 `./scripts/run-stack.sh`.
 
+## Running the shadow harness
+
+Two jobs on a daily cadence. `snapshot` writes today's predictions,
+`resolve` fills in what happened a day later; between them they accumulate
+the window Phase 4 is gated on.
+
+```bash
+python -m risk_engine.shadow init-addresses --out addrs.json   # template
+python -m risk_engine.shadow snapshot --journal shadow.db --addresses addrs.json
+python -m risk_engine.shadow resolve  --journal shadow.db --addresses addrs.json
+python -m risk_engine.shadow progress --journal shadow.db
+```
+
+`--fixture` swaps in a synthetic market and books, which exercises every
+moving part without a venue and validates nothing; every row it writes is
+stamped with a frame that says so. `--journal` takes a path for SQLite or a
+`postgresql://` DSN; the journal behaves identically on both, which
+`test_journal_backends.py` checks by running the same code against a real
+server (`HL_TEST_POSTGRES_DSN=... pytest -k backends`).
+
+A live run needs `--addresses`, and the file needs a non-empty `frame`
+field. That is deliberate: the Info API enumerates no addresses, so every
+list is biased somehow (OPEN-QUESTIONS B4), and a calibration score is
+uninterpretable without knowing what it is a sample of. `FileAddressSource`
+refuses a list that omits it rather than defaulting to something plausible.
+
+### Before the shadow clock starts
+
+Changing the distribution resets the counter (§3.3, §10). Five open
+questions still move it — A1, A8, C1, C2 and C5 — so 21 days accumulated now
+are 21 days that will be thrown away when any of them is answered. Resolve
+them first, or accept the reset knowingly. Details in
+[`OPEN-QUESTIONS.md`](../docs/hl-risk/OPEN-QUESTIONS.md).
+
+`progress` reads the gate off the `book_unchanged` cohort and the
+day-clustered interval, not the naive one. B1 records why: addresses
+observed on the same day share one market move, so the naive interval calls
+a coin flip significant, and under honest clustering §0.3's VaR criterion is
+not reachable in 21 days.
+
+## Champion/challenger
+
+`risk_engine/shadow/champion.py` scores two distribution versions against
+the same realised outcomes:
+
+```python
+from risk_engine.shadow.champion import compare
+print(compare(journal, champion_version="0.2", challenger_version="0.3"))
+```
+
+Paired by (address, day) and bootstrapped over days. Only observations both
+versions predicted are compared — a challenger always starts later, and
+scoring it on days the champion never saw compares two models on different
+markets. It migrates only when both bounds of the day-clustered interval sit
+below zero; "looks better" is not a verdict it can return.
+
 ## Layout
 
 ```
@@ -47,10 +107,11 @@ liquidation/  §1. Margin tiers, closed-form liquidation price, the simulator.
 model/        §2. EWMA, Ledoit-Wolf, PSD projection, Student-t marginals,
               t-copula fitting, funding AR(1), the global correlation matrix.
 sim/          §2.3/2.5. Path generation, Monte Carlo engine, interval estimation.
-tools/        §4. portfolio_risk, pre_trade_delta.
+tools/        §4. portfolio_risk, pre_trade_delta, funding_drag.
 service/      §8. Internal REST service the Node backend consumes.
 validation/   §3.1 benchmarks, §3.2 baselines, CLI.
-shadow/       §3.3/3.4. Calibration journal, snapshot cron, resolver, metrics.
+shadow/       §3.3/3.4. Calibration journal (SQLite or Postgres), snapshot
+              cron, resolver, metrics, champion/challenger, CLI.
 market/       §5.1. Info client and parsers.
 observability/§7. Counters and latency histograms.
 ```
