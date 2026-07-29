@@ -21,3 +21,6 @@ services/backend/dist/
 apps/web/.next/
 apps/web/next-env.d.ts
 *.tsbuildinfo
+
+# Deployment secrets (template: deploy/.env.example)
+deploy/.env

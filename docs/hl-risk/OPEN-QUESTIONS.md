@@ -172,12 +172,74 @@ will reject a correctly calibrated model.
 
 Implemented: breach-rate and PIT statistics are computed both naively and
 with day-clustered inference (block bootstrap over days; the day is the
-independent unit). The gate should be read off the clustered version. With
-21 days as the effective sample, the achievable precision on a 5% breach rate
-is roughly ±4 pp — which means **the §0.3 criterion as written is not
-reachable in 21 days**, and the shadow window needs to be far longer, or the
-criterion restated in terms of days rather than observations. This needs a
-decision before Phase 4's gate can be evaluated honestly.
+independent unit). The gate should be read off the clustered version.
+
+**Measured**, replacing the "roughly ±4 pp" estimate that stood here, which
+was arithmetic on the day count rather than a measurement. Run it with
+`python -m risk_engine.validation.power`; the generator is beta-binomial, its
+realised intra-class correlation is checked against the requested one, and
+the fast interval is checked against `clustered_bootstrap_ci`
+(`test_power.py`). 300 trials per cell:
+
+| days | addr/day | ICC | §0.3 rejects a *correct* model | clustered ±pp | power vs 8% | power vs 10% |
+|---|---|---|---|---|---|---|
+| 21 | 200 | 0.00 | 3.7% | 0.61 | 100% | 100% |
+| 21 | 200 | 0.05 | 58.0% | 1.94 | 71% | 97% |
+| 21 | 200 | 0.10 | 65.7% | 2.70 | 41% | 81% |
+| 21 | 200 | 0.20 | 77.7% | 3.60 | 18% | 49% |
+| 21 | 200 | 0.40 | 81.7% | 4.87 | 11% | 20% |
+| 21 | 500 | 0.20 | 88.0% | 3.43 | 23% | 47% |
+| 30 | 200 | 0.20 | 81.3% | 3.19 | 25% | 66% |
+| 60 | 200 | 0.20 | 76.7% | 2.42 | 55% | 92% |
+| 90 | 200 | 0.20 | 76.0% | 1.98 | 75% | 98% |
+| 180 | 200 | 0.20 | 77.0% | 1.38 | 97% | 100% |
+| 180 | 200 | 0.40 | 81.3% | 1.99 | 71% | 97% |
+
+The ICC=0 row is the harness calibrating itself: with genuinely independent
+observations §0.3's interval rejects a correct model 3.7% of the time against
+its nominal 5%, so the failures in every other row are the clustering, not a
+bug in the measurement.
+
+Three findings, none of which the estimate had:
+
+1. **§0.3 as written is not marginally wrong, it is inverted.** At any
+   non-zero clustering it rejects a *correctly calibrated* model more often
+   than it accepts one — 58% at ICC 0.05, 78% at 0.20. Whatever it is
+   measuring, it is not calibration.
+
+2. **More addresses buy almost nothing.** 200 → 500 per day moves the
+   clustered half-width from 3.60 to 3.43 pp at ICC 0.20. Under independence
+   2.5× the sample would cut it by 37%. The day is the unit; sampling harder
+   is not a substitute for waiting, and the §3.3 window's "× 200 addresses"
+   is doing far less work than its "21 days".
+
+3. **Days are the only lever, and 21 is not enough at plausible
+   clustering.** To reach 80% power against a model whose true breach rate is
+   double what it claims: ~21 days at ICC 0.05, ~30 at 0.10, ~60 at 0.20,
+   ~180 at 0.40. Against a 60% understatement (8% vs 5%) the same targets are
+   roughly 21 / 45 / 180 / not reached at 180.
+
+ICC itself is the one number neither the specification nor this code can
+supply — it takes real data, which is why it is swept rather than assumed.
+The first two weeks of shadow data will pin it, and the row to read is chosen
+then. On priors it is not small: on a day BTC drops 8% nearly every levered
+address breaches at once, which is ICC well above 0.2.
+
+**Still a decision, now an informed one.** Three options, in the order I would
+take them:
+
+- **Restate the criterion in days.** "The day-clustered 95% interval on the
+  breach rate contains 5%" is a test that can be run at 21 days and is honest
+  about what it establishes — which is little. Cheapest, and the one that
+  keeps §3.3's window; it must be paired with stating publicly that the gate
+  bounds the breach rate to roughly ±3.6 pp, not that it validates 5%.
+- **Size the window from measured ICC.** Run 14 days, measure ICC, then read
+  the required window off the table and commit to it before the counter is
+  read. This is the only option that yields a gate with real power.
+- **Keep 21 days and the naive interval.** Not defensible: it fails correct
+  models four times out of five, and a gate that fails on noise will be
+  re-run until it passes, which is §10's overfitting prohibition arrived at
+  by procedure instead of by intent.
 
 ### B2 `[BLOCKER]` Equity changes for reasons the model does not predict
 

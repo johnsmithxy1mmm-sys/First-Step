@@ -1,9 +1,21 @@
 """Internal REST service around the risk engine (§8).
 
-Consumed only by the Node backend, never exposed publicly: it carries no
-authentication because it is expected to listen on loopback behind the
-backend, and the backend owns rate limiting (§5.3) and the user-facing
-degradation contract (§6).
+Consumed only by the Node backend, never exposed publicly: the backend owns
+rate limiting (§5.3) and the user-facing degradation contract (§6), and this
+service trusts its caller to have done both.
+
+That trust is the reason it is not enough to *intend* loopback. A bearer
+token is required whenever `RISK_SERVICE_TOKEN` is set, and `serve` refuses
+to bind a non-loopback address without one -- a deployment that puts this on
+0.0.0.0 by accident fails to start rather than quietly serving an
+unauthenticated engine to the network. Refusing is the right direction here:
+the failure is loud, immediate, and happens before any request is served,
+whereas the alternative is discovered by whoever finds the open port.
+
+`/health` stays open, because orchestrators and load balancers check it
+before any token is in scope, and it discloses only model version and data
+age. Everything else, `/metrics` included, needs the token: the metrics
+snapshot describes model internals and request volumes.
 
 Standard library only. This endpoint speaks one dialect (POST JSON in, JSON
 out) to one consumer, and the request volume is bounded by the backend's own
@@ -24,8 +36,11 @@ stale (OPEN-QUESTIONS D4).
 
 from __future__ import annotations
 
+import hmac
+import ipaddress
 import json
 import logging
+import os
 import threading
 import traceback
 from datetime import datetime, timezone
@@ -81,14 +96,59 @@ def _parse_book(payload: dict) -> Book:
     )
 
 
+#: Endpoints reachable without a token. Only the one an orchestrator needs
+#: before it has any credentials, and it names no user and no book.
+OPEN_ROUTES = frozenset({"/health"})
+
+
+def _is_loopback(host: str) -> bool:
+    if host in ("", "localhost"):
+        # "" is INADDR_ANY -- every interface, which is the case this guard
+        # exists to catch, not a synonym for localhost.
+        return host == "localhost"
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        # A name that is not an IP literal cannot be shown to be loopback
+        # without resolving it, and a guard that resolves is a guard that can
+        # be moved by DNS. Treat it as exposed.
+        return False
+
+
 class RiskHandler(BaseHTTPRequestHandler):
     server_version = "hl-risk/1.0"
     state: EngineState  # injected by `serve`
+    token: str | None = None  # injected by `serve`
 
     def log_message(self, fmt: str, *args) -> None:
         log.info("%s - %s", self.address_string(), fmt % args)
 
     # -- plumbing -------------------------------------------------------
+
+    def _authorised(self) -> bool:
+        """Constant-time bearer check.
+
+        `compare_digest` rather than `==` because the comparison is against a
+        secret and an early-exit compare leaks its prefix one request at a
+        time. The cost of getting this right is one import.
+        """
+        if self.token is None:
+            return True
+        if self.path.rstrip("/") in OPEN_ROUTES:
+            return True
+        header = self.headers.get("Authorization") or ""
+        scheme, _, presented = header.partition(" ")
+        if scheme.lower() != "bearer":
+            return False
+        return hmac.compare_digest(presented.strip(), self.token)
+
+    def _reject_unauthorised(self) -> None:
+        # No echo of what was presented, and nothing about why it failed:
+        # "wrong scheme" versus "wrong token" is free information.
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Bearer realm="risk-engine"')
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def _send(self, code: int, body: dict) -> None:
         raw = json.dumps(body).encode()
@@ -105,6 +165,9 @@ class RiskHandler(BaseHTTPRequestHandler):
         return json.loads(self.rfile.read(length))
 
     def do_GET(self) -> None:
+        if not self._authorised():
+            self._reject_unauthorised()
+            return
         if self.path.rstrip("/") == "/health":
             self._send(200, self.state.health())
         elif self.path.rstrip("/") == "/metrics":
@@ -113,6 +176,9 @@ class RiskHandler(BaseHTTPRequestHandler):
             self._send(404, {"error": f"no such endpoint: {self.path}"})
 
     def do_POST(self) -> None:
+        if not self._authorised():
+            self._reject_unauthorised()
+            return
         route = self.path.rstrip("/")
         try:
             payload = self._read_json()
@@ -150,7 +216,9 @@ class RiskHandler(BaseHTTPRequestHandler):
             "publishable": out.publishable,
             "start_equity": out.start_equity,
             "effective_leverage": _estimate(out.effective_leverage),
-            "factor_beta": out.factor_beta,
+            "factor_beta": _estimate(out.factor_beta),
+            # Read off the interval, not the sign of the point (D3).
+            "direction_detectable": out.direction_detectable,
             "factor_coin": out.factor_coin,
             "p_liq_24h": _estimate(out.p_liq_24h_any),
             "p_liq_24h_cross": _estimate(out.p_liq_24h_cross),
@@ -225,8 +293,28 @@ class RiskHandler(BaseHTTPRequestHandler):
         }
 
 
-def serve(state: EngineState, host: str = "127.0.0.1", port: int = 8787) -> ThreadingHTTPServer:
-    handler = type("BoundRiskHandler", (RiskHandler,), {"state": state})
+def serve(
+    state: EngineState,
+    host: str = "127.0.0.1",
+    port: int = 8787,
+    token: str | None = None,
+) -> ThreadingHTTPServer:
+    """Bind the service, refusing an exposed bind without a token.
+
+    `token` defaults to `RISK_SERVICE_TOKEN`. Passing `token=""` is an
+    explicit "no auth" and is honoured only on loopback.
+    """
+    if token is None:
+        token = os.environ.get("RISK_SERVICE_TOKEN") or ""
+    if not token and not _is_loopback(host):
+        raise RuntimeError(
+            f"refusing to bind {host!r} without RISK_SERVICE_TOKEN: this service "
+            "answers unauthenticated callers and has no rate limiting of its own "
+            "(§5.3 puts that in the backend). Bind 127.0.0.1, or set a token."
+        )
+    handler = type(
+        "BoundRiskHandler", (RiskHandler,), {"state": state, "token": token or None}
+    )
     httpd = ThreadingHTTPServer((host, port), handler)
     httpd.daemon_threads = True
     return httpd
@@ -238,11 +326,20 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="risk_engine.service")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8787)
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--fixture", action="store_true",
         help="run on a synthetic bundle instead of live Hyperliquid data; "
              "the live path needs api.hyperliquid.xyz, which is unreachable "
              "from some build environments (OPEN-QUESTIONS E5)",
+    )
+    # A spelling for the default, so a caller assembling arguments from a
+    # variable always has a non-empty flag to pass. Compose substituting an
+    # empty string would otherwise reach argparse as an empty positional.
+    mode.add_argument(
+        "--live", action="store_true",
+        help="explicit opposite of --fixture; the default, named so it can be "
+             "passed rather than omitted",
     )
     parser.add_argument("--refresh-seconds", type=float, default=300.0,
                         help="global matrix rebuild cadence (§2.1)")
@@ -254,8 +351,11 @@ def main(argv: list[str] | None = None) -> int:
 
     httpd = serve(state, args.host, args.port)
     log.info(
-        "risk service on http://%s:%d  model=%s  mode=%s",
-        args.host, args.port, MODEL_VERSION, "fixture" if args.fixture else "live",
+        "risk service on http://%s:%d  model=%s  mode=%s  auth=%s",
+        args.host, args.port, MODEL_VERSION,
+        "fixture" if args.fixture else "live",
+        # The token itself never reaches a log line, here or anywhere.
+        "bearer" if os.environ.get("RISK_SERVICE_TOKEN") else "none (loopback)",
     )
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()

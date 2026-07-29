@@ -26,7 +26,10 @@ export interface PortfolioRiskValue {
   publishable: boolean;
   start_equity: number;
   effective_leverage: Estimate;
-  factor_beta: number;
+  /** Signed, and interval-bearing like every other number (OPEN-QUESTIONS D3). */
+  factor_beta: Estimate;
+  /** Read off beta's interval, not the sign of its point estimate. */
+  direction_detectable: boolean;
   factor_coin: string;
   p_liq_24h: Estimate;
   p_liq_24h_cross: Estimate;
@@ -98,5 +101,9 @@ export function formatAge(ms: number | null): string {
 }
 
 export const pct = (x: number) => `${(x * 100).toFixed(2)}%`;
+/** A probability *difference*, in percentage points, signed. A change of
+ *  +0.17 pp is a different quantity from a level of 0.17% and reads wrong
+ *  when formatted as one (OPEN-QUESTIONS D6). */
+export const pp = (x: number) => `${x >= 0 ? '+' : '−'}${Math.abs(x * 100).toFixed(2)} pp`;
 export const usd = (x: number) =>
   x.toLocaleString('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });

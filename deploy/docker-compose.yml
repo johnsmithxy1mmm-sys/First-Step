@@ -1,0 +1,151 @@
+# The read-only stack (Phases 1-3, 5) plus the shadow harness.
+#
+#   docker compose -f deploy/docker-compose.yml up -d --build
+#
+# Nothing here can move funds. There is no execution path in this codebase:
+# that is Phase 4, and Phase 4 is gated on shadow validation (§3.3).
+#
+# Run from the repository root -- the build contexts are the repo, because
+# the engine image needs risk_engine/ and the schema it ships with.
+#
+# Required in deploy/.env (see .env.example):
+#   RISK_SERVICE_TOKEN   shared secret between backend and engine
+#   POSTGRES_PASSWORD    journal database
+name: hl-risk
+
+x-engine-image: &engine-image
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile.engine
+  image: hl-risk/engine:latest
+
+services:
+  engine:
+    <<: *engine-image
+    restart: unless-stopped
+    environment:
+      # The engine refuses to bind 0.0.0.0 without this, which is what stops
+      # a compose network from quietly getting an unauthenticated engine.
+      RISK_SERVICE_TOKEN: ${RISK_SERVICE_TOKEN:?set RISK_SERVICE_TOKEN in deploy/.env}
+      RISK_ENGINE_WORKERS: ${RISK_ENGINE_WORKERS:-2}
+    command: ["--host", "0.0.0.0", "--port", "8787", "${ENGINE_MODE:---fixture}"]
+    # No `ports:`. The engine is reachable only from this network; the
+    # backend is the sole consumer and owns rate limiting (§5.3). Publishing
+    # 8787 would put an engine with no rate limit of its own on a host
+    # interface, which the token protects but does not justify.
+    expose:
+      - "8787"
+    mem_limit: 2g
+
+  backend:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+    image: hl-risk/backend:latest
+    restart: unless-stopped
+    environment:
+      PORT: 8080
+      RISK_SERVICE_URL: http://engine:8787
+      RISK_SERVICE_TOKEN: ${RISK_SERVICE_TOKEN:?set RISK_SERVICE_TOKEN in deploy/.env}
+    depends_on:
+      engine:
+        condition: service_started
+    # Deliberately `service_started`, not `service_healthy`. §6 says an
+    # unreachable engine is a state the backend reports, not a reason for it
+    # to be absent -- a user opening the page during an engine outage must
+    # get "no value available", and they cannot get that from a backend that
+    # refused to start.
+    expose:
+      - "8080"
+    mem_limit: 512m
+
+  web:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.web
+      args:
+        BACKEND_URL: http://backend:8080
+    image: hl-risk/web:latest
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+    mem_limit: 512m
+
+  journal:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-risk}
+      POSTGRES_DB: ${POSTGRES_DB:-shadow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}
+    volumes:
+      - journal-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-risk} -d ${POSTGRES_DB:-shadow}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    expose:
+      - "5432"
+    mem_limit: 1g
+
+  # The two shadow jobs (§3.3). Under the `shadow` profile so the read-only
+  # stack comes up without them: starting the clock is a decision, not a
+  # side effect of `up`. See risk_engine/README.md on what has to be settled
+  # before the counter is worth running -- A1, A8, C1, C2 and C5 all move the
+  # distribution, and moving it resets the window to zero.
+  shadow-snapshot:
+    <<: *engine-image
+    profiles: ["shadow"]
+    restart: unless-stopped
+    depends_on:
+      journal:
+        condition: service_healthy
+    environment:
+      SHADOW_DSN: postgresql://${POSTGRES_USER:-risk}:${POSTGRES_PASSWORD}@journal:5432/${POSTGRES_DB:-shadow}
+      SHADOW_INTERVAL_S: ${SHADOW_INTERVAL_S:-86400}
+      SHADOW_ARGS: ${SHADOW_ARGS:---fixture}
+    volumes:
+      - ./addresses.json:/app/addresses.json:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        while true; do
+          python3 -m risk_engine.shadow snapshot \
+            --journal "$$SHADOW_DSN" $$SHADOW_ARGS || echo "snapshot failed; retrying next cycle"
+          sleep "$$SHADOW_INTERVAL_S"
+        done
+    mem_limit: 2g
+
+  shadow-resolve:
+    <<: *engine-image
+    profiles: ["shadow"]
+    restart: unless-stopped
+    depends_on:
+      journal:
+        condition: service_healthy
+    environment:
+      SHADOW_DSN: postgresql://${POSTGRES_USER:-risk}:${POSTGRES_PASSWORD}@journal:5432/${POSTGRES_DB:-shadow}
+      SHADOW_INTERVAL_S: ${RESOLVE_INTERVAL_S:-3600}
+      SHADOW_ARGS: ${SHADOW_ARGS:---fixture}
+    volumes:
+      - ./addresses.json:/app/addresses.json:ro
+    entrypoint: ["/bin/sh", "-c"]
+    # Hourly rather than daily, and that is not a duplicate of the snapshot
+    # cadence. A prediction resolves 24 h after it was made; checking once a
+    # day means a resolution can sit up to a day late, and the journal marks
+    # a late resolution stale and drops it from the gate (audit A-04). The
+    # window is the scarce thing here, not the API calls.
+    command:
+      - |
+        while true; do
+          python3 -m risk_engine.shadow resolve \
+            --journal "$$SHADOW_DSN" $$SHADOW_ARGS || echo "resolve failed; retrying next cycle"
+          sleep "$$SHADOW_INTERVAL_S"
+        done
+    mem_limit: 1g
+
+volumes:
+  journal-data:

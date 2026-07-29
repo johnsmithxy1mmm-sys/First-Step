@@ -1,0 +1,43 @@
+# Risk engine (§8) — the Python service and the shadow harness.
+#
+# One image serves both, because they are the same code with different entry
+# points and the shadow jobs must run the *exact* model the service serves.
+# Two images drift, and a drift here is silent: the journal would accumulate
+# predictions attributed to a version that never produced them, which is the
+# one thing §3.3's counter cannot survive.
+#
+# Build from the repository root:
+#   docker build -f deploy/Dockerfile.engine -t hl-risk/engine .
+FROM python:3.11-slim
+
+# scipy wheels cover manylinux, so no toolchain is needed. Not installing one
+# keeps the image free of a compiler, which is a smaller attack surface than
+# it sounds for a service that parses untrusted JSON.
+WORKDIR /app
+
+COPY risk_engine/requirements.txt risk_engine/requirements.txt
+RUN pip install --no-cache-dir -r risk_engine/requirements.txt
+
+COPY risk_engine/ risk_engine/
+
+# Non-root. The engine writes nothing except logs; the journal lives in
+# Postgres or on a mounted volume owned by the same uid.
+RUN useradd --create-home --uid 10001 risk && chown -R risk:risk /app
+USER risk
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    RISK_ENGINE_WORKERS=2
+
+EXPOSE 8787
+
+# 0.0.0.0 is required inside a container, and `serve` refuses that bind
+# without RISK_SERVICE_TOKEN. That refusal is the point: an image that
+# silently served an unauthenticated engine to the compose network would be
+# the same defect as exposing it on a host interface.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
+    CMD python3 -c "import urllib.request,sys; \
+sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8787/health', timeout=4).status==200 else 1)"
+
+ENTRYPOINT ["python3", "-m", "risk_engine.service"]
+CMD ["--host", "0.0.0.0", "--port", "8787"]

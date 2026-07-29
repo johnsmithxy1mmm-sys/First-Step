@@ -17,7 +17,7 @@ import { GuardedPanel, EstimateValue } from '@/components/Guarded';
 import { AgentKeyDisclaimer } from '@/components/AgentKeyDisclaimer';
 import { WalletBar } from '@/components/WalletBar';
 import type { Guarded, PortfolioRiskValue, PreTradeDeltaValue } from '@/lib/contract';
-import { hasValue, pct, usd } from '@/lib/contract';
+import { hasValue, pct, pp, usd } from '@/lib/contract';
 
 const DEMO_BOOK = {
   address: '0xdemo',
@@ -136,12 +136,30 @@ export default function Page() {
               <p className="text-xs leading-relaxed text-neutral-500">
                 Your book&apos;s 24h volatility is {v.effective_leverage.point.toFixed(2)}× BTC&apos;s.
                 This ratio has no direction: a market-neutral book with large idiosyncratic
-                variance scores the same as an outright long.{' '}
-                <span className="font-medium text-neutral-700">
-                  Beta to {v.factor_coin}: {v.factor_beta.toFixed(2)}
-                </span>{' '}
-                is the number that carries direction.
+                variance scores the same as an outright long.
               </p>
+              <div className="rounded bg-neutral-50 px-3 py-2">
+                <p className="text-xs text-neutral-500">
+                  Beta to {v.factor_coin} — the number that carries direction
+                </p>
+                {v.direction_detectable ? (
+                  <>
+                    <EstimateValue estimate={v.factor_beta} format={(x) => x.toFixed(2)} />
+                    <p className="mt-1 text-xs text-neutral-400">
+                      Your book leans {v.factor_beta.point > 0 ? 'long' : 'short'} {v.factor_coin}.
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <EstimateValue estimate={v.factor_beta} format={(x) => x.toFixed(2)} />
+                    <p className="mt-1 text-xs text-neutral-400">
+                      This interval spans zero, so the model cannot resolve which way your
+                      book leans. Reading a direction off the point estimate would be
+                      reading it off noise.
+                    </p>
+                  </>
+                )}
+              </div>
               <div className="border-t border-neutral-100 pt-3">
                 <p className="text-xs text-neutral-500">CVaR 95% over 24h</p>
                 <EstimateValue estimate={v.cvar_95_24h_usd} format={usd} />
@@ -163,20 +181,40 @@ export default function Page() {
             <div className="space-y-3">
               <p className="text-sm font-medium">{v.summary}</p>
               {v.p_liq.distinguishable ? (
-                <div className="grid grid-cols-2 gap-3 text-sm">
-                  <div>
-                    <p className="text-xs text-neutral-500">P(liq) before</p>
-                    <p className="tabular-nums">{pct(v.p_liq.before.point)}</p>
+                <>
+                  <div className="grid grid-cols-2 gap-3 text-sm">
+                    <div>
+                      <p className="text-xs text-neutral-500">P(liq) before</p>
+                      <p className="tabular-nums">{pct(v.p_liq.before.point)}</p>
+                    </div>
+                    <div>
+                      <p className="text-xs text-neutral-500">after</p>
+                      <p className="tabular-nums">{pct(v.p_liq.after.point)}</p>
+                    </div>
                   </div>
-                  <div>
-                    <p className="text-xs text-neutral-500">after</p>
-                    <p className="tabular-nums">{pct(v.p_liq.after.point)}</p>
-                  </div>
-                </div>
+                  <p className="text-xs text-neutral-500 tabular-nums">
+                    Change {pp(v.p_liq.change.point)} (95%: {pp(v.p_liq.change.ci_low)} to{' '}
+                    {pp(v.p_liq.change.ci_high)})
+                  </p>
+                  {v.p_liq.overlap_rule_would_mislead ? (
+                    <p className="rounded border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-relaxed text-amber-900">
+                      The before and after intervals overlap, so comparing them side by
+                      side would have said &ldquo;no detectable change&rdquo; about this
+                      order. That comparison is not the right one here: both books are
+                      walked over identical price paths, so the interval on the{' '}
+                      <em>difference</em> is several times tighter than either side.
+                      Non-overlap implies a real change; overlap does not imply its
+                      absence.
+                    </p>
+                  ) : null}
+                </>
               ) : (
-                <p className="rounded bg-neutral-50 px-3 py-2 text-xs text-neutral-600">
-                  No statistically distinguishable change. Showing an arrow here would be
-                  false precision.
+                <p className="rounded bg-neutral-50 px-3 py-2 text-xs leading-relaxed text-neutral-600">
+                  No change this run can resolve: {pp(v.p_liq.change.point)} with an
+                  interval of {pp(v.p_liq.change.ci_low)} to {pp(v.p_liq.change.ci_high)},
+                  which spans zero. That is not the same as no change — it means this
+                  order&apos;s effect is smaller than what the simulation can separate
+                  from its own noise. Showing an arrow would be false precision.
                 </p>
               )}
               {v.new_assets.length > 0 ? (

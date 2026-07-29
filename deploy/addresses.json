@@ -1,0 +1,5 @@
+{
+  "frame": "",
+  "_frame_help": "REQUIRED. What is this a sample OF? The Info API enumerates no addresses, so every list is biased somehow: the leaderboard selects on performance (the very outcome being calibrated), the trades feed selects on activity (the cohort the book-unchanged filter then discards). State the bias here; it is attached to the published calibration score. See OPEN-QUESTIONS B4.",
+  "addresses": []
+}

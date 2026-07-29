@@ -166,7 +166,64 @@ class TestPortfolioRisk:
         a = portfolio_risk(long_book, spot, bundle, specs, n_paths=8_000, seed=17, now=now)
         b = portfolio_risk(short_book, spot, bundle, specs, n_paths=8_000, seed=17, now=now)
         assert a.effective_leverage.point == pytest.approx(b.effective_leverage.point, rel=0.15)
-        assert a.factor_beta > 0 > b.factor_beta
+        assert a.factor_beta.point > 0 > b.factor_beta.point
+
+    def test_beta_carries_an_interval_like_every_other_number(
+        self, bundle, specs, spot, now
+    ):
+        """D3. Beta is what the UI leads with to say which way a book leans,
+        which makes a bare point estimate worse here than elsewhere: "you are
+        long BTC" is a sentence a user acts on."""
+        book = Book("0x", 100_000.0,
+                    (Position("BTC", 5.0, 100_000.0, MarginMode.CROSS, 20.0),), now)
+        out = portfolio_risk(book, spot, bundle, specs, n_paths=8_000, seed=23, now=now)
+        assert isinstance(out.factor_beta, RiskEstimate)
+        assert out.factor_beta.ci_low <= out.factor_beta.point <= out.factor_beta.ci_high
+        # An outright levered long is about as directional as a book gets, so
+        # if this one is not resolvable the property is measuring nothing.
+        assert out.direction_detectable
+        assert out.factor_beta.ci_low > 0
+
+    def test_a_hedged_book_reports_no_resolvable_direction(
+        self, bundle, specs, spot, now
+    ):
+        """The case the property exists for: a long ETH leg hedged with short
+        BTC until the factor exposure cancels. The book still has plenty of
+        idiosyncratic variance -- effective leverage is nowhere near zero --
+        and that is exactly D3's point, because the unsigned ratio would
+        report it as though it moved with BTC.
+
+        The hedge is solved rather than hard-coded. With no liquidation the
+        equity return is a linear combination of the legs, so beta is exactly
+        linear in the BTC size and two evaluations locate the zero. A
+        hard-coded ratio would silently stop being a hedge the moment the
+        fixture's factor loadings changed, and the test would then be
+        asserting the property on a book that is not neutral.
+        """
+        def hedged(btc_size: float) -> Book:
+            return Book(
+                "0x", 200_000.0,
+                (
+                    Position("ETH", 25.0, 4_000.0, MarginMode.CROSS, 20.0),
+                    Position("BTC", btc_size, 100_000.0, MarginMode.CROSS, 20.0),
+                ),
+                now,
+            )
+
+        def run(btc_size: float):
+            return portfolio_risk(hedged(btc_size), spot, bundle, specs,
+                                  n_paths=8_000, seed=29, now=now)
+
+        lo, hi = -1.0, -1.5
+        b_lo, b_hi = run(lo).factor_beta.point, run(hi).factor_beta.point
+        assert b_lo > 0 > b_hi, "the bracket no longer straddles a neutral book"
+        neutral = run(lo - b_lo * (hi - lo) / (b_hi - b_lo))
+
+        assert neutral.factor_beta.ci_low <= 0.0 <= neutral.factor_beta.ci_high
+        assert not neutral.direction_detectable
+        # The ratio §4.1 specifies still reports a substantial number for a
+        # book with no resolvable direction at all.
+        assert neutral.effective_leverage.point > 0.2
 
     def test_isolated_positions_get_their_own_probability(self, bundle, specs, spot, now):
         book = Book(

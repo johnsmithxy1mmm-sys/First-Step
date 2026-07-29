@@ -1,0 +1,30 @@
+# Keep secrets and build junk out of the build context.
+#
+# The images COPY only named paths, so nothing here would reach a layer
+# anyway -- but the context is transferred to the daemon whole, and a
+# secret that never had to leave the host should not.
+**/.env
+**/.env.*
+!**/.env.example
+polymarket_bot/config.yaml
+polymarket_bot/config.json
+polymarket_bot/data/
+
+.git/
+.github/
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.ruff_cache/
+.venv/
+venv/
+
+node_modules/
+**/node_modules/
+services/backend/dist/
+apps/web/.next/
+**/*.tsbuildinfo
+
+*.db
+*.sqlite
+*.sqlite3

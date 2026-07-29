@@ -1,0 +1,249 @@
+"""How long the shadow window has to be for §0.3's VaR criterion to mean
+anything (OPEN-QUESTIONS B1).
+
+    python -m risk_engine.validation.power
+
+B1 records the problem: §0.3 wants the realised VaR@95 breach rate inside a
+*binomial* 95% interval, and 200-500 addresses observed on the same day are
+not 200-500 independent observations. One market move drives all of them, and
+on a day BTC drops 8% nearly every address breaches at once. It also records
+an estimate -- "roughly ±4 pp" -- which was arithmetic on the back of the day
+count, not a measurement. This measures it.
+
+Two failures, in opposite directions, and the decision needs both:
+
+**Keeping §0.3 as written** means testing the observed rate against an
+interval computed as though the observations were independent. That interval
+is far too tight, so a *correctly calibrated* model fails the gate on nothing
+but the luck of which days landed in the window. The false-rejection rate is
+reported below; at any realistic clustering it is not close to 5%.
+
+**Using the honest day-clustered interval** fixes the false rejections and
+replaces them with the opposite problem: over 21 days the interval is so wide
+that it contains 5% almost regardless of the truth. That is not a test that
+passes; it is a test that cannot fail, which is worse, because it reads as
+validation.
+
+The intra-day correlation is the parameter neither the specification nor this
+code can supply -- it takes real data. So it is swept rather than assumed, and
+the tables below are read at whichever value the first weeks of shadow data
+turn out to show. Assuming a convenient value here would be assuming the
+answer.
+
+The generating model is beta-binomial: each day draws its own breach
+probability, and addresses breach independently given the day. That is the
+standard one-parameter way to hold the marginal rate at 5% while varying how
+much a day moves everyone together, and its intra-class correlation is
+exactly the swept parameter.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from dataclasses import asdict, dataclass
+
+import numpy as np
+
+from risk_engine.sim.stats import wilson_interval
+
+#: §0.3's target: 5% of 24 h outcomes breach the 95% VaR.
+NOMINAL_BREACH_RATE = 0.05
+#: §3.3's window, and the number under examination.
+SPEC_DAYS = 21
+SPEC_ADDRESSES = 200
+
+
+def simulate_days(
+    n_days: int, n_per_day: int, p: float, icc: float, rng: np.random.Generator
+) -> tuple[np.ndarray, np.ndarray]:
+    """Breaches per day under a beta-binomial with the given intra-class
+    correlation.
+
+    `icc` is the correlation between two addresses' breach indicators on the
+    same day. At 0 the days are irrelevant and the observations are genuinely
+    independent; at 1 every address on a day breaches or none does, and the
+    effective sample size is the day count.
+    """
+    counts = np.full(n_days, n_per_day, dtype=np.int64)
+    if icc <= 0.0:
+        return rng.binomial(n_per_day, p, size=n_days), counts
+    if icc >= 1.0:
+        return (rng.random(n_days) < p).astype(np.int64) * n_per_day, counts
+    concentration = (1.0 - icc) / icc
+    daily_p = rng.beta(p * concentration, (1.0 - p) * concentration, size=n_days)
+    return rng.binomial(n_per_day, daily_p), counts
+
+
+def clustered_rate_ci(
+    day_sums: np.ndarray,
+    day_counts: np.ndarray,
+    rng: np.random.Generator,
+    n_boot: int = 2_000,
+    alpha: float = 0.05,
+) -> tuple[float, float]:
+    """Day-clustered percentile interval on the pooled breach rate.
+
+    Resamples whole days, which is what `clustered_bootstrap_ci` does for the
+    general case. Specialised here because the statistic is a ratio of sums:
+    a resampled rate is `sum(picked sums) / sum(picked counts)`, so a whole
+    sweep costs two gathers instead of rebuilding the observation vector
+    thousands of times. It is the same interval, and
+    `test_power.py` checks that against the general implementation rather
+    than taking it on trust.
+    """
+    d = day_sums.size
+    pick = rng.integers(0, d, size=(n_boot, d))
+    rates = day_sums[pick].sum(axis=1) / day_counts[pick].sum(axis=1)
+    return (
+        float(np.quantile(rates, alpha / 2)),
+        float(np.quantile(rates, 1 - alpha / 2)),
+    )
+
+
+@dataclass(frozen=True)
+class Cell:
+    days: int
+    addresses_per_day: int
+    icc: float
+    #: How often a correctly calibrated model is rejected by §0.3 as written.
+    naive_false_rejection: float
+    #: Median half-width of the honest day-clustered interval, in pp.
+    clustered_half_width_pp: float
+    #: Probability the clustered interval excludes 5% when the true rate is
+    #: 8% and 10% -- i.e. whether real miscalibration is detectable at all.
+    power_at_8pct: float
+    power_at_10pct: float
+
+    def render(self) -> str:
+        return (
+            f"{self.days:5d} {self.addresses_per_day:7d} {self.icc:6.2f} "
+            f"{self.naive_false_rejection:14.1%} "
+            f"{self.clustered_half_width_pp:12.2f} "
+            f"{self.power_at_8pct:10.1%} {self.power_at_10pct:11.1%}"
+        )
+
+
+def evaluate(
+    days: int,
+    addresses_per_day: int,
+    icc: float,
+    n_trials: int,
+    n_boot: int,
+    seed: int,
+) -> Cell:
+    rng = np.random.default_rng(seed)
+
+    rejected = 0
+    half_widths = np.empty(n_trials)
+    for t in range(n_trials):
+        sums, counts = simulate_days(days, addresses_per_day, NOMINAL_BREACH_RATE, icc, rng)
+        total, n = int(sums.sum()), int(counts.sum())
+
+        # §0.3 as written: is the observed rate inside the binomial interval?
+        lo, hi = wilson_interval(total, n)
+        if not (lo <= NOMINAL_BREACH_RATE <= hi):
+            rejected += 1
+
+        c_lo, c_hi = clustered_rate_ci(sums, counts, rng, n_boot=n_boot)
+        half_widths[t] = (c_hi - c_lo) / 2.0
+
+    def power(p_true: float) -> float:
+        detected = 0
+        for _ in range(n_trials):
+            sums, counts = simulate_days(days, addresses_per_day, p_true, icc, rng)
+            c_lo, c_hi = clustered_rate_ci(sums, counts, rng, n_boot=n_boot)
+            if not (c_lo <= NOMINAL_BREACH_RATE <= c_hi):
+                detected += 1
+        return detected / n_trials
+
+    return Cell(
+        days=days,
+        addresses_per_day=addresses_per_day,
+        icc=icc,
+        naive_false_rejection=rejected / n_trials,
+        clustered_half_width_pp=float(np.median(half_widths)) * 100.0,
+        power_at_8pct=power(0.08),
+        power_at_10pct=power(0.10),
+    )
+
+
+def sweep(
+    day_grid: list[int],
+    address_grid: list[int],
+    icc_grid: list[float],
+    n_trials: int,
+    n_boot: int,
+    seed: int,
+) -> list[Cell]:
+    cells = []
+    for i, days in enumerate(day_grid):
+        for j, addresses in enumerate(address_grid):
+            for k, icc in enumerate(icc_grid):
+                cells.append(
+                    evaluate(days, addresses, icc, n_trials, n_boot,
+                             seed + 1_000 * i + 100 * j + k)
+                )
+    return cells
+
+
+HEADER = (
+    " days address    icc  naive false-rej  clustered ±pp  "
+    "power@8%  power@10%"
+)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="risk_engine.validation.power",
+        description="what window §0.3's VaR criterion actually needs (B1)",
+    )
+    parser.add_argument("--days", default="21,30,45,60,90,120,180")
+    parser.add_argument("--addresses", default="200,500")
+    parser.add_argument("--icc", default="0.0,0.02,0.05,0.10,0.20,0.40")
+    parser.add_argument("--trials", type=int, default=400)
+    parser.add_argument("--boot", type=int, default=1_000)
+    parser.add_argument("--seed", type=int, default=20260729)
+    parser.add_argument("--report", help="write the full grid as JSON")
+    args = parser.parse_args(argv)
+
+    day_grid = [int(x) for x in args.days.split(",")]
+    address_grid = [int(x) for x in args.addresses.split(",")]
+    icc_grid = [float(x) for x in args.icc.split(",")]
+
+    cells = sweep(day_grid, address_grid, icc_grid, args.trials, args.boot, args.seed)
+
+    print(f"§0.3 VaR criterion, {args.trials} trials per cell, "
+          f"nominal breach rate {NOMINAL_BREACH_RATE:.0%}\n")
+    print(HEADER)
+    print("-" * len(HEADER))
+    last = None
+    for cell in cells:
+        if last is not None and cell.days != last:
+            print()
+        print(cell.render())
+        last = cell.days
+
+    if args.report:
+        with open(args.report, "w") as fh:
+            json.dump([asdict(c) for c in cells], fh, indent=2)
+        print(f"\nwrote {args.report}")
+
+    print(
+        "\nnaive false-rej: how often §0.3 as written rejects a model that is "
+        "correctly calibrated.\nAt 5% it would be behaving as advertised; above "
+        "that it is failing good models on\nwhich days happened to land in the "
+        "window.\n\nclustered ±pp: half-width of the honest day-clustered "
+        "interval. §0.3's own tolerance\naround a 5% rate is about ±0.6 pp at "
+        "4200 observations, so anything much above that\nmeans the window "
+        "cannot answer the question it was sized for.\n\npower: probability the "
+        "clustered interval excludes 5% when the truth is 8% or 10%.\nA model "
+        "understating tail risk by half is what this is meant to catch; where "
+        "power\nis low the gate cannot catch it, and passing says nothing."
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

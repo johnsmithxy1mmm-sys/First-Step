@@ -11,6 +11,14 @@ book with large idiosyncratic variance scores the same as an outright long,
 and a short book scores the same as a long one. Whatever the UI says, it
 should not claim a direction that this number does not carry
 (OPEN-QUESTIONS D3).
+
+The beta therefore carries an interval, like every other number here. It is
+the figure the UI leads with when it wants to say which way the book leans,
+and a directional claim read off a point estimate is the same mistake as
+any other point estimate in this engine -- worse, because "your book is long
+BTC" is a sentence a user acts on. `direction_detectable` reads the sign off
+the *interval*: a book whose beta interval spans zero has no direction this
+model can resolve, and saying so is the honest output.
 """
 
 from __future__ import annotations
@@ -32,7 +40,7 @@ WEEK_HOURS = 24 * 7
 class PortfolioRisk:
     address: str
     effective_leverage: RiskEstimate
-    factor_beta: float
+    factor_beta: RiskEstimate
     factor_coin: str
     p_liq_24h_any: RiskEstimate
     p_liq_24h_cross: RiskEstimate
@@ -51,8 +59,34 @@ class PortfolioRisk:
         """§2.5: an under-resolved probability is not shown to anyone."""
         return self.converged
 
+    @property
+    def direction_detectable(self) -> bool:
+        """Whether the book leans a way this model can actually resolve.
 
-def _effective_leverage(result: RiskResult, version: str, now: datetime) -> tuple[RiskEstimate, float]:
+        Read off the interval, not the point. A beta of +0.3 with an interval
+        of [-1.4, +2.0] is not a long book; it is a book whose direction the
+        sample does not determine, and "you are long BTC" is exactly the kind
+        of sentence a user would act on.
+        """
+        return self.factor_beta.ci_low > 0.0 or self.factor_beta.ci_high < 0.0
+
+
+def _resample_ratio(equity: np.ndarray, factor: np.ndarray, sample: np.ndarray) -> float:
+    i = sample.astype(int)
+    return float(np.std(equity[i])) / max(float(np.std(factor[i])), 1e-12)
+
+
+def _resample_beta(equity: np.ndarray, factor: np.ndarray, sample: np.ndarray) -> float:
+    i = sample.astype(int)
+    var = float(np.var(factor[i]))
+    if var <= 0.0:
+        return 0.0
+    return float(np.cov(equity[i], factor[i])[0, 1] / var)
+
+
+def _effective_leverage(
+    result: RiskResult, version: str, now: datetime
+) -> tuple[RiskEstimate, RiskEstimate]:
     if result.factor_return.size == 0:
         raise ValueError("effective leverage needs the factor column; run with factor_coin set")
     equity_ret = result.raw_equity_change / result.start_equity
@@ -61,19 +95,26 @@ def _effective_leverage(result: RiskResult, version: str, now: datetime) -> tupl
     if factor_vol <= 0:
         raise ValueError("factor volatility is zero; the ratio is undefined")
 
-    point = float(np.std(equity_ret)) / factor_vol
-    idx = np.arange(equity_ret.size)
-    lo, hi = bootstrap_ci(
-        idx.astype(float),
-        lambda sample: float(np.std(equity_ret[sample.astype(int)]))
-        / max(float(np.std(factor_ret[sample.astype(int)])), 1e-12),
-        np.random.default_rng(result.provenance.seed ^ 0xBE7A),
-        n_boot=200,
-    )
+    ratio = float(np.std(equity_ret)) / factor_vol
     beta = float(np.cov(equity_ret, factor_ret)[0, 1] / np.var(factor_ret))
+
+    # Both intervals come off the same resample -- same seed, so the same
+    # draws -- and therefore describe the same resampled book rather than two
+    # independently jittered ones. A user comparing the ratio against the beta
+    # is entitled to have them refer to one thing.
+    idx = np.arange(equity_ret.size, dtype=float)
+    seed = result.provenance.seed ^ 0xBE7A
+    lo, hi = bootstrap_ci(
+        idx, lambda s: _resample_ratio(equity_ret, factor_ret, s),
+        np.random.default_rng(seed), n_boot=200,
+    )
+    blo, bhi = bootstrap_ci(
+        idx, lambda s: _resample_beta(equity_ret, factor_ret, s),
+        np.random.default_rng(seed), n_boot=200,
+    )
     return (
-        RiskEstimate(point, min(lo, point), max(hi, point), version, now),
-        beta,
+        RiskEstimate(ratio, min(lo, ratio), max(hi, ratio), version, now),
+        RiskEstimate(beta, min(blo, beta), max(bhi, beta), version, now),
     )
 
 

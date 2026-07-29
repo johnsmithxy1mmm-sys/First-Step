@@ -27,7 +27,10 @@ export interface PortfolioRisk {
   publishable: boolean;
   start_equity: number;
   effective_leverage: Estimate;
-  factor_beta: number;
+  /** Signed, and interval-bearing like every other number (OPEN-QUESTIONS D3). */
+  factor_beta: Estimate;
+  /** Read off beta's interval, not the sign of its point estimate. */
+  direction_detectable: boolean;
   factor_coin: string;
   p_liq_24h: Estimate;
   p_liq_24h_cross: Estimate;
@@ -88,15 +91,22 @@ export class RiskServiceError extends Error {
 export interface RiskClientOptions {
   baseUrl?: string;
   timeoutMs?: number;
+  /** Bearer token for the engine. Defaults to `RISK_SERVICE_TOKEN`. */
+  token?: string;
 }
 
 export class RiskClient {
   private readonly baseUrl: string;
   private readonly timeoutMs: number;
+  private readonly token: string;
 
   constructor(options: RiskClientOptions = {}) {
     this.baseUrl = (options.baseUrl ?? 'http://127.0.0.1:8787').replace(/\/$/, '');
     this.timeoutMs = options.timeoutMs ?? 10_000;
+    // Empty means the engine is on loopback with no auth, which is the
+    // development default and which the engine itself refuses to allow on any
+    // other interface.
+    this.token = options.token ?? process.env.RISK_SERVICE_TOKEN ?? '';
   }
 
   private async request<T>(path: string, body?: unknown): Promise<T> {
@@ -106,12 +116,14 @@ export class RiskClient {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
     try {
+      const headers: Record<string, string> = {};
+      if (this.token) headers.authorization = `Bearer ${this.token}`;
       const init: RequestInit =
         body === undefined
-          ? { method: 'GET', signal: controller.signal }
+          ? { method: 'GET', headers, signal: controller.signal }
           : {
               method: 'POST',
-              headers: { 'content-type': 'application/json' },
+              headers: { ...headers, 'content-type': 'application/json' },
               body: JSON.stringify(body),
               signal: controller.signal,
             };
