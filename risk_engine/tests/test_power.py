@@ -19,6 +19,7 @@ from risk_engine.validation.power import (
     NOMINAL_BREACH_RATE,
     clustered_rate_ci,
     evaluate,
+    power_at,
     simulate_days,
 )
 
@@ -133,6 +134,30 @@ class TestCalibration:
                         n_trials=150, n_boot=400, seed=14)
         assert long.power_at_10pct > short.power_at_10pct
         assert long.clustered_half_width_pp < short.clustered_half_width_pp
+
+    def test_power_at_matches_the_tabulated_columns(self):
+        """`power_at` exists so window sizing is never quantised to the two
+        rates the table shows (audit F-1). It must agree with the table at
+        the rates the table does show."""
+        cell = evaluate(days=30, addresses_per_day=200, icc=0.10,
+                        n_trials=200, n_boot=400, seed=21)
+        at_10 = power_at(30, 200, 0.10, 0.10, n_trials=200, n_boot=400, seed=99)
+        assert at_10 == pytest.approx(cell.power_at_10pct, abs=0.12)
+
+    def test_power_at_is_monotone_in_the_target(self):
+        """The property F-1 violated: a true rate closer to the nominal 5% is
+        harder to detect, so power must fall as the target tightens."""
+        powers = [
+            power_at(30, 200, 0.10, p, n_trials=250, n_boot=400, seed=31)
+            for p in (0.06, 0.08, 0.12)
+        ]
+        assert powers[0] < powers[1] < powers[2]
+
+    def test_power_at_refuses_a_degenerate_target(self):
+        with pytest.raises(ValueError, match="false-rejection"):
+            power_at(30, 200, 0.10, NOMINAL_BREACH_RATE, 10, 50, 0)
+        with pytest.raises(ValueError, match="rate in"):
+            power_at(30, 200, 0.10, 1.5, 10, 50, 0)
 
     def test_more_addresses_barely_help_under_clustering(self):
         """The finding that decides how to spend effort: at a realistic

@@ -147,6 +147,24 @@ class TestBasis:
         assert check.status == FAIL
         assert "documented" in check.detail
 
+    def test_misaligned_universe_and_contexts_fail_rather_than_truncate(self):
+        """Audit F-5: zip silently truncated to the shorter side, so a
+        response with 3 universe entries and 1 context reported INCONCLUSIVE
+        for BTC alone and dropped ETH and SOL without a trace. A checker that
+        drops assets without saying so reports 'checked' for assets it never
+        saw — the length mismatch IS the schema drift this harness hunts."""
+        class Misaligned(StubClient):
+            def post(self, payload, weight=20):
+                return [
+                    {"universe": [{"name": "BTC"}, {"name": "ETH"}, {"name": "SOL"}]},
+                    [{"markPx": "100", "midPx": "100"}],
+                ]
+
+        check = verify.check_basis(Misaligned(), ["BTC", "ETH", "SOL"], 1, 0.0, 0.004)
+        assert check.status == FAIL
+        assert "misaligned" in check.detail
+        assert check.evidence == {"n_universe": 3, "n_ctxs": 1}
+
 
 class TestParsers:
     def test_meta_that_parses_passes(self):

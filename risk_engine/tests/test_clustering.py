@@ -231,6 +231,151 @@ class TestAssumptionFreeInterval:
         assert hi - lo > 0.4
 
 
+class TestAuditFindings:
+    """Regression tests for the adversarial audit, one per finding. Each of
+    these was a reproduced defect; the test is the PoC turned assertion."""
+
+    def test_f1_a_stricter_detect_target_changes_the_power_curve(self):
+        """F-1: --detect was silently quantised to the 8%/10% columns, so a
+        6% target — harder than 8% — returned the same window. Power must be
+        simulated at the requested rate itself."""
+        pit, breached, days = latent_world(30, 200, 0.15, seed=41)
+        icc = estimate_breach_icc(pit, breached, days, np.random.default_rng(41), n_boot=200)
+        grid = (21, 45, 90, 180)
+        strict = recommend_window(icc, detect_rate=0.07, n_trials=80, n_boot=200,
+                                  day_grid=grid)
+        loose = recommend_window(icc, detect_rate=0.12, n_trials=80, n_boot=200,
+                                 day_grid=grid)
+        # A target closer to the nominal 5% is harder: at every searched
+        # window its power is no higher, and the recommended window no shorter.
+        for (_, p_strict), (_, p_loose) in zip(
+            strict.searched, loose.searched[: len(strict.searched)], strict=False
+        ):
+            assert p_strict <= p_loose + 0.10
+        if strict.days_required is not None and loose.days_required is not None:
+            assert strict.days_required >= loose.days_required
+        assert strict.searched != loose.searched
+
+    def test_f1_a_detect_rate_at_or_below_nominal_is_refused(self):
+        pit, breached, days = latent_world(14, 100, 0.15, seed=42)
+        icc = estimate_breach_icc(pit, breached, days, np.random.default_rng(42), n_boot=150)
+        with pytest.raises(ValueError, match="above the nominal"):
+            recommend_window(icc, detect_rate=0.05, n_trials=10, n_boot=50)
+        with pytest.raises(ValueError, match="above the nominal"):
+            recommend_window(icc, detect_rate=0.03, n_trials=10, n_boot=50)
+
+    def test_f4_the_interval_covers_on_lumpy_day_sizes(self):
+        """F-4: simulating equal days at the mean size gave 80% coverage on
+        20/400 alternating designs against a nominal 95%, failing low. The
+        confidence set now simulates the pilot's actual day sizes."""
+        def lumpy_world(n_days, sizes, rho, seed):
+            rng = np.random.default_rng(seed)
+            pit, days = [], []
+            for d in range(n_days):
+                n = sizes[d % len(sizes)]
+                f = rng.standard_normal()
+                e = rng.standard_normal(n)
+                z = np.sqrt(rho) * f + np.sqrt(1 - rho) * e
+                pit.append(stats.norm.cdf(z))
+                days.append(np.full(n, d))
+            return np.concatenate(pit), np.concatenate(days)
+
+        covered = 0
+        trials = 40
+        for s in range(trials):
+            pit, days = lumpy_world(14, [20, 400], 0.20, seed=1_000 + s)
+            est = estimate_latent_correlation(pit, days, np.random.default_rng(s),
+                                              n_boot=1_000)
+            if est.ci_low <= 0.20 <= est.ci_high:
+                covered += 1
+        assert covered / trials >= 0.85
+
+    def test_f3_the_t_map_floor_is_deliberate_and_matches_simulation(self):
+        """F-3: at rho=0 the t map returns ~0.077, not 0. That is the shared
+        chi-square talking — a fat-tailed day inflates everyone at once — and
+        simulating the actual t world at rho=0 realises the same number, so
+        the floor is the model's physics. This test states it on purpose;
+        anyone flattening the floor to zero must argue with the simulation."""
+        floor = breach_icc_from_latent(0.0, copula="t", n_mc=200_000, seed=5)
+        assert 0.05 < floor < 0.11
+        from risk_engine.shadow.clustering import _icc_from_counts
+
+        rng = np.random.default_rng(6)
+        realised = []
+        for _ in range(4):
+            # rho=0: no common factor at all -- pure idiosyncratic normals
+            # under a shared per-day mixing draw.
+            e = rng.standard_normal((200, 200))
+            w = np.sqrt(4.0 / rng.chisquare(4.0, size=(200, 1)))
+            z = e * w
+            br = (z < stats.t.ppf(0.05, 4.0)).astype(float)
+            sums, counts = br.sum(axis=1), np.full(200, 200)
+            realised.append(_icc_from_counts(sums, counts)[0])
+        assert floor == pytest.approx(float(np.mean(realised)), abs=0.03)
+
+    def test_f3_the_gaussian_estimator_composes_unbiasedly_with_the_t_map(self):
+        """F-3: the latent rho is measured by Gaussian-scores ANOVA and fed
+        to a t-parameterised map — two different parameterisations, so the
+        composition could have been biased either way. Measured against true
+        shared-mixing t data (16 replications per rho) the mean bias is
+        within +/-0.007, i.e. approximately unbiased; individual pilots
+        scatter up to +/-0.05 at high rho, which is the interval's job, not
+        the point's. This pins the mean: a refactor that introduces a
+        systematic under-read would size windows short — the §10-forbidden
+        direction — and must fail here.
+
+        An earlier version of this test asserted the bias was systematically
+        POSITIVE off four datasets. Sixteen showed that was seed noise. The
+        assertion is now on the mean over eight, with a bound four standard
+        errors wide, so it tests the estimator rather than the seeds.
+        """
+        from risk_engine.shadow.clustering import _icc_from_counts
+
+        df = 4.0
+        for rho, bound in ((0.10, 0.02), (0.30, 0.04)):
+            biases = []
+            for s in range(8):
+                rng = np.random.default_rng(2_000 + s * 13 + int(rho * 100))
+                f = rng.standard_normal((200, 1))
+                e = rng.standard_normal((200, 200))
+                g = np.sqrt(rho) * f + np.sqrt(1 - rho) * e
+                w = np.sqrt(df / rng.chisquare(df, size=(200, 1)))
+                z = g * w
+                pit = stats.t.cdf(z, df).ravel()
+                br = (z < stats.t.ppf(0.05, df)).astype(float)
+                days = np.repeat(np.arange(200), 200)
+                icc = estimate_breach_icc(pit, br.ravel(), days,
+                                          np.random.default_rng(s), n_boot=100)
+                empirical = _icc_from_counts(br.sum(axis=1), np.full(200, 200))[0]
+                biases.append(icc.point - empirical)
+            mean_bias = float(np.mean(biases))
+            assert abs(mean_bias) < bound, (
+                f"composition bias at rho={rho} is {mean_bias:+.4f}; systematic "
+                "under-read sizes windows short, systematic over-read is dishonest"
+            )
+
+    def test_f2_degenerate_pits_are_counted_and_surfaced(self):
+        """F-2: the docstring promised clipped PITs were 'counted and
+        surfaced' while nothing counted them. A misfitted predictive
+        distribution shows up as a pile of exact-0/1 PITs, and silence here
+        would let that read as clustering."""
+        rng = np.random.default_rng(7)
+        pit = rng.random(4_000)
+        pit[:600] = 0.0
+        pit[600:800] = 1.0
+        days = np.repeat(np.arange(20), 200)
+        est = estimate_latent_correlation(pit, days, np.random.default_rng(7), n_boot=200)
+        assert est.n_clipped == 800
+        assert est.clipped_fraction == pytest.approx(0.2)
+        assert "degenerate" in est.summary()
+
+    def test_f2_clean_pits_report_zero_clipped_and_stay_quiet(self):
+        pit, _, days = latent_world(10, 100, 0.1, seed=8)
+        est = estimate_latent_correlation(pit, days, np.random.default_rng(8), n_boot=100)
+        assert est.n_clipped == 0
+        assert "degenerate" not in est.summary()
+
+
 class TestWindowSizing:
     def test_it_sizes_off_the_upper_bound_by_default(self):
         pit, breached, days = latent_world(14, 200, 0.30, seed=31)

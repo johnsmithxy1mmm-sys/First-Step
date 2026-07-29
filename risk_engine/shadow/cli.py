@@ -253,15 +253,19 @@ def cmd_icc(args) -> int:
             )
         print()
 
-        rec = recommend_window(
-            icc,
-            addresses_per_day=args.addresses_per_day,
-            target_power=args.power,
-            detect_rate=args.detect,
-            n_trials=args.trials,
-            n_boot=args.boot_power,
-            seed=args.seed,
-        )
+        try:
+            rec = recommend_window(
+                icc,
+                addresses_per_day=args.addresses_per_day,
+                target_power=args.power,
+                detect_rate=args.detect,
+                n_trials=args.trials,
+                n_boot=args.boot_power,
+                seed=args.seed,
+            )
+        except ValueError as exc:
+            print(f"cannot size the window: {exc}")
+            return 1
         print(rec.summary())
         print(
             "\nSized off the upper end of the interval, not the point estimate: "

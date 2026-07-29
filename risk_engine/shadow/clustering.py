@@ -52,17 +52,38 @@ of 0.106 — roughly 2.5x the relative precision.
 
 `breach_icc_from_latent` then maps it back: two addresses breach together
 when both latent values fall below the 5% quantile, which is a bivariate
-orthant probability. The map is strongly compressive — latent 0.30 becomes
-breach 0.10, latent 0.50 becomes 0.20 — and that compression is the reason
-the required window is shorter than the "clustering is obviously severe"
-intuition suggests.
+orthant probability. The map compresses — measured, both columns:
 
-The copula is the assumption, and it is stated rather than hidden. Under a
-Gaussian copula the map is the smallest defensible answer; the engine itself
-simulates a t-copula (§2.3), whose tail dependence makes joint breaches more
-likely at the same correlation. `copula="t"` is therefore the default for
-sizing, because between two stated assumptions the one that lengthens the
-window is the one §10 permits.
+    latent rho   breach ICC (gaussian)   breach ICC (t, df=4 — the default)
+      0.00            0.000                   0.077
+      0.05            0.012                   0.095
+      0.15            0.041                   0.130
+      0.30            0.098                   0.195
+      0.50            0.204                   0.301
+
+The copula is the assumption, and it is stated rather than hidden. The
+engine simulates a t-copula (§2.3) — one chi-square mixing draw shared
+across assets per step (`sim/paths.py`) — so `copula="t"` is the default,
+and it carries a consequence the Gaussian column hides: **a floor**. Under
+a shared-mixing t, zero correlation is not independence; a volatile day
+inflates everyone together, so the breach ICC is ~0.077 at rho=0. The floor
+was checked against reality's stand-in, not just the map: simulating actual
+shared-mixing t days at rho=0 realises an empirical breach ICC of 0.079.
+Two things follow. A pilot measuring a tiny latent correlation still sizes
+a substantial window — that is the tail dependence talking, and it is
+correct, not conservatism stacked on top. And the map's low end cannot
+distinguish quiet markets from moderately clustered ones; the latent
+interval printed alongside is what preserves that distinction.
+
+The composition — Gaussian-scores ANOVA feeding a t-parameterised map — was
+measured against data generated from the true shared-mixing t world rather
+than assumed compatible. Sixteen replications per rho: the mean bias is
+within +/-0.007 across rho 0 to 0.5 (standard errors 0.003-0.012), i.e.
+approximately unbiased, with per-pilot scatter up to +/-0.05 at high rho.
+The scatter is real sampling noise and it is what the *interval* absorbs;
+sizing reads ci_high, not the point. `test_clustering.py` pins the
+near-unbiasedness so a refactor cannot silently push it in the direction
+that shortens the window.
 """
 
 from __future__ import annotations
@@ -138,33 +159,74 @@ class LatentCorrelation:
     n_observations: int
     effective_cluster_size: float
     raw: float
+    #: PIT values at exactly 0 or 1, clipped before the probit. A few are
+    #: rounding; a lot means the predictive distribution is misfitted, and
+    #: that has to be visible rather than silently absorbed into the clamp.
+    n_clipped: int = 0
+
+    @property
+    def clipped_fraction(self) -> float:
+        return self.n_clipped / self.n_observations if self.n_observations else 0.0
 
     def summary(self) -> str:
-        return (
+        base = (
             f"latent intra-day correlation {self.point:.3f} "
             f"[{self.ci_low:.3f}, {self.ci_high:.3f}]\n"
             f"  from {self.n_observations} PIT values over {self.n_days} days"
         )
+        if self.n_clipped:
+            base += (
+                f"\n  {self.n_clipped} PIT values ({self.clipped_fraction:.1%}) were "
+                "degenerate (exactly 0 or 1) and clipped. More than a percent or so "
+                "means the predictive distribution is misfitted -- fix that before "
+                "trusting this estimate."
+            )
+        return base
 
 
-def _icc_batch_equal(x: np.ndarray) -> np.ndarray:
-    """ANOVA ICC for a batch of equal-sized designs, shape (sims, days, per)."""
-    n_days, n_per = x.shape[1], x.shape[2]
-    total = n_days * n_per
-    day_means = x.mean(axis=2)
-    grand = x.mean(axis=(1, 2))
-    wss = ((x - day_means[:, :, None]) ** 2).sum(axis=(1, 2))
-    bss = n_per * ((day_means - grand[:, None]) ** 2).sum(axis=1)
-    msw = wss / (total - n_days)
-    msb = bss / (n_days - 1)
-    denominator = msb + (n_per - 1) * msw
+def _simulated_icc_draws(
+    rho: float, counts: np.ndarray, n_sims: int, rng: np.random.Generator
+) -> np.ndarray:
+    """ANOVA ICC draws for the Gaussian latent world with these EXACT day sizes.
+
+    The day sizes are the real ones, not their mean. This matters and was
+    measured before being fixed: simulating equal days at the mean size gave
+    the confidence set 80% coverage against a nominal 95% on lumpy designs
+    (20/400 alternating), and it failed *low* — the ceiling the window is
+    sized from came out too small. Lumpy days are not a corner case here:
+    the shadow cron's weight-budget governor truncates sweeps by design
+    (§5.3), so real pilots produce exactly this shape.
+
+    Simulated through sufficient statistics rather than raw observations.
+    Conditional on the day factors, the day means and the pooled within-day
+    sum of squares are independent:
+
+        m_j  = sqrt(rho) f_j + sqrt(1-rho) u_j / sqrt(n_j),   f, u ~ N(0,1)
+        WSS  = (1-rho) * chi2(N - k)
+
+    which is exact for the Gaussian latent world and makes the cost per draw
+    O(days) instead of O(observations).
+    """
+    c = np.asarray(counts, dtype=np.float64)
+    c = c[c > 0]
+    k = c.size
+    total = float(c.sum())
+    factor = rng.standard_normal((n_sims, k))
+    mean_noise = rng.standard_normal((n_sims, k)) / np.sqrt(c)
+    m = np.sqrt(rho) * factor + np.sqrt(1.0 - rho) * mean_noise
+    wss = (1.0 - rho) * rng.chisquare(total - k, size=n_sims)
+    grand = (m * c).sum(axis=1) / total
+    bss = (c * (m - grand[:, None]) ** 2).sum(axis=1)
+    msw = wss / (total - k)
+    msb = bss / (k - 1)
+    n0 = (total - float((c**2).sum()) / total) / (k - 1)
+    denominator = msb + (n0 - 1.0) * msw
     return np.where(denominator > 0, (msb - msw) / np.maximum(denominator, 1e-300), 0.0)
 
 
 def _latent_confidence_set(
     observed: float,
-    n_days: int,
-    n_per_day: int,
+    counts: np.ndarray,
     rng: np.random.Generator,
     grid: np.ndarray,
     n_sims: int,
@@ -178,14 +240,13 @@ def _latent_confidence_set(
     but still failing *low*, and a ceiling that is too low shortens the
     window. This construction has correct coverage because the acceptance
     region is computed under each candidate rather than resampled from one
-    dataset.
+    dataset, and because each region is simulated with the pilot's actual
+    day sizes (see `_simulated_icc_draws`).
     """
     included: list[float] = []
     for candidate in grid:
         rho = float(np.clip(candidate, 0.0, 0.999))
-        factor = rng.standard_normal((n_sims, n_days, 1))
-        idio = rng.standard_normal((n_sims, n_days, n_per_day))
-        draws = _icc_batch_equal(np.sqrt(rho) * factor + np.sqrt(1.0 - rho) * idio)
+        draws = _simulated_icc_draws(rho, counts, n_sims, rng)
         lo, hi = np.quantile(draws, [alpha / 2, 1 - alpha / 2])
         if lo <= observed <= hi:
             included.append(rho)
@@ -233,6 +294,7 @@ def estimate_latent_correlation(
     # the standard handling and the bias is negligible at these clip levels,
     # but a *lot* of clipped values means the distribution is misfitted, not
     # that the correlation is high -- so it is counted and surfaced.
+    n_clipped = int((p <= clip).sum() + (p >= 1.0 - clip).sum())
     z = stats.norm.ppf(np.clip(p, clip, 1.0 - clip))
 
     raw, n0 = _icc_continuous(z, day_index, n_days)
@@ -246,14 +308,9 @@ def estimate_latent_correlation(
             grid = np.round(
                 np.concatenate([np.arange(0.0, 0.40, 0.02), np.arange(0.40, 1.0, 0.05)]), 3
             )
-        # Unequal day sizes are simulated at the mean size. The ANOVA n0
-        # differs from the mean only in the second order for the spreads a
-        # real sweep produces, and the alternative is a per-day design that
-        # would make the acceptance region depend on the exact dropout
-        # pattern of one pilot.
-        per_day = max(round(z.size / n_days), 2)
+        counts = np.bincount(day_index, minlength=n_days)
         lo, hi = _latent_confidence_set(
-            point, n_days, per_day, rng, grid, n_sims=max(n_boot // 10, 100), alpha=alpha
+            point, counts, rng, grid, n_sims=max(n_boot // 2, 500), alpha=alpha
         )
     elif method == "bootstrap":
         groups = [z[day_index == i] for i in range(n_days)]
@@ -281,6 +338,7 @@ def estimate_latent_correlation(
         n_observations=int(p.size),
         effective_cluster_size=float(n0),
         raw=float(raw),
+        n_clipped=n_clipped,
     )
 
 
@@ -304,6 +362,15 @@ def breach_icc_from_latent(
     dependence makes joint breaches more likely at the same correlation, so
     it maps to a higher ICC and a longer window. Between two stated
     assumptions, §10 permits the one that does not shorten validation.
+
+    The t map has a FLOOR: at rho=0 it returns ~0.077, not 0, because a
+    shared-mixing t is not independent at zero correlation — a fat-tailed
+    day inflates every address at once. This matches what actual t-world
+    simulation realises (0.079 measured at rho=0), so it is the model's
+    physics, not an artifact. Consequence: under the default map the low
+    end is dominated by tail dependence rather than by the measured
+    correlation, and two pilots with latent 0.03 and 0.15 can size to the
+    same window. Read the latent interval when the distinction matters.
     """
     rho = float(np.clip(rho, 0.0, 0.999))
     if copula == "gaussian":
@@ -352,7 +419,7 @@ class BreachIcc:
         direct = (
             f"{self.direct_point:.3f}" if self.direct_point is not None else "n/a"
         )
-        return (
+        out = (
             f"breach ICC {self.point:.3f} [{self.ci_low:.3f}, {self.ci_high:.3f}]  "
             f"({self.copula}-copula map)\n"
             f"  latent correlation {self.latent.point:.3f} "
@@ -364,6 +431,13 @@ class BreachIcc:
             f"  effective n        {self.effective_sample_size:.0f} "
             f"(the naive interval assumes {self.n_observations})"
         )
+        if self.latent.n_clipped:
+            out += (
+                f"\n  WARNING: {self.latent.n_clipped} PIT values "
+                f"({self.latent.clipped_fraction:.1%}) were degenerate (0 or 1). "
+                "That is a misfitted predictive distribution, not clustering."
+            )
+        return out
 
 
 def estimate_breach_icc(
@@ -512,16 +586,30 @@ def recommend_window(
     off the middle is wrong half the time in the direction that shortens the
     window, and a window that is too short yields a gate that passes without
     establishing anything.
-    """
-    from risk_engine.validation.power import evaluate
 
+    Power is simulated at the requested `detect_rate` itself, never snapped
+    to a nearby tabulated one: a stricter target (closer to the nominal 5%)
+    is *harder* to detect and needs a longer window, and quantising it to an
+    easier column was measured to under-size the window (audit F-1).
+    """
+    from risk_engine.validation.power import NOMINAL_BREACH_RATE as NOMINAL
+    from risk_engine.validation.power import power_at
+
+    if not NOMINAL < detect_rate < 1.0:
+        raise ValueError(
+            f"detect_rate must be a true breach rate above the nominal {NOMINAL:.0%} "
+            f"and below 1; got {detect_rate}. The gate exists to catch a model that "
+            "understates tail risk, so the alternative worth power against is a "
+            "rate above the claimed one."
+        )
     value = {"point": icc.point, "ci_high": icc.ci_high, "ci_low": icc.ci_low}[basis]
 
     searched: list[tuple[int, float]] = []
     required: int | None = None
     for i, days in enumerate(day_grid):
-        cell = evaluate(days, addresses_per_day, value, n_trials, n_boot, seed + i)
-        power = cell.power_at_10pct if detect_rate >= 0.095 else cell.power_at_8pct
+        power = power_at(
+            days, addresses_per_day, value, detect_rate, n_trials, n_boot, seed + i
+        )
         searched.append((days, power))
         if required is None and power >= target_power:
             required = days

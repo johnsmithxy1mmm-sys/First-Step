@@ -254,23 +254,41 @@ precision. `breach_icc_from_latent` maps it back through the bivariate
 orthant probability, matching the empirically realised breach ICC to within
 0.02 across latent 0.05–0.50.
 
-That map is **strongly compressive, which improves the outlook materially**:
+That map compresses, and the copula chosen decides by how much — both
+columns measured, and **the conclusion must be read off the t column,
+because that is the tool's default and the engine's own copula** (§2.3; one
+chi-square mixing draw shared across assets per step, `sim/paths.py`):
 
-| latent ρ | breach ICC (Gaussian) |
-|---|---|
-| 0.05 | 0.012 |
-| 0.15 | 0.041 |
-| 0.30 | 0.098 |
-| 0.50 | 0.204 |
+| latent ρ | breach ICC (Gaussian) | breach ICC (t, df=4 — default) |
+|---|---|---|
+| 0.00 | 0.000 | 0.077 |
+| 0.05 | 0.012 | 0.095 |
+| 0.15 | 0.041 | 0.130 |
+| 0.30 | 0.098 | 0.195 |
+| 0.50 | 0.204 | 0.301 |
 
 The prior stated here before — "on a day BTC drops 8% nearly every levered
 address breaches at once, so ICC is well above 0.2" — conflated the two
-scales. Latent co-movement that strong is real; the *breach* ICC it implies
-is ~0.10–0.20, which per the table above needs 60–90 days, not 180. The
-copula is the assumption: the engine simulates a t-copula (§2.3), whose tail
-dependence maps higher than Gaussian at the same ρ, so `--copula t` is the
-default because between two stated assumptions §10 permits the one that
-lengthens validation.
+scales. Latent co-movement of 0.3–0.5 is plausible; under the default t map
+that implies breach ICC ~0.20–0.30, i.e. **roughly 60–180 days** by the
+power table, and under the Gaussian map ~0.10–0.20, i.e. 30–90. The pilot
+decides which row is real; the honest range before it runs is wide.
+
+Two facts about the t column, both verified by simulating the actual
+shared-mixing t world rather than trusting the map:
+
+- **It has a floor.** At ρ=0 the breach ICC is ~0.077 (measured 0.079 in
+  simulation), because a fat-tailed day inflates every address at once even
+  with zero correlation. Under the engine's own copula the §0.3 gate can
+  never be sized as if observations were independent, however quiet the
+  market — the floor alone puts the effective day-clustering near the 0.05
+  row of the power table.
+- **The estimator composes without material bias.** The latent ρ is measured
+  by Gaussian-scores ANOVA and fed to a t-parameterised map; against true
+  shared-mixing t data (16 replications per ρ) the mean bias is within
+  ±0.007 across ρ 0–0.5, with per-pilot scatter up to ±0.05 at high ρ. The
+  scatter is what the confidence interval absorbs — sizing reads the upper
+  bound, not the point. Pinned by a regression test.
 
 **Still a decision, now an informed one.** Three options, in the order I would
 take them:

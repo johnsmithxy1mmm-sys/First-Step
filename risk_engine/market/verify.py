@@ -226,7 +226,20 @@ def check_basis(client: InfoClient, coins: list[str], samples: int,
                 f"metaAndAssetCtxs is not the documented [meta, ctxs] pair: "
                 f"{type(exc).__name__}: {exc}",
             )
-        for name, ctx in zip(universe, ctxs, strict=False):
+        if len(universe) != len(ctxs):
+            # zip would silently truncate to the shorter side, and a checker
+            # that drops assets without saying so reports "checked" for assets
+            # it never saw. A length mismatch IS the schema drift this
+            # harness exists to catch.
+            return Check(
+                "C2", "is mark ≈ mid, per §1.4's threshold?", FAIL,
+                f"metaAndAssetCtxs is misaligned: {len(universe)} universe entries "
+                f"against {len(ctxs)} contexts. The documented contract is one "
+                "context per universe entry, in order; a mismatch means the pairing "
+                "cannot be trusted for any asset.",
+                evidence={"n_universe": len(universe), "n_ctxs": len(ctxs)},
+            )
+        for name, ctx in zip(universe, ctxs, strict=True):
             if name not in observed:
                 continue
             mark, mid = ctx.get("markPx"), ctx.get("midPx")

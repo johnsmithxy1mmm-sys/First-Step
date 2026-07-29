@@ -169,6 +169,41 @@ def evaluate(
     )
 
 
+def power_at(
+    days: int,
+    addresses_per_day: int,
+    icc: float,
+    p_true: float,
+    n_trials: int,
+    n_boot: int,
+    seed: int,
+) -> float:
+    """Power of the day-clustered gate against an arbitrary true breach rate.
+
+    `evaluate` reports power only at the two rates its table shows (8%, 10%).
+    Window sizing must not be quantised to those: detecting a true rate of 6%
+    is *harder* than detecting 8%, and the audit found that mapping every
+    requested rate below 9.5% onto the 8% column recommended windows that
+    were too short for the stricter target -- the §10-forbidden direction.
+    This computes the requested rate itself.
+    """
+    if not 0.0 < p_true < 1.0:
+        raise ValueError(f"p_true must be a rate in (0, 1), got {p_true}")
+    if abs(p_true - NOMINAL_BREACH_RATE) < 1e-9:
+        raise ValueError(
+            "p_true equals the nominal rate; power against the null is just the "
+            "false-rejection rate, and asking for it this way is a sign of confusion"
+        )
+    rng = np.random.default_rng(seed)
+    detected = 0
+    for _ in range(n_trials):
+        sums, counts = simulate_days(days, addresses_per_day, p_true, icc, rng)
+        lo, hi = clustered_rate_ci(sums, counts, rng, n_boot=n_boot)
+        if not (lo <= NOMINAL_BREACH_RATE <= hi):
+            detected += 1
+    return detected / n_trials
+
+
 def sweep(
     day_grid: list[int],
     address_grid: list[int],
