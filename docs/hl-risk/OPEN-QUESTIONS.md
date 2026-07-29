@@ -365,6 +365,47 @@ observability) whenever the two disagree, so the discrepancy is visible
 rather than silently resolved. Confirmation wanted that the paired test is
 the intended one.
 
+### D7 `[BLOCKER]` §2.6's 300 ms budget is not met at the book size §0 targets
+
+Measured, not estimated. A `pre_trade_delta` request at 20 000 paths on the
+build machine:
+
+| positions held | universe | median latency | vs budget |
+|---|---|---|---|
+| 2 | 3 | 328 ms | 1.1x |
+| 4 | 5 | 492 ms | 1.6x |
+| 5 | 6 | 593 ms | 2.0x |
+| 6 | 7 | 646 ms | 2.2x |
+| 8 | 9 | 889 ms | 3.0x |
+
+§0 describes the target user as holding 5-8 simultaneous positions, so the
+budget is missed by 2-3x for exactly the person the product is for. It is met
+only for a two-asset universe.
+
+The cost scales with the universe because both path generation and the
+liquidation walk are per-asset. Three optimisations already went in and are
+reflected in the numbers above (uniform-grid quantile map, branch-free map
+application, vectorised float32 CVaR bootstrap), taking a two-asset request
+from 426 ms to 242 ms. Reaching the budget at eight positions needs
+something structural.
+
+What is NOT available: cutting the path count. §2.5's interval rule outranks
+the clock (D1), and the engine escalates paths rather than trimming them.
+
+Open options, none taken unilaterally because they trade against things the
+specification cares about:
+- production hardware, which this shared build container is not;
+- threading the per-chunk work, since numpy releases the GIL on the large
+  array operations that dominate;
+- float32 path generation, roughly a 2x saving, but it costs precision in a
+  cumulative-sum over 24 steps and this is a risk engine;
+- a smaller default path count with the interval rule still binding, which
+  in practice means accepting wider intervals on high-probability books.
+
+Reported rather than worked around, per §9. The engine counts every
+over-budget request (`pre_trade_budget_exceeded`) and never trades the
+interval guarantee for the clock.
+
 ### D5 `[RESOLVED]` Full-liquidation modelling is not conservative in every metric
 
 §1.6 permits modelling full cross liquidation instead of partial, calling it

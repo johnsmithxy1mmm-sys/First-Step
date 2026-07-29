@@ -333,6 +333,23 @@ class RiskEstimate:
     def __post_init__(self) -> None:
         if self.computed_at.tzinfo is None:
             raise ValueError("computed_at must be timezone-aware")
+        # Normalise numpy scalars to Python floats. Estimates are routinely
+        # built from np.quantile and friends, and a np.float64 field makes
+        # `overlaps` return np.bool_ -- which is not a bool subclass and is
+        # not JSON serialisable, so the failure surfaces at the service
+        # boundary as a 400 rather than here. Coercing at the type keeps
+        # every consumer honest.
+        # `type(...) is not float`, not `isinstance`: np.float64 IS a float
+        # subclass, so an isinstance check passes it through unconverted and
+        # every comparison on it still yields np.bool_.
+        for name in ("point", "ci_low", "ci_high"):
+            value = getattr(self, name)
+            if type(value) is not float:
+                object.__setattr__(self, name, float(value))
+        if not math.isfinite(self.point + self.ci_low + self.ci_high):
+            raise ValueError(
+                f"estimate must be finite, got ({self.point}, {self.ci_low}, {self.ci_high})"
+            )
         if not (self.ci_low <= self.point <= self.ci_high):
             raise ValueError(
                 f"point {self.point} outside interval [{self.ci_low}, {self.ci_high}]"

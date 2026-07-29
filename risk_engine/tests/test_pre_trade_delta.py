@@ -177,10 +177,15 @@ class TestColdStartAndBudget:
         assert out.p_liq.after.point >= 0.0
         assert out.converged
 
-    def test_the_unheld_asset_path_stays_inside_the_300ms_budget(
+    def test_a_two_asset_universe_stays_inside_the_300ms_budget(
         self, bundle, specs, spot, now
     ):
         """The §9 Phase-2 acceptance number, measured rather than asserted.
+
+        Holds for a two-asset universe. It does NOT hold at the book size §0
+        describes for the target user -- see
+        `test_latency_scaling_is_recorded_not_hidden` below and
+        OPEN-QUESTIONS D7.
 
         Timed over repeats because a single cold measurement on a shared CI
         box is mostly scheduler noise; the median is the honest figure.
@@ -199,6 +204,50 @@ class TestColdStartAndBudget:
         ]
         median = float(np.median(timings))
         assert median <= LATENCY_BUDGET_MS, f"median {median:.0f}ms over budget: {timings}"
+
+    def test_latency_scaling_is_recorded_not_hidden(self, bundle, specs, spot, now):
+        """§2.6's budget does not hold at the target user's book size.
+
+        §0 describes a trader with 5-8 simultaneous positions. Measured on
+        this hardware, a pre-trade request costs roughly 300 ms at a
+        two-asset universe and around 900 ms at nine, because path
+        generation and the liquidation walk both scale with the universe.
+        §2.5's interval rule forbids buying the time back by cutting paths.
+
+        This test pins the *shape* of that cost so a regression is visible,
+        and deliberately does not assert the budget it knows is missed. The
+        absolute numbers are hardware-dependent; the scaling is not.
+        """
+        # The shared fixture bundle tracks three assets, so the widest
+        # universe testable here is three. The table in OPEN-QUESTIONS D7
+        # was measured on a ten-asset bundle; this test pins the shape.
+        book = Book(
+            "0x", 300_000.0,
+            (
+                Position("BTC", 2.0, 100_000.0, MarginMode.CROSS, 20.0),
+                Position("ETH", 50.0, 4_000.0, MarginMode.CROSS, 20.0),
+            ),
+            now,
+        )
+        order = ProposedOrder("SOL", 400.0, 20.0)
+        pre_trade_delta(book, order, spot, bundle, specs, n_paths=20_000, seed=20, now=now)
+        wide = float(np.median([
+            pre_trade_delta(book, order, spot, bundle, specs,
+                            n_paths=20_000, seed=21 + i, now=now).total_latency_ms
+            for i in range(3)
+        ]))
+
+        narrow_book = Book("0x", 100_000.0,
+                           (Position("BTC", 5.0, 100_000.0, MarginMode.CROSS, 20.0),), now)
+        narrow = float(np.median([
+            pre_trade_delta(narrow_book, order, spot, bundle, specs,
+                            n_paths=20_000, seed=31 + i, now=now).total_latency_ms
+            for i in range(3)
+        ]))
+        assert wide > narrow, (wide, narrow)
+        # Superlinear would mean something worse than per-asset work is going
+        # on; linear-ish in universe size is the expected and acceptable shape.
+        assert wide < 3.0 * narrow, (wide, narrow)
 
     def test_over_budget_runs_are_counted(self, bundle, specs, spot, now):
         """§7: a latency violation is a metric, never a silently cut path count.
