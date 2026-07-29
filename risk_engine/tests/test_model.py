@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from itertools import pairwise
 
 import numpy as np
 import pytest
@@ -370,7 +371,7 @@ class TestShrinkageIntensityMagnitude:
 
     def test_intensity_falls_monotonically_with_sample_size(self):
         vals = [self._intensity(n, 8, 4003) for n in (100, 400, 1600, 6400)]
-        assert all(b < a for a, b in zip(vals, vals[1:])), vals
+        assert all(b < a for a, b in pairwise(vals)), vals
 
     def test_intensity_saturates_when_the_target_is_exactly_right(self):
         """The other end of the scale, and the reason the old fixture was

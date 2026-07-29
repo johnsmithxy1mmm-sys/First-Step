@@ -7,6 +7,8 @@ implementations of the same condition, and they must flip at the same price.
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import numpy as np
 import pytest
 
@@ -249,7 +251,7 @@ class TestWithPositionConservesValue:
     fabricated $50k on a market-price flip by dropping the realized PnL of
     the closed portion and letting the flipped side inherit the old entry."""
 
-    PRICES = {"BTC": 90_000.0, "ETH": 4_000.0, "SOL": 200.0}
+    PRICES: ClassVar[dict[str, float]] = {"BTC": 90_000.0, "ETH": 4_000.0, "SOL": 200.0}
 
     @pytest.mark.parametrize("order_size", [-0.5, -1.0, -1.9, -2.0, -3.0, -5.0, 1.0])
     def test_cross_order_at_market_conserves_equity(self, now, order_size):

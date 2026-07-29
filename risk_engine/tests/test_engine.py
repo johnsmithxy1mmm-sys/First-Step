@@ -242,7 +242,7 @@ class TestStatistics:
         assert atom_pits.std() > 0.01
         assert len(np.unique(atom_pits)) > 100
 
-        stat, p = ks_uniformity(pits)
+        _stat, p = ks_uniformity(pits)
         assert p > 0.01, f"KS rejected a perfectly calibrated forecast: p={p:.3g}"
 
     def test_cdf_interval_exposes_the_atom(self):
