@@ -23,7 +23,15 @@ Format: MAJOR.MINOR.PATCH-tag
 #: The randomized PIT (A-02) changes how outcomes are *scored*, not what the
 #: model predicts, but it invalidates every PIT value recorded under 0.1.x
 #: just as thoroughly, so those observations cannot be pooled either.
-MODEL_VERSION = "0.2.0-phase1"
+#:
+#: 0.2.1 — thread-parallel path blocks (OPEN-QUESTIONS D7). PATCH, not MINOR:
+#: blocks now draw from independent spawned streams instead of sequentially
+#: from one generator, so a given seed produces a different *sample*. The law
+#: being sampled is identical, which is the only thing the shadow window
+#: cares about, so the counter is not reset. Old seeds no longer reproduce
+#: old numbers, which is a provenance note rather than a calibration one --
+#: every journal row already stores the model version beside its seed.
+MODEL_VERSION = "0.2.1-phase1"
 
 # Distribution-affecting prefix; the shadow counter keys on this, not on the
 # full string, so that PATCH releases keep accumulating validation days.

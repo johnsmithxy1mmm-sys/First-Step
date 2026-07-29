@@ -399,3 +399,75 @@ class TestMetricsAreBounded:
         assert len(m.psd_corrections) == MAX_EVENT_SAMPLES
         # The lifetime tally survives even though the samples rolled over.
         assert m.counters["psd_projection_corrections"] == MAX_EVENT_SAMPLES + 50
+
+
+class TestParallelBlocks:
+    """OPEN-QUESTIONS D7. Threads are only admissible here because they do
+    not change what the model predicts -- only which sample is drawn from
+    it. That distinction is what keeps this a PATCH release and leaves the
+    shadow window intact (§3.3)."""
+
+    def test_blocks_are_planned_for_both_memory_and_parallelism(self):
+        from risk_engine.sim.engine import plan_chunks
+
+        # One block per worker when memory allows: the previous sizing
+        # produced a single block and left every other core idle.
+        assert plan_chunks(20_000, 75, workers=4) == [5_000] * 4
+        assert plan_chunks(20_000, 75, workers=1) == [20_000]
+        # Memory still wins when a block would be too large.
+        wide = plan_chunks(200_000, 4_000, workers=4)
+        assert max(wide) <= 4_000_000 // 4_000
+        assert sum(wide) == 200_000
+        # Balanced, so no worker waits on a straggler.
+        uneven = plan_chunks(10_001, 75, workers=4)
+        assert sum(uneven) == 10_001
+        assert max(uneven) - min(uneven) <= 1
+
+    def test_streams_are_independent_and_reproducible(self):
+        from risk_engine.sim.engine import spawn_streams
+
+        a = [g.standard_normal(5) for g in spawn_streams(42, 4)]
+        b = [g.standard_normal(5) for g in spawn_streams(42, 4)]
+        for x, y in zip(a, b):
+            assert np.array_equal(x, y)
+        # Distinct blocks must not replay the same numbers.
+        assert not np.array_equal(a[0], a[1])
+
+    def test_the_result_does_not_depend_on_completion_order(self, bundle, specs, spot, now):
+        """Every block's randomness is decided before any thread starts, so
+        two runs agree exactly however the threads interleave."""
+        engine = MonteCarloEngine(bundle, specs, workers=4)
+        a = engine.run(levered_book(now, 18.0), spot, 24, n_paths=8_000, seed=5, now=now)
+        b = engine.run(levered_book(now, 18.0), spot, 24, n_paths=8_000, seed=5, now=now)
+        assert a.p_liq_any.point == b.p_liq_any.point
+        assert np.array_equal(a.raw_equity_change, b.raw_equity_change)
+
+    def test_worker_count_changes_the_sample_but_not_the_answer(
+        self, bundle, specs, spot, now
+    ):
+        """Different blocking means different draws from the SAME law. The
+        estimates must therefore agree to within Monte Carlo error, not
+        bit-for-bit -- and this is exactly why the change is a PATCH."""
+        book = levered_book(now, 18.0)
+        serial = MonteCarloEngine(bundle, specs, workers=1).run(
+            book, spot, 24, n_paths=20_000, seed=5, now=now
+        )
+        threaded = MonteCarloEngine(bundle, specs, workers=4).run(
+            book, spot, 24, n_paths=20_000, seed=5, now=now
+        )
+        assert serial.p_liq_any.point != threaded.p_liq_any.point
+        # Two independent 20k estimates: 3 standard errors is a generous bound.
+        se = (serial.p_liq_any.point * (1 - serial.p_liq_any.point) / 20_000) ** 0.5
+        assert abs(serial.p_liq_any.point - threaded.p_liq_any.point) < 4 * max(se, 1e-4)
+
+    def test_the_benchmarks_are_untouched_by_blocking(self):
+        """The §3.1 gate drives the simulator directly with an explicit
+        BaseRandomness, so it never goes through the block planner and its
+        numbers are unaffected by any of this."""
+        import inspect
+
+        from risk_engine.validation import benchmarks
+
+        source = inspect.getsource(benchmarks)
+        assert "run_blocks" not in source
+        assert "simulate_paths(" in source

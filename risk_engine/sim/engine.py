@@ -16,7 +16,10 @@ is under-resolved.
 
 from __future__ import annotations
 
+import math
+import os
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -55,6 +58,66 @@ DEFAULT_PATHS = 20_000
 DEFAULT_TARGET_HALF_WIDTH = 0.02  # §2.5: 2 percentage points
 MAX_PATHS = 320_000
 DEFAULT_CHUNK = 5_000
+#: Threads used to walk path blocks concurrently (OPEN-QUESTIONS D7).
+#: Threads rather than processes because numpy releases the GIL on the large
+#: array operations that dominate, so the arrays stay shared and nothing has
+#: to be pickled across a boundary.
+#:
+#: The default is 2, not the core count. Measured on a contended four-core
+#: container with a six-position book (min of seven runs): serial 656 ms,
+#: two threads 418 ms, four threads 648 ms. Beyond two, oversubscription
+#: against whatever else shares the box costs more than the parallelism
+#: buys, and the liquidation walk's per-step Python loop does not
+#: parallelise anyway. The optimum is hardware-dependent -- tune
+#: RISK_ENGINE_WORKERS on the deployment target rather than trusting this
+#: number, which was measured somewhere else.
+DEFAULT_WORKERS = max(1, min(int(os.environ.get("RISK_ENGINE_WORKERS", "2")), os.cpu_count() or 1))
+#: Floats per block of price paths, roughly 32 MB. Multiplied by the worker
+#: count for peak memory, which is why it is a per-block figure and not a
+#: total.
+CHUNK_FLOAT_BUDGET = 4_000_000
+#: Below this a block costs more in per-block overhead than it saves.
+MIN_CHUNK = 2_000
+
+
+def plan_chunks(
+    n_paths: int,
+    per_path_floats: int,
+    workers: int = DEFAULT_WORKERS,
+    min_chunk: int = MIN_CHUNK,
+    float_budget: int = CHUNK_FLOAT_BUDGET,
+) -> list[int]:
+    """Split `n_paths` into blocks that are both memory-bounded and parallel.
+
+    Two constraints pull in opposite directions. Memory wants blocks no
+    larger than the float budget. Parallelism wants at least one block per
+    worker, which for a 20 000-path request over a handful of assets means
+    *smaller* blocks than memory alone would pick -- the previous adaptive
+    sizing produced a single block, which left three of four cores idle.
+
+    Sizes are balanced rather than "full blocks plus a remainder", so no
+    worker finishes early and waits on a straggler.
+    """
+    if n_paths <= 0:
+        raise ValueError("n_paths must be positive")
+    memory_cap = max(1, float_budget // max(per_path_floats, 1))
+    parallel_target = max(min_chunk, math.ceil(n_paths / max(workers, 1)))
+    size = max(1, min(memory_cap, parallel_target, n_paths))
+    n_chunks = math.ceil(n_paths / size)
+    base, remainder = divmod(n_paths, n_chunks)
+    return [base + (1 if i < remainder else 0) for i in range(n_chunks)]
+
+
+def spawn_streams(seed: int, n: int) -> list[np.random.Generator]:
+    """Independent, reproducible generators, one per block.
+
+    `SeedSequence.spawn` gives streams that are statistically independent and
+    a deterministic function of the seed, so a parallel run reproduces
+    exactly and does not depend on the order blocks happen to finish in.
+    Drawing blocks sequentially from one generator, as the serial version
+    did, cannot be parallelised without exactly that dependence.
+    """
+    return [np.random.default_rng(s) for s in np.random.SeedSequence(seed).spawn(n)]
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,16 +309,73 @@ def simulate_paths(
     )[n_steps]
 
 
+def run_blocks(
+    *,
+    books: Sequence[Book],
+    specs: dict[str, AssetSpec],
+    bundle: ModelBundle,
+    spec: PathSpec,
+    spot_vec: np.ndarray,
+    n_paths: int,
+    horizons: tuple[int, ...],
+    seed: int,
+    n_iso: int,
+    include_funding: bool,
+    use_bridge: bool = True,
+    factor_col: int | None = None,
+    workers: int = DEFAULT_WORKERS,
+) -> list[dict[int, _RawOutcome]]:
+    """Draw and walk `n_paths` in parallel blocks, for every book at once.
+
+    Every book sees the same paths (the common random numbers `pre_trade_delta`
+    depends on), and every block runs on its own thread with its own
+    independent stream. The result is deterministic in `seed` and independent
+    of completion order, because each block's randomness is decided before
+    any thread starts.
+    """
+    longest = max(horizons)
+    per_path = (longest + 1) * spec.n_assets
+    sizes = plan_chunks(n_paths, per_path, workers)
+    streams = spawn_streams(seed, len(sizes))
+    funding_models = bundle.funding_models(spec.coins) if include_funding else None
+
+    def one_block(index: int) -> list[dict[int, _RawOutcome]]:
+        size = sizes[index]
+        rng = streams[index]
+        base = draw_base_randomness(size, longest, spec.n_assets, n_iso, spec.copula_df, rng)
+        funding = (
+            simulate_funding(funding_models, bundle.funding_bounds, size, longest, rng)
+            if include_funding
+            else None
+        )
+        return simulate_books_checkpointed(
+            books, specs, spec, spot_vec, base, funding, horizons, use_bridge, factor_col,
+        )
+
+    if len(sizes) == 1 or workers <= 1:
+        results = [one_block(0)]
+    else:
+        with ThreadPoolExecutor(max_workers=min(workers, len(sizes))) as pool:
+            results = list(pool.map(one_block, range(len(sizes))))
+
+    return [
+        {h: _concat([block[b][h] for block in results]) for h in horizons}
+        for b in range(len(books))
+    ]
+
+
 class MonteCarloEngine:
     def __init__(
         self,
         bundle: ModelBundle,
         specs: dict[str, AssetSpec],
         metrics: Metrics | None = None,
+        workers: int = DEFAULT_WORKERS,
     ) -> None:
         self.bundle = bundle
         self.specs = specs
         self.metrics = metrics or METRICS
+        self.workers = workers
 
     def run(
         self,
@@ -382,31 +502,22 @@ class MonteCarloEngine:
         self, book, spec, spot_vec, n_paths, horizons, seed, n_iso,
         include_funding, use_bridge, chunk_paths, factor_col=None,
     ) -> dict[int, _RawOutcome]:
-        rng = np.random.default_rng(seed)
-        funding_models = self.bundle.funding_models(spec.coins) if include_funding else None
-        longest = max(horizons)
-        parts: dict[int, list[_RawOutcome]] = {h: [] for h in horizons}
-        done = 0
-        while done < n_paths:
-            size = min(chunk_paths, n_paths - done)
-            base = draw_base_randomness(
-                size, longest, spec.n_assets, n_iso, spec.copula_df, rng
-            )
-            funding = (
-                simulate_funding(
-                    funding_models, self.bundle.funding_bounds, size, longest, rng
-                )
-                if include_funding
-                else None
-            )
-            block = simulate_paths_checkpointed(
-                book, self.specs, spec, spot_vec, base, funding, horizons,
-                use_bridge, factor_col,
-            )
-            for h in horizons:
-                parts[h].append(block[h])
-            done += size
-        return {h: _concat(v) for h, v in parts.items()}
+        blocks = run_blocks(
+            books=(book,),
+            specs=self.specs,
+            bundle=self.bundle,
+            spec=spec,
+            spot_vec=spot_vec,
+            n_paths=n_paths,
+            horizons=horizons,
+            seed=seed,
+            n_iso=n_iso,
+            include_funding=include_funding,
+            use_bridge=use_bridge,
+            factor_col=factor_col,
+            workers=self.workers,
+        )
+        return blocks[0]
 
     def _assemble(
         self, raw, seed, n_paths, horizon_hours, converged, now, notes, factor_coin=None

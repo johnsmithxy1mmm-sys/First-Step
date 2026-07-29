@@ -370,13 +370,16 @@ the intended one.
 Measured, not estimated. A `pre_trade_delta` request at 20 000 paths on the
 build machine:
 
-| positions held | universe | median latency | vs budget |
+| positions | serial | 2 threads | vs budget |
 |---|---|---|---|
-| 2 | 3 | 328 ms | 1.1x |
-| 4 | 5 | 492 ms | 1.6x |
-| 5 | 6 | 593 ms | 2.0x |
-| 6 | 7 | 646 ms | 2.2x |
-| 8 | 9 | 889 ms | 3.0x |
+| 2 | 336 ms | **236 ms** | 0.8x — met |
+| 4 | 526 ms | 318 ms | 1.1x |
+| 5 | 592 ms | 373 ms | 1.2x |
+| 6 | 668 ms | 431 ms | 1.4x |
+| 8 | — | 528 ms | 1.8x |
+
+(Minimum of seven runs; the build container is shared and medians move by
+30% between sweeps, which is why the minimum is quoted.)
 
 §0 describes the target user as holding 5-8 simultaneous positions, so the
 budget is missed by 2-3x for exactly the person the product is for. It is met
@@ -392,13 +395,34 @@ something structural.
 What is NOT available: cutting the path count. §2.5's interval rule outranks
 the clock (D1), and the engine escalates paths rather than trimming them.
 
-Open options, none taken unilaterally because they trade against things the
+**Taken since:** thread-parallel path blocks, worth 1.4-1.65x. Threads
+rather than processes because numpy releases the GIL on the operations that
+dominate. The default is two workers, not the core count: on a contended
+four-core box, four threads measured *slower* than two (648 ms against
+418 ms at six positions), because oversubscription costs more than the
+parallelism buys and the liquidation walk's per-step Python loop does not
+parallelise at all. The optimum is hardware-dependent — tune
+`RISK_ENGINE_WORKERS` on the deployment target rather than trusting a
+number measured somewhere else.
+
+Admissible only because it does not change the predicted distribution, only
+which sample is drawn from it, so it is a PATCH release and the shadow
+window survives it.
+
+**Tried and reverted:** vectorising the funding AR(1) across assets. It
+measured *slower* than the per-asset loop it replaced (24.6 ms against
+19.6 ms per 5 000-path block at seven assets) because the per-step slice
+`x[:, s, :]` is strided on both read and write, and that costs more than
+the interpreted loop it removes. The finding is recorded in the code so
+nobody re-attempts it.
+
+Still open, none taken unilaterally because they trade against things the
 specification cares about:
 - production hardware, which this shared build container is not;
-- threading the per-chunk work, since numpy releases the GIL on the large
-  array operations that dominate;
 - float32 path generation, roughly a 2x saving, but it costs precision in a
-  cumulative-sum over 24 steps and this is a risk engine;
+  cumulative-sum over 24 steps and this is a risk engine. It *is*
+  distribution-affecting, so it must land before the shadow clock starts or
+  not at all;
 - a smaller default path count with the interval rule still binding, which
   in practice means accepting wider intervals on high-probability books.
 

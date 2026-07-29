@@ -47,20 +47,17 @@ from risk_engine.domain.types import (
     RiskEstimate,
     SimulationProvenance,
 )
-from risk_engine.model.funding import simulate_funding
 from risk_engine.observability.metrics import METRICS, Metrics, Timer
 from risk_engine.sim.engine import (
-    DEFAULT_CHUNK,
     DEFAULT_PATHS,
     DEFAULT_TARGET_HALF_WIDTH,
+    DEFAULT_WORKERS,
     MAX_PATHS,
     ModelBundle,
     _RawOutcome,
     _any_liq,
-    _concat,
-    simulate_books_checkpointed,
+    run_blocks,
 )
-from risk_engine.sim.paths import draw_base_randomness
 from risk_engine.sim.stats import (
     Z95,
     conditional_value_at_risk,
@@ -269,7 +266,7 @@ def pre_trade_delta(
     include_funding: bool = True,
     target_half_width: float = DEFAULT_TARGET_HALF_WIDTH,
     max_paths: int = MAX_PATHS,
-    chunk_paths: int = DEFAULT_CHUNK,
+    workers: int = DEFAULT_WORKERS,
     now: datetime | None = None,
     metrics: Metrics | None = None,
 ) -> PreTradeDelta:
@@ -313,10 +310,9 @@ def pre_trade_delta(
         notes: list[str] = []
         before_raw = after_raw = None
         while True:
-            chunk = adaptive_chunk(target, horizon_hours, len(coins), chunk_paths)
             before_raw, after_raw = _accumulate_pair(
                 book, after_book, specs, bundle, spec, spot_vec, target,
-                horizon_hours, seed, n_iso, include_funding, chunk,
+                horizon_hours, seed, n_iso, include_funding, workers,
             )
             widest = max(
                 wilson_half_width(int(_any_liq(r).sum()), target)
@@ -390,43 +386,21 @@ def pre_trade_delta(
     )
 
 
-def adaptive_chunk(n_paths: int, n_steps: int, n_assets: int, floor: int = DEFAULT_CHUNK) -> int:
-    """Paths per block, sized by the price array rather than by a constant.
-
-    The engine's fixed 5 000 was chosen for the worst case -- a 7-day walk
-    over a wide universe. A 24-hour pre-trade request over two or three
-    assets is two orders of magnitude smaller per path, and splitting it
-    into four blocks pays the per-block overhead four times for no reason.
-    Targets roughly 4M floats (~32 MB) of price array per block.
-    """
-    per_path = max(1, (n_steps + 1) * n_assets)
-    return max(floor, min(n_paths, 4_000_000 // per_path))
-
-
 def _accumulate_pair(
     book, after_book, specs, bundle, spec, spot_vec, n_paths, horizon_hours,
-    seed, n_iso, include_funding, chunk_paths,
+    seed, n_iso, include_funding, workers,
 ) -> tuple[_RawOutcome, _RawOutcome]:
-    rng = np.random.default_rng(seed)
-    funding_models = bundle.funding_models(spec.coins) if include_funding else None
-    parts: list[list[_RawOutcome]] = [[], []]
-    done = 0
-    while done < n_paths:
-        size = min(chunk_paths, n_paths - done)
-        base = draw_base_randomness(
-            size, horizon_hours, spec.n_assets, n_iso, spec.copula_df, rng
-        )
-        funding = (
-            simulate_funding(
-                funding_models, bundle.funding_bounds, size, horizon_hours, rng
-            )
-            if include_funding
-            else None
-        )
-        blocks = simulate_books_checkpointed(
-            (book, after_book), specs, spec, spot_vec, base, funding, (horizon_hours,)
-        )
-        for i, block in enumerate(blocks):
-            parts[i].append(block[horizon_hours])
-        done += size
-    return _concat(parts[0]), _concat(parts[1])
+    before, after = run_blocks(
+        books=(book, after_book),
+        specs=specs,
+        bundle=bundle,
+        spec=spec,
+        spot_vec=spot_vec,
+        n_paths=n_paths,
+        horizons=(horizon_hours,),
+        seed=seed,
+        n_iso=n_iso,
+        include_funding=include_funding,
+        workers=workers,
+    )
+    return before[horizon_hours], after[horizon_hours]

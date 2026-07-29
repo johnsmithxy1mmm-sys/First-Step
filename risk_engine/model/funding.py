@@ -114,6 +114,11 @@ def simulate_funding(
     zero, which understates cost. Callers must not pass None for an asset the
     book actually holds -- `tools/` enforces that.
     """
+    # Deliberately a loop over assets, each walking a contiguous (n_paths,)
+    # array. Vectorising across assets was tried and measured slower (24.6 ms
+    # against 19.6 ms per 5k block at seven assets): the step slice
+    # `x[:, s, :]` is strided on both read and write, and that costs more
+    # than the interpreted loop it removes.
     out = np.zeros((n_paths, n_steps, len(models)), dtype=np.float64)
     cap = bounds.cap_per_hour
     for col, m in enumerate(models):
