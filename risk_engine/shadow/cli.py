@@ -3,6 +3,7 @@
     python -m risk_engine.shadow snapshot --journal shadow.db --addresses addrs.json
     python -m risk_engine.shadow resolve  --journal shadow.db
     python -m risk_engine.shadow progress --journal shadow.db
+    python -m risk_engine.shadow icc      --journal shadow.db
 
 Two jobs on a daily cadence: `snapshot` writes predictions, `resolve` fills
 in what actually happened a day later. Between them they accumulate the
@@ -25,7 +26,7 @@ from pathlib import Path
 
 from risk_engine.shadow.cron import ShadowCron
 from risk_engine.shadow.journal import CalibrationJournal
-from risk_engine.shadow.metrics import COHORTS, calibration_report
+from risk_engine.shadow.metrics import COHORT_BOOK_UNCHANGED, COHORTS, calibration_report
 from risk_engine.shadow.providers import FileAddressSource, LiveSnapshotProvider
 from risk_engine.shadow.resolve import DEFAULT_STALE_AFTER_S, resolve_due
 from risk_engine.validation.baselines import NaiveBaseline, historical_24h_log_returns
@@ -200,6 +201,82 @@ def cmd_progress(args) -> int:
     return 0
 
 
+def cmd_icc(args) -> int:
+    """Measure the intra-day correlation and size the window from it (B1)."""
+    import numpy as np
+
+    from risk_engine.shadow.clustering import (
+        breach_icc_confidence_set,
+        estimate_breach_icc,
+        recommend_window,
+    )
+    from risk_engine.shadow.journal import VARIANT_MODEL
+    from risk_engine.shadow.metrics import load_cohort
+
+    version = args.version or DISTRIBUTION_VERSION
+    with CalibrationJournal(args.journal) as journal:
+        cohort = load_cohort(journal, version, VARIANT_MODEL, args.cohort)
+        if cohort.n == 0:
+            print(f"no resolved observations in cohort {args.cohort}")
+            return 1
+        try:
+            icc = estimate_breach_icc(
+                cohort.pit, cohort.breached.astype(float), cohort.days,
+                np.random.default_rng(args.seed), n_boot=args.boot,
+                copula=args.copula,
+            )
+        except ValueError as exc:
+            print(f"cannot estimate: {exc}")
+            return 1
+
+        print(f"cohort {args.cohort}, distribution {version}")
+        print(icc.summary())
+        print(
+            "\nEstimated through the PIT values rather than the breaches. A "
+            "breach is a 5% event, so a day of 200 addresses carries about ten "
+            "of them, and ten events cannot resolve a correlation; the PIT "
+            "values carry the same co-movement across every observation. The "
+            f"{args.copula}-copula map converts it back (OPEN-QUESTIONS B1)."
+        )
+
+        if args.direct_interval:
+            print("\ncomputing the assumption-free interval (slow)...")
+            lo, hi = breach_icc_confidence_set(
+                cohort.breached.astype(float), cohort.days,
+                np.random.default_rng(args.seed), n_sims=args.direct_sims,
+            )
+            print(
+                f"  breach data alone supports ICC in [{lo:.2f}, {hi:.2f}] "
+                "with no copula assumption.\n"
+                "  Wide by nature, not by defect — this is what the breaches on "
+                "their own establish."
+            )
+        print()
+
+        rec = recommend_window(
+            icc,
+            addresses_per_day=args.addresses_per_day,
+            target_power=args.power,
+            detect_rate=args.detect,
+            n_trials=args.trials,
+            n_boot=args.boot_power,
+            seed=args.seed,
+        )
+        print(rec.summary())
+        print(
+            "\nSized off the upper end of the interval, not the point estimate: "
+            "sizing off the middle is wrong half the time in the direction that "
+            "shortens the window, and a short window yields a gate that passes "
+            "without establishing anything."
+        )
+        if icc.n_days < 10:
+            print(
+                f"\n{icc.n_days} days is little to estimate a correlation from. "
+                "Treat this as a direction until the pilot has run a fortnight."
+            )
+    return 0
+
+
 def cmd_frame(args) -> int:
     """Write an address-list template that refuses to omit its frame."""
     path = Path(args.out)
@@ -251,6 +328,27 @@ def main(argv: list[str] | None = None) -> int:
     prog = sub.add_parser("progress", help="report the §3.3 window and calibration")
     prog.add_argument("--journal", required=True)
     prog.set_defaults(func=cmd_progress)
+
+    icc = sub.add_parser(
+        "icc", help="measure the intra-day correlation and size the window (B1)"
+    )
+    icc.add_argument("--journal", required=True)
+    icc.add_argument("--version", help=f"distribution version (default {DISTRIBUTION_VERSION})")
+    icc.add_argument("--cohort", default=COHORT_BOOK_UNCHANGED, choices=list(COHORTS))
+    icc.add_argument("--addresses-per-day", dest="addresses_per_day", type=int, default=200)
+    icc.add_argument("--power", type=float, default=0.8, help="target power for sizing")
+    icc.add_argument("--detect", type=float, default=0.10,
+                     help="true breach rate the window must be able to detect")
+    icc.add_argument("--boot", type=int, default=2_000, help="bootstrap draws for the interval")
+    icc.add_argument("--boot-power", dest="boot_power", type=int, default=400)
+    icc.add_argument("--copula", default="t", choices=["t", "gaussian"],
+                     help="latent-to-breach map; t matches the engine (§2.3)")
+    icc.add_argument("--direct-interval", dest="direct_interval", action="store_true",
+                     help="also invert the test on the breach data alone (slow, wide)")
+    icc.add_argument("--direct-sims", dest="direct_sims", type=int, default=200)
+    icc.add_argument("--trials", type=int, default=200)
+    icc.add_argument("--seed", type=int, default=0)
+    icc.set_defaults(func=cmd_icc)
 
     frame = sub.add_parser("init-addresses", help="write an address-list template")
     frame.add_argument("--out", required=True)

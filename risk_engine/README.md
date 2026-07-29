@@ -77,6 +77,33 @@ are 21 days that will be thrown away when any of them is answered. Resolve
 them first, or accept the reset knowingly. Details in
 [`OPEN-QUESTIONS.md`](../docs/hl-risk/OPEN-QUESTIONS.md).
 
+### Sizing the window first — a pilot that does not reset
+
+```bash
+python -m risk_engine.shadow icc --journal shadow.db
+```
+
+How long the window has to be depends almost entirely on how much of a day's
+breaches are one event, and that number takes data. This measures it and
+prints the window it implies.
+
+Running this pilot does **not** burn the §3.3 counter. What makes two
+addresses breach together on one day is the common market move, not the
+model version: a new version shifts the VaR levels, it does not change
+whether BTC fell 8% that day. So the fortnight is not thrown away when the
+distribution changes.
+
+It estimates through the PIT values rather than the breaches. A breach is a
+5% event — a day of 200 addresses carries about ten, and ten events cannot
+resolve a correlation. The PIT values carry the same co-movement across
+every observation, and a copula map converts back. `--direct-interval` shows
+what the breaches alone support, which at pilot length is nearly nothing;
+that contrast is the point rather than a caveat.
+
+The window is sized off the *upper* end of the interval. Sizing off the
+point estimate is wrong half the time in the direction that shortens it, and
+a short window yields a gate that passes without establishing anything.
+
 `progress` reads the gate off the `book_unchanged` cohort and the
 day-clustered interval, not the naive one. B1 records why: addresses
 observed on the same day share one market move, so the naive interval calls

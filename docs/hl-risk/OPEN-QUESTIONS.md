@@ -221,9 +221,56 @@ Three findings, none of which the estimate had:
 
 ICC itself is the one number neither the specification nor this code can
 supply — it takes real data, which is why it is swept rather than assumed.
-The first two weeks of shadow data will pin it, and the row to read is chosen
-then. On priors it is not small: on a day BTC drops 8% nearly every levered
-address breaches at once, which is ICC well above 0.2.
+
+**Measuring it is `python -m risk_engine.shadow icc`**, and doing so does not
+burn the §3.3 counter: what makes two addresses breach together is the common
+market move, not the model version, so the estimate survives a version change
+to first order. A pilot can therefore run *before* A1, A8, C1, C2 and C5 are
+settled.
+
+Three things had to be got right for that command to mean anything, and each
+was measured rather than assumed:
+
+**The obvious estimator does not work.** ANOVA moments on the breach
+indicators are unbiased and useless at pilot length: a breach is a 5% event,
+so a day of 200 addresses carries about ten of them, and ten events cannot
+resolve a correlation. At 14 days the estimate has sd 0.117 on a true 0.20,
+and an interval with correct coverage spans roughly [0, 0.85]. Thirty days
+barely improves it.
+
+**Two standard intervals undercover, both failing low.** The day-clustered
+percentile bootstrap covers 43% at 14 days against a nominal 95%; the
+normal-theory F interval covers 66% at ICC 0.20 and 50% at 0.40. Failing low
+matters specifically: the window is sized off the *upper* end, so an interval
+whose ceiling is too low produces a window that is too short — §10's
+forbidden direction reached by arithmetic. Both were discarded. The shipped
+intervals invert the test against the validated generator and cover 92-100%.
+
+**The PIT values carry the same information and far more of it.** They exist
+for every observation, not just the 5% that breach. On the `Phi^-1(PIT)`
+scale a day's common shock is an ordinary intra-class correlation, and it is
+recovered accurately (true 0.30 → 0.3044) at roughly 2.5× the relative
+precision. `breach_icc_from_latent` maps it back through the bivariate
+orthant probability, matching the empirically realised breach ICC to within
+0.02 across latent 0.05–0.50.
+
+That map is **strongly compressive, which improves the outlook materially**:
+
+| latent ρ | breach ICC (Gaussian) |
+|---|---|
+| 0.05 | 0.012 |
+| 0.15 | 0.041 |
+| 0.30 | 0.098 |
+| 0.50 | 0.204 |
+
+The prior stated here before — "on a day BTC drops 8% nearly every levered
+address breaches at once, so ICC is well above 0.2" — conflated the two
+scales. Latent co-movement that strong is real; the *breach* ICC it implies
+is ~0.10–0.20, which per the table above needs 60–90 days, not 180. The
+copula is the assumption: the engine simulates a t-copula (§2.3), whose tail
+dependence maps higher than Gaussian at the same ρ, so `--copula t` is the
+default because between two stated assumptions §10 permits the one that
+lengthens validation.
 
 **Still a decision, now an informed one.** Three options, in the order I would
 take them:
