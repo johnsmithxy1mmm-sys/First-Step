@@ -39,6 +39,7 @@ from typing import Any
 
 import numpy as np
 
+from risk_engine.domain.types import normalise_address
 from risk_engine.market.info import InfoClient
 from risk_engine.market.parse import (
     parse_candles_to_log_returns,
@@ -366,7 +367,19 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     coins = [c.strip().upper() for c in args.coins.split(",") if c.strip()]
-    checks = run_all(args.address, coins, args.days, args.samples,
+    # The address gets the same treatment as the coins on the line above. It
+    # is normalised again inside `InfoClient`, so this is not about what
+    # reaches the venue -- it is about *where the operator hears about it*: an
+    # unnormalisable address surfaces from `run_all` as E5.3 FAIL, which in
+    # this tool's vocabulary means the live API contradicted a documented
+    # shape. A typo must not be reportable as evidence about the venue.
+    address: str | None = None
+    if args.address:
+        try:
+            address = normalise_address(args.address)
+        except ValueError as exc:
+            parser.error(str(exc))
+    checks = run_all(address, coins, args.days, args.samples,
                      args.interval_s, args.testnet)
 
     print(f"live-API verification against {'testnet' if args.testnet else 'mainnet'}\n")

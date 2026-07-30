@@ -54,6 +54,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 
+from risk_engine.domain.types import normalise_address
 from risk_engine.market.info import MAINNET_URL, TESTNET_URL, InfoClient
 
 #: Funding is charged on the hour. Sample a little after so the venue has
@@ -311,7 +312,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--report", help="write the full observation as JSON")
     args = parser.parse_args(argv)
 
-    result = probe(args.address, testnet=args.testnet, wait=args.wait,
+    # Refused as a usage error, before the hour-long wait starts. `InfoClient`
+    # would catch it anyway, but this probe's own verdict for an address it
+    # cannot read is "holds no isolated position, UNCHECKABLE" -- which is
+    # indistinguishable from a genuinely flat account, and is the answer the
+    # operator would otherwise get back after waiting for a funding tick.
+    try:
+        address = normalise_address(args.address)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    result = probe(address, testnet=args.testnet, wait=args.wait,
                    max_wait_s=args.max_wait_minutes * 60.0)
     print(result.render())
 

@@ -69,6 +69,13 @@ list is biased somehow (OPEN-QUESTIONS B4), and a calibration score is
 uninterpretable without knowing what it is a sample of. `FileAddressSource`
 refuses a list that omits it rather than defaulting to something plausible.
 
+Each address is `0x` plus 40 hex digits, in any case — paste the checksummed
+form a block explorer shows you. `normalise_address` (in `domain/types.py`)
+folds it to lowercase at the Info client and again at the journal write, so
+one account cannot acquire two identities and inflate the §3.3 address count;
+anything that is not an address is refused when the list loads, with its
+index, rather than part-way through a sweep that has already spent weight.
+
 ### Before the shadow clock starts
 
 Changing the distribution resets the counter (§3.3, §10), so any question

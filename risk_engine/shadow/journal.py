@@ -29,6 +29,7 @@ from typing import Any
 
 import numpy as np
 
+from risk_engine.domain.types import normalise_address
 from risk_engine.shadow.backends import Backend, canonical_ddl, open_backend, sqlite_ddl
 from risk_engine.sim.stats import PredictiveDistribution
 
@@ -161,6 +162,25 @@ class CalibrationJournal:
         distribution: PredictiveDistribution,
         book_snapshot: dict,
     ) -> int:
+        # One account, one identity, enforced at the only place the journal is
+        # written. `address` is stored as TEXT and compared byte-for-byte by
+        # both backends -- there is no COLLATE anywhere in schema.sql, and
+        # neither Postgres's default collation nor SQLite's BINARY folds case
+        # -- so the UNIQUE constraint on (address, variant, predicted_at,
+        # distribution_version) does not see two spellings of one account as a
+        # duplicate at all. It would accept both and call them independent
+        # predictions of different accounts.
+        #
+        # Canonicalising here rather than in the sweep is the point: a
+        # backfill, a one-off StaticAddressSource run and a future writer all
+        # come through this method, and any of them could otherwise write the
+        # second identity. Nothing can correct it afterwards, because
+        # predictions are never updated (§3.4, audit A-09).
+        #
+        # Read paths deliberately do not normalise: they hand back the bytes
+        # that are actually stored, so rows written before this check existed
+        # stay visible as themselves instead of being silently papered over.
+        address = normalise_address(address)
         resolves_at = predicted_at.timestamp() + horizon_hours * 3600
         # RETURNING on both backends. SQLite has supported it since 3.35 and
         # ships far newer with every Python this targets, so the id comes

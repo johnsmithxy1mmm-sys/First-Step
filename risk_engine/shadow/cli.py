@@ -71,8 +71,14 @@ def _fixture_world():
                 Position(coin, side * notional / spot[coin], spot[coin],
                          MarginMode.CROSS, 20.0)
             )
-        books[f"0xfixture{i:03d}"] = Book(
-            f"0xfixture{i:03d}", equity, tuple(positions), now - timedelta(seconds=5)
+        # A well-formed address, because the journal now canonicalises what it
+        # stores and would refuse a readable stub like "0xfixture000". That is
+        # the right way round: a fixture run that skipped the address
+        # discipline of the live path would not be exercising the live path.
+        # "facade" is legal hex and says what these are.
+        address = f"0xfacade{i:034x}"  # 6 + 34 = the required 40 hex digits
+        books[address] = Book(
+            address, equity, tuple(positions), now - timedelta(seconds=5)
         )
 
     class FixtureProvider:
@@ -299,6 +305,14 @@ def cmd_frame(args) -> int:
                     "the published calibration score. See OPEN-QUESTIONS B4."
                 ),
                 "addresses": [],
+                "_addresses_help": (
+                    "Each entry is 0x followed by 40 hex digits. Case does not "
+                    "matter -- paste the checksummed form a block explorer shows "
+                    "you; it is folded to lowercase so one account cannot end up "
+                    "in the journal twice under two spellings. Anything else is "
+                    "refused when the list loads, with its index, rather than "
+                    "part-way through a sweep."
+                ),
             },
             indent=2,
         )

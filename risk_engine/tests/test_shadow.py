@@ -32,6 +32,18 @@ from risk_engine.version import DISTRIBUTION_VERSION
 
 SCHEMA_SQL = Path(__file__).resolve().parents[1] / "shadow" / "schema.sql"
 
+# Well-formed account addresses. The journal canonicalises what it writes
+# (`normalise_address`), so a readable stub like "0xaaa" is refused at the
+# write -- which is the point of these being real: the fixtures exercise the
+# identity rules production runs under rather than a laxer variant of them.
+ADDR_A = "0x" + "a" * 40
+ADDR_B = "0x" + "b" * 40
+ADDR_FLAT = "0x" + "d" * 40
+
+
+def addr(i: int) -> str:
+    return f"0x{i:040x}"
+
 
 class FakeProvider:
     """Stands in for the Info API; the cron and resolver see only this."""
@@ -65,12 +77,12 @@ class FakeProvider:
 @pytest.fixture
 def books(now):
     return {
-        "0xaaa": Book("0xaaa", 100_000.0,
-                      (Position("BTC", 5.0, 100_000.0, MarginMode.CROSS, 20.0),), now),
-        "0xbbb": Book("0xbbb", 50_000.0,
-                      (Position("ETH", 60.0, 4_000.0, MarginMode.CROSS, 10.0),
-                       Position("SOL", 1_000.0, 200.0, MarginMode.ISOLATED, 10.0, 20_000.0)),
-                      now),
+        ADDR_A: Book(ADDR_A, 100_000.0,
+                     (Position("BTC", 5.0, 100_000.0, MarginMode.CROSS, 20.0),), now),
+        ADDR_B: Book(ADDR_B, 50_000.0,
+                     (Position("ETH", 60.0, 4_000.0, MarginMode.CROSS, 10.0),
+                      Position("SOL", 1_000.0, 200.0, MarginMode.ISOLATED, 10.0, 20_000.0)),
+                     now),
     }
 
 
@@ -121,7 +133,7 @@ class TestJournalSchema:
         journal = CalibrationJournal()
         dist = PredictiveDistribution.from_samples(np.linspace(-100, 100, 1001))
         args = dict(
-            address="0xa", variant=VARIANT_MODEL, predicted_at=now, horizon_hours=24,
+            address=ADDR_A, variant=VARIANT_MODEL, predicted_at=now, horizon_hours=24,
             model_version="v", distribution_version="0.1", seed=1, n_paths=10,
             converged=True, start_equity=1000.0, p_liq=0.1, p_liq_ci=(0.05, 0.15),
             var_95=50.0, cvar_95=70.0, distribution=dist, book_snapshot={},
@@ -154,12 +166,12 @@ class TestShadowSweep:
         self, bundle, specs, spot, books, naive, now
     ):
         broken = dict(books)
-        broken["0xdead"] = Book("0xdead", 0.0, (), now)  # no positions
+        broken[ADDR_FLAT] = Book(ADDR_FLAT, 0.0, (), now)  # no positions
         provider = FakeProvider(broken, spot, specs)
         journal = CalibrationJournal()
         report = ShadowCron(provider, bundle, journal, naive, n_paths=1_000).run_once(now)
         assert report.written == 2
-        assert [a for a, _ in report.skipped] == ["0xdead"]
+        assert [a for a, _ in report.skipped] == [ADDR_FLAT]
         journal.close()
 
     def test_yields_to_live_users_when_the_budget_runs_out(
@@ -226,23 +238,23 @@ class TestResolve:
         journal = CalibrationJournal()
         deposit = 500_000.0
         after = {
-            "0xaaa": Book("0xaaa", books["0xaaa"].cross_collateral + deposit,
-                          books["0xaaa"].positions, now)
+            ADDR_A: Book(ADDR_A, books[ADDR_A].cross_collateral + deposit,
+                         books[ADDR_A].positions, now)
         }
         provider = FakeProvider(books, spot, specs, later_books=after,
-                                flows={"0xaaa": deposit})
+                                flows={ADDR_A: deposit})
         ShadowCron(provider, bundle, journal, naive, n_paths=1_000).run_once(now)
         later = now + timedelta(hours=24)
         provider.phase = "after"
         resolve_due(journal, provider, later)
 
         rows = {r["address"]: r for r in journal.scored(DISTRIBUTION_VERSION, VARIANT_MODEL)}
-        assert rows["0xaaa"]["external_flow_usd"] == deposit
-        assert rows["0xaaa"]["actual_equity"] == pytest.approx(
-            rows["0xaaa"]["actual_equity_change"] + deposit + 100_000.0
+        assert rows[ADDR_A]["external_flow_usd"] == deposit
+        assert rows[ADDR_A]["actual_equity"] == pytest.approx(
+            rows[ADDR_A]["actual_equity_change"] + deposit + 100_000.0
         )
         # Prices did not move in the fake, so all that is left is ~zero.
-        assert abs(rows["0xaaa"]["actual_equity_change"]) < 1.0
+        assert abs(rows[ADDR_A]["actual_equity_change"]) < 1.0
         assert load_cohort(journal, DISTRIBUTION_VERSION, VARIANT_MODEL, COHORT_ALL).n == 2
         journal.close()
 
@@ -250,8 +262,8 @@ class TestResolve:
         self, bundle, specs, spot, books, naive, now
     ):
         after = {
-            "0xaaa": Book("0xaaa", 100_000.0,
-                          (Position("BTC", 1.0, 100_000.0, MarginMode.CROSS, 20.0),), now)
+            ADDR_A: Book(ADDR_A, 100_000.0,
+                         (Position("BTC", 1.0, 100_000.0, MarginMode.CROSS, 20.0),), now)
         }
         provider = FakeProvider(books, spot, specs, later_books=after)
         journal = CalibrationJournal()
@@ -260,8 +272,8 @@ class TestResolve:
         resolve_due(journal, provider, now + timedelta(hours=24))
 
         rows = {r["address"]: r for r in journal.scored(DISTRIBUTION_VERSION, VARIANT_MODEL)}
-        assert rows["0xaaa"]["book_changed"]
-        assert not rows["0xbbb"]["book_changed"]
+        assert rows[ADDR_A]["book_changed"]
+        assert not rows[ADDR_B]["book_changed"]
         unchanged = load_cohort(
             journal, DISTRIBUTION_VERSION, VARIANT_MODEL, COHORT_BOOK_UNCHANGED
         )
@@ -301,7 +313,7 @@ class TestCalibrationMetrics:
                     (VARIANT_BASELINE_B, wrong),
                 ):
                     pid = journal.record_prediction(
-                        address=f"0x{i:03d}", variant=variant, predicted_at=when,
+                        address=addr(i), variant=variant, predicted_at=when,
                         horizon_hours=24, model_version="v", distribution_version="test",
                         seed=1, n_paths=100, converged=True, start_equity=100_000.0,
                         p_liq=0.01, p_liq_ci=(0.005, 0.02),
@@ -379,7 +391,7 @@ class TestBaselines:
     def test_naive_baseline_has_no_correlation_structure(
         self, specs, spot, books, naive
     ):
-        pred = naive.predict(books["0xbbb"], spot, specs, n_draws=5_000, seed=1)
+        pred = naive.predict(books[ADDR_B], spot, specs, n_draws=5_000, seed=1)
         assert pred.start_equity > 0
         assert 0.0 <= pred.p_liq <= 1.0
         assert pred.equity_change.quantile(0.99) > pred.equity_change.quantile(0.01)
@@ -389,7 +401,7 @@ class TestBaselines:
     ):
         from risk_engine.validation.baselines import run_baseline_b
 
-        out = run_baseline_b(bundle, specs, books["0xbbb"], spot, 24,
+        out = run_baseline_b(bundle, specs, books[ADDR_B], spot, 24,
                              n_paths=4_000, seed=2, now=now)
         assert out.provenance.model_version == bundle.model_version
         assert out.p_liq_any.ci_low <= out.p_liq_any.point <= out.p_liq_any.ci_high
@@ -468,7 +480,7 @@ class TestOutcomeImmutability:
         journal = CalibrationJournal()
         dist = PredictiveDistribution.from_samples(np.linspace(-100, 100, 1001))
         pid = journal.record_prediction(
-            address="0xa", variant=VARIANT_MODEL, predicted_at=now, horizon_hours=24,
+            address=ADDR_A, variant=VARIANT_MODEL, predicted_at=now, horizon_hours=24,
             model_version="v", distribution_version="0.1", seed=1, n_paths=10,
             converged=True, start_equity=1000.0, p_liq=0.1, p_liq_ci=(0.05, 0.15),
             var_95=50.0, cvar_95=70.0, distribution=dist, book_snapshot={},

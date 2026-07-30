@@ -16,6 +16,18 @@ from risk_engine.sim.stats import PredictiveDistribution
 from risk_engine.tools.funding_drag import funding_drag
 
 
+def addr(i: int) -> str:
+    """A distinct well-formed account address per index.
+
+    The journal canonicalises what it writes, so a stub like "0x000" is
+    refused at the write. Champion/challenger pairs its two versions on
+    `(address, observation_day)`, so both `_fill` runs have to derive their
+    addresses the same way -- which is exactly the property that broke when
+    one source spelled an account differently from another.
+    """
+    return f"0x{i:040x}"
+
+
 def long_book(now):
     return Book(
         "0xuser", 200_000.0,
@@ -152,7 +164,7 @@ class TestChampionChallenger:
             shock = rng.normal(0, 1.0)  # one market move shared by the day
             for i in range(per_day):
                 pid = journal.record_prediction(
-                    address=f"0x{i:03d}", variant=VARIANT_MODEL, predicted_at=when,
+                    address=addr(i), variant=VARIANT_MODEL, predicted_at=when,
                     horizon_hours=24, model_version=version, distribution_version=version,
                     seed=1, n_paths=100, converged=True, start_equity=100_000.0,
                     p_liq=0.01, p_liq_ci=(0.0, 0.02), var_95=100.0, cvar_95=200.0,

@@ -36,7 +36,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol
 
-from risk_engine.domain.types import AssetSpec, Book
+from risk_engine.domain.types import AssetSpec, Book, normalise_address
 from risk_engine.market.info import InfoClient, WeightBudget
 from risk_engine.market.parse import parse_clearinghouse_state, parse_meta
 
@@ -47,6 +47,12 @@ class AddressSource(Protocol):
     `frame` is mandatory and is written into every run's provenance. A
     calibration score whose sampling frame is unstated is not a calibration
     score, it is a number.
+
+    `addresses` returns canonical addresses (`normalise_address`), deduped.
+    Stating it in the Protocol is what stops two implementations from
+    disagreeing about it: they feed the same journal, and an account that
+    arrives lowercase from one source and checksummed from another becomes two
+    permanent identities in it.
     """
 
     @property
@@ -86,9 +92,22 @@ class FileAddressSource:
 
     def addresses(self) -> list[str]:
         payload = self._load()
+        # Canonical form as the dedup key: an operator who lists one account
+        # twice -- once lowercase, once EIP-55 as a block explorer shows it --
+        # gets one address, not two identities in the journal.
+        #
+        # Load time is the right place to refuse a malformed entry. The sweep
+        # charges §5.3 weight per address before it fetches anything and
+        # swallows per-address failures into `skipped` (cron.py), so a typo
+        # caught here costs nothing and is reported with its index, while the
+        # same typo caught downstream costs budget and reads as one more
+        # uninteresting skip line.
         seen: dict[str, None] = {}
-        for a in payload["addresses"]:
-            seen.setdefault(str(a).lower(), None)
+        for i, a in enumerate(payload["addresses"]):
+            try:
+                seen.setdefault(normalise_address(a), None)
+            except ValueError as exc:
+                raise ValueError(f"{self.path}: addresses[{i}]: {exc}") from exc
         return list(seen)
 
 
@@ -106,7 +125,16 @@ class StaticAddressSource:
         return self._frame
 
     def addresses(self) -> list[str]:
-        return list(self._addresses)
+        # Canonicalised and deduped exactly as `FileAddressSource` does. The
+        # two used to disagree, and that asymmetry was the realistic way one
+        # account acquired a second identity: this class is documented for
+        # one-off runs, a one-off run writes to the same permanent journal as
+        # the cron, and the address an operator has to hand for a one-off run
+        # is the checksummed one they just copied out of a block explorer.
+        seen: dict[str, None] = {}
+        for a in self._addresses:
+            seen.setdefault(normalise_address(a), None)
+        return list(seen)
 
 
 class LiveSnapshotProvider:
@@ -169,6 +197,12 @@ class LiveSnapshotProvider:
         return dict(out)
 
     def book(self, address: str) -> Book:
+        # Normalised once here so the request and the Book carry the same
+        # string. `parse_clearinghouse_state` echoes the address it is handed
+        # into `Book.address` and reads none from the response, so taking the
+        # raw argument would put the canonical spelling on the wire and a
+        # different one on the book the cron then journals.
+        address = normalise_address(address)
         state = self.client.clearinghouse_state(address)
         return parse_clearinghouse_state(state, address, datetime.now(timezone.utc))
 

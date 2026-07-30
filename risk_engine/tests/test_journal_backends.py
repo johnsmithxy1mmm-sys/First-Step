@@ -26,6 +26,17 @@ NOW = datetime(2026, 7, 29, 12, tzinfo=timezone.utc)
 DSN = os.environ.get("HL_TEST_POSTGRES_DSN")
 
 
+def addr(i: int) -> str:
+    """A distinct well-formed account address per index.
+
+    The journal canonicalises what it writes (`normalise_address`), so a
+    readable stub like "0xa" is refused at the write. Real 40-hex addresses
+    here also mean these tests exercise the same identity rules production
+    does, rather than a laxer variant of them.
+    """
+    return f"0x{i:040x}"
+
+
 def _fresh(target: str) -> CalibrationJournal:
     journal = CalibrationJournal(target)
     if journal.is_postgres:
@@ -52,7 +63,7 @@ def _distribution() -> PredictiveDistribution:
     return PredictiveDistribution.from_samples(np.linspace(-1000.0, 1000.0, 5_000))
 
 
-def _write_prediction(journal: CalibrationJournal, address: str = "0xa") -> int:
+def _write_prediction(journal: CalibrationJournal, address: str = addr(0)) -> int:
     return journal.record_prediction(
         address=address, variant=VARIANT_MODEL, predicted_at=NOW, horizon_hours=24,
         model_version="0.2.1", distribution_version="0.2", seed=7, n_paths=20_000,
@@ -128,7 +139,7 @@ class TestBackendParity:
     def test_progress_counts_days_and_addresses(self, journal):
         for i in range(3):
             pid = journal.record_prediction(
-                address=f"0x{i}", variant=VARIANT_MODEL, predicted_at=NOW,
+                address=addr(i), variant=VARIANT_MODEL, predicted_at=NOW,
                 horizon_hours=24, model_version="0.2.1", distribution_version="0.2",
                 seed=i, n_paths=100, converged=True, start_equity=1_000.0, p_liq=0.1,
                 p_liq_ci=(0.05, 0.15), var_95=10.0, cvar_95=20.0,
@@ -157,7 +168,7 @@ class TestBatchResilience:
     does not, unless the backend rolls back. SQLite never showed this."""
 
     def test_a_failed_row_does_not_poison_the_rest_of_the_batch(self, journal):
-        ids = [_write_prediction(journal, f"0x{i}") for i in range(3)]
+        ids = [_write_prediction(journal, addr(i)) for i in range(3)]
         _write_outcome(journal, ids[0])
         with pytest.raises(Exception):
             _write_outcome(journal, ids[0])

@@ -85,7 +85,10 @@ C1, C2 and C5 no longer block — all three were closed against live data.
 
 Live runs also need `deploy/addresses.json` filled in — both the list and the
 `frame` field describing what it is a sample *of*. `FileAddressSource`
-refuses a list without one (OPEN-QUESTIONS B4).
+refuses a list without one (OPEN-QUESTIONS B4). Each address is `0x` plus 40
+hex digits in any case; the checksummed form from a block explorer is fine, it
+is folded to lowercase so one account cannot be journalled twice under two
+spellings. A malformed entry fails the load, naming its index.
 
 The resolver runs hourly against a daily snapshot. That is not a mistake:
 a prediction resolves 24 h after it was made, and a resolution collected

@@ -1,6 +1,6 @@
 """Value types shared by every layer of the engine.
 
-Two of these carry design intent rather than just data:
+Three of these carry design intent rather than just data:
 
 `RiskEstimate` cannot be constructed without an interval. §4 requires that
 returning a point estimate alone be *impossible*, not merely discouraged, so
@@ -8,6 +8,12 @@ the interval is positional and validated in `__post_init__`.
 
 `AssetSpec` owns the margin-tier table (§1.3). The table comes from the
 `meta` endpoint; nothing in this package hardcodes a maintenance margin rate.
+
+`normalise_address` is the single definition of what an account address is.
+It lives here, in the layer both the Info client and the calibration journal
+already sit above, because an address is a domain identity rather than a
+detail of either the transport or the storage -- and because a copy in each
+of them would be two definitions that could drift.
 """
 
 from __future__ import annotations
@@ -19,6 +25,87 @@ from enum import Enum
 from itertools import pairwise
 
 import numpy as np
+
+#: An account is 20 bytes, written as `0x` plus exactly 40 hex digits.
+ADDRESS_HEX_DIGITS = 40
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+
+def normalise_address(value: object) -> str:
+    """The one canonical spelling of an account address: `0x` + 40 lowercase hex.
+
+    Every address in this system ends up in one of two places -- the `user`
+    field of an Info request, or the `address` column of the calibration
+    journal -- and both punish a spelling difference silently rather than
+    loudly. That is why this is a boundary that raises, not a convenience:
+
+      - the venue answers an address it does not recognise with a well-formed
+        *empty* state (§5.1), so a typo does not fail. It reads as "this
+        account holds no positions", which for a risk tool is the most
+        dangerous possible failure;
+      - journal rows are written once and never updated (audit A-09), so
+        anything written is permanent. `progress()` counts
+        `DISTINCT address` towards §3.3's 200-account gate, `load_cohort`
+        makes one row per address-day, and champion/challenger pairs runs on
+        `(address, observation_day)`. One account admitted under two
+        spellings therefore counts twice towards the gate, contributes the
+        same realised outcome twice to the cohort, and can break the pairing
+        the migration decision depends on -- unfixably, since the rows cannot
+        be edited afterwards.
+
+    Case is *folded*, not checked. An EIP-55 checksummed address -- what every
+    block explorer displays, and so what an operator pastes -- is accepted and
+    returns identical to its all-lowercase form, because the account is the 20
+    bytes and the mixed case is only a checksum written over them. Verifying
+    that checksum here would either reject the perfectly legal all-lowercase
+    spelling or need keccak in a module that needs none, and would buy a
+    refusal to measure a real account's risk.
+
+    Whitespace is refused rather than stripped. An address list is
+    hand-edited, so a stray tab or newline is a mistake worth showing the
+    operator, and trimming it silently would make two entries that look
+    different behave the same -- the same class of confusion this function
+    exists to remove.
+
+    Every rejection names the specific defect. A single regex would be
+    shorter, but "invalid address" is not enough to fix a 42-character string
+    by eye, and the operator holding a wrong address is exactly the person
+    §5.1's empty-state footgun is waiting for.
+    """
+    if value is None:
+        raise ValueError(
+            "address is required, got None; expected 0x followed by "
+            f"{ADDRESS_HEX_DIGITS} hex digits"
+        )
+    if not isinstance(value, str):
+        raise ValueError(
+            f"address must be a string, got {type(value).__name__}: {value!r}"
+        )
+    if not value:
+        raise ValueError(
+            f"address is empty; expected 0x followed by {ADDRESS_HEX_DIGITS} hex digits"
+        )
+    if any(ch.isspace() for ch in value):
+        raise ValueError(
+            f"address must not contain whitespace, got {value!r}; "
+            "remove the surrounding spaces or newline rather than relying on a trim"
+        )
+    if value[:2] not in ("0x", "0X"):
+        raise ValueError(
+            f"address must start with '0x', got {value!r}"
+        )
+    digits = value[2:]
+    if len(digits) != ADDRESS_HEX_DIGITS:
+        raise ValueError(
+            f"address must have exactly {ADDRESS_HEX_DIGITS} hex digits after '0x', "
+            f"got {len(digits)} in {value!r}"
+        )
+    if unexpected := sorted(set(digits) - _HEX_DIGITS):
+        raise ValueError(
+            f"address must be hexadecimal after '0x', got {value!r} "
+            f"containing {unexpected}"
+        )
+    return "0x" + digits.lower()
 
 
 class MarginMode(str, Enum):
