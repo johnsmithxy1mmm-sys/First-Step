@@ -53,13 +53,63 @@ def normalise_address(value: object) -> str:
         the migration decision depends on -- unfixably, since the rows cannot
         be edited afterwards.
 
+    **This prevents the split; it cannot heal one, and it is sound only
+    because the journal is greenfield.** Normalising at the write makes every
+    row written from now on canonical. It does nothing for a journal that
+    already holds a non-canonical row, and the two mix: one real account
+    written checksummed before this existed and lowercase after it reads back
+    as two accounts, `progress().distinct_addresses == 2` for one account --
+    the §3.3 gate inflation this function exists to prevent, arrived at from
+    the other side. Reproduced, not inferred. There is no detection query and
+    no backfill, deliberately: the blast radius today is empty, because the
+    shadow counter has not started and no journal database exists anywhere,
+    so there is no row to find and nothing to migrate. That emptiness is the
+    precondition the fix rests on, and it expires the moment the first sweep
+    writes. If a journal is ever restored from before 2026-07-30, or a writer
+    is ever added that bypasses `record_prediction`, this paragraph stops
+    being true, and the thing to write first is the query the `address` column
+    cannot express by itself: group on `LOWER(address)` and report every group
+    holding more than one distinct spelling.
+
     Case is *folded*, not checked. An EIP-55 checksummed address -- what every
     block explorer displays, and so what an operator pastes -- is accepted and
     returns identical to its all-lowercase form, because the account is the 20
-    bytes and the mixed case is only a checksum written over them. Verifying
-    that checksum here would either reject the perfectly legal all-lowercase
-    spelling or need keccak in a module that needs none, and would buy a
-    refusal to measure a real account's risk.
+    bytes and the mixed case is only a checksum written over them.
+
+    The reason for not verifying that checksum is the dependency, and only the
+    dependency. An earlier version of this docstring said verification would
+    mean "either rejecting the perfectly legal all-lowercase spelling or
+    refusing to measure a real account over a mis-transcribed capital". The
+    first horn is not real and stating it made the choice look forced when it
+    is a trade: EIP-55 defines the checksum as a *case* pattern, so a string
+    that is entirely lowercase or entirely uppercase carries no checksum
+    information at all and every implementation accepts it unverified. Only a
+    MIXED-case string is checkable. Verifying would therefore have rejected no
+    legal spelling -- it would have caught a mistyped capital in exactly the
+    checksummed paste this docstring cites as the motivating path, for free.
+
+    What it costs is the keccak-256 the checksum is defined over, which the
+    standard library does not have. `hashlib` ships NIST SHA-3; `sha3_256` is
+    NOT keccak-256 (they differ in the domain-separation padding byte and give
+    unrelated digests), so it cannot be substituted, and no amount of care
+    makes it work. The two available routes are a third-party package
+    (`pycryptodome`, `eth-utils`, `web3`) in a codebase whose core
+    dependencies are numpy and scipy, or hand-rolling the Keccak permutation
+    here -- an unreviewed crypto primitive inside the module that defines
+    account identity. Neither is worth a typo class a checksummed paste catches
+    and a lowercase paste never could, so the checksum is skipped knowingly.
+
+    That leaves a real, unclosed gap, recorded rather than implied: a wrong
+    hex digit in an otherwise valid address is caught by nothing here. Swap
+    the last digit of `0x...beaed` for `0x...beaec` and the result is still 40
+    hex digits, still a well-formed address, and still a *different real
+    account* -- one the venue will answer with the well-formed empty state of
+    §5.1, which reads downstream as "this account holds no positions". EIP-55
+    could not have caught that one either if the string were lowercase, since
+    a lowercase string carries no checksum; it would have caught it only in
+    the mixed-case spelling. The defence against the lowercase case is not in
+    this function and does not exist: it is an operator reading a plausible
+    zero-risk answer and disbelieving it.
 
     Whitespace is refused rather than stripped. An address list is
     hand-edited, so a stray tab or newline is a mistake worth showing the

@@ -29,6 +29,17 @@ horizon, which is why the default is a day: over 24h it is small beside the
 estimation error on the rate itself, over a week it is not. The independence
 is stated on every result rather than buried, because a user planning a long
 hold is exactly who it misleads.
+
+That last sentence used to be read as "so the user has been told", and it is
+not: `caveats` travels with a `FundingDrag`, and no shipped code path builds
+one -- the service serves /portfolio_risk and /pre_trade_delta, and the shadow
+cron calls the engine directly. The funding figure a user sees comes from
+`portfolio_risk.result_24h.funding_cost`, a type with no caveats field. The
+user-facing half of A8's disclosure therefore lives on the funding panel in
+apps/web/app/page.tsx and on the `funding_cost_24h` field in client.ts and
+contract.ts; this tuple discloses to a *caller*, which is a different audience.
+Anyone adding a route that returns a FundingDrag has to carry `caveats` onto
+the wire, because from that point the caller and the user are the same person.
 """
 
 from __future__ import annotations
@@ -74,7 +85,13 @@ class FundingDrag:
     share_of_equity: PredictiveDistribution
     start_equity: float
     provenance: SimulationProvenance
-    #: OPEN-QUESTIONS A8, restated on every result rather than in a footnote.
+    #: OPEN-QUESTIONS A8, attached to every `FundingDrag` this module returns
+    #: rather than left in a footnote. Note the scope precisely: that is every
+    #: result a CALLER of this function gets, and no shipped code path calls
+    #: it, so this string reaches nobody outside Python. The user-facing half
+    #: of the A8 disclosure lives in the funding panel copy and on the
+    #: `funding_cost_24h` field comments; a future route that returns a
+    #: `FundingDrag` has to carry these onto the wire itself.
     #: The horizon clause is not padding: the default is now 24h but a week is
     #: still reachable by explicit argument, so one static string is attached
     #: to results at horizons whose bias magnitudes differ. A caveat that named

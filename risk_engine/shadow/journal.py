@@ -180,6 +180,19 @@ class CalibrationJournal:
         # Read paths deliberately do not normalise: they hand back the bytes
         # that are actually stored, so rows written before this check existed
         # stay visible as themselves instead of being silently papered over.
+        #
+        # Which is the limit of what this achieves, and the limit is only
+        # harmless because the journal is greenfield. A row already written
+        # non-canonically is not repaired by anything here, and a journal
+        # holding one spelling from before this check and the other from after
+        # returns `distinct_addresses == 2` for a single real account -- §3.3's
+        # gate inflated by exactly the mechanism this line prevents (measured
+        # against an in-memory journal, not argued). There is no detection
+        # query and no backfill because there is nothing yet to detect: the
+        # shadow counter has not started and no journal database exists. That
+        # is a precondition with an expiry date, not a property of the design;
+        # see `normalise_address` in domain/types.py for what to write first if
+        # a pre-2026-07-30 journal ever turns up.
         address = normalise_address(address)
         resolves_at = predicted_at.timestamp() + horizon_hours * 3600
         # RETURNING on both backends. SQLite has supported it since 3.35 and

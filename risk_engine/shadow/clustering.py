@@ -9,11 +9,18 @@ invent it — it is a property of how the market moves, and it takes data.
 
 **A pilot for this does not burn the §3.3 counter.** Changing the
 distribution resets the validation window (§3.3, §10), which is why the real
-counter must not start until A1, A8, C1, C2 and C5 are settled. This is
-different: what makes two addresses breach together on one day is the common
-market move, not the model version. A new version shifts the VaR levels; it
-does not change whether BTC fell 8% that day. The estimate survives a version
-change to first order, so a fortnight spent measuring it is not thrown away.
+counter must not start until every distribution-affecting question is settled.
+That list is maintained in one place — "Before the shadow clock starts" in
+`risk_engine/README.md` — and as of 2026-07-30 it is empty. Naming its members
+here instead is what this paragraph used to do, and it went stale the day A1
+and A8 were decided: a copy of a list is a second thing to update, and the
+reader who follows a stale copy concludes the clock is still blocked when it
+is not. This is different: what makes two addresses breach together on one day
+is the common market move, not the model version. A new version shifts the VaR
+levels; it does not change whether BTC fell 8% that day. The estimate survives
+a version change to first order, so a fortnight spent measuring it is not
+thrown away — which is why this pilot was always runnable ahead of that list
+emptying, and remains worth running now that it has.
 
 ## Why this does not estimate the breach ICC directly
 

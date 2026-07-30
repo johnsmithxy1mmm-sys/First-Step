@@ -240,17 +240,48 @@ export default function Page() {
               <p className="text-xs text-neutral-500 tabular-nums">
                 5th–95th percentile {usd(v.funding_cost_24h.p05)} – {usd(v.funding_cost_24h.p95)}
               </p>
-              {/* The figure above is 24h (funding_cost_24h), so the copy has to
-                  justify 24h. It previously justified it with what funding does
-                  "over a week", which is a longer horizon than anything on this
-                  screen reports and reads as a claim about the number shown.
-                  Funding is also simulated independently of price, and that
-                  approximation degrades with the horizon (OPEN-QUESTIONS A8) --
-                  the reason the engine's own default is a day. */}
               <p className="text-xs leading-relaxed text-neutral-400">
                 Charged hourly and simulated on every step of every path, because a cost
                 that accrues every hour erodes collateral without ever showing up as a
                 loss.
+              </p>
+              {/* This paragraph is the ONLY place OPEN-QUESTIONS A8's independence
+                  caveat reaches a user, which is why it is rendered rather than
+                  left in a comment. `funding_drag` states it on every result via
+                  `FundingDrag.caveats`, but nothing shipped constructs a
+                  FundingDrag: the engine serves /portfolio_risk and
+                  /pre_trade_delta, and the number above comes from
+                  portfolio_risk's `result_24h.funding_cost` — `PortfolioRisk` has
+                  no caveats field, the JSON has no caveats key, and neither
+                  contract.ts nor client.ts carries one. A disclosure that lives
+                  only in a Python dataclass no route builds has zero readers.
+
+                  The note this replaces claimed the deleted "over a week" copy
+                  named "a longer horizon than anything on this screen reports".
+                  That was false: the Portfolio risk panel renders p_liq_7d under
+                  "Within 7 days", so a week is precisely a horizon this screen
+                  reports. Deleting that copy removed the screen's only visible
+                  mention of a longer hold and left wording that named no horizon
+                  at all — an understatement, not a fix for one. Measured on the
+                  fitted fixtures: at $200k equity the week median is $1,690
+                  against $241 at 24h, so ~$1,450 (0.7% of equity) is missing
+                  from a week-holder's plan; the demo book rendered here shows
+                  the same gap ($173 at 24h, $1,197 over a week). §10 forbids
+                  exactly that direction of error.
+
+                  "Roughly" and "about" are load-bearing in the copy below: the
+                  measured week/day ratio is 6.95–7.01×, not exactly 7, because
+                  liquidation truncates the cash flow on paths that die inside
+                  the week. Scaling any of the three published figures by 7
+                  therefore lands slightly high on the week rather than low —
+                  the side §10 permits. */}
+              <p className="text-xs leading-relaxed text-neutral-400">
+                This covers the next 24 hours only. Funding accrues hourly, so a longer
+                hold scales roughly with time — about 7× this figure over a week, the
+                horizon this screen&apos;s liquidation probability also covers. Funding
+                rates are simulated independently of price moves, an approximation that
+                holds better over a day than over a week, so read a week-long figure as
+                indicative rather than calibrated.
               </p>
             </div>
           )}

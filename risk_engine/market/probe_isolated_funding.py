@@ -21,7 +21,10 @@ hold an isolated position.
 
 What this cannot do is invent an address. It needs one holding at least one
 isolated position across the tick, and it says so rather than guessing when
-it does not get one.
+it does not get one. An address that is not an address gets the same
+treatment -- UNCHECKABLE, before any connection is opened. FAIL from this
+probe means §1.1's independence claim is false and the simulator is missing
+a coupling term; a typo must not be able to reach a verdict that strong.
 
 Confounds are checked rather than hoped away. A user who trades during the
 window moves both balances for reasons that have nothing to do with funding,
@@ -138,6 +141,30 @@ def probe(
     wait: bool = True,
     max_wait_s: float = 4_000.0,
 ) -> ProbeResult:
+    # Before the client exists, so no connection is opened and no §5.3 weight
+    # is charged for a request that could not be made. `main` normalises too,
+    # but this function is importable and is what the tests drive, and the
+    # vocabulary has to hold wherever it is entered from.
+    #
+    # UNCHECKABLE, not FAIL. FAIL out of this probe is the loudest verdict in
+    # the repository -- it says §1.1's independence claim is false, that an
+    # isolated position can drain the cross pool through funding, and that the
+    # simulator is missing a term; `main` maps it to exit code 2. A typo'd
+    # address must not be able to reach that verdict. Before this guard the
+    # format error surfaced as an unhandled ValueError out of the first
+    # `_snapshot`, which is not FAIL but is not a verdict either: the caller
+    # got a traceback where the type says it gets a `ProbeResult`, and a
+    # `--report` file that was never written.
+    try:
+        address = normalise_address(address)
+    except ValueError as exc:
+        return ProbeResult(
+            "UNCHECKABLE",
+            f"'{address}' is not an account address ({exc}), so nothing was "
+            "read and C5 is exactly as open as it was. This says nothing about "
+            "where the venue debits isolated funding from.",
+        )
+
     client = InfoClient(url=TESTNET_URL if testnet else MAINNET_URL)
 
     before = _snapshot(client, address)
@@ -312,11 +339,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--report", help="write the full observation as JSON")
     args = parser.parse_args(argv)
 
-    # Refused as a usage error, before the hour-long wait starts. `InfoClient`
-    # would catch it anyway, but this probe's own verdict for an address it
-    # cannot read is "holds no isolated position, UNCHECKABLE" -- which is
-    # indistinguishable from a genuinely flat account, and is the answer the
-    # operator would otherwise get back after waiting for a funding tick.
+    # Refused as a usage error here as well as inside `probe`, and the two are
+    # not redundant. `probe` returns UNCHECKABLE with the format complaint,
+    # which is the right *verdict* for a library caller and lands in
+    # `--report`; argparse gives the operator the standard usage error and a
+    # distinct exit code, so a typo at the terminal does not read as "the
+    # probe ran and could not tell", which is what an UNCHECKABLE line looks
+    # like next to the several genuine ways this probe cannot tell.
     try:
         address = normalise_address(args.address)
     except ValueError as exc:

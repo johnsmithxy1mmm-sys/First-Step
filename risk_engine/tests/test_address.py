@@ -61,13 +61,54 @@ class TestCanonicalForm:
         assert normalise_address(UPPER_PREFIX) == LOWER
         assert normalise_address(LOWER.upper()) == LOWER
 
-    def test_the_checksum_itself_is_not_verified(self):
-        """Deliberate. Verifying EIP-55 would mean either rejecting the
-        perfectly legal all-lowercase spelling or refusing to measure the risk
-        of a real account over a mis-transcribed capital -- and the venue
-        identifies the account by its bytes regardless."""
+    def test_a_broken_checksum_is_accepted_which_is_a_known_gap(self):
+        """Records a gap, not a virtue. This assertion used to be justified as
+        avoiding "either rejecting the perfectly legal all-lowercase spelling
+        or refusing to measure a real account over a mis-transcribed capital",
+        which is a false dilemma: EIP-55 is a *case* pattern, so an
+        all-lowercase or all-uppercase string carries no checksum and is
+        accepted unverified by every implementation. Only a mixed-case string
+        is checkable, and `broken_checksum` below is mixed-case -- so
+        verification would have rejected no legal spelling and would have
+        caught this exact typo on the paste path the docstring cites.
+
+        The decision to skip it stands on its real cost: EIP-55 is defined
+        over keccak-256, `hashlib` has none, `hashlib.sha3_256` is NIST SHA-3
+        and not keccak (different padding byte, unrelated digest), so the only
+        routes are a third-party dependency in a numpy+scipy package or a
+        hand-rolled Keccak permutation inside the module that defines account
+        identity. What this test pins is the *consequence* of that decision, so
+        that adding keccak later is a visible change to a recorded gap rather
+        than a silent tightening -- and so nobody re-derives the false dilemma
+        from the passing assertion.
+        """
+        # Mixed case, one capital wrong against the EIP-55 vector in
+        # CHECKSUMMED above. A verifier would reject it; this one does not.
         broken_checksum = "0x5AaEb6053f3e94c9b9a09f33669435e7ef1beaed"
+        assert any(c.isupper() for c in broken_checksum[2:])
+        assert any(c.islower() for c in broken_checksum[2:])
+        assert broken_checksum != CHECKSUMMED
         assert normalise_address(broken_checksum) == LOWER
+
+    def test_a_swapped_hex_digit_is_caught_by_nothing_at_all(self):
+        """The consequence worth stating plainly, and the one EIP-55 would not
+        have fixed either.
+
+        `...beaed` mistyped as `...beaec` is 40 valid hex digits, so every
+        check in `normalise_address` passes, and it is a *different real
+        account*. The venue answers an address it does not recognise with the
+        well-formed empty state of §5.1 -- so this typo does not fail, it
+        returns "no positions", which a risk tool renders as no risk. Nothing
+        in this codebase can catch it: a lowercase string carries no checksum
+        information, so even a keccak verifier would pass it through.
+        """
+        swapped = LOWER[:-1] + "c"
+        assert swapped != LOWER
+        assert normalise_address(swapped) == swapped
+        # Same length, same shape, both canonical -- indistinguishable to
+        # anything downstream, including the journal's identity column.
+        assert len(swapped) == len(LOWER)
+        assert normalise_address(swapped) != normalise_address(LOWER)
 
     def test_normalising_is_idempotent(self):
         """The check sits at more than one layer (client wrapper, `post`,

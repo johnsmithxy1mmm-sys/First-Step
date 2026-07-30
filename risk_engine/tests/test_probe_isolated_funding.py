@@ -85,9 +85,17 @@ def _no_network(monkeypatch):
     ))
 
 
+#: A well-formed account address. `probe` refuses anything else with its own
+#: UNCHECKABLE verdict before it constructs a client, so the fixtures have to
+#: carry a real one -- the previous "0xtest" only worked because `StubVenue`
+#: does not normalise, i.e. the tests exercised a laxer contract than the
+#: production `InfoClient`, which raises on it.
+ADDRESS = "0x" + "c" * 40
+
+
 def _run(monkeypatch, venue, **kwargs):
     monkeypatch.setattr(probe_mod, "InfoClient", lambda **kw: venue)
-    return probe("0xtest", wait=False, **kwargs)
+    return probe(ADDRESS, wait=False, **kwargs)
 
 
 class TestVerdicts:
@@ -246,6 +254,25 @@ class TestRefusals:
         assert result.status == "INCONCLUSIVE"
         assert "too small" in result.detail
 
+    def test_a_malformed_address_is_uncheckable_and_opens_no_connection(self):
+        """A local format error must not be able to produce this probe's FAIL.
+
+        FAIL here is the loudest verdict in the repository -- §1.1's
+        independence claim is false, an isolated position can drain cross
+        through funding, exit code 2 -- and a typo must not reach it. Before
+        the guard, a malformed address surfaced as an unhandled ValueError out
+        of the first snapshot: no verdict, no `--report` file, a traceback
+        where the signature promises a `ProbeResult`.
+
+        No `monkeypatch` of `InfoClient` here on purpose: the autouse
+        `_no_network` fixture makes constructing one fail the test, so passing
+        proves the refusal happens before the client exists.
+        """
+        result = probe("0xabc", wait=False)
+        assert result.status == "UNCHECKABLE"
+        assert "40 hex digits" in result.detail
+        assert result.before is None and result.after is None
+
     def test_a_missing_funding_endpoint_degrades_with_the_deltas_kept(self, monkeypatch):
         """`userFunding` is the ground truth. Without it there is no
         attribution, but the observed moves are still worth recording for a
@@ -277,6 +304,6 @@ class TestTickTiming:
         )
         monkeypatch.setattr(probe_mod, "InfoClient", lambda **kw: venue)
         monkeypatch.setattr(probe_mod, "_seconds_to_next_tick", lambda *a: 3_500.0)
-        result = probe("0xtest", wait=True, max_wait_s=60.0)
+        result = probe(ADDRESS, wait=True, max_wait_s=60.0)
         assert result.status == "UNCHECKABLE"
         assert "over the" in result.detail

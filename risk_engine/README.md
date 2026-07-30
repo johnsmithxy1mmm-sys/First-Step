@@ -37,7 +37,20 @@ python -m risk_engine.validation.cli benchmarks     # §3.1, exits non-zero on f
 python -m risk_engine.validation.cli shadow --journal shadow.db
 pytest risk_engine/tests -q                          # excludes the slow gate
 pytest risk_engine/tests/test_benchmarks.py -q       # the gate itself, ~15s
+pytest risk_engine/tests -q -m load_sensitive        # the wall-clock assertions alone
 ```
+
+`load_sensitive` marks the assertions that time the engine against §2.6's
+300 ms budget. They measure the machine as much as the code — on a four-core
+box the §9 Phase-2 budget test passes idle and misses by more than 2x with all
+four cores busy, with nothing in the engine changed — so CI runs them in a
+separate **non-blocking** step and the blocking step deselects them. They are
+not skipped and the budget is not relaxed: a local `pytest risk_engine/tests`
+runs them like anything else, and OPEN-QUESTIONS D7 remains the record that
+the budget is genuinely missed at the 5-8 positions §0 describes. If the
+advisory step goes red, read the timings in the failure message before
+concluding anything — a saturated runner and a real regression look identical
+apart from those numbers.
 
 To run the whole read-only stack, see
 [`docs/hl-risk/RUNNING.md`](../docs/hl-risk/RUNNING.md) or
@@ -75,6 +88,49 @@ folds it to lowercase at the Info client and again at the journal write, so
 one account cannot acquire two identities and inflate the §3.3 address count;
 anything that is not an address is refused when the list loads, with its
 index, rather than part-way through a sweep that has already spent weight.
+That last clause is a statement about ordering, and it is true only because
+two callers were changed to make it true: `snapshot` loads the list before it
+builds the live bundle, and `ShadowCron.run_once` reads it before it asks for
+`specs` or `spot`. Built the other way round, a one-character typo cost 40
+weight on a 1-coin universe before the file was opened.
+
+Two limits on that, both in OPEN-QUESTIONS C7 and neither obvious from the
+code. **It prevents a split identity, it cannot heal one**: normalising at the
+write makes future rows canonical and repairs nothing already written, and one
+account written checksummed before the fix and lowercase after it reads back
+as two accounts against §3.3's gate. That is harmless today only because the
+counter has not started and no journal exists anywhere — a precondition, not a
+property, and there is deliberately no detection query and no backfill.
+**And the venue-side motivation is weaker than the commit that introduced it
+claims**: an HTTP 422 on a checksummed address was seen once, the command that
+produced it was never recorded, and it has never been reproduced. The fix does
+not depend on it. It stands on §5.1's silent empty state and on the journal's
+byte-compared `address` column, both of which are properties of this codebase.
+
+**A refused list refuses the whole run, loudly.** One bad entry is not one
+skipped address: the sweep writes nothing, prints the offending index, and
+`snapshot` exits non-zero (1 — the list is caught while the world is being
+built, before the sweep starts, so it surfaces as `SystemExit` rather than
+through the sweep's own return path). That is the deliberate choice — a list
+containing
+something that is not an address is not the sampling frame its `frame` field
+describes, and sweeping the entries that happen to parse would publish a
+score against a frame nobody wrote down. It is also why the exit code
+matters: an address file does not change between days, so a run that failed
+quietly would fail again every day, and §3.3 needs 21 of them. `resolve` is
+deliberately *not* blocked by the same file — it takes its addresses from the
+journal's pending rows, and the Info API serves current state only, so
+refusing to run it would strand yesterday's predictions past their staleness
+window instead of costing a day of new ones.
+
+`resolve` retries a failed row forever; there is no attempt counter. Mostly
+that is what you want. But a row whose stored address is not an address —
+written before the journal canonicalised, and left visible because the read
+paths deliberately do not normalise — fails identically on every run and
+never clears. It is documented rather than bounded (the reasoning, and the
+two worse alternatives, are in `shadow/resolve.py`) and reported rather than
+left to look transient: such rows are counted separately as permanent, with
+the fix being a deliberate correction of the journal row.
 
 ### Collecting the address list
 
@@ -92,13 +148,24 @@ circular.
 The collector subscribes to the trades WebSocket, harvests the accounts named
 on each trade, folds them through `normalise_address`, and writes a file
 `FileAddressSource` reads directly — including a generated `frame` that states
-the window, the coins, the activity bias, and the tension that the
-book-unchanged cohort the gate is read from (B2) discards precisely the most
-active accounts this frame selects for. It stops at `--target` (default 500,
-the top of §3.3's range, because the sweep drops flat and zero-equity accounts
-before any of them count towards a 200-address gate) or when `--minutes`
-elapses, and refuses to write fewer than the gate's requirement without
-`--allow-short`. Progress prints while it runs.
+the window, the coins that actually **delivered** trades (not the ones
+`--coins` subscribed to; the difference can only overstate the sample), the
+activity bias, and the tension that the book-unchanged cohort the gate is read
+from (B2) discards precisely the most active accounts this frame selects for.
+It stops at `--target` (default 500, the top of §3.3's range, because the
+sweep drops flat and zero-equity accounts before any of them count towards a
+200-address gate) or when `--minutes` elapses, and refuses to write fewer than
+the gate's requirement without `--allow-short`. Progress prints while it runs.
+
+A refusal never throws the harvest away. A run that comes back short writes
+its addresses to `<out>.refused-<window-start>` — a loadable list whose frame
+opens by saying it was refused — because the alternative is telling an
+operator who just stood over a 30-minute window that their 199 addresses are
+in no file anywhere. Exit codes are distinct so that each one implies its own
+next move: `0` wrote it, `1` collected and refused to publish, `2` the feed
+did not match the assumed message shape, `3` no usable connection (`--ws-url`,
+DNS, TLS, refusal, or the missing package), `4` bad invocation, caught before
+anything connects.
 
 Two things to know before running it. `websockets` is **not** an engine
 dependency and is imported lazily — `pip install 'websockets>=12.0'`, and add
@@ -111,6 +178,16 @@ the collector asserts the shape while collecting and aborts with the frame
 quoted verbatim if a trade carries no address where it expects one. It will
 never write an empty list and report success — that file would load cleanly,
 sweep nothing, and show up three weeks later as a gate that never advanced.
+
+That assertion is fatal **only until the first address is read**. After one
+has come out of the expected field the venue has demonstrated the shape, so a
+later odd record is counted, warned about on the progress line, and published
+in the frame and `_provenance` as a trade the list does not contain — not
+turned into an abort that discards a 300-address harvest while telling the
+operator the assumption "did not hold". Any output you see quoted in this
+repository, in the collector's tests or in a review of it is stub-generated:
+the live venue is 403 at this environment's proxy, so no example here is
+evidence that the shape is right.
 
 ### Before the shadow clock starts
 

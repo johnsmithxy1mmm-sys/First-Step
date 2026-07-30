@@ -106,12 +106,24 @@ class FileAddressSource:
         # twice -- once lowercase, once EIP-55 as a block explorer shows it --
         # gets one address, not two identities in the journal.
         #
-        # Load time is the right place to refuse a malformed entry. The sweep
-        # charges §5.3 weight per address before it fetches anything and
-        # swallows per-address failures into `skipped` (cron.py), so a typo
-        # caught here costs nothing and is reported with its index, while the
-        # same typo caught downstream costs budget and reads as one more
-        # uninteresting skip line.
+        # Load time is the right place to refuse a malformed entry, and the
+        # index is what makes the refusal actionable: "invalid address" sends
+        # an operator hunting through 200 lines by eye.
+        #
+        # A typo caught here costs no §5.3 weight -- but only because the two
+        # callers were changed to make that true, so both are named here and
+        # the claim breaks if either is reordered. `ShadowCron.run_once` reads
+        # this list before it calls `specs()` or `spot()`, and `cli._live_world`
+        # loads it before `_build_live_bundle`. Neither ordering was the
+        # original: the CLI charged 40 weight (meta plus a candle fetch, on a
+        # 1-coin universe) before the file was opened at all.
+        #
+        # Refusing the list refuses the whole sweep, which `run_once` reports
+        # as a run-level failure rather than as one more skip line. That is
+        # the deliberate choice: a list with a non-address in it is not the
+        # sampling frame its `frame` field claims to describe, and sweeping
+        # the entries that happen to parse would publish a calibration score
+        # against a frame nobody wrote down (OPEN-QUESTIONS B4).
         seen: dict[str, None] = {}
         for i, a in enumerate(payload["addresses"]):
             try:
@@ -141,9 +153,17 @@ class StaticAddressSource:
         # one-off runs, a one-off run writes to the same permanent journal as
         # the cron, and the address an operator has to hand for a one-off run
         # is the checksummed one they just copied out of a block explorer.
+        #
+        # The index is reported for the same reason `FileAddressSource` reports
+        # it: `run_once` surfaces this message as the reason the whole sweep
+        # was refused, and "one of these is not an address" is not a message
+        # anyone can act on.
         seen: dict[str, None] = {}
-        for a in self._addresses:
-            seen.setdefault(normalise_address(a), None)
+        for i, a in enumerate(self._addresses):
+            try:
+                seen.setdefault(normalise_address(a), None)
+            except ValueError as exc:
+                raise ValueError(f"addresses[{i}]: {exc}") from exc
         return list(seen)
 
 

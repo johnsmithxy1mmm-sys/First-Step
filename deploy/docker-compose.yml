@@ -93,9 +93,14 @@ services:
 
   # The two shadow jobs (§3.3). Under the `shadow` profile so the read-only
   # stack comes up without them: starting the clock is a decision, not a
-  # side effect of `up`. See risk_engine/README.md on what has to be settled
-  # before the counter is worth running -- A1, A8, C1, C2 and C5 all move the
-  # distribution, and moving it resets the window to zero.
+  # side effect of `up`. Moving the distribution resets the window to zero, so
+  # every question that moves it has to be settled before days accumulate; the
+  # list of those questions lives in risk_engine/README.md under "Before the
+  # shadow clock starts" and nowhere else. This comment used to enumerate it
+  # (A1, A8, C1, C2, C5) and by 2026-07-30 it enumerated a list that README
+  # records as empty -- so an operator who followed the pointer got the
+  # opposite answer from the file it pointed at, and the safe-looking reading
+  # ("still blocked, do not start") is the one that quietly costs weeks.
   shadow-snapshot:
     <<: *engine-image
     profiles: ["shadow"]

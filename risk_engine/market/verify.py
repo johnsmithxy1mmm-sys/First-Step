@@ -20,6 +20,13 @@ outcomes, because collapsing them is how "we ran the checker" becomes
                 counter-example is not confirmation)
   UNCHECKABLE   this harness cannot decide it at all; the entry says what can
 
+FAIL is reserved for the venue. It means a live response contradicted a
+documented shape, it exits 2, and it says the model is wrong today. A fault
+in this harness's own input -- an `--address` that is not an address -- is
+UNCHECKABLE instead, whatever layer notices it: a checker that reports an
+operator's typo as the venue contradicting the model is a checker whose
+FAILs stop being read.
+
 The distinction between PASS and INCONCLUSIVE carries most of the weight.
 A clamp no observation exceeded is not a verified clamp -- it is a clamp
 nothing has contradicted yet, over whatever window the venue serves. Saying
@@ -126,6 +133,32 @@ def check_clearinghouse(client: InfoClient, address: str | None) -> Check:
             "E5.3", "does `clearinghouseState` parse into a Book?", UNCHECKABLE,
             "no --address given. This is the parser the whole product reads a "
             "user's book through; pass any address holding perps.",
+        )
+    # A local format error is not evidence about the venue, and this function
+    # is where that has to be enforced rather than only at the argparse layer.
+    # `InfoClient` normalises on the way out (§5.1), so a malformed address
+    # raises ValueError before a byte leaves the process -- and the `except`
+    # below would file that under FAIL, which in this file's published
+    # vocabulary means "live data contradicts it, the model is wrong today"
+    # (see the module docstring) and exits 2 with "the model is wrong today;
+    # fix it before the live path runs". Nothing was contradicted, because
+    # nothing was asked. `main` does refuse a bad `--address`, but `run_all`
+    # and this function are both importable and this is the one the tests
+    # drive, so the vocabulary has to hold here on its own.
+    #
+    # UNCHECKABLE, still blocking, and deliberately not softer than that: a
+    # typo leaves E5.3 exactly as unverified as no address at all did, and the
+    # parser the whole product reads a user's book through must not come out
+    # of a run looking checked.
+    try:
+        address = normalise_address(address)
+    except ValueError as exc:
+        return Check(
+            "E5.3", "does `clearinghouseState` parse into a Book?", UNCHECKABLE,
+            f"--address is not an account address ({exc}), so no request was "
+            "made and nothing was learned about the venue. This is a local "
+            "format error, not a contradiction: fix the address and re-run.",
+            evidence={"rejected_address": address},
         )
     try:
         raw = client.clearinghouse_state(address)

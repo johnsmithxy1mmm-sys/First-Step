@@ -25,6 +25,7 @@ from risk_engine.shadow.metrics import (
     load_cohort,
     tail_calibration,
 )
+from risk_engine.shadow.providers import StaticAddressSource
 from risk_engine.shadow.resolve import resolve_due
 from risk_engine.sim.stats import PredictiveDistribution
 from risk_engine.validation.baselines import NaiveBaseline, historical_24h_log_returns
@@ -43,6 +44,40 @@ ADDR_FLAT = "0x" + "d" * 40
 
 def addr(i: int) -> str:
     return f"0x{i:040x}"
+
+
+def _insert_legacy_prediction(journal, address: str, predicted_at, hours: int = 24) -> int:
+    """Write a pending prediction the way a row written before the address
+    discipline existed sits in the journal today.
+
+    Deliberately bypasses `record_prediction`, which normalises: the point of
+    these rows is that they predate that check (audit A-09) and that the read
+    paths hand back the stored bytes rather than papering over them. There is
+    no other way to construct the state, and pretending it cannot occur is how
+    the resolver's forever-retry went unnoticed.
+    """
+    import json
+
+    resolves_at = predicted_at + timedelta(hours=hours)
+    rows = journal._query(
+        """
+        INSERT INTO calibration_predictions (
+            address, variant, predicted_at, horizon_hours, resolves_at,
+            model_version, distribution_version, seed, n_paths, converged,
+            start_equity, p_liq, p_liq_ci_low, p_liq_ci_high, var_95, cvar_95,
+            quantile_values, n_quantile_levels, book_snapshot
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        RETURNING id
+        """,
+        (
+            address, VARIANT_MODEL, predicted_at.isoformat(), hours,
+            resolves_at.isoformat(), "0.2.0", DISTRIBUTION_VERSION, 1, 10, True,
+            1_000.0, 0.0, 0.0, 0.0, 100.0, 100.0,
+            json.dumps(list(np.linspace(-1_000.0, 1_000.0, 11))), 11, json.dumps({}),
+        ),
+    )
+    journal.backend.commit()
+    return int(rows[0]["id"])
 
 
 class FakeProvider:
@@ -200,6 +235,274 @@ class TestShadowSweep:
         assert live.available() == 100
 
 
+class TestARefusedAddressList:
+    """A malformed list takes the whole sweep down, and must say so.
+
+    `AddressSource.addresses()` refuses an entry that is not an address, which
+    is right -- the alternative put a typo on the wire, where §5.1's
+    well-formed empty state resolved as equity 0 and wrote liquidated=1,
+    var_95_breached=1 into a row that can never be edited. But the refusal
+    used to leave `run_once` as an unhandled ValueError: with
+    [good, '0xabc', good] the pre-refusal code wrote 2 of 3 and skipped 1, and
+    the refusal wrote 0 and printed a traceback. Address files are static, so
+    that is every day of §3.3's 21-day window, not one address.
+    """
+
+    def _provider(self, entries, books, spot, specs):
+        source = StaticAddressSource(tuple(entries), "a deliberately broken list")
+
+        class Provider(FakeProvider):
+            def __init__(self, *a):
+                super().__init__(*a)
+                self.market_reads = 0
+
+            def addresses(self):
+                return source.addresses()
+
+            def specs(self):
+                self.market_reads += 1
+                return super().specs()
+
+            def spot(self):
+                self.market_reads += 1
+                return super().spot()
+
+        return Provider(books, spot, specs)
+
+    def test_a_malformed_entry_is_reported_not_raised(
+        self, bundle, specs, spot, books, naive, now
+    ):
+        entries = [ADDR_A, "0xabc", ADDR_B]
+        provider = self._provider(entries, books, spot, specs)
+        journal = CalibrationJournal()
+
+        report = ShadowCron(provider, bundle, journal, naive, n_paths=500).run_once(now)
+
+        assert report.refused
+        assert report.written == 0 and report.attempted == 0
+        # The index is the actionable part: "invalid address" sends an
+        # operator hunting through 200 lines by eye.
+        assert "addresses[1]" in report.address_source_error
+        assert "40 hex digits" in report.address_source_error
+        # Not laundered into the per-address channel, which a caller reads as
+        # "199 of 200 fine".
+        assert report.skipped == []
+        assert "REFUSED" in str(report)
+        rows = journal._query("SELECT COUNT(*) c FROM calibration_predictions")[0]
+        assert rows["c"] == 0
+        journal.close()
+
+    def test_the_list_is_read_before_any_market_data_is_fetched(
+        self, bundle, specs, spot, books, naive, now
+    ):
+        """The claim `providers.py` makes: a typo caught at load costs nothing.
+
+        `specs()` and `spot()` are Info requests. Called before the list was
+        validated -- which is how `run_once` was ordered -- a one-character
+        typo cost 40 weight on a 1-coin universe, around 80 of the 300/minute
+        the shadow reserve allows, for a list that was never loadable.
+        """
+        provider = self._provider([ADDR_A, "0xabc"], books, spot, specs)
+        journal = CalibrationJournal()
+
+        report = ShadowCron(provider, bundle, journal, naive, n_paths=500).run_once(now)
+
+        assert report.refused
+        assert provider.market_reads == 0
+        journal.close()
+
+    def test_a_missing_file_is_the_same_run_level_failure(
+        self, bundle, specs, spot, books, naive, now, tmp_path
+    ):
+        """Not only ValueError. A list that is absent, or truncated mid-write,
+        leaves the operator in the same position -- nothing to sweep today --
+        and each one used to produce a differently-shaped traceback."""
+        from risk_engine.shadow.providers import FileAddressSource
+
+        missing = FileAddressSource(tmp_path / "not-there.json")
+
+        class Provider(FakeProvider):
+            def addresses(self):
+                return missing.addresses()
+
+        journal = CalibrationJournal()
+        report = ShadowCron(
+            Provider(books, spot, specs), bundle, journal, naive, n_paths=500
+        ).run_once(now)
+        assert report.refused
+        assert "FileNotFoundError" in report.address_source_error
+        journal.close()
+
+    def test_a_good_list_still_reports_nothing_refused(
+        self, bundle, specs, spot, books, naive, now
+    ):
+        """The guard must not turn every sweep into a refusal."""
+        provider = self._provider([ADDR_A, ADDR_B], books, spot, specs)
+        journal = CalibrationJournal()
+        report = ShadowCron(provider, bundle, journal, naive, n_paths=500).run_once(now)
+        assert not report.refused and report.address_source_error is None
+        assert report.written == 2
+        journal.close()
+
+    def test_the_cli_exits_non_zero_when_the_list_is_refused(self, monkeypatch, capsys):
+        """The exit code is the whole interface for the cron that runs this.
+
+        Turning the traceback into a report is only half the fix: a daily job
+        that prints "0 addresses written" and exits 0 is a §3.3 window that
+        stops advancing with nobody told, and the list is static so it stops
+        advancing every day after that too. `deploy/docker-compose.yml` runs
+        `snapshot ... || echo "snapshot failed"`, which only says anything at
+        all because the exit code is non-zero.
+        """
+        from argparse import Namespace
+
+        from risk_engine.shadow import cli as cli_mod
+
+        class Refusing:
+            frame = "a list that will not load"
+
+            def addresses(self):
+                raise ValueError("addrs.json: addresses[3]: not an address")
+
+            def specs(self):
+                pytest.fail("market data was fetched for a refused list")
+
+            def spot(self):
+                pytest.fail("market data was fetched for a refused list")
+
+        # `_live_world` is stubbed because the real one reaches the venue;
+        # `bundle` and `naive` are never touched, since `run_once` returns
+        # before it needs them, and that is itself part of the claim.
+        monkeypatch.setattr(
+            cli_mod, "_live_world", lambda args, **kw: (Refusing(), None, None)
+        )
+        code = cli_mod.cmd_snapshot(
+            Namespace(journal=":memory:", fixture=False, addresses="addrs.json",
+                      n_paths=10)
+        )
+        assert code == 2
+        out = capsys.readouterr().out
+        assert "addresses[3]" in out
+        assert "REFUSED" in out
+
+
+class TestTheLiveCliSpendsNoWeightItNeedNot:
+    """Two §5.3 claims `_live_world` makes, both of which were false.
+
+    The README's, that a bad entry is refused "rather than part-way through a
+    sweep that has already spent weight": the bundle was built first, so meta
+    and a candle snapshot were paid for before the file was opened at all.
+    And its own, that the provider reuses the bundle's prices: it seeded them
+    without the timestamp `spot()` reads, so they were re-fetched anyway.
+    """
+
+    def _args(self, path):
+        from argparse import Namespace
+
+        return Namespace(addresses=str(path), fixture=False, journal=":memory:")
+
+    def _stub_bundle(self, monkeypatch):
+        """Replace the one call in `_live_world` that reaches the network.
+
+        Everything past this point is Info requests. Raising a sentinel here
+        both keeps the test offline and makes "did the refusal happen before
+        any weight was spent?" a question with a yes/no answer: SystemExit
+        means it did, `ReachedTheBundle` means it did not.
+        """
+        from risk_engine.service import state as state_mod
+
+        class ReachedTheBundle(Exception):
+            pass
+
+        def _reached(*a, **k):
+            raise ReachedTheBundle
+
+        monkeypatch.setattr(state_mod, "_build_live_bundle", _reached)
+        return ReachedTheBundle
+
+    def _write(self, tmp_path, addresses):
+        import json
+
+        path = tmp_path / "addrs.json"
+        path.write_text(json.dumps({"frame": "broken", "addresses": addresses}))
+        return path
+
+    def test_a_malformed_list_is_refused_before_the_bundle_is_built(
+        self, tmp_path, monkeypatch
+    ):
+        from risk_engine.shadow import cli as cli_mod
+
+        self._stub_bundle(monkeypatch)
+        path = self._write(tmp_path, [ADDR_A, "0xabc"])
+
+        with pytest.raises(SystemExit) as exc:
+            cli_mod._live_world(self._args(path))
+        assert "addresses[1]" in str(exc.value)
+        assert "nothing was fetched" in str(exc.value)
+
+    def test_resolve_is_not_blocked_by_a_list_it_never_reads(
+        self, tmp_path, monkeypatch
+    ):
+        """A typo must not strand yesterday's predictions.
+
+        The resolver takes its addresses from the journal's pending rows, and
+        the Info API serves current state only -- a resolution that misses its
+        window (`DEFAULT_STALE_AFTER_S`) cannot be recovered afterwards. A bad
+        list has to cost a day of new predictions, never an observation
+        already paid for. So `cmd_resolve` passes `load_addresses=False` and
+        gets all the way to the bundle on a list `snapshot` refuses.
+        """
+        from risk_engine.shadow import cli as cli_mod
+
+        reached = self._stub_bundle(monkeypatch)
+        path = self._write(tmp_path, ["0xabc"])
+
+        with pytest.raises(reached):
+            cli_mod._live_world(self._args(path), load_addresses=False)
+
+    def test_the_seeded_prices_are_actually_reused(self, tmp_path, monkeypatch):
+        """`_live_world` hands the provider the bundle's prices to avoid a
+        re-fetch, and used to set only `_spot`.
+
+        `spot()` measures freshness against `_spot_at`, a `time.monotonic()`
+        stamp left at its 0.0 default -- so the first call in the sweep saw an
+        age of "seconds since the process started", judged prices that were
+        seconds old to be stale, and re-fetched a candle snapshot per coin at
+        20 weight each. The cache the comment described was never hit once.
+        """
+        from risk_engine.service import state as state_mod
+        from risk_engine.shadow import cli as cli_mod
+
+        calls: list[str] = []
+
+        def _candles(self, coin, interval, start_ms, end_ms):
+            calls.append(coin)
+            return [{"t": 1, "c": "100000.0"}]
+
+        monkeypatch.setattr(
+            state_mod, "_build_live_bundle",
+            lambda *a, **k: (object(), {"BTC": object()}, {"BTC": 100_000.0}),
+        )
+        monkeypatch.setattr(
+            "risk_engine.market.info.InfoClient.candle_snapshot", _candles
+        )
+        monkeypatch.setattr(
+            "risk_engine.market.parse.parse_candles_to_log_returns",
+            lambda c: (None, [0.001] * 500),
+        )
+        monkeypatch.setattr(
+            cli_mod, "historical_24h_log_returns", lambda r: np.full(100, 0.01)
+        )
+
+        provider, _, _ = cli_mod._live_world(self._args(self._write(tmp_path, [ADDR_A])))
+        # One call, and it is the 90-day history the naive baseline is fitted
+        # from -- not a price refresh.
+        assert calls == ["BTC"]
+
+        assert provider.spot() == {"BTC": 100_000.0}
+        assert calls == ["BTC"], "spot() re-fetched prices it had just been given"
+
+
 class TestResolve:
     def test_fills_in_the_outcome_a_day_later(
         self, bundle, specs, spot, books, naive, now
@@ -278,6 +581,77 @@ class TestResolve:
             journal, DISTRIBUTION_VERSION, VARIANT_MODEL, COHORT_BOOK_UNCHANGED
         )
         assert unchanged.n == 1
+        journal.close()
+
+    def test_a_row_that_can_never_resolve_says_so_on_every_run(self, spot, now):
+        """The resolver retries without bound, and some rows are forever.
+
+        A prediction whose stored `address` is not an address -- written
+        before `record_prediction` canonicalised, and left visible because the
+        read paths deliberately do not normalise -- fails before any request
+        is made, so it is handed back by `due()` on every future run:
+        measured resolved=0, failed=1, still_due=1 on three consecutive runs,
+        with the failed list never emptying. That is better than the old
+        behaviour, which resolved it once as a liquidation, and it is
+        documented rather than bounded (see `resolve.py`). What it must not be
+        is invisible: `permanent` names it as a row that will fail identically
+        next time, so a forever-failure cannot hide among transient ones.
+        """
+        journal = CalibrationJournal()
+        _insert_legacy_prediction(journal, "0xabc", now)
+
+        class Provider:
+            """As `LiveSnapshotProvider` behaves: normalise, then fetch."""
+
+            def book(self, address):
+                from risk_engine.domain.types import normalise_address
+
+                normalise_address(address)
+                raise AssertionError("a malformed address must not reach a fetch")
+
+            def spot(self):
+                return spot
+
+            def external_flow(self, address, since, until):
+                return 0.0
+
+        later = now + timedelta(hours=24, minutes=1)
+        for _ in range(3):
+            report = resolve_due(journal, Provider(), later)
+            assert report.resolved == 0
+            assert len(report.failed) == 1
+            assert len(report.permanent) == 1
+            assert "not an account address" in report.permanent[0][1]
+            assert "permanently" in str(report)
+            # Still due, still not silently dropped, still not resolved with a
+            # fabricated outcome -- the row is intact for a deliberate fix.
+            assert len(journal.due(later)) == 1
+        journal.close()
+
+    def test_a_transient_failure_is_not_called_permanent(self, spot, now):
+        """The classification must stay narrow.
+
+        A timeout or a 5xx on a perfectly good address is exactly what the
+        unbounded retry exists for, and labelling it permanent would tell an
+        operator to go and edit a journal row that is fine.
+        """
+        journal = CalibrationJournal()
+        _insert_legacy_prediction(journal, ADDR_A, now)
+
+        class Flaky:
+            def book(self, address):
+                raise TimeoutError("the venue took too long")
+
+            def spot(self):
+                return spot
+
+            def external_flow(self, address, since, until):
+                return 0.0
+
+        report = resolve_due(journal, Flaky(), now + timedelta(hours=24, minutes=1))
+        assert len(report.failed) == 1
+        assert report.permanent == []
+        assert "permanently" not in str(report)
         journal.close()
 
     def test_fingerprint_ignores_price_but_not_size(self, now):

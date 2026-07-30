@@ -23,6 +23,11 @@ from risk_engine.model.funding import FundingBounds
 
 HOUR_MS = 3_600_000
 
+#: A well-formed account address. `check_clearinghouse` refuses anything else
+#: locally rather than letting `InfoClient`'s normalisation surface as a FAIL
+#: about the venue, so the fixture has to be a real one.
+ADDRESS = "0x" + "a" * 40
+
 META = {
     "universe": [
         {"name": "BTC", "szDecimals": 5, "maxLeverage": 40, "marginTableId": 1},
@@ -201,8 +206,38 @@ class TestParsers:
         assert not check.satisfied
 
     def test_the_book_parser_passes_on_a_real_response(self):
-        check = verify.check_clearinghouse(StubClient(), "0xabc")
+        # A well-formed address, because that is what the check now requires
+        # and what a real run supplies. The old "0xabc" documented the
+        # unguarded contract: against `StubClient`, which does not normalise,
+        # it reported PASS -- so the test asserted that E5.3 could be *passed*
+        # by an address the live client would refuse to send.
+        check = verify.check_clearinghouse(StubClient(), ADDRESS)
         assert check.status == PASS
+
+    def test_a_malformed_address_is_uncheckable_not_a_contradiction(self):
+        """FAIL is reserved for the venue.
+
+        `InfoClient` normalises before it sends, so a malformed `--address`
+        raises inside `check_clearinghouse`'s try and used to come back as
+        E5.3 FAIL, blocking -- which in this tool's own vocabulary means live
+        data contradicted a documented shape and exits 2 with "the model is
+        wrong today". Nothing was contradicted; no request was made. The
+        assumption is unverified either way, so it stays blocking.
+        """
+        check = verify.check_clearinghouse(StubClient(), "0xabc")
+        assert check.status == UNCHECKABLE
+        assert check.blocking and not check.satisfied
+        assert "40 hex digits" in check.detail
+        assert "not a contradiction" in check.detail
+
+    def test_a_malformed_address_never_reaches_the_client(self):
+        """The guard sits ahead of the request, not around it."""
+        class Exploding(StubClient):
+            def clearinghouse_state(self, address, is_agent_address=False):
+                raise AssertionError("a malformed address reached the client")
+
+        check = verify.check_clearinghouse(Exploding(), "0xnot-an-address")
+        assert check.status == UNCHECKABLE
 
 
 class TestUncheckable:

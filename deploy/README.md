@@ -109,6 +109,18 @@ into both shadow containers while `SHADOW_ARGS` defaults to `--fixture`;
 flipping it to `--addresses /app/addresses.json` before the file has a frame
 fails both jobs at startup.
 
+Read the exit code rather than the fact that it was non-zero — they mean four
+different things and only one of them is fixed by a longer window: `1`
+collected but refused to publish (short of §3.3's 200, or `--out` exists), and
+the addresses are parked in `deploy/addresses.json.refused-<window-start>`
+rather than discarded; `2` the feed did not match the collector's assumed
+message shape, which is a code problem, not weather; `3` no usable connection
+at all — check `--ws-url` first, it has never been confirmed from here; `4` a
+bad invocation, caught before anything connects. A run that succeeds but
+prints a `NOTE:` line about anomalies harvested a list the feed partly
+disagreed with; the count and the offending records are in the file's
+`_provenance.anomalies`.
+
 The resolver runs hourly against a daily snapshot. That is not a mistake:
 a prediction resolves 24 h after it was made, and a resolution collected
 late is marked stale and dropped from the gate (audit A-04). The scarce

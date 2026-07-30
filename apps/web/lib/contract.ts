@@ -36,6 +36,16 @@ export interface PortfolioRiskValue {
   p_liq_24h_isolated: Record<string, Estimate>;
   p_liq_7d: Estimate;
   cvar_95_24h_usd: Estimate;
+  /**
+   * 24 HOURS of funding, not the 7 days `p_liq_7d` above covers — and the two
+   * sit in the same grid, so a reader will compare them. Funding accrues
+   * hourly: a week is roughly 7× this. It is published at 24h only because
+   * funding is simulated independently of price and that bias grows with the
+   * horizon (OPEN-QUESTIONS A8), so a week-long figure is indicative rather
+   * than calibrated. Any component rendering this owes the user the horizon
+   * and that scaling in visible copy; the funding panel in `app/page.tsx` is
+   * where they are said.
+   */
   funding_cost_24h: { median: number; p05: number; p95: number };
   matrix_age_s: number | null;
 }

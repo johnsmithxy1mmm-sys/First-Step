@@ -16,17 +16,56 @@ when a user deposits, withdraws, opens or closes -- none of which the model
 claimed to predict. Scoring those as model error measures how actively the
 sampled traders traded. Both are recorded rather than filtered here, so the
 cohort choice is made at analysis time and is visible.
+
+RETRIES ARE UNBOUNDED, AND SOME OF THEM ARE FOREVER. A failed row gets no
+outcome written, so `journal.due()` hands it back on the next run, and there
+is no attempt counter anywhere. For a transient failure that is the whole
+point. But one class of failure is deterministic in the stored row and so
+never clears: a prediction whose `address` column is not an address. Those
+rows exist because `record_prediction` only started canonicalising what it
+writes later, and they stay visible because the read paths deliberately do
+not normalise -- `journal.py` hands back the bytes that are actually stored,
+so a legacy row reads as itself instead of being papered over by the very
+check it predates. `LiveSnapshotProvider.book` normalises before it fetches,
+so such a row raises before any request: measured resolved=0, failed=1,
+still_due=1 on three consecutive runs, with the failed list never emptying.
+
+That is documented rather than bounded, deliberately, and the alternatives
+are worth naming because two of them are worse:
+
+  - writing an outcome for it is what the pre-normalisation code effectively
+    did. A typo'd address is answered by the venue with a well-formed *empty*
+    state (§5.1), which resolved as equity 0 -- liquidated=1,
+    var_95_breached=1, permanently, in a table that cannot be edited (§3.4).
+    A retry loop is not in the same class of harm as a fabricated
+    liquidation in a published calibration score;
+  - dropping the row, or marking it resolved-and-excluded after N attempts,
+    silently discards an observation the schema exists to make immutable, and
+    the honest version of that needs a terminal state in the schema plus the
+    versioning discussion that comes with changing it (§3.3: a distribution
+    change resets the window). It is not a change to make as a side effect of
+    a retry bound;
+  - a retry *ceiling* with no terminal state just means the row stops being
+    attempted while still counting as pending, which is the same forever-row
+    with the evidence removed.
+
+So the retry stays unbounded and stops being silent instead:
+`ResolveReport.permanent` lists the rows that will fail identically on the
+next run and why, the CLI prints them under that heading, and the operator's
+fix is a deliberate, visible correction of the journal row. The cost of the
+loop itself is bounded already -- these rows raise before any request, so
+they spend no §5.3 weight, only a line of output.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Protocol
 
 import numpy as np
 
-from risk_engine.domain.types import Book
+from risk_engine.domain.types import Book, normalise_address
 from risk_engine.observability.metrics import METRICS, Metrics
 from risk_engine.shadow.cron import position_fingerprint
 from risk_engine.shadow.journal import CalibrationJournal
@@ -59,10 +98,24 @@ class ResolveReport:
     resolved: int
     failed: list[tuple[int, str]]
     stale: int = 0
+    #: The subset of `failed` whose failure is deterministic in the stored row
+    #: and will therefore recur on every future run: (prediction id, why).
+    #: A subset rather than a separate bucket on purpose -- these rows did
+    #: fail this run, and a caller that iterates `failed` must still see them.
+    permanent: list[tuple[int, str]] = field(default_factory=list)
 
     def __str__(self) -> str:
         tail = f", {self.stale} flagged stale" if self.stale else ""
-        return f"resolved {self.resolved} predictions, {len(self.failed)} failed{tail}"
+        forever = (
+            f" ({len(self.permanent)} of them permanently -- retried every run "
+            "until the journal row is corrected)"
+            if self.permanent
+            else ""
+        )
+        return (
+            f"resolved {self.resolved} predictions, "
+            f"{len(self.failed)} failed{forever}{tail}"
+        )
 
 
 def _pit_uniform(prediction_id: int) -> float:
@@ -73,6 +126,29 @@ def _pit_uniform(prediction_id: int) -> float:
     draw cannot be retried until it flatters the model.
     """
     return float(np.random.default_rng(0xC0FFEE ^ prediction_id).random())
+
+
+def _permanent_reason(address: str) -> str | None:
+    """Why a pending row can never resolve, or None if it might.
+
+    Only one condition is claimed, and it is claimed because it is decidable
+    from the row alone: an `address` column that `normalise_address` refuses
+    is refused identically on every future run, before any request is made,
+    for as long as the row exists. Every provider in this repository looks a
+    book up by that address -- `LiveSnapshotProvider.book` normalises it
+    first, the fixture provider indexes a dict with it -- so no retry can
+    succeed while the stored bytes stay as they are.
+
+    Everything else is left transient on purpose. A timeout, a 5xx, a
+    provider that has not implemented `external_flow` yet: those are exactly
+    the failures the unbounded retry exists for, and guessing that one of
+    them is permanent is how a resolvable observation gets abandoned.
+    """
+    try:
+        normalise_address(address)
+    except ValueError as exc:
+        return f"stored address is not an account address ({exc})"
+    return None
 
 
 def resolve_due(
@@ -88,6 +164,7 @@ def resolve_due(
     resolved = 0
     stale = 0
     failed: list[tuple[int, str]] = []
+    permanent: list[tuple[int, str]] = []
 
     # One address may have several pending rows (model plus both baselines);
     # they share a realised outcome, so it is fetched once per address.
@@ -134,5 +211,16 @@ def resolve_due(
             resolved += 1
         except Exception as exc:  # one bad row must not stop the batch
             failed.append((pending.id, f"{type(exc).__name__}: {exc}"))
+            # Classified from the row, not from the exception that surfaced
+            # this time: the reason such a row is permanent is that the stored
+            # address is unusable, which holds whichever call happens to raise
+            # first. Recorded so the report can say "this one is forever"
+            # instead of leaving a never-emptying failed list looking transient
+            # (see the module docstring on why the retry is unbounded).
+            reason = _permanent_reason(pending.address)
+            if reason is not None:
+                permanent.append((pending.id, reason))
 
-    return ResolveReport(resolved=resolved, failed=failed, stale=stale)
+    return ResolveReport(
+        resolved=resolved, failed=failed, stale=stale, permanent=permanent
+    )

@@ -17,6 +17,23 @@ gate simply never advances. So the assertions below are mostly about
 refusals, and the one on the happy path that matters most is the round trip
 through `FileAddressSource` -- the consumer this output exists for, which
 until now had no test of its own at all.
+
+The mirror-image failure gets the same treatment. A refusal is only correct if
+it refuses the *right* thing: aborting a 300-address harvest over one odd
+record, or over a transient "Websocket request timed out", destroys a good
+sample and then misdiagnoses it -- the abort text accuses B4's assumption of
+not holding when it had just held 300 times. `TestAnomaliesAfterTheShapeHolds`
+pins the boundary: fatal while nothing has been collected, counted and
+published afterwards.
+
+**Every frame, counter, timestamp and address in this file is
+STUB-GENERATED.** `StubSocket` replays scripted text, `FakeClock` and
+`FakeUtcNow` invent the window, and `_addr` invents the accounts. The live
+venue is 403 at this environment's proxy (OPEN-QUESTIONS E5), so no example
+here -- and no example in any document or review of this collector -- is a
+capture. Anything that reads like one (round half-hour windows, five-figure
+record counts) came out of these helpers, and a reader deciding whether the
+message shape is confirmed has to look at a live run instead.
 """
 
 from __future__ import annotations
@@ -25,6 +42,7 @@ import asyncio
 import json
 import sys
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -125,6 +143,17 @@ def _trade(users, coin: str = "BTC", **extra) -> dict:
     return record
 
 
+def _liquidation() -> dict:
+    """The record from the review: a trades frame carrying a liquidation.
+
+    Plausible as a real message on this feed and it names no participant at
+    all, which makes it the cheapest way for a good harvest to meet something
+    the assumed shape does not describe. Built fresh per call so no test can
+    mutate another test's fixture.
+    """
+    return {"coin": "BTC", "px": "118250.0", "sz": "0.0142", "liquidation": True}
+
+
 def _frame(records, channel: str = "trades") -> str:
     return json.dumps({"channel": channel, "data": records})
 
@@ -144,6 +173,28 @@ def _transport(frames, closed_error=None):
         yield socket
 
     return collect.Transport(connect=connect, closed_errors=(StubClosed,)), socket
+
+
+class RefusingConnect:
+    """A connection attempt that fails at the handshake, as a wrong URL does.
+
+    A class rather than an `asynccontextmanager` that raises before its yield,
+    because the whole point is that `__aenter__` never succeeds and a generator
+    with unreachable code after the raise reads like a mistake.
+    """
+
+    def __init__(self, exc: BaseException) -> None:
+        self._exc = exc
+
+    async def __aenter__(self):
+        raise self._exc
+
+    async def __aexit__(self, *exc_info) -> bool:
+        return False
+
+
+def _unreachable_transport(exc: BaseException):
+    return collect.Transport(connect=lambda: RefusingConnect(exc), closed_errors=(StubClosed,))
 
 
 def _run(frames, *, closed_error=None, coins=("BTC",), clock_step=5.0, minutes=30.0, **kwargs):
@@ -550,6 +601,22 @@ class TestTheFrame:
         assert "asserted at runtime" in frame
         assert "blocked at the proxy" in frame
 
+    def test_it_says_the_runtime_assertion_is_a_floor_and_not_a_proof(self, frame):
+        """Without this the NOT VERIFIED clause reads as though every frame was
+        checked and passed, when what actually happened is that the check stops
+        being fatal once the first address is read."""
+        assert "a floor and not a proof" in frame
+        assert "treated as confirmed" in frame
+
+    def test_it_labels_the_repository_examples_as_stub_generated(self, frame):
+        """A reader of a published score may well go looking for the example
+        frames in this repository as evidence that the shape is right. They are
+        not evidence -- the venue is 403 here and every one of them came out of
+        this test file's helpers -- and the frame is the only place that reader
+        is guaranteed to look."""
+        assert "stub-generated" in frame
+        assert "nothing there can be cited as evidence" in frame
+
     def test_thin_headroom_is_called_out_at_the_gate_boundary(self):
         """Exactly 200 addresses cannot clear a 200-address gate: the sweep
         drops flat and zero-equity accounts before any of them count."""
@@ -650,6 +717,572 @@ class TestTheDependencyAndTheCLI:
         for argv in (["--minutes", "0"], ["--target", "0"], ["--coins", " ,, "]):
             with pytest.raises((SystemExit, ValueError)):
                 collect.main(["--out", str(tmp_path / "a.json"), *argv])
+
+
+class TestAnomaliesAfterTheShapeHolds:
+    """Fatal while nothing has been collected; counted and published after.
+
+    The asymmetry is the whole finding. Before the first address, an odd record
+    is evidence that the assumed shape is wrong and aborting is the only safe
+    move. After 300 addresses have come out of the assumed field, the venue has
+    *demonstrated* the shape, and an abort both throws the sample away and
+    tells the operator a falsehood about why.
+    """
+
+    def _three_hundred_then(self, extra_frames, **kwargs):
+        """300 good addresses, then whatever oddity is being tested, then 2 more.
+
+        Ending on two more good addresses rather than on the time budget so the
+        run stops on its target deterministically -- and so the test proves the
+        loop kept *collecting* after the anomaly, not merely that it survived it.
+        """
+        frames = [_frame([_trade([_addr(2 * i), _addr(2 * i + 1)])]) for i in range(1, 151)]
+        frames += list(extra_frames)
+        frames += [_frame([_trade([_addr(900), _addr(901)])])]
+        return _run(frames, target=302, progress_every_s=600.0, **kwargs)
+
+    def test_one_record_without_an_address_does_not_destroy_the_harvest(self):
+        """300 addresses had already been read from 'users' when a single record
+        arrived without it. Aborting there loses a good 30-minute sample and
+        reports that B4's assumption "did not hold" -- which is false, it held
+        300 times, and it sends an operator to edit TRADE_ADDRESS_FIELDS on
+        evidence that says nothing of the kind."""
+        result, _, lines = self._three_hundred_then([_frame([_liquidation()])])
+
+        assert len(result.addresses) == 302
+        assert "target" in result.stopped_because
+        assert result.anomalies.records_without_address == 1
+        assert result.anomalies.total == 1
+        # Counted, never silent: the operator watching the run is warned as it
+        # happens, and the published frame carries it as a named shortfall.
+        assert any("WARNING: a trade record carried none of" in line for line in lines)
+        frame = collect.build_frame(result, required=200)
+        assert "ANOMALIES: 1 frame(s)/record(s)" in frame
+        assert "liquidation" in frame            # the record, verbatim
+        assert "lower bound" in frame
+
+    def test_a_transient_error_frame_mid_run_does_not_destroy_the_harvest(self):
+        """'Websocket request timed out' is a real Hyperliquid WS error string.
+        Arriving at minute 29 of a delivering run it used to abort and report a
+        rejected subscription -- an accusation the 41 000 trades already
+        collected flatly contradict."""
+        error = json.dumps({"channel": "error", "data": "Websocket request timed out"})
+        result, _, lines = self._three_hundred_then([error])
+
+        assert len(result.addresses) == 302
+        assert result.anomalies.error_frames == 1
+        assert any("WARNING: error frame from the feed" in line for line in lines)
+        frame = collect.build_frame(result, required=200)
+        assert "Websocket request timed out" in frame
+        assert "1 error frame from the venue" in frame
+
+    def test_the_same_error_frame_before_any_address_is_still_fatal(self):
+        """The dangerous case is preserved exactly: an error frame with nothing
+        collected is the most likely way this collector is wrong, because the
+        channel name is inference from C4's webData3 snippet."""
+        error = json.dumps({"channel": "error", "data": "Invalid subscription trades"})
+        with pytest.raises(UnexpectedFeedShape) as exc:
+            _run([error, _frame([_trade([_addr(1)])])], target=2)
+
+        assert "before one address had been collected" in str(exc.value)
+
+    def test_the_same_odd_record_before_any_address_is_still_fatal(self):
+        with pytest.raises(UnexpectedFeedShape) as exc:
+            _run([_frame([_liquidation()])], target=2)
+
+        message = str(exc.value)
+        assert "no account address" in message
+        assert "none had been collected yet" in message
+        assert "B4" in message
+
+    def test_the_anomaly_share_of_records_is_stated_not_just_the_count(self):
+        """A stray record and a second record layout on the same feed produce
+        identical address lists and are not the same sample. If most records
+        carry no address field, this list is a sample of the records the parser
+        could read -- §10 forbids publishing that without saying so."""
+        odd = [_frame([_liquidation()]) for _ in range(20)]
+        result, _, _ = self._three_hundred_then(odd)
+
+        assert result.anomalies.records_without_address == 20
+        frame = collect.build_frame(result, required=200)
+        assert "% of the" in frame
+        assert "second record layout on the same feed" in frame
+
+    def test_the_anomaly_counts_reach_the_provenance_as_data(self):
+        """The frame is prose. A reader diffing two address lists needs the
+        counts as numbers, without parsing English."""
+        result, _, _ = self._three_hundred_then([_frame([_liquidation()])])
+        anomalies = collect.build_payload(result, required=200)["_provenance"]["anomalies"]
+
+        assert anomalies["total"] == 1
+        assert anomalies["trade_records_without_address_field"] == 1
+        assert anomalies["records_without_address_examples"], "no evidence retained"
+        assert "liquidation" in anomalies["records_without_address_examples"][0]
+
+    def test_the_progress_line_reports_anomalies_while_there_is_time_to_react(self):
+        """The operator standing over the window is the only person who can
+        still act on a count that climbs with every frame."""
+        frames = [_frame([_trade([_addr(1), _addr(2)])])]
+        frames += [_frame([_liquidation()]) for _ in range(4)]
+        frames += [_frame([_trade([_addr(i), _addr(i + 1)])]) for i in range(11, 40, 2)]
+        _, _, lines = _run(frames, target=40, progress_every_s=1.0)
+
+        progress = [line for line in lines if "anomalies" in line and "frames" in line]
+        assert progress, "the progress line does not mention anomalies at all"
+        assert "4 anomalies" in progress[-1]
+
+
+class TestTheEnvelopeIsTheTolerantHalf:
+    """A guessed envelope must not feed a fatal check on the contents.
+
+    `{"channel": "trades", ...}` is the venue labelling the frame; a bare array
+    is this module inferring. The inferred half is the one that has to be
+    tolerant, because a fatal reading of an inference produces an abort about a
+    frame that was never evidence either way.
+    """
+
+    def test_a_bare_array_that_is_not_trades_is_not_a_shape_fault(self):
+        """`[{"px": "1", "sz": "2"}]` has no channel and no address field. It
+        used to become a fatal 'a trade record carried no account address ...
+        B4 ... did not hold' -- an accusation about trades, made on a frame with
+        no claim to be one."""
+        frames = [json.dumps([{"px": "1", "sz": "2"}])]
+        with pytest.raises(UnexpectedFeedShape) as exc:
+            _run(frames, target=2, clock_step=0.1, first_trade_grace_s=1.0)
+
+        message = str(exc.value)
+        assert "without one recognisable trade record" in message
+        assert "no account address" not in message
+        assert "B4" not in message
+        # Still quoted, because it is the only evidence about what did arrive.
+        assert '"px": "1"' in message
+
+    def test_a_bare_array_carrying_the_address_field_is_still_accepted(self):
+        """Tolerance is not indifference. Where the frame itself supports the
+        inference -- a dict with 'users' in it -- the bare envelope is read,
+        because a venue can change its wrapper without changing what a trade is."""
+        frames = [json.dumps([_trade([_addr(1), _addr(2)])])]
+        result, _, _ = _run(frames, target=2)
+
+        assert result.addresses == (_addr(1), _addr(2))
+        assert result.address_field == "users"
+
+    def test_a_labelled_trades_frame_without_the_field_is_still_a_shape_fault(self):
+        """The other side of the same rule: when the venue calls it a trade, a
+        missing address field really is B4's assumption failing."""
+        with pytest.raises(UnexpectedFeedShape) as exc:
+            _run([_frame([{"px": "1", "sz": "2"}])], target=2)
+
+        assert "no account address" in str(exc.value)
+
+
+class TestEvidenceForTheLoudAborts:
+    def test_a_trades_frame_whose_data_holds_no_records_is_kept_as_evidence(self):
+        """Nine decodable `{"channel": "trades", "data": ["0x.."]}` frames used
+        to produce an abort whose RECEIVED section read 'nothing decodable':
+        `[]` records is falsy but not None, so the frame was neither counted nor
+        retained. A venue naming participants directly in `data` -- plausible,
+        the field name is a guess -- lands exactly here, and the one thing worth
+        reading was the thing discarded."""
+        frames = [json.dumps({"channel": "trades", "data": [_addr(3), _addr(4)]})
+                  for _ in range(9)]
+        with pytest.raises(UnexpectedFeedShape) as exc:
+            _run(frames, target=2, clock_step=0.1, first_trade_grace_s=1.0)
+
+        message = str(exc.value)
+        assert "nothing decodable" not in message
+        assert _addr(3) in message                       # verbatim, quotable
+        assert "entries inside a 'trades' frame that were not records" in message
+
+    def test_undecodable_frames_reach_the_published_artifact(self):
+        """`counters.undecodable` was incremented and read by nothing at all, so
+        a run could take non-JSON off the wire all window and publish no hint of
+        it."""
+        frames = ["<html>403 Forbidden</html>", _frame([_trade([_addr(1), _addr(2)])])]
+        result, _, _ = _run(frames, target=2)
+
+        assert result.anomalies.undecodable_frames == 1
+        payload = collect.build_payload(result, required=2)
+        assert payload["_provenance"]["anomalies"]["undecodable_frames"] == 1
+        assert "1 frame(s) that were not decodable JSON" in payload["frame"]
+
+    def test_the_no_frames_abort_still_names_the_counts_it_has(self):
+        """Belt and braces on the same failure: the abort quotes its counters
+        even when it retained no example, so 'RECEIVED: nothing' is always
+        accompanied by how many of what."""
+        frames = [_ack(), json.dumps({"channel": "pong"})]
+        with pytest.raises(UnexpectedFeedShape) as exc:
+            _run(frames, target=2, clock_step=0.1, first_trade_grace_s=1.0)
+
+        assert "2 frames that yielded no trade record" in str(exc.value)
+
+
+class TestObservedVersusSubscribedCoins:
+    def test_the_frame_states_the_coins_that_delivered_not_the_ones_asked_for(self):
+        """`result.coins` is the --coins argument. Publishing it as observed can
+        only ever overstate the breadth of the sample: subscribe BTC, ETH, SOL,
+        have only BTC deliver, and the frame claimed accounts trading all three.
+        Every record carries `coin`, so the honest set costs nothing."""
+        frames = [_frame([_trade([_addr(2 * i), _addr(2 * i + 1)], coin="BTC")])
+                  for i in range(1, 4)]
+        result, _, _ = _run(frames, target=6, coins=("BTC", "ETH", "SOL"))
+
+        assert result.coins == ("BTC", "ETH", "SOL")      # subscribed
+        assert result.coins_observed == ("BTC",)          # observed
+        frame = collect.build_frame(result, required=6)
+        assert "6 distinct accounts observed trading BTC on" in frame
+        assert "observed trading BTC, ETH, SOL" not in frame
+        assert "subscriptions were sent for BTC, ETH, SOL" in frame
+        assert "Nothing arrived for ETH, SOL" in frame
+
+    def test_the_per_coin_record_counts_are_published(self):
+        frames = [_frame([_trade([_addr(1), _addr(2)], coin="BTC"),
+                          _trade([_addr(3), _addr(4)], coin="ETH"),
+                          _trade([_addr(5), _addr(6)], coin="ETH")])]
+        result, _, _ = _run(frames, target=6, coins=("BTC", "ETH"))
+
+        assert dict(result.records_by_coin) == {"BTC": 1, "ETH": 2}
+        provenance = collect.build_payload(result, required=6)["_provenance"]
+        assert provenance["coins"] == ["BTC", "ETH"]                 # subscribed
+        assert provenance["coins_observed"] == ["BTC", "ETH"]
+        assert provenance["trade_records_by_coin"] == {"BTC": 1, "ETH": 2}
+        assert "BTC 1, ETH 2 records" in collect.build_frame(result, required=6)
+
+    def test_records_with_no_coin_field_make_the_counts_a_stated_lower_bound(self):
+        """The coin field is as much an assumption as anything else here. If it
+        is absent the observed set is unknown, and the frame must say unknown
+        rather than fall back to the subscription list."""
+        frames = [json.dumps({"channel": "trades", "data": [{"users": [_addr(1)]}]})]
+        result, _, _ = _run(frames, target=1, coins=("BTC", "ETH"))
+
+        assert result.coins_observed == ()
+        assert result.records_without_coin == 1
+        frame = collect.build_frame(result, required=1)
+        assert "the coin per record was not readable" in frame
+        assert "which of them actually delivered is UNKNOWN" in frame
+
+
+class TestTheGateFloorAndTheRescueCopy:
+    def _two_addresses(self):
+        frames = [_frame([_trade([_addr(1), _addr(2)])])]
+        result, _, _ = _run(frames, target=500, minutes=0.5)
+        return result
+
+    def test_required_cannot_be_used_to_lower_the_gate(self, tmp_path):
+        """`required=2` used to do two damaging things at once: skip the refusal
+        for a 2-address harvest, and make the published frame assert 'THIN
+        HEADROOM: the gate counts 2 distinct addresses' while §3.3's gate is
+        200. A caller may tighten this bar; lowering §3.3 from a keyword
+        argument is what --allow-short is for."""
+        out = tmp_path / "addresses.json"
+        with pytest.raises(ValueError) as exc:
+            collect.write_address_list(self._two_addresses(), out, required=2)
+
+        assert "needs 200" in str(exc.value)
+        assert not out.exists()
+
+    def test_a_lowered_required_cannot_corrupt_the_published_frame(self, tmp_path):
+        out = tmp_path / "addresses.json"
+        payload = collect.write_address_list(
+            self._two_addresses(), out, allow_short=True, required=2
+        )
+
+        assert "SHORT: 2 addresses is below §3.3's requirement of 200" in payload["frame"]
+        assert "THIN HEADROOM" not in payload["frame"]
+        assert payload["_provenance"]["gate_required_addresses"] == 200
+
+    def test_required_may_still_be_raised_above_the_gate(self, tmp_path):
+        """The floor only ever tightens. A caller who wants more headroom than
+        §3.3 demands is asking for something reasonable."""
+        frames = [_frame([_trade([_addr(2 * i), _addr(2 * i + 1)])]) for i in range(105)]
+        result, _, _ = _run(frames, target=210, progress_every_s=60.0)
+
+        with pytest.raises(ValueError, match="needs 400"):
+            collect.write_address_list(result, tmp_path / "a.json", required=400)
+
+    def test_a_refused_harvest_is_parked_rather_than_discarded(self, tmp_path):
+        """A 199-address harvest used to appear in no file anywhere: the refusal
+        printed counts and wrote nothing, so the fix was another 30-minute
+        window. That is the same 'discover it after standing over the window'
+        failure the pre-flight checks exist to prevent."""
+        out = tmp_path / "addresses.json"
+        with pytest.raises(ValueError) as exc:
+            collect.write_address_list(self._two_addresses(), out)
+
+        rescued = list(tmp_path.glob("addresses.json.refused-*"))
+        assert len(rescued) == 1
+        assert str(rescued[0]) in str(exc.value)
+        assert not out.exists(), "the requested path must stay untouched"
+        # Not a .json: it must not be swept up by a glob, or mistaken for the
+        # file that was asked for, but it IS a loadable list -- being usable is
+        # the entire point.
+        assert not rescued[0].name.endswith(".json")
+        assert FileAddressSource(rescued[0]).addresses() == [_addr(1), _addr(2)]
+
+    def test_the_rescue_copy_says_in_its_frame_that_it_was_refused(self, tmp_path):
+        """It loads cleanly, so a reader who finds it has to be told from the
+        frame itself that nothing accepted this list."""
+        out = tmp_path / "addresses.json"
+        with pytest.raises(ValueError):
+            collect.write_address_list(self._two_addresses(), out)
+
+        frame = FileAddressSource(next(tmp_path.glob("*.refused-*"))).frame
+        assert "NOT THE FILE THAT WAS ASKED FOR" in frame
+        assert "2 addresses against §3.3's requirement of 200" in frame
+        assert "SHORT: 2 addresses is below" in frame
+
+    def test_two_refused_runs_do_not_overwrite_each_others_rescue(self, tmp_path):
+        """The stamp is the collection window's start, so a second refused run
+        cannot destroy the first one's addresses -- which would resurrect the
+        bug in a subtler form."""
+        first = self._two_addresses()
+        second = replace(
+            first,
+            addresses=(_addr(7), _addr(8)),
+            started_at=first.started_at + timedelta(hours=1),
+        )
+        out = tmp_path / "addresses.json"
+        for result in (first, second):
+            with pytest.raises(ValueError):
+                collect.write_address_list(result, out)
+
+        rescued = sorted(tmp_path.glob("addresses.json.refused-*"))
+        assert len(rescued) == 2
+        assert FileAddressSource(rescued[0]).addresses() == [_addr(1), _addr(2)]
+        assert FileAddressSource(rescued[1]).addresses() == [_addr(7), _addr(8)]
+
+    def test_an_existing_out_also_parks_the_harvest_before_refusing(self, tmp_path):
+        """The CLI pre-flights this, but a library caller does not, and the
+        addresses are just as real either way."""
+        out = tmp_path / "addresses.json"
+        out.write_text("{}")
+        with pytest.raises(ValueError, match="--force"):
+            collect.write_address_list(self._two_addresses(), out, allow_short=True)
+
+        assert out.read_text() == "{}"
+        assert len(list(tmp_path.glob("addresses.json.refused-*"))) == 1
+
+    def test_a_rescue_that_cannot_be_written_still_reports_the_refusal(
+        self, tmp_path, monkeypatch
+    ):
+        """The rescue runs on the way to raising, so a failure writing it must
+        not replace 'you are 198 short of the gate' with an unrelated errno.
+        The refusal is the more important of the two messages."""
+        real_write = Path.write_text
+
+        def _fail_the_rescue(self, *args, **kwargs):
+            if ".refused-" in self.name:
+                raise PermissionError(13, "Permission denied")
+            return real_write(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "write_text", _fail_the_rescue)
+        with pytest.raises(ValueError) as exc:
+            collect.write_address_list(self._two_addresses(), tmp_path / "addresses.json")
+
+        message = str(exc.value)
+        assert "needs 200" in message
+        assert "could not be parked" in message
+        assert "Permission denied" in message
+
+    def test_an_empty_result_has_nothing_to_rescue(self, tmp_path):
+        """No file at all for a zero-address run: a loadable empty list is the
+        exact artifact this module exists to keep out of the world."""
+        result = self._two_addresses()
+        empty = replace(result, addresses=())
+        with pytest.raises(ValueError, match="empty address list"):
+            collect.write_address_list(empty, tmp_path / "a.json", allow_short=True)
+
+        assert list(tmp_path.iterdir()) == []
+
+
+class TestNormalisationAtTheWriteBoundary:
+    def test_a_hand_built_result_cannot_publish_a_count_the_loader_disagrees_with(
+        self, tmp_path
+    ):
+        """`write_address_list` used to publish whatever it was handed, so a
+        result holding one account under two spellings wrote
+        `addresses_collected: 3` into a file `FileAddressSource` loads as 2 --
+        and because that loader dedups on the same key, the disagreement would
+        never surface as an error, only as a frame whose arithmetic is wrong."""
+        same = "cd" * 20
+        result = collect.HarvestResult(
+            addresses=("0x" + same.upper(), "0x" + same, _addr(5)),
+            coins=("BTC",), ws_url="wss://example.invalid/ws",
+            started_at=WINDOW_START, ended_at=WINDOW_START + timedelta(minutes=30),
+            stopped_because="a test built it by hand", frames=1, trade_records=1,
+            unparseable_addresses=0, address_field="users", target=1,
+        )
+
+        assert result.addresses == ("0x" + same, _addr(5))
+        out = tmp_path / "a.json"
+        payload = collect.write_address_list(result, out, allow_short=True)
+        assert payload["_provenance"]["addresses_collected"] == 2
+        assert len(FileAddressSource(out).addresses()) == 2
+
+    def test_a_malformed_address_is_refused_where_the_operator_is_standing(self):
+        """Same boundary `normalise_address` already draws, moved as early as it
+        will go: at construction, rather than at load time three weeks into a
+        window."""
+        with pytest.raises(ValueError, match="hex"):
+            collect.HarvestResult(
+                addresses=("0xnot-an-address",), coins=("BTC",), ws_url="wss://x/ws",
+                started_at=WINDOW_START, ended_at=WINDOW_START, stopped_because="",
+                frames=0, trade_records=0, unparseable_addresses=0,
+                address_field="users", target=1,
+            )
+
+
+class TestExitCodesDoNotCollide:
+    """Each code is a different next action, so two failures sharing one is a
+    wrong diagnosis handed to whoever reads the shell."""
+
+    def test_a_refused_connection_raises_rather_than_tracebacking(self):
+        """The URL is this module's most-doubted fact. It spends a paragraph on
+        the silent way of being wrong -- a host that accepts and never delivers
+        -- and left the loud way as an unhandled OSError."""
+        transport = _unreachable_transport(ConnectionRefusedError(111, "Connection refused"))
+        with pytest.raises(collect.FeedUnreachable) as exc:
+            harvest(coins=("BTC",), minutes=1.0, transport=transport,
+                    clock=FakeClock(), utcnow=FakeUtcNow(), emit=lambda line: None,
+                    ws_url="wss://api.hyperliquid.invalid/ws")
+
+        message = str(exc.value)
+        assert "could not open a WebSocket connection" in message
+        assert "wss://api.hyperliquid.invalid/ws" in message
+        assert "--ws-url" in message
+        assert "UNCHECKABLE" in message
+
+    def test_a_wrong_url_exits_three_not_one(self, tmp_path, monkeypatch, capsys):
+        """Exit 1 means 'collected a list, refused to publish it', whose fix is
+        a longer window -- useless advice for a collector that never opened a
+        socket."""
+        def _unreachable(**kwargs):
+            raise collect.FeedUnreachable("could not open a WebSocket connection to wss://x")
+
+        monkeypatch.setattr(collect, "harvest", _unreachable)
+        assert collect.main(["--out", str(tmp_path / "a.json")]) == collect.EXIT_UNREACHABLE
+        assert "COULD NOT CONNECT" in capsys.readouterr().out
+
+    def test_a_missing_websockets_package_exits_three_with_the_install_line(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        def _missing(**kwargs):
+            raise ImportError("... pip install 'websockets>=12.0' ...")
+
+        monkeypatch.setattr(collect, "harvest", _missing)
+        assert collect.main(["--out", str(tmp_path / "a.json")]) == collect.EXIT_UNREACHABLE
+        assert "pip install 'websockets>=12.0'" in capsys.readouterr().out
+
+    def test_a_failed_write_prints_the_harvest_instead_of_losing_it(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """The same defect as F7, reached by a different door.
+
+        A read-only mount, a full disk or a dangling symlink all pass every
+        pre-flight check -- the pre-flight cannot know a write will succeed
+        until it tries one -- and they surface as OSError from `write_text`,
+        after the collection window has already been stood over. Only
+        ValueError was caught, so the harvest died to a traceback with the
+        addresses in memory and nothing on disk.
+
+        Exit 5, not 1: EXIT_REFUSED tells an operator the sample was not good
+        enough and to collect for longer, which is precisely the wrong advice
+        when the sample is fine and sitting on stdout.
+        """
+        frames = [_frame([_trade([_addr(2 * i), _addr(2 * i + 1)])]) for i in range(101)]
+        result, _, _ = _run(frames, target=202, progress_every_s=60.0)
+        monkeypatch.setattr(collect, "harvest", lambda **kw: result)
+
+        out = tmp_path / "addresses.json"
+        real_write_text = Path.write_text
+
+        def _read_only(self, *args, **kwargs):
+            if self == out:
+                raise OSError(30, "Read-only file system")
+            return real_write_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "write_text", _read_only)
+        assert collect.main(["--out", str(out), "--minutes", "30"]) == collect.EXIT_WRITE_FAILED
+
+        printed = capsys.readouterr().out
+        assert "COULD NOT WRITE" in printed
+        assert "Read-only file system" in printed
+        assert "NOT lost" in printed
+        # The whole harvest is recoverable from stdout, not just a count of it.
+        dumped = json.loads(printed[printed.index("{"):printed.rindex("}") + 1])
+        assert dumped["addresses"] == list(result.addresses)
+        assert dumped["frame"]
+        assert not out.exists()
+
+    def test_a_zero_length_window_is_a_usage_error_not_a_short_run(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """--minutes 0 used to traceback out of `harvest` and exit 1, sending an
+        operator to lengthen a window they had just set to zero."""
+        monkeypatch.setattr(collect, "harvest", lambda **kw: pytest.fail(
+            "the collector connected on a window that cannot collect anything"
+        ))
+        with pytest.raises(SystemExit) as exc:
+            collect.main(["--out", str(tmp_path / "a.json"), "--minutes", "0"])
+
+        assert exc.value.code == collect.EXIT_USAGE
+        assert "--minutes must be positive" in capsys.readouterr().err
+
+    def test_a_usage_error_does_not_claim_a_feed_shape_mismatch(self, tmp_path, capsys):
+        """argparse exits 2 for everything, and 2 is 'the feed did not look the
+        way I assume'. Left alone, a typo in a flag name sends an operator to
+        TRADE_ADDRESS_FIELDS."""
+        with pytest.raises(SystemExit) as exc:
+            collect.main(["--out", str(tmp_path / "a.json"), "--not-a-flag"])
+
+        assert exc.value.code == collect.EXIT_USAGE
+        assert exc.value.code != collect.EXIT_FEED_SHAPE
+        assert "unrecognized arguments" in capsys.readouterr().err
+
+    def test_the_pre_flight_path_refusal_is_a_usage_error_too(self, tmp_path, capsys):
+        existing = tmp_path / "addresses.json"
+        existing.write_text("{}")
+        with pytest.raises(SystemExit) as exc:
+            collect.main(["--out", str(existing)])
+
+        assert exc.value.code == collect.EXIT_USAGE
+        assert "pass --force" in capsys.readouterr().err
+
+    def test_a_directory_as_out_is_caught_before_the_collection_window(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """--out <dir> --force passed validation, collected the full window and
+        then died on an uncaught IsADirectoryError with the harvest in memory
+        and nowhere to put it."""
+        monkeypatch.setattr(collect, "harvest", lambda **kw: pytest.fail(
+            "the collector connected with a directory as --out"
+        ))
+        with pytest.raises(SystemExit) as exc:
+            collect.main(["--out", str(tmp_path), "--force"])
+
+        assert exc.value.code == collect.EXIT_USAGE
+        assert "is a directory" in capsys.readouterr().err
+
+    def test_a_missing_parent_is_still_caught_and_names_the_directory(self, tmp_path, capsys):
+        with pytest.raises(SystemExit) as exc:
+            collect.main(["--out", str(tmp_path / "nope" / "a.json")])
+
+        assert exc.value.code == collect.EXIT_USAGE
+        assert "not an existing directory" in capsys.readouterr().err
+
+    def test_the_summary_line_names_the_anomalies_the_run_counted(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """The frame is long; this is the line an operator reads."""
+        frames = [_frame([_trade([_addr(2 * i), _addr(2 * i + 1)])]) for i in range(101)]
+        frames.insert(50, _frame([{"coin": "BTC", "px": "1", "liquidation": True}]))
+        result, _, _ = _run(frames, target=202, progress_every_s=600.0)
+        monkeypatch.setattr(collect, "harvest", lambda **kw: result)
+
+        assert collect.main(["--out", str(tmp_path / "a.json")]) == collect.EXIT_OK
+        printed = capsys.readouterr().out
+        assert "NOTE: 1 anomaly was counted rather than aborted on" in printed
+        assert "anomalies: 1 trade record carrying none of" in printed  # result.summary()
 
 
 def test_the_module_is_importable_without_a_websocket_library():

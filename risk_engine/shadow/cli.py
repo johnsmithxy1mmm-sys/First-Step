@@ -105,7 +105,9 @@ def _fixture_world():
     return FixtureProvider(), bundle, NaiveBaseline(factor)
 
 
-def _live_world(args):
+def _live_world(args, *, load_addresses: bool = True):
+    import time as _time
+
     from risk_engine.market.info import WeightBudget
     from risk_engine.service.state import _build_live_bundle
 
@@ -114,20 +116,53 @@ def _live_world(args):
             "--addresses is required for a live run: the address list is a sampling "
             "frame and it has to be chosen deliberately (OPEN-QUESTIONS B4)"
         )
-    bundle, specs, spot = _build_live_bundle()
     source = FileAddressSource(Path(args.addresses))
+    if load_addresses:
+        # Loaded and validated HERE: before `_build_live_bundle` and before
+        # the candle fetch at the bottom of this function, which are Info
+        # requests charged against §5.3's budget. Built the other way round --
+        # bundle first, list opened only once the sweep reached it -- a
+        # one-character typo cost 40 weight on a 1-coin universe (meta plus
+        # candleSnapshot) and around 80 of the 300/minute the shadow reserve
+        # allows on the real path, which is what made two written claims
+        # false: providers.py's "a typo caught here costs nothing" and the
+        # README's "rather than part-way through a sweep that has already
+        # spent weight". This ordering is what makes them true.
+        #
+        # The list is read twice as a result -- once here, once by the sweep.
+        # That is two reads of a local file and no requests, and it is the
+        # safer arrangement anyway: a file edited between the two is caught by
+        # `run_once`'s own guard rather than trusted because startup liked it.
+        try:
+            source.addresses()
+        except (OSError, ValueError) as exc:
+            # ValueError covers the malformed entry (with its index) and
+            # JSONDecodeError, which subclasses it; OSError covers a path that
+            # is not there. SystemExit rather than a traceback because this is
+            # an operator's fixable mistake, and it is the same channel the
+            # missing-`--addresses` refusal above already uses.
+            raise SystemExit(
+                f"address list refused, and nothing was fetched: {exc}"
+            ) from exc
+
+    bundle, specs, spot = _build_live_bundle()
     budget = WeightBudget(reserved_fraction=SHADOW_RESERVED_FRACTION)
     provider = LiveSnapshotProvider(source, budget=budget, universe=tuple(spot))
     # Reuse the freshly-built bundle's view of the venue rather than
-    # re-fetching it per sweep.
+    # re-fetching it per sweep. `_spot_at` has to be stamped too: it is the
+    # monotonic clock reading `spot()` measures its 60-second freshness
+    # window against, and leaving it at 0.0 meant the very first call in the
+    # sweep saw an age of "seconds since the process booted", judged the
+    # seeded prices stale, and re-fetched a candle snapshot per coin -- 20
+    # weight each, for prices that were seconds old. The cache this comment
+    # claims to be reusing was never once hit.
     provider._specs = specs
     provider._spot = dict(spot)
+    provider._spot_at = _time.monotonic()
 
     import numpy as np
 
     from risk_engine.market.parse import parse_candles_to_log_returns
-
-    import time as _time
 
     now_ms = int(_time.time() * 1000)
     candles = provider.client.candle_snapshot(
@@ -145,6 +180,19 @@ def cmd_snapshot(args) -> int:
         cron = ShadowCron(provider, bundle, journal, naive, n_paths=args.n_paths)
         report = cron.run_once(datetime.now(timezone.utc))
         print(report)
+        if report.refused:
+            # Non-zero, and loud. A daily cron that prints "0 addresses
+            # written" and exits 0 is a §3.3 window that stops advancing
+            # without anybody being told: the address list is static, so the
+            # same entry is refused again tomorrow and every day after, and
+            # the 21-day requirement is read off consecutive days. Whatever
+            # watches this job has to see a failure on day one.
+            print(
+                "  Nothing was written, and no market data was fetched. The list "
+                "is static, so this repeats every day until the entry above is "
+                "corrected -- and §3.3 needs 21 days of it."
+            )
+            return 2
         print(f"  sampling frame: {getattr(provider, 'frame', 'UNSTATED')}")
         for address, reason in report.skipped:
             print(f"  skipped {address}: {reason}")
@@ -157,15 +205,36 @@ def cmd_snapshot(args) -> int:
 
 
 def cmd_resolve(args) -> int:
-    provider, _, _ = _fixture_world() if args.fixture else _live_world(args)
+    # `load_addresses=False`: the resolver takes the addresses it needs from
+    # the journal's own pending rows, never from the file. Refusing to run it
+    # over a typo in a list it does not read would strand yesterday's
+    # predictions past `DEFAULT_STALE_AFTER_S`, and the Info API serves only
+    # current state -- a resolution that arrives late cannot be recovered, it
+    # is lost. Blocking the snapshot on a bad list costs a day of new
+    # predictions; blocking the resolver on it destroys observations already
+    # paid for.
+    provider, _, _ = (
+        _fixture_world() if args.fixture else _live_world(args, load_addresses=False)
+    )
     with CalibrationJournal(args.journal) as journal:
         report = resolve_due(
             journal, provider, datetime.now(timezone.utc),
             stale_after_s=args.stale_after_s,
         )
         print(report)
+        permanent = dict(report.permanent)
         for pid, error in report.failed:
             print(f"  prediction {pid}: {error}")
+        if permanent:
+            # Named as permanent, because the retry is unbounded by design
+            # (see `resolve.py`) and a row that fails identically every night
+            # otherwise reads as a transient blip in a list that never
+            # empties -- and hides the next real failure inside itself.
+            print(
+                f"  {len(permanent)} of those cannot ever resolve and will be "
+                "retried on every run until the journal row is corrected by "
+                "hand: " + ", ".join(f"{pid} ({why})" for pid, why in permanent.items())
+            )
     return 0
 
 

@@ -41,9 +41,22 @@ def long_book(now):
 
 class TestFundingDrag:
     def test_returns_a_distribution_not_a_point(self, bundle, specs, spot, now):
-        """§4.4 is explicit: the AR(1) with its clamp produces a genuinely
-        wide spread over a week, and a median alone would let a user plan
-        around a number they have even odds of beating."""
+        """§4.4 is explicit: a median alone would let a user plan around a
+        number the model gives them roughly even odds of beating.
+
+        The justification used to be that the AR(1) and its clamp "produce a
+        genuinely wide spread over a week", which reads as though the week were
+        what makes the spread wide -- i.e. as though narrowing the horizon
+        could retire the requirement. The measurement says otherwise: on these
+        fixtures the 5th-95th band is *relatively* wider at the shipped 24h
+        default -- 0.99 to 1.02 of the median across seeds, against 0.52 to
+        0.54 at 168h -- because the persistent AR(1) has less of the horizon to
+        mean-revert in. So the requirement bites hardest at the default, and
+        `test_the_default_horizon_is_a_day` asserts it there too. This case
+        stays at 168h because that is where the band is widest in dollars
+        (about $1,170-$2,080, against $120-$365 at 24h), which is the form a
+        plan for a long hold actually goes wrong in.
+        """
         out = funding_drag(long_book(now), spot, bundle, specs,
                            horizon_hours=168, n_paths=4_000, seed=1, now=now)
         assert out.quantile(0.95) > out.quantile(0.5) > out.quantile(0.05)

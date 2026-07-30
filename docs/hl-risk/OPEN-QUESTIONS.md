@@ -8,6 +8,17 @@ instead, and — where the choice biases risk — in which direction.
 external data before the phase that depends on it can close.
 `[RESOLVED]` = a defensible reading exists, taken, and recorded here.
 
+A label may carry an em-dash suffix, and the suffix is the load-bearing part:
+it names what the label does *not* cover. `[BLOCKER — downgraded]` (C1) still
+wants provenance but no longer gates anything; `[BLOCKER — frame decided, feed
+shape unverified]` (B4) has the decision and not the data; `[RESOLVED — at the
+24h default, ...]` (A8) settles one horizon and leaves the others carrying the
+bias. An unqualified `[RESOLVED]` is a claim that nothing is outstanding, so it
+is only correct where the entry needed a convention and not a measurement —
+A1 is the clean case. Where an entry's own text still asks for external data,
+the suffix has to say so, otherwise the legend and the entry disagree and the
+reader believes the legend.
+
 ---
 
 ## A. Mathematical contradictions
@@ -153,7 +164,7 @@ implemented twice: for cross books the grid varies *effective* leverage
 (position size at fixed collateral), and for isolated positions it varies the
 set leverage `L`. Confirmation wanted that this is the intent.
 
-### A8 `[RESOLVED]` Funding is simulated independently of price
+### A8 `[RESOLVED — at the 24h default; the week and portfolio_risk's 7-day arm still carry the bias]` Funding is simulated independently of price
 
 Funding shocks are drawn independently of price shocks. In reality the
 funding rate tracks the perp-spot premium, which correlates with recent
@@ -188,7 +199,11 @@ the §3.3 shadow-day counter is keyed on the distribution version
 (`risk_engine/version.py`), so it resets the validation window to zero. Doing
 that now would mean the clock never starts. Narrowing the default is the
 honest interim position rather than a workaround: it makes the shipped default
-the horizon the simplification survives, and says so on every result.
+the horizon the simplification survives, and discloses the approximation to
+whoever receives the number — see "Where the disclosure actually reaches a
+user" below, which corrects an earlier version of this sentence that claimed
+it was said "on every result". It is not: `FundingDrag.caveats` discloses to a
+*caller*, and no shipped path constructs one.
 
 What is *not* fixed, and must not be read as fixed:
 
@@ -205,6 +220,20 @@ What is *not* fixed, and must not be read as fixed:
   anti-conservative for shorts. `funding_cost` is published at 24 h only, so
   no *funding* figure reaches a user at a week.
 
+Where the disclosure actually reaches a user (corrected 2026-07-30, after
+adversarial review): **not** through `FundingDrag.caveats`. Nothing shipped
+constructs a `FundingDrag` — the engine serves `/portfolio_risk` and
+`/pre_trade_delta`, and the shadow cron calls the engine directly — so the
+caveat tuple this entry relied on has no readers. The figure a user sees is
+`funding_cost_24h`, from `portfolio_risk.result_24h.funding_cost`, and
+`PortfolioRisk` carries no caveats field. The disclosure therefore lives in
+three places that are on the shipped path: rendered copy on the funding panel
+(`apps/web/app/page.tsx`), which states the 24 h horizon and that a week runs
+roughly 7× it; doc comments on the field in `services/backend/src/risk/client.ts`
+and `apps/web/lib/contract.ts`; and a test that the published figure really is
+a 24 h walk (`risk_engine/tests/test_service.py`), because `portfolio_risk`
+owns a `DAY_HOURS` of its own that `funding_drag`'s guard does not reach.
+
 To revisit: measure the correlation between hourly funding and hourly returns
 per asset over the shadow window — the measurement this entry originally asked
 for, which does not need to precede the clock because it is a property of the
@@ -212,6 +241,20 @@ market, not of the model version. If it is material, add the return-driven
 term to the AR(1), accept the MINOR bump and the counter reset, and widen the
 default back. Until that measurement exists there is nothing to decide with,
 which is why this is closed as a decision rather than left open as a gate.
+
+**Why the label is qualified rather than a flat `[RESOLVED]`** (corrected
+2026-07-30). The legend reserves `[BLOCKER]` for what needs a decision *or*
+external data, and the paragraph immediately above still asks for external
+data — the funding/return correlation has never been measured. The two
+paragraphs before it name two reachable paths, `horizon_hours=WEEK_HOURS` and
+`portfolio_risk`'s 7-day arm behind the published `p_liq_7d`, on which the
+bias is not bounded at all, only disclosed. A flat `[RESOLVED]` would say
+none of that is outstanding, and a reader who trusts the label over the body
+would carry a week-horizon number as calibrated. The suffix is what the entry
+actually establishes: the default horizon is decided and the simplification is
+survivable there. Compare A1, which is flat `[RESOLVED]` correctly — it is a
+choice of convention, nothing external is owed, and no path escapes the
+decision.
 
 ### A9 `[RESOLVED]` §2.3 never says how the copula's degrees of freedom are chosen
 
@@ -485,10 +528,32 @@ fewer addresses than `ShadowProgress.required_addresses` without
   Instead of assuming, it asserts: a trade record carrying no address where
   one is expected aborts the run quoting the frame verbatim, an
   acknowledged-but-undelivered subscription aborts, silence on connect
-  aborts, and no path reaches a written file with zero addresses. The failure
-  it is built to prevent is the quiet one — a valid, empty, confidently
-  framed list that loads cleanly, sweeps nothing, and surfaces three weeks
-  later as a gate that never advanced.
+  aborts, a connection that never opens aborts naming `--ws-url`, and no path
+  reaches a written file with zero addresses. The failure it is built to
+  prevent is the quiet one — a valid, empty, confidently framed list that
+  loads cleanly, sweeps nothing, and surfaces three weeks later as a gate
+  that never advanced.
+
+  **Those assertions are fatal only until the first address is read**, and
+  that boundary is deliberate rather than a softening. Before an address has
+  come out of one of `TRADE_ADDRESS_FIELDS`, an odd record or an error frame
+  is evidence the assumed shape is wrong. After one has, the venue has
+  demonstrated the shape, and aborting both discards a good sample and
+  misdiagnoses it — a single non-trade record after 300 harvested addresses
+  used to abort claiming this entry's assumption "did not hold", which is
+  false, it had just held 300 times, and it would send an operator to edit
+  `TRADE_ADDRESS_FIELDS` on evidence that says nothing of the kind. Past that
+  point anomalies are counted, warned about on the progress stream while the
+  operator can still kill the run, and published in both the generated frame
+  and the `_provenance` block as trades the list does not contain. A count of
+  zero and a count of nine thousand produce identical address lists
+  otherwise.
+
+  **No example frame in this repository is a capture.** Every trade frame,
+  counter, timestamp and address in the collector's tests, in its docstrings
+  and in any review of it is stub-generated — the suite drives it through a
+  scripted socket and a fake clock. Nothing here can be cited as evidence
+  that the shape is right; only a live run can.
 - **More addresses still buy almost nothing.** B1 measured it: 200 → 500 per
   day moves the clustered half-width from 3.60 to 3.43 pp. Days are the
   lever. `--target` defaults to 500 for headroom against the accounts the
@@ -678,6 +743,126 @@ live users. Daily snapshots are feasible; the resolver doubles the traffic.
 The cron is built with a weight-budget governor and an explicit low-priority
 lane, but the address count and the live-user headroom are coupled and should
 be sized against real traffic, not assumed.
+
+### C7 `[BLOCKER — non-blocking in practice]` Is the Info API case-sensitive on `user`?
+
+**Recorded 2026-07-30, after adversarial review, because it was recorded
+nowhere.** Commit 667f539 opens by asserting a live venue finding as
+established fact:
+
+> The C5 probe returned HTTP 422 on an address pasted in EIP-55 checksummed
+> form ... Lowercasing the same string made the call succeed against an
+> unchanged account, so the venue's Info API is case-sensitive on the `user`
+> field.
+
+That is the only place in this repository where the finding appears, and a
+commit message is not one of the places this project records live findings.
+Every other one has a dated entry here with its numbers attached: E5's three
+parsers on live mainnet, C1's 1500 hourly funding observations, C2's 12 basis
+samples, C5's funding tick on testnet. Case sensitivity — the observation that
+motivated a change to two boundaries across thirteen files — left this
+document silent on the subject. A claim that lives only in pushed history is a claim
+nobody can check or correct, which is why it is being written down here
+instead of by rewriting the commit.
+
+**What is known, and what is not.** Known: a 422 was seen; the string was the
+checksummed spelling; lowercasing it produced a successful response against an
+account that had not changed in between. The sequence is consistent with the
+conclusion drawn from it. Not known: the exact command line that produced the
+422 was never captured, so the failure cannot be replayed, and the ordinary
+alternatives are not excluded — a different defect in that one invocation, or
+a transient venue-side response that the second attempt happened to clear. One
+unrepeated observation with no recorded command is evidence; the commit stated
+it as a protocol property. The distinction matters because a protocol property
+is something later work is entitled to build on, and this is not yet that. The
+API is 403 at this environment's proxy (E5), so it cannot be re-run from here.
+
+To settle it, from a network where the API is reachable, and record the result
+in this file rather than in a commit message:
+
+```bash
+A=0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed   # any real account, checksummed
+for u in "$A" "$(printf %s "$A" | tr 'A-F' 'a-f')"; do
+  curl -s -o /dev/null -w "%{http_code}  $u\n" -X POST https://api.hyperliquid.xyz/info \
+    -H 'Content-Type: application/json' \
+    -d "{\"type\":\"clearinghouseState\",\"user\":\"$u\"}"
+done
+```
+
+Two different status codes confirm case sensitivity; two 200s refute it and
+this entry should then say so.
+
+**The normalisation fix does not rest on this observation and must not be read
+as doing so.** If the venue turns out to be perfectly case-insensitive,
+`normalise_address` stays exactly as it is, because the two failures it
+defends against are properties of this codebase, verified offline against
+stubs rather than against the venue:
+
+- **§5.1's silent empty state.** The venue answers an address it does not
+  recognise with a well-formed *empty* clearinghouse state, never an error. A
+  wrong address therefore does not fail — it reads downstream as "this account
+  holds no positions", which a risk tool renders as no risk. Case sensitivity
+  would only change *which* wrong strings land there, not what happens when
+  one does.
+- **Journal identity.** `address` is TEXT with no COLLATE in `schema.sql`, and
+  neither Postgres's default collation nor SQLite's BINARY folds case, so the
+  UNIQUE constraint cannot see two spellings of one account as a duplicate.
+  `progress()` counts `DISTINCT address` towards §3.3's 200-account gate. That
+  is arithmetic over storage this repository owns outright; the venue has no
+  say in it.
+
+The honest ordering is that the fix was worth making either way, and the 422
+is what prompted somebody to look.
+
+**What the fix cannot do: heal a journal that already holds a split account.**
+Normalising at the write makes every future row canonical and repairs nothing
+already written, and the two mix badly. Reproduced against an in-memory
+journal — one real account written checksummed the way a pre-fix writer wrote
+it, then lowercase the way the post-fix writer writes it, both resolved:
+
+```
+shadow gate CLOSED for 0.2: 2/21 days, 2/200 addresses, 2 resolved observations
+```
+
+`distinct_addresses == 2` for **one** account: precisely the §3.3 gate
+inflation the fix is described as preventing, reached from the other side.
+
+**The blast radius is currently empty, and that emptiness is the precondition
+the fix rests on.** The shadow counter has not started, no journal database
+exists in this repository or on any deployment target, and
+`deploy/docker-compose.yml` keeps the shadow jobs behind a profile so `up`
+cannot create one as a side effect. There is therefore no split row anywhere
+to find — which is why there is **no detection query and no backfill**, stated
+here rather than left for someone to discover by looking for them. That is a
+statement about today, not a property of the design. It expires the first time
+a sweep writes, and it would already be false for a journal restored from
+before 2026-07-30 or for any future writer that bypasses `record_prediction`.
+If either happens, the first thing to write is the grouping the identity
+column cannot express — group on `LOWER(address)` and report every group whose
+`COUNT(DISTINCT address)` exceeds 1 — followed by a decision about rows that
+cannot be edited (§3.4, audit A-09). That is a migration question, not a bug
+fix, and it is cheaper to never need it than to answer it.
+
+**One further correction to the same commit.** Its closing paragraph justifies
+folding rather than verifying the checksum as avoiding "either rejecting the
+perfectly legal all-lowercase form or drag[ging] keccak into a module that
+needs none". The first horn is false: EIP-55 is a *case* pattern, so an
+all-lowercase or all-uppercase address carries no checksum information and is
+accepted unverified by every implementation — only mixed-case strings are
+checkable, and verification would have rejected no legal spelling. It would
+have caught a mistyped capital on exactly the checksummed paste path the
+commit cites as its motivation, for free. The decision to skip it is still
+right, on its real cost: EIP-55 is defined over keccak-256, `hashlib` has no
+keccak, and `hashlib.sha3_256` is NIST SHA-3 rather than keccak-256 (different
+domain-separation padding, unrelated digest), so the routes are a third-party
+dependency in a numpy+scipy package or a hand-rolled Keccak permutation inside
+the module that defines account identity. Corrected in `normalise_address`'s
+docstring and in `test_address.py`, where the assertion that a broken checksum
+is accepted now records a known gap instead of a virtue. The gap that remains
+either way: `0x...beaed` mistyped as `0x...beaec` is 40 valid hex digits and a
+different real account, caught by nothing, returning the §5.1 empty state that
+reads as "no positions" — and a lowercase string carries no checksum, so
+keccak would not have caught that one either.
 
 ---
 

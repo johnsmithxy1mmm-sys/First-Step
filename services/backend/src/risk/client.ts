@@ -39,6 +39,21 @@ export interface PortfolioRisk {
   p_liq_7d_cross: Estimate;
   p_liq_7d_isolated: Record<string, Estimate>;
   cvar_95_24h_usd: Estimate;
+  /**
+   * Funding over 24 HOURS, not over the 7 days `p_liq_7d` covers. It comes
+   * from `portfolio_risk`'s `result_24h`, whose horizon lives in
+   * `portfolio_risk.DAY_HOURS` — a constant separate from `funding_drag`'s,
+   * guarded by its own test in `risk_engine/tests/test_service.py`.
+   *
+   * The engine draws funding independently of price and that bias compounds
+   * hour by hour, so 24h is the horizon over which it stays below the
+   * estimation error on the rate itself (OPEN-QUESTIONS A8) — the reason no
+   * funding figure is published at a week. Funding accrues hourly, so a week
+   * is roughly 7× this; anyone presenting it beside a 7-day number owes the
+   * user that scaling and the caveat. `FundingDrag.caveats` states both, but
+   * that type never crosses this wire, so the disclosure travels with this
+   * field and is rendered in `apps/web/app/page.tsx`.
+   */
   funding_cost_24h: { median: number; p05: number; p95: number };
   matrix_age_s: number | null;
 }

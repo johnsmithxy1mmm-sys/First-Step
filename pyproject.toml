@@ -7,6 +7,16 @@ testpaths = ["polymarket_bot/tests", "risk_engine/tests"]
 addopts = "-q"
 markers = [
     "slow: excluded from the fast pre-commit run",
+    # Wall-clock assertions. They measure the box as much as the code, so a
+    # contended runner turns them red with nothing changed -- measured: the
+    # §2.6 budget test passes on an idle four-core box and misses by 2x with
+    # all four cores busy. CI runs them in a non-blocking step so the branch
+    # does not fail on unrelated load; a plain `pytest risk_engine/tests`
+    # still runs them, because on a developer's machine they are meaningful.
+    # This is a quarantine, not a licence to soften one: the budget stays
+    # §2.6's 300 ms and OPEN-QUESTIONS D7 stays the honest record of it being
+    # missed at the book size §0 targets.
+    "load_sensitive: timing assertion; non-blocking in CI, still run locally",
 ]
 
 [tool.coverage.run]

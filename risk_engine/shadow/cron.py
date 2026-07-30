@@ -17,6 +17,20 @@ Rate limits (§5.3): the job holds a `WeightBudget` with a large reserved
 fraction, so it refuses to spend into the headroom that live users need.
 Running out of budget mid-sweep truncates the sweep and is reported -- it is
 not an error, and it must not be retried into the reserve.
+
+Two failure channels, and the difference between them is load-bearing:
+
+  - `SweepReport.skipped` is per address. A flat book, a non-positive equity,
+    a request that failed for one account: the sweep continues, because the
+    other 199 addresses are still a day of the §3.3 window.
+  - `SweepReport.address_source_error` is the whole run. The address list is
+    the sampling frame the calibration score will be published against
+    (OPEN-QUESTIONS B4), so a list containing an entry that is not an address
+    is not swept as if it were that frame -- but the refusal has to arrive as
+    a *reported* run-level failure naming the offending index, which the CLI
+    turns into a non-zero exit. It escaped as an unhandled ValueError before,
+    and because an address file does not change between days, that took the
+    whole 21-day window with it rather than one address.
 """
 
 from __future__ import annotations
@@ -65,8 +79,29 @@ class SweepReport:
     written: int
     skipped: list[tuple[str, str]] = field(default_factory=list)
     budget_exhausted: bool = False
+    #: Set when the address list itself could not be loaded, in which case the
+    #: sweep wrote nothing and `attempted` is 0. Carries the source's own
+    #: message, which names the offending index. Distinct from `skipped`
+    #: because it is not one address that went wrong, it is the day.
+    address_source_error: str | None = None
+
+    @property
+    def refused(self) -> bool:
+        """Whether the run refused to sweep at all.
+
+        A caller that reports success on `written == 0` cannot tell an empty
+        list from a rejected one, and the second is the case that repeats
+        every day until an operator edits the file.
+        """
+        return self.address_source_error is not None
 
     def __str__(self) -> str:
+        if self.refused:
+            return (
+                f"shadow sweep {self.started_at.isoformat()}: REFUSED, nothing "
+                f"written -- the address list would not load: "
+                f"{self.address_source_error}"
+            )
         tail = " (budget exhausted, sweep truncated)" if self.budget_exhausted else ""
         return (
             f"shadow sweep {self.started_at.isoformat()}: {self.written}/{self.attempted} "
@@ -95,9 +130,53 @@ class ShadowCron:
 
     def run_once(self, now: datetime | None = None, seed: int | None = None) -> SweepReport:
         now = now or datetime.now(timezone.utc)
+
+        # The address list is read FIRST, and inside a guard. Both parts are
+        # fixes for measured behaviour, and they are separate points.
+        #
+        # First: it goes inside a guard because `addresses()` raises on an
+        # entry that is not an address (providers.py, deliberately -- the old
+        # path put a typo on the wire, and §5.1's answer for an address the
+        # venue does not recognise is a well-formed *empty* state, which the
+        # resolver then scored as equity 0: liquidated=1, var_95_breached=1,
+        # permanently, in a table that is never updated). Outside every `try`, that
+        # refusal left the sweep as an unhandled ValueError out of
+        # `cmd_snapshot`: with [good, '0xabc', good] the pre-refusal code
+        # wrote 2 of 3 and skipped 1, and the refusal wrote 0 and printed a
+        # traceback. An address file is static, so that is not one bad day, it
+        # is all 21 of §3.3's -- the blast radius the refusal was supposed to
+        # shrink. The list is still refused whole (sweeping the good half
+        # would quietly publish a different sampling frame from the one the
+        # file declares, OPEN-QUESTIONS B4), but as a run-level report that
+        # names the index, which `cmd_snapshot` exits non-zero on.
+        #
+        # `Exception` rather than `ValueError`: a missing file (OSError), a
+        # truncated one (JSONDecodeError) and a typo (ValueError) all mean the
+        # same thing to the operator -- there is no list to sweep today -- and
+        # each one used to produce a differently-shaped traceback.
+        # KeyboardInterrupt and SystemExit are BaseException and still escape,
+        # so an interrupted sweep is not reported as a bad list.
+        #
+        # Second: it goes first because `specs()` and `spot()` are Info
+        # requests. Validating after them charged 40 weight (meta plus one
+        # candleSnapshot on a 1-coin universe; more on a real universe) before
+        # the list was so much as opened, which made two written claims false
+        # -- providers.py's "a typo caught here costs nothing" and the
+        # README's "rather than part-way through a sweep that has already
+        # spent weight". Reading a local file before spending §5.3 budget
+        # makes them true instead of having to soften them.
+        try:
+            addresses = self.provider.addresses()
+        except Exception as exc:
+            return SweepReport(
+                started_at=now,
+                attempted=0,
+                written=0,
+                address_source_error=f"{type(exc).__name__}: {exc}",
+            )
+
         specs = self.provider.specs()
         spot = self.provider.spot()
-        addresses = self.provider.addresses()
         rng = np.random.default_rng(seed if seed is not None else int(now.timestamp()))
 
         written = 0

@@ -30,6 +30,22 @@ its participants' addresses is exactly what B4 says "need[s] to be verified".
 So every one of those facts is asserted while collecting, and a mismatch
 raises `UnexpectedFeedShape` quoting the frame verbatim.
 
+**Those assertions are fatal only until the first address is read.** This is
+the one asymmetry in the module worth stating twice, because getting it wrong
+in either direction is a real failure. Before anything has been collected, an
+odd record or an error frame is evidence that the assumed shape is wrong, and
+aborting is the only safe response. *After* an address has been read out of
+one of `TRADE_ADDRESS_FIELDS`, the assumption is no longer an assumption: the
+venue has demonstrated it, and a later anomaly is one bad record on a feed
+whose shape has been confirmed hundreds of times. Aborting there destroys a
+good harvest and -- worse -- misdiagnoses it, telling an operator that "the
+B4 assumption did not hold" when it had just held 300 times and sending them
+to edit `TRADE_ADDRESS_FIELDS` on evidence that says nothing of the kind. So
+past that point anomalies are counted, warned about on the progress stream as
+they happen, and published in the frame and the provenance as a named
+shortfall of the sample. They are never dropped silently: an anomaly is a
+trade this list does not contain.
+
 The failure this module is built to make impossible is the quiet one: a
 collector that connects to the wrong URL, or subscribes with a key the venue
 acknowledges and never delivers on, or reads an address field that does not
@@ -39,6 +55,30 @@ nightly sweep snapshots nothing, `progress()` shows a gate that never moves,
 and the reason sits three layers away. Every path that reaches zero addresses
 here raises instead, and the write refuses an empty list even when the
 operator has passed `--allow-short`.
+
+The mirror-image failure -- refusing to publish a harvest and then discarding
+it -- is guarded too. A run that comes back short of §3.3's gate is refused,
+but the addresses are written to a timestamped rescue file first, because the
+alternative is telling an operator who has just stood over a 30-minute window
+that their 199 addresses exist in no file anywhere.
+
+Exit codes are distinct because the four failures need different responses,
+and a collision between any two of them is a wrong diagnosis in an operator's
+hands (`EXIT_*` constants below):
+
+    0  wrote the list
+    1  collected, then refused to publish it (short of the gate, path exists)
+    2  the feed did not look the way this module assumes -- code, not weather
+    3  never got a usable connection: --ws-url, DNS, TLS, refusal, missing dep
+    4  bad invocation, caught before anything connects
+
+**No example output anywhere in this repository was captured from the live
+feed.** The API is 403 at this environment's proxy (OPEN-QUESTIONS E5), so
+every frame, counter, timestamp and address quoted in a docstring, a document
+or a test is stub-generated -- the test suite drives this module through a
+scripted socket and a fake clock. Anything that looks like a capture is not
+one, and a reader deciding whether the shape is confirmed must go to a live
+run, not to an example.
 
 `websockets` is not a dependency of the risk engine and must not become one
 (`requirements.txt` is numerics only). It is imported lazily, inside the one
@@ -53,10 +93,11 @@ import json
 import sys
 import time
 from collections.abc import Callable, Iterable, Sequence
+from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 from risk_engine.domain.types import normalise_address
 
@@ -76,8 +117,10 @@ MAINNET_WS_URL = "wss://api.hyperliquid.xyz/ws"
 #: envelope anyone has written down here, so the outer `method`/`subscription`
 #: shape is borrowed from it and the inner `type`/`coin` pair is inference. If
 #: the venue names either differently the subscription is either rejected --
-#: which surfaces as an error frame and a loud abort -- or acknowledged and
-#: never delivered, which surfaces as the no-trade-records abort below.
+#: which surfaces as an error frame, and as a loud abort while nothing has been
+#: collected -- or acknowledged and never delivered, which surfaces as the
+#: no-trade-records abort below. Both of those are the same fault seen from two
+#: sides, and neither can be told from a quiet market without asserting.
 TRADES_CHANNEL = "trades"
 
 #: Where a trade record is expected to carry the accounts that traded. This is
@@ -147,8 +190,40 @@ PING_INTERVAL_S = 20.0
 _EXAMPLE_LIMIT = 3
 _EXAMPLE_CHARS = 300
 
+#: Exit codes. Every one of these is a different action for the operator, and
+#: two failures sharing a code is a wrong diagnosis handed to whoever is
+#: reading the shell: a refused connection reported as "short run" sends them
+#: to lengthen `--minutes` on a collector that never opened a socket, and a
+#: mistyped flag reported as "shape mismatch" sends them to edit
+#: `TRADE_ADDRESS_FIELDS`. Note EXIT_USAGE is 4 rather than argparse's default
+#: of 2: `_ExitCodeParser` below re-routes argparse's own errors onto it,
+#: because 2 belongs to the shape mismatch and argparse would otherwise hand
+#: out that meaning for a typo in a flag name.
+EXIT_OK = 0
+EXIT_REFUSED = 1
+EXIT_FEED_SHAPE = 2
+EXIT_UNREACHABLE = 3
+EXIT_USAGE = 4
+#: The harvest succeeded and only the write failed -- read-only mount, dangling
+#: symlink, full disk. Distinct from EXIT_REFUSED because the two call for
+#: opposite responses: a refusal means the sample is not good enough and the
+#: operator needs another window, whereas this means the sample IS good and is
+#: sitting on stdout waiting to be redirected somewhere writable. Collapsing
+#: them would send an operator to spend thirty minutes re-collecting addresses
+#: they already have.
+EXIT_WRITE_FAILED = 5
 
-class UnexpectedFeedShape(RuntimeError):
+
+class FeedFault(RuntimeError):
+    """Base for the two ways this collector declares the feed unusable.
+
+    Shared so a library caller can catch both with one clause, kept as two
+    subclasses because the CLI must not: they exit differently and they send
+    an operator to different places (a URL, versus this module's parser).
+    """
+
+
+class UnexpectedFeedShape(FeedFault):
     """The feed was not shaped the way this collector assumed.
 
     A distinct type rather than a bare RuntimeError because the caller has to
@@ -156,6 +231,24 @@ class UnexpectedFeedShape(RuntimeError):
     operator can override with `--allow-short`, while this means the frame on
     the wire does not match what was parsed and no address list from this run
     is trustworthy at any length.
+
+    Raised only while nothing has been collected. Once an address has been
+    read from an expected field the shape is confirmed by observation, and a
+    later contradiction is recorded in `FeedAnomalies` instead -- see the
+    module docstring for why the abort would be both destructive and wrong.
+    """
+
+
+class FeedUnreachable(FeedFault):
+    """No usable connection was ever opened, so nothing was observed at all.
+
+    Separate from `UnexpectedFeedShape` because the module's most-doubted fact
+    is its URL, and the two ways a wrong URL shows up need different words. It
+    spends a paragraph on the *silent* case -- a host that accepts the
+    connection and never delivers trades -- and the *loud* case used to fall
+    out as an unhandled `OSError`, which tracebacks and exits 1, the code
+    reserved for "collected, but short". An operator reading that goes and
+    lengthens the window on a collector that never opened a socket.
     """
 
 
@@ -182,9 +275,78 @@ class _Counters:
     other_frames: int = 0
     undecodable: int = 0
     unparseable_addresses: int = 0
+    error_frames: int = 0
+    records_without_address: int = 0
+    unreadable_trade_entries: int = 0
+    records_without_coin: int = 0
     address_field: str = ""
+    #: Per-coin record counts in arrival order. The *observed* coins, which are
+    #: not the subscribed ones and can only be a subset of them.
+    coin_counts: dict[str, int] = field(default_factory=dict)
     examples: list[str] = field(default_factory=list)
     bad_address_examples: list[str] = field(default_factory=list)
+    error_examples: list[str] = field(default_factory=list)
+    no_address_examples: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class FeedAnomalies:
+    """Frames that contradicted the assumed shape *after* it had already held.
+
+    Every field here is a trade this address list does not contain. They are
+    counted rather than fatal because the shape assumption was confirmed by
+    observation before they arrived (see `UnexpectedFeedShape`), and they are
+    published rather than swallowed because a count of zero and a count of
+    nine thousand describe very different samples while producing identical
+    address lists. §10 forbids understating what a number rests on, so these
+    reach the generated frame and the provenance block, not just a log line
+    that scrolls off an operator's terminal.
+
+    `undecodable_frames` is in here rather than beside `frames` on the result
+    for one reason: it used to be incremented and read by nothing at all, so a
+    run could take thousands of non-JSON frames off the wire and publish no
+    hint of it.
+    """
+
+    error_frames: int = 0
+    records_without_address: int = 0
+    unreadable_trade_entries: int = 0
+    undecodable_frames: int = 0
+    error_examples: tuple[str, ...] = ()
+    no_address_examples: tuple[str, ...] = ()
+
+    @property
+    def total(self) -> int:
+        return (
+            self.error_frames
+            + self.records_without_address
+            + self.unreadable_trade_entries
+            + self.undecodable_frames
+        )
+
+    def clauses(self) -> list[str]:
+        """One phrase per kind of contradiction, for the frame and the summary."""
+        parts = []
+        if self.error_frames:
+            parts.append(
+                f"{self.error_frames} error frame{'' if self.error_frames == 1 else 's'} "
+                f"from the venue (verbatim: {list(self.error_examples)})"
+            )
+        if self.records_without_address:
+            parts.append(
+                f"{self.records_without_address} trade record"
+                f"{'' if self.records_without_address == 1 else 's'} carrying none of "
+                f"{list(TRADE_ADDRESS_FIELDS)} (verbatim: {list(self.no_address_examples)})"
+            )
+        if self.unreadable_trade_entries:
+            parts.append(
+                f"{self.unreadable_trade_entries} entr"
+                f"{'y' if self.unreadable_trade_entries == 1 else 'ies'} inside a "
+                f"'{TRADES_CHANNEL}' frame's data that was not a trade record"
+            )
+        if self.undecodable_frames:
+            parts.append(f"{self.undecodable_frames} frame(s) that were not decodable JSON")
+        return parts
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,6 +358,17 @@ class HarvestResult:
     hour and 200 harvested from 210 trades in the first four seconds are
     different samples of different things, and a reader of the calibration
     score has no way to tell them apart afterwards unless the run says so.
+
+    `coins` is what was SUBSCRIBED. What was observed is `records_by_coin`,
+    derived from the `coin` field of the records themselves, and the two are
+    not the same fact: subscribing BTC, ETH and SOL while only BTC delivers is
+    an ordinary outcome, and the difference can only ever overstate the
+    breadth of the sample, never understate it. Both are kept because a coin
+    that was asked for and never arrived is itself a finding.
+
+    Every field added after `target` carries a default, so a caller
+    constructing a result by hand -- a test, or a script fixing up a rescued
+    run -- keeps working and simply publishes zeroes for what it does not know.
     """
 
     addresses: tuple[str, ...]
@@ -209,17 +382,48 @@ class HarvestResult:
     unparseable_addresses: int
     address_field: str
     target: int
+    records_by_coin: tuple[tuple[str, int], ...] = ()
+    records_without_coin: int = 0
+    other_frames: int = 0
+    anomalies: FeedAnomalies = FeedAnomalies()
+
+    def __post_init__(self) -> None:
+        # Canonicalise and dedup HERE, not only in `_collect`. This type is the
+        # only thing `build_payload` and `write_address_list` see, and both
+        # publish `len(self.addresses)` as the count a reader of the
+        # calibration score is asked to trust. A hand-built result holding the
+        # same account twice under two spellings would otherwise write
+        # `addresses_collected: 3` into a file that `FileAddressSource` loads
+        # as 2 -- and that loader dedups on exactly this key, so the
+        # disagreement would never surface as an error, only as a frame whose
+        # arithmetic is wrong. Raising on a malformed entry is the same
+        # boundary `normalise_address` already draws: better at construction,
+        # where the operator is standing here, than at load time three weeks in.
+        canonical: dict[str, None] = {}
+        for a in self.addresses:
+            canonical.setdefault(normalise_address(a), None)
+        if tuple(canonical) != self.addresses:
+            object.__setattr__(self, "addresses", tuple(canonical))
 
     @property
     def window_seconds(self) -> float:
         return (self.ended_at - self.started_at).total_seconds()
 
+    @property
+    def coins_observed(self) -> tuple[str, ...]:
+        """The coins trade records actually arrived for, in arrival order."""
+        return tuple(coin for coin, _ in self.records_by_coin)
+
     def summary(self) -> str:
+        observed = ", ".join(self.coins_observed) or "no coin field on any record"
+        anomalies = self.anomalies.clauses()
         return (
             f"{len(self.addresses)} distinct addresses from {self.trade_records} trade "
             f"records over {self.frames} frames in {self.window_seconds / 60:.1f} min "
-            f"({', '.join(self.coins)}); addresses read from '{self.address_field}'; "
+            f"(subscribed {', '.join(self.coins)}; records arrived for {observed}); "
+            f"addresses read from '{self.address_field}'; "
             f"{_values(self.unparseable_addresses)} refused by normalise_address; "
+            f"anomalies: {'; '.join(anomalies) if anomalies else 'none'}; "
             f"stopped because {self.stopped_because}"
         )
 
@@ -246,6 +450,29 @@ def _remember(bucket: list[str], raw: object) -> None:
         bucket.append(_truncate(raw))
 
 
+def _anomalies(counters: _Counters) -> FeedAnomalies:
+    """Freeze the anomaly counters for publication."""
+    return FeedAnomalies(
+        error_frames=counters.error_frames,
+        records_without_address=counters.records_without_address,
+        unreadable_trade_entries=counters.unreadable_trade_entries,
+        undecodable_frames=counters.undecodable,
+        error_examples=tuple(counters.error_examples),
+        no_address_examples=tuple(counters.no_address_examples),
+    )
+
+
+def _anomaly_total(counters: _Counters) -> int:
+    """The running anomaly count, for the progress line.
+
+    On the progress stream as well as in the published frame because an
+    operator watching a 30-minute window is the only person who can still act
+    on it -- a count that climbs with every frame means the shape is only
+    accidentally right, and killing the run costs less than publishing it.
+    """
+    return _anomalies(counters).total
+
+
 def _error_text(payload: object) -> str | None:
     """The feed's own complaint, if this frame is one.
 
@@ -264,29 +491,58 @@ def _error_text(payload: object) -> str | None:
     return None
 
 
-def _trade_records(payload: object) -> list[dict] | None:
-    """The trade records in one frame, or None if this frame is not trades.
+def _trade_records(payload: object) -> tuple[list[dict], list[object]] | None:
+    """The trade records in one frame, and the entries that were not records.
 
-    Permissive about the envelope, strict about the contents. The outer
-    wrapper is a transport detail that a venue can change without changing
-    what a trade *is*, and the repo has no record of it either way, so both
-    the documented-by-convention `{"channel": ..., "data": [...]}` form and a
-    bare array of records are accepted. The address field inside a record is
-    the load-bearing fact and is not guessed at all -- see
-    `_address_values`.
+    Returns None when this frame is not trades at all, which the caller counts
+    as an ordinary non-trade frame (an ack, a heartbeat, something unknown)
+    and retains as evidence.
+
+    **Envelope tolerance is calibrated to how much the envelope was guessed.**
+    The pairing this function used to have was backwards: it accepted a bare
+    JSON array of dicts as trade records on inference alone, and then handed
+    the contents to a check that was fatal. So `[{"px": "1", "sz": "2"}]` --
+    a frame that was never trades and says so by having no channel and no
+    address field -- became a loud abort asserting that B4's "a trade names
+    its participants" assumption "did not hold", on a frame that is no
+    evidence about trades either way. Where a fact is inferred, the reading of
+    it has to be the tolerant half.
+
+    So there are two envelopes with two confidence levels:
+
+      - `{"channel": "trades", "data": [...]}` -- the venue has *labelled*
+        the frame. Every dict in `data` is a trade record, and one carrying no
+        address field really is the B4 assumption failing, because the venue
+        called it a trade. Non-dict entries in `data` are returned separately
+        rather than dropped: a venue that puts addresses directly in `data` is
+        plausible (the field name is a guess), and silently discarding those
+        entries is how nine decodable trades frames produced an abort message
+        whose evidence section read "nothing decodable".
+      - a bare array -- inference. Accepted only if at least one dict in it
+        actually carries one of `TRADE_ADDRESS_FIELDS`, i.e. only if the frame
+        itself supports the guess. Otherwise it is not treated as trades, and
+        the first-trade grace decides whether the run was ever delivering.
     """
     if isinstance(payload, dict):
         if payload.get("channel") != TRADES_CHANNEL:
             return None
         data = payload.get("data")
         if isinstance(data, dict):
-            return [data]
+            return [data], []
         if isinstance(data, list):
-            return [r for r in data if isinstance(r, dict)]
+            return (
+                [r for r in data if isinstance(r, dict)],
+                [r for r in data if not isinstance(r, dict)],
+            )
+        # Labelled trades, but `data` is neither a record nor a list of them.
+        # Not treated as trades, and returned as an unknown frame so the caller
+        # keeps it verbatim for whatever abort message needs the evidence.
         return None
     if isinstance(payload, list):
         records = [r for r in payload if isinstance(r, dict)]
-        return records or None
+        if not any(_address_values(r) is not None for r in records):
+            return None
+        return records, [r for r in payload if not isinstance(r, dict)]
     return None
 
 
@@ -294,12 +550,13 @@ def _address_values(record: dict) -> tuple[str, list[object]] | None:
     """The account addresses on a trade record, with the field they came from.
 
     Returns None when no expected field is present, which the caller turns
-    into a loud abort. A scalar field is read as one address and a sequence as
+    into a loud abort while nothing has been collected and into a counted
+    anomaly afterwards. A scalar field is read as one address and a sequence as
     many; the *contents* are not inspected here on purpose, so that a single
     junk entry inside an otherwise good list travels to `normalise_address`
     and is counted as one refused value rather than condemning the whole
     record as the wrong shape. The distinction the two paths draw is between
-    "this field does not exist" (a shape fault, fatal) and "this field holds
+    "this field does not exist" (a shape fault) and "this field holds
     something that is not an address" (dirty data, counted).
 
     Anything that is neither a string nor a sequence -- a nested object, a
@@ -342,9 +599,35 @@ async def _collect(
     last_progress = started
     first_frame_at: float | None = None
     first_trade_at: float | None = None
+    # One warning per kind of anomaly, not one per occurrence: a feed with a
+    # second record layout produces thousands of them, and a progress stream
+    # nobody can read is the same as no progress stream. The running total goes
+    # on the progress line instead.
+    warned_unreadable = False
     stopped = ""
 
-    async with transport.connect() as ws:
+    async with AsyncExitStack() as stack:
+        # Only the handshake is wrapped, not the loop below it. A refused
+        # connection, an unresolvable host, a TLS failure or a URL the library
+        # rejects outright all land here, and all four used to escape as an
+        # unhandled OSError -- a traceback whose exit code (1) means "collected
+        # a short list" to anyone reading it. The URL is this module's
+        # most-doubted fact; the loud way of it being wrong deserves at least
+        # as clear a diagnosis as the silent way.
+        try:
+            ws = await stack.enter_async_context(transport.connect())
+        except Exception as exc:
+            raise FeedUnreachable(
+                f"could not open a WebSocket connection to {ws_url}: "
+                f"{type(exc).__name__}: {exc}. Nothing was collected and nothing will be "
+                f"written. This URL has never been reached from this repository -- "
+                f"`market/verify.py` records it as UNCHECKABLE and the host is 403 at this "
+                f"environment's proxy (OPEN-QUESTIONS C4, E5) -- so a refusal here is as "
+                f"likely to mean the URL is wrong as it is to mean the network is. Check "
+                f"--ws-url, then check whether this host is reachable at all from where "
+                f"the collector is running."
+            ) from exc
+
         for coin in coins:
             await ws.send(_subscribe_payload(coin))
         emit(
@@ -378,8 +661,13 @@ async def _collect(
                     f"received {counters.frames} frames from {ws_url} in {elapsed:.0f}s "
                     f"without one recognisable trade record. EXPECTED: frames shaped "
                     f"{{\"channel\": \"{TRADES_CHANNEL}\", \"data\": [ <trade record>, ... ]}}, "
-                    f"or a bare array of trade records. RECEIVED, verbatim: "
-                    f"{counters.examples or 'nothing decodable'}. A subscription that is "
+                    f"or a bare array of trade records carrying "
+                    f"{list(TRADE_ADDRESS_FIELDS)}. RECEIVED, verbatim: "
+                    f"{counters.examples or 'nothing decodable'} "
+                    f"({counters.other_frames} frames that yielded no trade record, "
+                    f"{counters.undecodable} undecodable, "
+                    f"{counters.unreadable_trade_entries} entries inside a "
+                    f"'{TRADES_CHANNEL}' frame that were not records). A subscription that is "
                     f"acknowledged and never delivered is the shape of a wrong "
                     f"'subscription.type' or a coin the venue does not list -- both of "
                     f"which look identical to a quiet market, which is why this aborts "
@@ -396,7 +684,8 @@ async def _collect(
                 emit(
                     f"  {elapsed / 60:6.1f} min  {counters.frames:7d} frames  "
                     f"{counters.trade_records:7d} trades  {len(seen):5d}/{target} addresses  "
-                    f"{counters.unparseable_addresses} unparseable"
+                    f"{counters.unparseable_addresses} unparseable  "
+                    f"{_anomaly_total(counters)} anomalies"
                 )
                 last_progress = now
 
@@ -433,20 +722,61 @@ async def _collect(
                 continue
 
             if error := _error_text(payload):
-                raise UnexpectedFeedShape(
-                    f"the feed answered with an error frame: {error}. The subscription "
-                    f"sent was {_subscribe_payload(coins[0])} (one per coin). EXPECTED: "
-                    f"an acknowledgement, then trade frames. The channel name "
-                    f"'{TRADES_CHANNEL}' and the 'coin' key are inference from "
-                    f"OPEN-QUESTIONS C4's webData3 snippet, not documentation, so the "
-                    f"venue rejecting them is a likely outcome and is reported as a fault "
-                    f"in this collector rather than as an empty sample."
-                )
+                # Fatal only while nothing has been collected. "Websocket
+                # request timed out" is a real Hyperliquid error string, and a
+                # transient one arriving at minute 29 of a delivering run used
+                # to abort it and report a REJECTED SUBSCRIPTION -- an
+                # accusation flatly contradicted by the trades that had been
+                # flowing for 29 minutes.
+                counters.error_frames += 1
+                _remember(counters.error_examples, error)
+                if not seen:
+                    raise UnexpectedFeedShape(
+                        f"the feed answered with an error frame before one address had been "
+                        f"collected: {error}. The subscription sent was "
+                        f"{_subscribe_payload(coins[0])} (one per coin). EXPECTED: "
+                        f"an acknowledgement, then trade frames. The channel name "
+                        f"'{TRADES_CHANNEL}' and the 'coin' key are inference from "
+                        f"OPEN-QUESTIONS C4's webData3 snippet, not documentation, so the "
+                        f"venue rejecting them is a likely outcome and is reported as a fault "
+                        f"in this collector rather than as an empty sample."
+                    )
+                if counters.error_frames == 1:
+                    emit(
+                        f"  WARNING: error frame from the feed after {len(seen)} addresses; "
+                        f"counted, not fatal, and recorded in the sampling frame: {error}"
+                    )
+                continue
 
-            records = _trade_records(payload)
-            if records is None:
+            classified = _trade_records(payload)
+            if classified is None:
                 counters.other_frames += 1
                 _remember(counters.examples, raw)
+                continue
+
+            records, unreadable = classified
+            if unreadable:
+                # A labelled trades frame carrying entries that are not records
+                # at all. Kept as evidence: `[]` here used to be indistinguishable
+                # from "no such frame arrived", so nine decodable
+                # {"channel": "trades", "data": ["0x.."]} frames produced an
+                # abort whose RECEIVED section read 'nothing decodable' -- and
+                # a venue naming its participants directly in `data` lands
+                # exactly here, with the one thing worth reading discarded.
+                counters.unreadable_trade_entries += len(unreadable)
+                _remember(counters.examples, raw)
+                if not warned_unreadable:
+                    warned_unreadable = True
+                    emit(
+                        f"  WARNING: a '{TRADES_CHANNEL}' frame's data held "
+                        f"{len(unreadable)} entr{'y' if len(unreadable) == 1 else 'ies'} that "
+                        f"was not a trade record: {_truncate(raw)}"
+                    )
+            if not records:
+                # Labelled trades, nothing readable in it. Counted as a
+                # non-delivering frame so the first-trade grace still fires on a
+                # run of these rather than waiting out the whole budget.
+                counters.other_frames += 1
                 continue
 
             for record in records:
@@ -454,20 +784,51 @@ async def _collect(
                 if first_trade_at is None:
                     first_trade_at = now
 
+                # The observed coin, per record. `result.coins` is the
+                # subscription list, which is what was ASKED FOR; publishing it
+                # as what was seen can only overstate the breadth of the sample
+                # (subscribe BTC, ETH, SOL, have only BTC deliver, and the frame
+                # claims accounts trading all three). Every record carries the
+                # coin, so the honest set costs one dict update.
+                coin = record.get("coin")
+                if isinstance(coin, str) and coin:
+                    counters.coin_counts[coin] = counters.coin_counts.get(coin, 0) + 1
+                else:
+                    counters.records_without_coin += 1
+
                 found = _address_values(record)
                 if found is None:
-                    raise UnexpectedFeedShape(
-                        f"a trade record carried no account address. EXPECTED one of the "
-                        f"fields {list(TRADE_ADDRESS_FIELDS)}, holding an address or a "
-                        f"list of them. RECEIVED: {_truncate(json.dumps(record))} "
-                        f"(keys: {sorted(record)}). This is exactly the assumption "
-                        f"OPEN-QUESTIONS B4 flags as needing verification -- that a public "
-                        f"trade names its participants -- and it did not hold. If the venue "
-                        f"names the field differently, add it to TRADE_ADDRESS_FIELDS here, "
-                        f"where the frame string can record which field the addresses came "
-                        f"from; do not translate it downstream, where the published "
-                        f"calibration score would carry a sample nobody can account for."
+                    counters.records_without_address += 1
+                    _remember(
+                        counters.no_address_examples,
+                        f"{_truncate(json.dumps(record))} (keys: {sorted(record)})",
                     )
+                    if not seen:
+                        raise UnexpectedFeedShape(
+                            f"a trade record carried no account address, and none had been "
+                            f"collected yet. EXPECTED one of the "
+                            f"fields {list(TRADE_ADDRESS_FIELDS)}, holding an address or a "
+                            f"list of them. RECEIVED: {_truncate(json.dumps(record))} "
+                            f"(keys: {sorted(record)}). This is exactly the assumption "
+                            f"OPEN-QUESTIONS B4 flags as needing verification -- that a "
+                            f"public trade names its participants -- and it has not held "
+                            f"once. If the venue names the field differently, add it to "
+                            f"TRADE_ADDRESS_FIELDS here, where the frame string can record "
+                            f"which field the addresses came from; do not translate it "
+                            f"downstream, where the published calibration score would carry "
+                            f"a sample nobody can account for."
+                        )
+                    if counters.records_without_address == 1:
+                        emit(
+                            f"  WARNING: a trade record carried none of "
+                            f"{list(TRADE_ADDRESS_FIELDS)} after {len(seen)} addresses had "
+                            f"been read from '{counters.address_field}'. The field exists on "
+                            f"this feed, so this is one odd record rather than a wrong "
+                            f"assumption: counted, and recorded in the sampling frame as a "
+                            f"trade this list does not contain. Verbatim: "
+                            f"{_truncate(json.dumps(record))}"
+                        )
+                    continue
 
                 name, values = found
                 counters.address_field = name
@@ -518,18 +879,18 @@ def harvest(
     market that an operator can weigh, an empty list is almost always a fact
     about this code being wrong, and the two must not arrive looking alike.
 
+    Anomalies that arrive *after* the first address are counted into
+    `HarvestResult.anomalies` instead of raising, because by then the shape is
+    confirmed rather than assumed. Everything counted there is published.
+
     `clock` and `utcnow` are injectable so the time-budget path and the
     generated frame's window are testable without a wall-clock wait. The
     project has one test already failing intermittently on a shared box
     because it measures elapsed time; adding a 30-minute one, or a sleeping
     one, would be adding to that problem.
     """
-    if not coins:
-        raise ValueError("at least one coin is required; the feed is subscribed per coin")
-    if minutes <= 0:
-        raise ValueError(f"--minutes must be positive, got {minutes}")
-    if target <= 0:
-        raise ValueError(f"--target must be positive, got {target}")
+    if complaint := _window_complaint(coins, minutes, target):
+        raise ValueError(complaint)
 
     transport = transport or _websockets_transport(ws_url)
     started_at = utcnow()
@@ -560,7 +921,8 @@ def harvest(
             f"over {counters.frames} frames, without any of the shape checks firing. "
             f"That combination is not understood and must not be reported as an empty "
             f"sample: frames seen were {counters.examples or 'none retained'}, refused "
-            f"address values were {counters.bad_address_examples or 'none'}."
+            f"address values were {counters.bad_address_examples or 'none'}, anomalies were "
+            f"{_anomalies(counters).clauses() or 'none'}."
         )
 
     return HarvestResult(
@@ -575,7 +937,31 @@ def harvest(
         unparseable_addresses=counters.unparseable_addresses,
         address_field=counters.address_field,
         target=target,
+        records_by_coin=tuple(counters.coin_counts.items()),
+        records_without_coin=counters.records_without_coin,
+        other_frames=counters.other_frames,
+        anomalies=_anomalies(counters),
     )
+
+
+def _window_complaint(coins: Sequence[str], minutes: float, target: int) -> str | None:
+    """Why this collection window cannot collect anything, if it cannot.
+
+    Shared between `harvest` and `main` so the CLI can refuse before it
+    connects and still say the same thing the library says. Split out for the
+    exit code rather than for the DRY: `--minutes 0` used to reach `harvest`,
+    raise an uncaught ValueError, traceback, and exit 1 -- the code that means
+    "collected a list, refused to publish it". The operator's next move for
+    that code is a longer window, which is precisely the thing they had just
+    set to zero.
+    """
+    if not coins:
+        return "at least one coin is required; the feed is subscribed per coin"
+    if minutes <= 0:
+        return f"--minutes must be positive, got {minutes}"
+    if target <= 0:
+        return f"--target must be positive, got {target}"
+    return None
 
 
 def _websockets_transport(url: str, ping_interval_s: float = PING_INTERVAL_S) -> Transport:
@@ -633,7 +1019,81 @@ def gate_required_addresses() -> int:
     ).required_addresses
 
 
-def build_frame(result: HarvestResult, required: int) -> str:
+def _observed_clause(result: HarvestResult) -> str:
+    """What was subscribed against what actually delivered.
+
+    Two facts that the first sentence of this frame used to conflate, in the
+    direction that flatters the sample: `result.coins` is the `--coins`
+    argument, so subscribing BTC, ETH and SOL while only BTC ever delivers
+    published "N distinct accounts observed trading BTC, ETH, SOL". The error
+    is one-sided -- the observed set is always a subset of the subscribed one
+    -- so conflating them can only ever overstate the breadth of the sample,
+    and this artifact's whole purpose is to be the one place that does not do
+    that.
+    """
+    subscribed = ", ".join(result.coins)
+    if not result.records_by_coin:
+        return (
+            f"SUBSCRIBED vs OBSERVED: subscriptions were sent for {subscribed}, but no trade "
+            "record carried a 'coin' field, so which of them actually delivered is UNKNOWN "
+            "and the subscription list must not be read as the observed one."
+        )
+    per_coin = ", ".join(f"{coin} {n}" for coin, n in result.records_by_coin)
+    missing = [c for c in result.coins if c not in result.coins_observed]
+    clause = (
+        f"SUBSCRIBED vs OBSERVED: subscriptions were sent for {subscribed}; trade records "
+        f"actually arrived for {', '.join(result.coins_observed)} ({per_coin} records). "
+    )
+    if missing:
+        clause += (
+            f"Nothing arrived for {', '.join(missing)}, which therefore contribute no "
+            "accounts to this list -- a subscription the venue never delivered on is "
+            "indistinguishable here from a coin that did not trade, and either way naming "
+            "it as observed would overstate this sample. "
+        )
+    if result.records_without_coin:
+        clause += (
+            f"{result.records_without_coin} record(s) carried no readable 'coin' field, so "
+            "the per-coin counts are a lower bound. "
+        )
+    return clause.rstrip()
+
+
+def _anomaly_clause(result: HarvestResult) -> str:
+    """The contradictions that were counted rather than aborted on.
+
+    Published because the alternative is a file that cannot be told apart from
+    one collected off a feed that matched the assumption exactly. §10 forbids
+    understating what a number rests on; a demoted abort that reached no
+    artifact would be exactly that.
+    """
+    anomalies = result.anomalies
+    lower_bound = (
+        "Each one is a trade this list does NOT contain, so treat the address count as a "
+        "lower bound on the accounts that traded and the message shape as only partly "
+        "understood."
+    )
+    share = ""
+    if anomalies.records_without_address and result.trade_records:
+        pct = 100.0 * anomalies.records_without_address / result.trade_records
+        share = (
+            f" That is {pct:.1f}% of the {result.trade_records} records read; above a few "
+            "per cent this is no longer a stray record but a second record layout on the "
+            "same feed, and this list is then a sample of the records this parser could "
+            "read rather than of the trades that occurred."
+        )
+    return (
+        f"ANOMALIES: {anomalies.total} frame(s)/record(s) on this feed did not match the "
+        f"assumed message shape: {'; '.join(anomalies.clauses())}. They were counted rather "
+        f"than aborted on, because this collector's shape assertions are fatal only until "
+        f"the first address is read out of one of {list(TRADE_ADDRESS_FIELDS)} -- and this "
+        f"run read {len(result.addresses)} from '{result.address_field}', which confirms the "
+        f"assumption these anomalies would otherwise be read as refuting.{share} "
+        f"{lower_bound}"
+    )
+
+
+def build_frame(result: HarvestResult, required: int, *, refusal: str = "") -> str:
     """The sampling frame this run represents, as prose fit to publish.
 
     `FileAddressSource` refuses a list whose frame is blank because an
@@ -645,6 +1105,15 @@ def build_frame(result: HarvestResult, required: int) -> str:
     sample is therefore assembled here -- what was watched, when, how it was
     selected, what that selection does to the gate, and what remains
     unverified.
+
+    `required` is used verbatim, not floored: this function formats what it is
+    told. The floor belongs at the write boundary, where the decision to
+    publish is actually taken -- see `write_address_list`.
+
+    `refusal`, when set, marks the frame as belonging to a rescue copy of a
+    file the writer refused to publish. It matters because that file is a
+    valid, loadable address list sitting next to the one that was asked for,
+    and a reader who finds it has to be told it was never accepted.
     """
     n = len(result.addresses)
     window = (
@@ -652,13 +1121,19 @@ def build_frame(result: HarvestResult, required: int) -> str:
         f"{result.ended_at.strftime('%Y-%m-%dT%H:%M:%SZ')} UTC "
         f"({result.window_seconds / 60:.1f} min)"
     )
+    # What was OBSERVED, never what was subscribed. See `_observed_clause`.
+    traded = (
+        f" trading {', '.join(result.coins_observed)}" if result.coins_observed
+        else " (the coin per record was not readable -- see SUBSCRIBED vs OBSERVED)"
+    )
     parts = [
-        f"{n} distinct accounts observed trading {', '.join(result.coins)} on "
+        f"{n} distinct accounts observed{traded} on "
         f"Hyperliquid's public trades WebSocket feed ({result.ws_url}, subscription "
         f"type '{TRADES_CHANNEL}', addresses read from each trade record's "
         f"'{result.address_field}' field), {window}, from {result.trade_records} trade "
         f"records over {result.frames} frames; collection stopped because "
         f"{result.stopped_because}.",
+        _observed_clause(result),
         "SELECTION: an account is in this list because it traded inside that window, so "
         "the frame selects on trading activity. It over-represents accounts that trade "
         "frequently, omits every account that holds a position without touching it, and "
@@ -680,15 +1155,32 @@ def build_frame(result: HarvestResult, required: int) -> str:
         f"materially smaller than {n}.",
         "NOT VERIFIED: the feed's message shape was asserted at runtime while collecting "
         "-- this collector refuses to report success unless it finds addresses where it "
-        "expects them -- but the URL, the subscription name and the record layout are not "
-        "confirmed against Hyperliquid documentation from the environment this was built "
-        "in, where the API is blocked at the proxy (OPEN-QUESTIONS C4, E5).",
+        "expects them -- but the assertion is a floor and not a proof: once the first "
+        "address had been read the shape was treated as confirmed, and later contradictions "
+        "were counted (see ANOMALIES if that section is present) rather than aborting a "
+        "window that had already produced a sample. The URL, the subscription name and the "
+        "record layout are not confirmed against Hyperliquid documentation from the "
+        "environment this was built in, where the API is blocked at the proxy "
+        "(OPEN-QUESTIONS C4, E5). No example trade frame in the collector's own repository "
+        "was captured from the live venue either -- every one is stub-generated, so nothing "
+        "there can be cited as evidence that this shape is right.",
     ]
+    if result.anomalies.total:
+        parts.append(_anomaly_clause(result))
+    if refusal:
+        parts.append(
+            f"NOT THE FILE THAT WAS ASKED FOR: this is a rescue copy, written because the "
+            f"requested output was refused -- {refusal}. The requested path was left "
+            f"untouched. It exists so that a collection window is never spent and then "
+            f"thrown away, and it is a loadable address list, so pointing a sweep at it is "
+            f"a deliberate act with the consequences stated in this frame."
+        )
     if n < required:
         parts.append(
             f"SHORT: {n} addresses is below §3.3's requirement of {required} distinct "
-            "addresses, and this file was written with --allow-short. It cannot open the "
-            "Phase 4 gate on its own."
+            "addresses. It cannot open the Phase 4 gate on its own, and a list this short "
+            "is only ever published because someone asked for it explicitly (--allow-short) "
+            "or as the rescue copy of a refused write."
         )
     elif n < required * 1.25:
         parts.append(
@@ -706,7 +1198,7 @@ def build_frame(result: HarvestResult, required: int) -> str:
     return " ".join(parts)
 
 
-def build_payload(result: HarvestResult, required: int) -> dict:
+def build_payload(result: HarvestResult, required: int, *, refusal: str = "") -> dict:
     """The file `FileAddressSource` reads, plus a record of how it was made.
 
     Two load-bearing keys and one extra. `frame` and `addresses` are what the
@@ -717,24 +1209,58 @@ def build_payload(result: HarvestResult, required: int) -> dict:
     a reader unable to tell whether a human curated this list. The counts a
     reader would otherwise have to take on trust from the frame sentence go
     here as data.
+
+    `addresses_collected` is `len(result.addresses)` and `HarvestResult`
+    canonicalises in `__post_init__`, so this count is the count
+    `FileAddressSource` will load -- the two cannot disagree.
     """
     return {
-        "frame": build_frame(result, required),
+        "frame": build_frame(result, required, refusal=refusal),
         "_provenance": {
             "collector": "risk_engine.market.collect_addresses",
             "source": "hyperliquid public trades websocket",
             "ws_url": result.ws_url,
             "subscription_type": TRADES_CHANNEL,
             "address_field": result.address_field,
+            # `coins` is what was SUBSCRIBED, and keeps that key because it is
+            # what this file has always carried. What the feed actually
+            # delivered is `coins_observed`, which is a subset and is the only
+            # one of the two that can honestly be called observed.
             "coins": list(result.coins),
+            "coins_observed": list(result.coins_observed),
+            "trade_records_by_coin": dict(result.records_by_coin),
+            "records_without_coin_field": result.records_without_coin,
             "window_start_utc": result.started_at.isoformat(),
             "window_end_utc": result.ended_at.isoformat(),
             "frames": result.frames,
+            # Acks, heartbeats, unknown frames, and frames the venue labelled
+            # 'trades' that held nothing readable. Not called "non-trade" because
+            # the last of those was labelled a trade and is the interesting case.
+            "frames_yielding_no_trade_record": result.other_frames,
             "trade_records": result.trade_records,
             "addresses_collected": len(result.addresses),
             "unparseable_values_skipped": result.unparseable_addresses,
+            # The anomaly counts as data, not only as prose in the frame. A
+            # reader comparing two address lists needs to be able to diff these
+            # without parsing English.
+            "anomalies": {
+                "total": result.anomalies.total,
+                "error_frames": result.anomalies.error_frames,
+                "trade_records_without_address_field": (
+                    result.anomalies.records_without_address
+                ),
+                "unreadable_entries_in_trades_frames": (
+                    result.anomalies.unreadable_trade_entries
+                ),
+                "undecodable_frames": result.anomalies.undecodable_frames,
+                "error_examples": list(result.anomalies.error_examples),
+                "records_without_address_examples": list(
+                    result.anomalies.no_address_examples
+                ),
+            },
             "target": result.target,
             "gate_required_addresses": required,
+            "refused_write": refusal,
             "stopped_because": result.stopped_because,
         },
         "addresses": list(result.addresses),
@@ -760,8 +1286,25 @@ def write_address_list(
     `--allow-short` is an operator saying "I know this sample is small";
     nobody means "write a file that loads cleanly and sweeps nothing" by it,
     and `FileAddressSource` accepts `addresses: []` without complaint.
+
+    `required` can only ever make the check STRICTER. It is floored at
+    `gate_required_addresses()` because as a plain override it did two
+    damaging things at once: `required=2` both skipped the refusal for a
+    2-address harvest and made the published frame say "THIN HEADROOM: the
+    gate counts 2 distinct addresses" -- a false statement about §3.3 in the
+    one artifact whose job is to be honest about the sample. A caller
+    tightening the bar is a legitimate thing to want; a caller lowering §3.3's
+    gate from a keyword argument is not, and `--allow-short` already exists
+    for the case where someone genuinely means to publish a short list.
+
+    Every refusal that has addresses to lose writes a timestamped rescue copy
+    first. A refusal that also discards the harvest makes an operator find out
+    about a problem after standing over a collection window -- the exact thing
+    the pre-flight checks in `main` exist to prevent -- and 199 addresses
+    appearing in no file anywhere costs another 30 minutes to fix.
     """
-    required = gate_required_addresses() if required is None else required
+    gate = gate_required_addresses()
+    required = gate if required is None else max(required, gate)
     n = len(result.addresses)
     if n == 0:
         raise ValueError(
@@ -770,16 +1313,21 @@ def write_address_list(
             "that never advances rather than as a collector that failed."
         )
     if n < required and not allow_short:
+        rescued = _write_rescue_copy(
+            result, path, required, f"{n} addresses against §3.3's requirement of {required}"
+        )
         raise ValueError(
-            f"found {n} distinct addresses, §3.3 needs {required} -- nothing written. "
-            f"The gate counts addresses with a resolved observation, and the sweep drops "
-            f"flat and zero-equity accounts before that, so aim above {required} rather "
-            f"than at it ({DEFAULT_TARGET} is the top of §3.3's range). Re-run with a "
+            f"found {n} distinct addresses, §3.3 needs {required} -- nothing written to "
+            f"{path}. The gate counts addresses with a resolved observation, and the sweep "
+            f"drops flat and zero-equity accounts before that, so aim above {required} "
+            f"rather than at it ({DEFAULT_TARGET} is the top of §3.3's range). Re-run with a "
             f"longer --minutes or more --coins, or pass --allow-short to write it anyway "
-            f"-- the frame will record that it is short and cannot open the gate."
+            f"-- the frame will record that it is short and cannot open the gate. {rescued} "
+            f"Nothing reads that path by itself."
         )
     if path.exists() and not force:
-        raise ValueError(f"{path} exists; pass --force to overwrite")
+        rescued = _write_rescue_copy(result, path, required, f"{path} already exists")
+        raise ValueError(f"{path} exists; pass --force to overwrite. {rescued}")
 
     payload = build_payload(result, required)
     # indent=2 with a trailing newline, matching `shadow init-addresses`, so a
@@ -789,6 +1337,43 @@ def write_address_list(
     return payload
 
 
+def _write_rescue_copy(result: HarvestResult, path: Path, required: int, refusal: str) -> str:
+    """Park a refused harvest next to where it was going; report where it went.
+
+    Three deliberate choices in the filename. It keeps the requested name as a
+    prefix so the two are obviously related; it ends in the collection
+    window's UTC start rather than anything reusable, so no rescue file can
+    ever overwrite another one and no addresses are lost to a second refused
+    run; and it does NOT end in `.json`, so it cannot be swept up by a glob or
+    mistaken for the list an operator asked for. The contents are a valid
+    address list -- deliberately, since the point is to be usable -- carrying a
+    frame that opens by saying it was refused.
+
+    Returns a sentence rather than a path, and swallows OSError into that
+    sentence, because this runs on the way to raising the refusal. A rescue
+    that failed on a read-only directory must not replace the operator's "you
+    are 199 short" message with an unrelated errno; the refusal is the more
+    important of the two and has to survive.
+    """
+    n = len(result.addresses)
+    stamp = result.started_at.strftime("%Y%m%dT%H%M%SZ")
+    rescue = path.parent / f"{path.name}.refused-{stamp}"
+    try:
+        rescue.write_text(
+            json.dumps(build_payload(result, required, refusal=refusal), indent=2) + "\n"
+        )
+    except OSError as exc:
+        return (
+            f"WARNING: the {n} addresses collected could not be parked beside {path} either "
+            f"({type(exc).__name__}: {exc}), so this window's harvest exists nowhere on "
+            f"disk. Fix that path before re-running, or the next 30 minutes go the same way."
+        )
+    return (
+        f"The {n} addresses collected are NOT lost: they are in {rescue}, whose frame states "
+        f"that it was refused and why."
+    )
+
+
 def _parse_coins(raw: str) -> tuple[str, ...]:
     coins = tuple(c.strip().upper() for c in raw.split(",") if c.strip())
     if not coins:
@@ -796,12 +1381,35 @@ def _parse_coins(raw: str) -> tuple[str, ...]:
     return coins
 
 
+class _ExitCodeParser(argparse.ArgumentParser):
+    """argparse, with its exit code moved off the one that means "shape".
+
+    argparse exits 2 for every usage error, and 2 is this module's "the feed
+    did not look the way I assume". Left alone, a typo in a flag name reports
+    itself as a feed-shape mismatch and sends an operator to
+    `TRADE_ADDRESS_FIELDS` -- a wrong diagnosis of a wrong diagnosis. The
+    message and its destination (stderr) are unchanged; only the number moves.
+    """
+
+    def error(self, message: str) -> NoReturn:
+        self.print_usage(sys.stderr)
+        print(f"{self.prog}: error: {message}", file=sys.stderr)
+        raise SystemExit(EXIT_USAGE)
+
+
 def main(argv: Iterable[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
+    parser = _ExitCodeParser(
         prog="risk_engine.market.collect_addresses",
         description=(
             "harvest a §3.3 shadow address list from Hyperliquid's public trades feed "
             "(OPEN-QUESTIONS B4)"
+        ),
+        epilog=(
+            "exit codes: 0 wrote the list; 1 collected but refused to publish "
+            "(short of the gate, or --out exists) -- the addresses are kept in a "
+            "'.refused-<window>' file beside --out; 2 the feed did not match this "
+            "collector's assumed message shape; 3 no usable connection (--ws-url, DNS, "
+            "TLS, refusal, or the missing 'websockets' package); 4 bad invocation."
         ),
     )
     parser.add_argument("--out", required=True, help="where to write the address list")
@@ -826,13 +1434,28 @@ def main(argv: Iterable[str] | None = None) -> int:
     out = Path(args.out)
     required = gate_required_addresses()
 
-    # Both checks BEFORE connecting. An operator who mistypes the output path
-    # or forgets --force should learn that in the first second, not after
-    # standing over a 30-minute collection window that then refuses to write.
+    # Every check BEFORE connecting. An operator who mistypes the output path,
+    # forgets --force or asks for a zero-length window should learn that in the
+    # first second, not after standing over a 30-minute collection window that
+    # then refuses to write -- or, worse, dies on an uncaught IsADirectoryError
+    # with the harvest already in memory and no file to put it in.
+    if out.is_dir():
+        parser.error(
+            f"--out {out} is a directory. --force would have got past the exists check "
+            f"below and the write would then have failed with IsADirectoryError after the "
+            f"whole collection window (checked before collecting)"
+        )
     if out.exists() and not args.force:
         parser.error(f"{out} exists; pass --force to overwrite (checked before collecting)")
-    if not out.parent.exists():
-        parser.error(f"{out.parent} does not exist (checked before collecting)")
+    if not out.parent.is_dir():
+        parser.error(
+            f"{out.parent} is not an existing directory (checked before collecting)"
+        )
+    if complaint := _window_complaint(args.coins, args.minutes, args.target):
+        # Validated here as well as in `harvest` so it exits 4 rather than
+        # tracebacking out of `harvest` with exit 1, the code that means
+        # "collected a list and refused to publish it".
+        parser.error(f"{complaint} (checked before collecting)")
 
     try:
         result = harvest(
@@ -842,13 +1465,26 @@ def main(argv: Iterable[str] | None = None) -> int:
             ws_url=args.ws_url,
             progress_every_s=args.progress_seconds,
         )
+    except FeedUnreachable as exc:
+        # Exit 3. Distinct from the shape mismatch because nothing was observed
+        # at all: there is no evidence here about the message shape, only about
+        # the URL and the network, and sending an operator to this module's
+        # parser on that evidence wastes their time.
+        print(f"COULD NOT CONNECT -- nothing collected, nothing written.\n\n{exc}")
+        return EXIT_UNREACHABLE
+    except ImportError as exc:
+        # The lazy `websockets` import. Also exit 3: from the operator's side it
+        # is the same class of problem -- no connection was ever attempted --
+        # and the message says exactly what to install.
+        print(f"COULD NOT CONNECT -- the transport is missing.\n\n{exc}")
+        return EXIT_UNREACHABLE
     except UnexpectedFeedShape as exc:
         # Exit 2, distinct from the short-list refusal below: this says the
         # collector's assumptions about the feed are wrong and no run of it is
         # currently trustworthy, which is a code-and-documentation problem
         # rather than something a longer window fixes.
         print(f"FEED SHAPE MISMATCH -- nothing collected, nothing written.\n\n{exc}")
-        return 2
+        return EXIT_FEED_SHAPE
 
     print(result.summary())
     try:
@@ -857,11 +1493,44 @@ def main(argv: Iterable[str] | None = None) -> int:
         )
     except ValueError as exc:
         print(f"REFUSED: {exc}")
-        return 1
+        return EXIT_REFUSED
+    except OSError as exc:
+        # The harvest is already in memory and the operator has already stood
+        # over the collection window; losing it to a filesystem error would be
+        # the same defect as F7 (a refusal that discards what it took thirty
+        # minutes to gather), just with a different cause. Read-only mount and
+        # dangling symlink both land here and both pass every pre-flight check,
+        # because the pre-flight cannot know whether a write will succeed until
+        # it tries one.
+        #
+        # Dump to stdout rather than to a second guessed path: any fallback
+        # location is another write that can fail the same way, and an operator
+        # who can see the addresses can save them. Exit distinctly so this is
+        # not confused with a short run.
+        print(f"COULD NOT WRITE {out}: {type(exc).__name__}: {exc}")
+        print(
+            f"The harvest is NOT lost -- all {len(result.addresses)} addresses follow "
+            "as the exact file that was about to be written. Redirect this output to a "
+            "path that is writable, or paste it into an address file; another "
+            "collection window is not needed."
+        )
+        print(json.dumps(build_payload(result, required), indent=2))
+        return EXIT_WRITE_FAILED
 
     print(f"wrote {out} with {len(result.addresses)} addresses")
+    if result.anomalies.total:
+        # Repeated outside the frame text because the frame is long and this is
+        # the line an operator reads. An anomaly count is the difference
+        # between a shape that is confirmed and one that is only mostly right.
+        one = result.anomalies.total == 1
+        print(
+            f"NOTE: {result.anomalies.total} anomal{'y' if one else 'ies'} "
+            f"{'was' if one else 'were'} counted rather than aborted on, because addresses "
+            f"had already been read from '{result.address_field}': "
+            f"{'; '.join(result.anomalies.clauses())}"
+        )
     print(f"sampling frame: {payload['frame']}")
-    return 0
+    return EXIT_OK
 
 
 if __name__ == "__main__":

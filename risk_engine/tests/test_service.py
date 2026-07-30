@@ -13,11 +13,14 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 
 import pytest
 
+from risk_engine.domain.types import Book, MarginMode, Position
 from risk_engine.service.app import serve
 from risk_engine.service.state import EngineState, NotReady
+from risk_engine.sim.engine import MonteCarloEngine
 
 BOOK = {
     "address": "0xdemo",
@@ -29,6 +32,31 @@ BOOK = {
          "mode": "cross", "leverage": 20},
     ],
 }
+
+
+def as_book(payload: dict) -> Book:
+    """`BOOK` as engine types, for tests that walk it themselves.
+
+    Derived from the same dict the request sends rather than restated, so a
+    reference walk and the request it is compared against cannot describe two
+    different books -- a divergence there would present as a horizon bug,
+    which is the one thing the comparison exists to detect.
+    """
+    return Book(
+        address=payload["address"],
+        cross_collateral=payload["cross_collateral"],
+        positions=tuple(
+            Position(
+                coin=p["coin"],
+                size=p["size"],
+                entry_price=p["entry_price"],
+                mode=MarginMode(p["mode"]),
+                leverage=p["leverage"],
+            )
+            for p in payload["positions"]
+        ),
+        captured_at=datetime.now(timezone.utc),
+    )
 
 
 @pytest.fixture(scope="module")
@@ -96,6 +124,50 @@ class TestPortfolioRisk:
         base, _ = service
         r = call(base, "/portfolio_risk", {"book": BOOK, "n_paths": 8_000, "seed": 2})
         assert r["p_liq_7d"]["point"] >= r["p_liq_24h"]["point"]
+
+    def test_funding_cost_24h_really_is_twenty_four_hours(self, service):
+        """The field is named `_24h` and the UI labels it 24h; nothing until now
+        made it be 24h.
+
+        `funding_drag` has a guard on *its* 24h default (OPEN-QUESTIONS A8,
+        `test_phase5.test_the_default_horizon_is_a_day`), but `funding_drag` is
+        on no shipped path -- no route constructs it, and the shadow cron calls
+        the engine directly. The funding number a user actually sees comes from
+        `portfolio_risk.result_24h.funding_cost`, whose horizon is
+        `portfolio_risk.DAY_HOURS`: a second constant, unrelated to
+        `funding_drag`'s, that no test read. Setting it to 168 published a full
+        week of funding under a field named `_24h` and a panel labelled 24h --
+        roughly 7x the cost of the horizon claimed -- and the suite still
+        exited 0, because the only other assertions on this response are key
+        presence and `p_liq_7d >= p_liq_24h`, which holds when both arms have
+        collapsed onto the same horizon.
+
+        The anchor is an independent walk of the same book on the same seed
+        with both horizons written as literals, so the reference cannot follow
+        the constant it is checking. Equality is exact rather than approximate
+        because it is the same computation on the same seed: a mismatch means
+        the horizon moved, not that Monte Carlo noise drifted.
+
+        The week is asserted to be far from the day first. Without that the
+        equality could pass for the wrong reason -- if the two arms ever became
+        the same number, every horizon assertion in this file would be
+        satisfied by a book whose funding does not depend on the horizon at
+        all, which is exactly how the original regression stayed invisible.
+        """
+        base, state = service
+        bundle, specs, spot = state.require_ready()
+        r = call(base, "/portfolio_risk", {"book": BOOK, "n_paths": 4_000, "seed": 11})
+
+        reference = MonteCarloEngine(bundle, specs).run_horizons(
+            as_book(BOOK), spot, (24, 24 * 7), n_paths=4_000, seed=11,
+        )
+        day, week = reference[24].funding_cost, reference[24 * 7].funding_cost
+        assert week.quantile(0.5) > 3.0 * day.quantile(0.5)
+
+        wire = r["funding_cost_24h"]
+        for key, q in (("median", 0.5), ("p05", 0.05), ("p95", 0.95)):
+            assert wire[key] == pytest.approx(day.quantile(q), rel=1e-9), key
+            assert wire[key] != pytest.approx(week.quantile(q), rel=1e-3), key
 
     def test_the_response_is_plain_json(self, service):
         """numpy scalars are not JSON serialisable, and np.float64 is a float
