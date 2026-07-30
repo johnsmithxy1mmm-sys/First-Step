@@ -136,6 +136,19 @@ class InfoClient:
             }
         )
 
+    def user_funding(self, address: str, start_ms: int, end_ms: int | None = None) -> list:
+        """Per-user funding payments. Ground truth for OPEN-QUESTIONS C5.
+
+        `fundingHistory` gives the venue-wide rate; this gives what a
+        specific account actually paid or received, which is what makes the
+        isolated-vs-cross accounting question answerable by observation
+        instead of by opening a position.
+        """
+        req: dict = {"type": "userFunding", "user": address, "startTime": start_ms}
+        if end_ms is not None:
+            req["endTime"] = end_ms
+        return self.post(req)  # type: ignore[return-value]
+
     def funding_history(self, coin: str, start_ms: int, end_ms: int | None = None) -> list:
         req = {"type": "fundingHistory", "coin": coin, "startTime": start_ms}
         if end_ms is not None:

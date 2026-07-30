@@ -361,15 +361,39 @@ gate and A as context.
 
 ## C. Hyperliquid integration — facts that must be verified, not assumed
 
-### C1 `[BLOCKER]` The funding-rate protocol clamp (§1.5)
+### C1 `[BLOCKER — downgraded]` The funding-rate protocol clamp (§1.5)
 
 §1.5 correctly forbids inventing the bound, and the AR(1) is unusable without
 it. The engine takes the clamp from a configuration record carrying a
 `source` field, defaults to ±4%/hour attributed to the Hyperliquid docs, and
 **refuses to run** if any observed historical funding rate exceeds the
 configured clamp — a stale or wrong bound then fails loudly instead of
-silently truncating reality. The value still has to be confirmed against the
-live API before Phase 4.
+silently truncating reality.
+
+**Measured against live mainnet 2026-07-29** (`market.verify`, 1500 hourly
+observations over 30 days across BTC/ETH/SOL): no breach, and the worst
+observed rate was `2.27e-05/h` on SOL — **0.06% of the configured 0.04/h
+cap**, i.e. the clamp sits roughly 1760× above anything the market did in a
+month.
+
+Two consequences, and together they change what this question is worth:
+
+- **The clamp is not a binding constraint in normal conditions.** It never
+  activates, so the simulated funding distribution is determined entirely by
+  the AR(1) fit, not by the bound. C1 was feared as a distribution-shaping
+  parameter; measurement says it is a guard rail far off to the side.
+- **Any error in it is very likely in the safe direction.** A cap set too
+  high lets the model simulate funding paths more extreme than the protocol
+  permits, which *overstates* cost of carry — permitted under §10. A cap too
+  low would truncate reality and understate, which is forbidden; at 1760×
+  headroom, too-low is not the plausible failure.
+
+What remains is provenance, not calibration: the `source` field still says
+"unverified against live API". Confirm 0.04/h from protocol documentation or
+source and rewrite that string. **This no longer blocks the pilot**, because
+a non-binding constraint cannot move the distribution the shadow counter is
+accumulating against. It should still be settled before Phase 4 touches real
+money.
 
 ### C2 `[BLOCKER]` Mark-vs-trade price basis (§1.4)
 
@@ -378,8 +402,30 @@ measure the basis. That measurement does not exist yet, so the "mark ≈ trade
 price" approximation is *not* silently adopted: the engine requires an
 explicit `BasisModel`, and the only one available before measurement is
 `UnmeasuredBasis`, which is flagged in every result it touches and counted in
-observability. §1.4's own condition (median |basis| < 25% of a typical hourly
-move) cannot be evaluated until shadow mode has run.
+observability.
+
+**First live measurement 2026-07-29** (`market.verify`, `metaAndAssetCtxs`,
+12 samples over 1 minute): worst median |basis| was `2.63e-05` on ETH,
+against §1.4's threshold of `9.06e-04` (25% of the measured 0.00363 hourly
+BTC vol). That is **2.9% of the threshold — a 34× margin**.
+
+Reported INCONCLUSIVE rather than PASS, deliberately: §1.4 asks for a median
+over a real window, and one minute is not that window. But the margin is
+large enough to change the expectation. The plausible outcome is now that the
+condition holds comfortably and `UnmeasuredBasis` can be replaced by the
+identity with a measured justification — not that the simulator needs a
+basis term.
+
+To promote it, re-run with a window §1.4 would accept:
+
+```
+python -m risk_engine.market.verify --address 0x... --samples 720 --interval-s 60
+```
+
+That is 12 hours of minute-by-minute sampling. The check still reports
+INCONCLUSIVE on a clean result by construction, because the promotion is a
+judgement about the window, not something the harness should grant itself —
+read the reported median and decide.
 
 ### C3 `[RESOLVED]` Builder fee units (§5.4)
 
@@ -389,11 +435,27 @@ footgun and the spec's own prose alternates between the two numbers when
 describing the positioning; the UI copy should quote the charged 0.02%, not
 the 0.03% ceiling.
 
-### C4 `[BLOCKER]` `webData3` (§5.2)
+### C4 `[BLOCKER — non-blocking in practice]` `webData3` (§5.2)
 
 `webData2` is the documented subscription. I have no confirmation that
-`webData3` exists. To be verified against the live API before the Phase 3
-listener is written; the shard planner is agnostic either way.
+`webData3` exists. The shard planner is agnostic either way, so nothing
+downstream waits on this.
+
+A WebSocket question, which the Info-API harness cannot reach. Two minutes to
+settle by hand:
+
+```bash
+pip install websockets
+python -c "
+import asyncio, json, websockets
+async def main():
+    async with websockets.connect('wss://api.hyperliquid.xyz/ws') as ws:
+        await ws.send(json.dumps({'method':'subscribe','subscription':{'type':'webData3'}}))
+        print(await asyncio.wait_for(ws.recv(), 10))
+asyncio.run(main())"
+```
+
+An error response means it does not exist and §5.2 should say `webData2`.
 
 ### C5 `[BLOCKER]` Isolated-position funding
 
@@ -402,6 +464,32 @@ isolated margin (which is what makes isolated liquidations independent, per
 §1.1). Behaviour at the protocol level should be confirmed — if funding on
 isolated positions is instead debited from the cross pool, the independence
 claim in §1.1 is violated and the simulator needs a coupling term.
+
+This is the only remaining open question that can invalidate **structure**
+rather than shift a number, which makes it the one worth spending effort on.
+
+**Answerable read-only, no capital required.** The `verify` harness reports
+it UNCHECKABLE because no single read distinguishes the two, and the original
+note here assumed that meant opening a funded position. It does not:
+`clearinghouseState` exposes `leverage.rawUsd` per isolated position — the
+collateral in that pocket — alongside `crossMarginSummary.accountValue`, and
+`userFunding` gives what the account actually paid. Snapshot both sides of an
+hourly funding tick and see which balance moved by the payment:
+
+```
+python -m risk_engine.market.probe_isolated_funding --address 0x... --report c5.json
+```
+
+Needs an address holding at least one isolated position across the tick — any
+address, since the data is public. It waits for the top of the hour plus a
+settle grace, aborts if the book changed during the window (a trade moves
+both balances for unrelated reasons), and reports INCONCLUSIVE when the
+payment is too small to separate from rounding rather than resolving it in
+whichever direction the arithmetic landed. Exit code 2 means the cross pool
+absorbed it — §1.1 is false and the simulator needs a term it does not have.
+
+Testnet works too (`--testnet`) if a suitable mainnet address is hard to
+find; opening a minimal isolated position there costs nothing.
 
 ### C6 `[BLOCKER]` Shadow cron vs. rate limit (§3.3 vs §5.3)
 
@@ -578,5 +666,5 @@ in the risk number, and is recorded in the journal's model version.
 | E2 | KMS/age key material and the agent-key encryption boundary (§5.4) | Phase 4 |
 | E3 | Postgres DSN / deployment target | Shadow persistence at scale |
 | E4 | The shadow address sampling frame (B4) | Phase 4 gate validity |
-| E5 | Live API access from the build environment — `api.hyperliquid.xyz` is blocked at the proxy here (403), so every §5.1 parser is written against recorded fixtures and **has not been exercised against the live schema** | Phases 2-5; must be re-verified where the API is reachable |
+| E5 | ~~Live API access — every §5.1 parser written against fixtures, never exercised against the live schema~~ **RESOLVED 2026-07-29** by `python -m risk_engine.market.verify` run from a network where the API is reachable (it is still 403 at the build-environment proxy). All three parsers PASS on live mainnet: `meta` → 177 assets, 34 with multiple margin tiers; `candleSnapshot` → 720 hourly BTC returns, 0 gaps, hourly vol 0.00363; `clearinghouseState` → 10 positions, cross collateral $3,957,459.72. The documented response shapes were correct. | closed |
 | E6 | Historical liquidation frequencies by nominal leverage for Baseline A's `P(liq)` arm (B3) | Baseline A's probability output |
