@@ -20,6 +20,7 @@ from risk_engine.validation.power import (
     clustered_rate_ci,
     evaluate,
     power_at,
+    power_ci_at,
     simulate_days,
 )
 
@@ -158,6 +159,23 @@ class TestCalibration:
             power_at(30, 200, 0.10, NOMINAL_BREACH_RATE, 10, 50, 0)
         with pytest.raises(ValueError, match="rate in"):
             power_at(30, 200, 0.10, 1.5, 10, 50, 0)
+
+    def test_power_ci_at_agrees_with_power_at_on_the_point(self):
+        """Both walk the identical simulation (`_power_trials`); they must
+        not drift into reporting different points for the same inputs."""
+        point = power_at(45, 200, 0.15, 0.10, n_trials=150, n_boot=300, seed=7)
+        ci_point, lo, hi = power_ci_at(45, 200, 0.15, 0.10, n_trials=150, n_boot=300, seed=7)
+        assert ci_point == point
+        assert lo <= point <= hi
+
+    def test_power_ci_at_bound_narrows_with_more_trials(self):
+        """The whole reason this exists: the interval is what tells a caller
+        whether the point estimate is a decision or a coin flip."""
+        _, lo_small, hi_small = power_ci_at(45, 200, 0.15, 0.10, n_trials=50,
+                                            n_boot=200, seed=3)
+        _, lo_big, hi_big = power_ci_at(45, 200, 0.15, 0.10, n_trials=800,
+                                        n_boot=200, seed=3)
+        assert (hi_big - lo_big) < (hi_small - lo_small)
 
     def test_more_addresses_barely_help_under_clustering(self):
         """The finding that decides how to spend effort: at a realistic

@@ -104,6 +104,21 @@ The window is sized off the *upper* end of the interval. Sizing off the
 point estimate is wrong half the time in the direction that shortens it, and
 a short window yields a gate that passes without establishing anything.
 
+Two separate sources of noise are both handled conservatively, because both
+shorten the window when read optimistically:
+
+- the **measured ICC** has sampling error, so sizing reads its upper
+  confidence bound rather than its point estimate;
+- the **power simulation** has Monte Carlo error, so a day count is accepted
+  only when the 95% *lower* bound on its power clears the target. A point
+  estimate near the target is a coin flip: at 30 days and breach ICC 0.15
+  the true power against a 10% rate is ~0.80, and at 40 trials 11 of 20
+  seeds put the point estimate over target while the bound stays under it.
+
+`--trials` controls the second one. The default (500) is what makes the
+bound tight enough to read; lowering it widens the bound and pushes the
+recommendation longer, never shorter.
+
 `progress` reads the gate off the `book_unchanged` cohort and the
 day-clustered interval, not the naive one. B1 records why: addresses
 observed on the same day share one market move, so the naive interval calls

@@ -17,6 +17,8 @@ from scipy import stats
 
 from risk_engine.shadow.clustering import (
     NOMINAL_BREACH_RATE,
+    BreachIcc,
+    LatentCorrelation,
     breach_icc_confidence_set,
     breach_icc_from_latent,
     estimate_breach_icc,
@@ -248,7 +250,7 @@ class TestAuditFindings:
                                  day_grid=grid)
         # A target closer to the nominal 5% is harder: at every searched
         # window its power is no higher, and the recommended window no shorter.
-        for (_, p_strict), (_, p_loose) in zip(
+        for (_, p_strict, _), (_, p_loose, _) in zip(
             strict.searched, loose.searched[: len(strict.searched)], strict=False
         ):
             assert p_strict <= p_loose + 0.10
@@ -374,6 +376,68 @@ class TestAuditFindings:
         est = estimate_latent_correlation(pit, days, np.random.default_rng(8), n_boot=100)
         assert est.n_clipped == 0
         assert "degenerate" not in est.summary()
+
+    def test_sizing_does_not_accept_a_day_count_on_a_lucky_power_draw(self):
+        """Found while fixing F-1/F-4: `recommend_window` compared the power
+        POINT estimate to the target, so a favourable Monte Carlo draw could
+        buy a shorter window than the evidence supports.
+
+        The boundary case is measured, not hypothetical. At 30 days and breach
+        ICC 0.15 the true power against a 10% rate is ~0.801 -- right on the
+        80% target. At n_trials=40, 11 of 20 seeds produce a point estimate at
+        or above 0.80 while the 95% lower bound sits below it. Under the old
+        rule every one of those 11 seeds would have accepted 30 days; under
+        the bound rule none of them do, because a coin-flip estimate is not
+        evidence a window is long enough.
+
+        Built by constructing the ICC directly rather than estimating one, so
+        the boundary is exactly where it is claimed to be and the test is not
+        also measuring the estimator.
+        """
+        boundary = 0.15
+        icc = BreachIcc(
+            point=boundary, ci_low=boundary, ci_high=boundary,
+            latent=LatentCorrelation(0.4, 0.4, 0.4, 30, 6_000, 200.0, 0.4),
+            copula="t", direct_point=None, breach_rate=0.05,
+            n_observations=6_000, n_days=30,
+        )
+        grid = (30,)
+
+        near_threshold = 0
+        for seed in range(20):
+            rec = recommend_window(icc, n_trials=40, n_boot=150, day_grid=grid,
+                                   seed=seed * 17)
+            _, power, power_lo = rec.searched[0]
+            if power >= 0.80 > power_lo:
+                near_threshold += 1
+                # The defect, stated as the assertion: a point estimate over
+                # target must NOT be enough on its own.
+                assert rec.days_required is None, (
+                    f"seed {seed * 17}: accepted 30 days on a point estimate of "
+                    f"{power:.3f} whose lower bound is only {power_lo:.3f}"
+                )
+        assert near_threshold >= 5, (
+            f"only {near_threshold}/20 seeds landed in the near-threshold band, "
+            "so this run is not exercising the regression; the boundary case "
+            "has moved and the construction needs re-measuring rather than "
+            "the test deleting"
+        )
+
+    def test_sizing_accepts_a_day_count_once_the_evidence_is_solid(self):
+        """The other half: the bound must not be so conservative that nothing
+        is ever accepted. Well clear of the target with enough trials, the
+        window is recommended."""
+        icc = BreachIcc(
+            point=0.05, ci_low=0.05, ci_high=0.05,
+            latent=LatentCorrelation(0.15, 0.15, 0.15, 30, 6_000, 200.0, 0.15),
+            copula="t", direct_point=None, breach_rate=0.05,
+            n_observations=6_000, n_days=30,
+        )
+        rec = recommend_window(icc, n_trials=400, n_boot=200, day_grid=(21, 30, 45))
+        assert rec.days_required is not None
+        _, _, power_lo = rec.searched[-1]
+        assert power_lo >= 0.80
+        assert "at 95% confidence" in rec.summary()
 
 
 class TestWindowSizing:

@@ -350,7 +350,11 @@ def main(argv: list[str] | None = None) -> int:
     icc.add_argument("--direct-interval", dest="direct_interval", action="store_true",
                      help="also invert the test on the breach data alone (slow, wide)")
     icc.add_argument("--direct-sims", dest="direct_sims", type=int, default=200)
-    icc.add_argument("--trials", type=int, default=200)
+    icc.add_argument("--trials", type=int, default=500,
+                     help="Monte Carlo trials per day count; the go/no-go decision "
+                          "is read off a 95% lower confidence bound on power, and "
+                          "that bound needs this many trials to be worth reading "
+                          "(too few makes the recommendation itself a coin flip)")
     icc.add_argument("--seed", type=int, default=0)
     icc.set_defaults(func=cmd_icc)
 

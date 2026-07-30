@@ -169,6 +169,38 @@ def evaluate(
     )
 
 
+def _power_trials(
+    days: int,
+    addresses_per_day: int,
+    icc: float,
+    p_true: float,
+    n_trials: int,
+    n_boot: int,
+    seed: int,
+) -> int:
+    """How many of `n_trials` Monte Carlo trials the gate detects on.
+
+    Shared by `power_at` and `power_ci_at` so the two never drift: a caller
+    asking for the point estimate and a caller asking for its confidence
+    bound must be describing the same simulation.
+    """
+    if not 0.0 < p_true < 1.0:
+        raise ValueError(f"p_true must be a rate in (0, 1), got {p_true}")
+    if abs(p_true - NOMINAL_BREACH_RATE) < 1e-9:
+        raise ValueError(
+            "p_true equals the nominal rate; power against the null is just the "
+            "false-rejection rate, and asking for it this way is a sign of confusion"
+        )
+    rng = np.random.default_rng(seed)
+    detected = 0
+    for _ in range(n_trials):
+        sums, counts = simulate_days(days, addresses_per_day, p_true, icc, rng)
+        lo, hi = clustered_rate_ci(sums, counts, rng, n_boot=n_boot)
+        if not (lo <= NOMINAL_BREACH_RATE <= hi):
+            detected += 1
+    return detected
+
+
 def power_at(
     days: int,
     addresses_per_day: int,
@@ -186,22 +218,38 @@ def power_at(
     requested rate below 9.5% onto the 8% column recommended windows that
     were too short for the stricter target -- the §10-forbidden direction.
     This computes the requested rate itself.
+
+    A point estimate over `n_trials` Monte Carlo trials. For deciding whether
+    a window is long enough, use `power_ci_at` instead -- the point estimate
+    alone lets Monte Carlo noise pick the window (audit: measured 76% against
+    an 80% target on one seed at n_trials=120, which is 1.1 standard errors
+    from the threshold, i.e. close to a coin flip).
     """
-    if not 0.0 < p_true < 1.0:
-        raise ValueError(f"p_true must be a rate in (0, 1), got {p_true}")
-    if abs(p_true - NOMINAL_BREACH_RATE) < 1e-9:
-        raise ValueError(
-            "p_true equals the nominal rate; power against the null is just the "
-            "false-rejection rate, and asking for it this way is a sign of confusion"
-        )
-    rng = np.random.default_rng(seed)
-    detected = 0
-    for _ in range(n_trials):
-        sums, counts = simulate_days(days, addresses_per_day, p_true, icc, rng)
-        lo, hi = clustered_rate_ci(sums, counts, rng, n_boot=n_boot)
-        if not (lo <= NOMINAL_BREACH_RATE <= hi):
-            detected += 1
-    return detected / n_trials
+    return _power_trials(days, addresses_per_day, icc, p_true, n_trials, n_boot, seed) / n_trials
+
+
+def power_ci_at(
+    days: int,
+    addresses_per_day: int,
+    icc: float,
+    p_true: float,
+    n_trials: int,
+    n_boot: int,
+    seed: int,
+    alpha: float = 0.05,
+) -> tuple[float, float, float]:
+    """(point, ci_low, ci_high) for power against `p_true`, Wilson over trials.
+
+    `power_at`'s point estimate is itself a Monte Carlo draw with its own
+    sampling error -- a proportion out of `n_trials` binary outcomes -- and
+    a window-sizing decision that reads the point estimate against a target
+    is exactly the same mistake §0.3's naive breach-rate test makes: it
+    lets sampling noise decide instead of the data. `recommend_window` reads
+    `ci_low` and requires it, not the point, to clear the target.
+    """
+    detected = _power_trials(days, addresses_per_day, icc, p_true, n_trials, n_boot, seed)
+    lo, hi = wilson_interval(detected, n_trials)
+    return detected / n_trials, lo, hi
 
 
 def sweep(

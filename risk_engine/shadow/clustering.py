@@ -542,7 +542,9 @@ class WindowRecommendation:
     target_power: float
     detect_rate: float
     days_required: int | None
-    searched: list[tuple[int, float]]
+    #: (days, power point estimate, power lower confidence bound) per day
+    #: searched. The lower bound is what the decision is actually made on.
+    searched: list[tuple[int, float, float]]
 
     def summary(self) -> str:
         head = (
@@ -552,11 +554,13 @@ class WindowRecommendation:
             f"{self.detect_rate:.0%} against the claimed 5%\n"
         )
         rows = "\n".join(
-            f"    {days:4d} days   power {power:.0%}" for days, power in self.searched
+            f"    {days:4d} days   power {power:.0%} (>= {lo:.0%} at 95% confidence)"
+            for days, power, lo in self.searched
         )
         if self.days_required is None:
             tail = (
-                f"\n  no window in the searched grid reaches {self.target_power:.0%}. "
+                f"\n  no window in the searched grid reaches {self.target_power:.0%} "
+                "power with 95% confidence -- not merely on a lucky Monte Carlo draw. "
                 "At this much clustering the VaR criterion is not the right gate; "
                 "see OPEN-QUESTIONS B1 for the alternatives."
             )
@@ -572,7 +576,7 @@ def recommend_window(
     detect_rate: float = 0.10,
     day_grid: tuple[int, ...] = (21, 30, 45, 60, 90, 120, 180),
     basis: str = "ci_high",
-    n_trials: int = 200,
+    n_trials: int = 500,
     n_boot: int = 400,
     seed: int = 0,
 ) -> WindowRecommendation:
@@ -582,18 +586,28 @@ def recommend_window(
     table, because the table was computed on a grid the measurement will not
     land on.
 
-    Defaults to the upper end of the interval, not the point estimate. Sizing
-    off the middle is wrong half the time in the direction that shortens the
-    window, and a window that is too short yields a gate that passes without
-    establishing anything.
+    Defaults to the upper end of the ICC interval, not the point estimate.
+    Sizing off the middle is wrong half the time in the direction that
+    shortens the window, and a window that is too short yields a gate that
+    passes without establishing anything.
 
     Power is simulated at the requested `detect_rate` itself, never snapped
     to a nearby tabulated one: a stricter target (closer to the nominal 5%)
     is *harder* to detect and needs a longer window, and quantising it to an
     easier column was measured to under-size the window (audit F-1).
+
+    A day count is accepted only when the 95% LOWER confidence bound on its
+    power estimate clears `target_power` -- not the point estimate. The point
+    estimate is itself a Monte Carlo draw: at the default `n_trials`, one
+    audit run measured 76% against an 80% target, 1.1 standard errors from
+    the threshold -- close enough to a coin flip that the "-> N days" line
+    would be reporting noise as a decision (audit, found while fixing F-1/
+    F-4). `n_trials` defaults higher than `evaluate`'s table-sweep default
+    for the same reason: this number is read as a single go/no-go, not
+    plotted alongside its neighbours where an eye can discount the scatter.
     """
     from risk_engine.validation.power import NOMINAL_BREACH_RATE as NOMINAL
-    from risk_engine.validation.power import power_at
+    from risk_engine.validation.power import power_ci_at
 
     if not NOMINAL < detect_rate < 1.0:
         raise ValueError(
@@ -604,14 +618,14 @@ def recommend_window(
         )
     value = {"point": icc.point, "ci_high": icc.ci_high, "ci_low": icc.ci_low}[basis]
 
-    searched: list[tuple[int, float]] = []
+    searched: list[tuple[int, float, float]] = []
     required: int | None = None
     for i, days in enumerate(day_grid):
-        power = power_at(
+        power, power_lo, _ = power_ci_at(
             days, addresses_per_day, value, detect_rate, n_trials, n_boot, seed + i
         )
-        searched.append((days, power))
-        if required is None and power >= target_power:
+        searched.append((days, power, power_lo))
+        if required is None and power_lo >= target_power:
             required = days
             break
 
