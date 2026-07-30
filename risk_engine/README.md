@@ -76,6 +76,42 @@ one account cannot acquire two identities and inflate the §3.3 address count;
 anything that is not an address is refused when the list loads, with its
 index, rather than part-way through a sweep that has already spent weight.
 
+### Collecting the address list
+
+```bash
+python -m risk_engine.market.collect_addresses --minutes 30 --out addresses.json
+```
+
+The frame is **decided**: the public trades feed. The leaderboard was
+rejected because it ranks on realised performance, which is the variable the
+calibration score measures — sampling on the outcome would make the model
+look mis-calibrated in whichever direction the sample was skewed, and nothing
+downstream recovers from that. Activity bias is awkward; performance bias is
+circular.
+
+The collector subscribes to the trades WebSocket, harvests the accounts named
+on each trade, folds them through `normalise_address`, and writes a file
+`FileAddressSource` reads directly — including a generated `frame` that states
+the window, the coins, the activity bias, and the tension that the
+book-unchanged cohort the gate is read from (B2) discards precisely the most
+active accounts this frame selects for. It stops at `--target` (default 500,
+the top of §3.3's range, because the sweep drops flat and zero-equity accounts
+before any of them count towards a 200-address gate) or when `--minutes`
+elapses, and refuses to write fewer than the gate's requirement without
+`--allow-short`. Progress prints while it runs.
+
+Two things to know before running it. `websockets` is **not** an engine
+dependency and is imported lazily — `pip install 'websockets>=12.0'`, and add
+the same line to `deploy/Dockerfile.engine` if the collector is to run in the
+container. And the message shape is an assumption, not an established fact:
+nothing in this repository has ever spoken Hyperliquid's WebSocket protocol
+(the URL is recorded as UNCHECKABLE in `market/verify.py`, the subscribe
+envelope comes from a snippet in C4 that has never been executed here). So
+the collector asserts the shape while collecting and aborts with the frame
+quoted verbatim if a trade carries no address where it expects one. It will
+never write an empty list and report success — that file would load cleanly,
+sweep nothing, and show up three weeks later as a gate that never advanced.
+
 ### Before the shadow clock starts
 
 Changing the distribution resets the counter (§3.3, §10), so any question
@@ -178,7 +214,8 @@ service/      §8. Internal REST service the Node backend consumes.
 validation/   §3.1 benchmarks, §3.2 baselines, CLI.
 shadow/       §3.3/3.4. Calibration journal (SQLite or Postgres), snapshot
               cron, resolver, metrics, champion/challenger, CLI.
-market/       §5.1. Info client and parsers.
+market/       §5.1. Info client and parsers, the live-API verification
+              harness, and the B4 trades-feed address collector.
 observability/§7. Counters and latency histograms.
 ```
 

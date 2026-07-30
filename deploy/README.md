@@ -78,10 +78,11 @@ docker compose -f deploy/docker-compose.yml run --rm engine \
   -m risk_engine.shadow progress --journal "$SHADOW_DSN"
 ```
 
-**Read `risk_engine/README.md` before you do.** A1 and A8 still move the
-distribution, and §3.3 resets the window to zero when it moves, so days
-accumulated before those two are settled are days that get thrown away.
-C1, C2 and C5 no longer block — all three were closed against live data.
+**Read `risk_engine/README.md` before you do.** §3.3 resets the window to zero
+whenever the distribution moves, so every question that moves it has to be
+settled before days start accumulating. That list is now empty: A1 and A8 were
+the last two and both were decided on 2026-07-30 without changing the
+distribution, and C1, C2 and C5 were closed against live data.
 
 Live runs also need `deploy/addresses.json` filled in — both the list and the
 `frame` field describing what it is a sample *of*. `FileAddressSource`
@@ -89,6 +90,24 @@ refuses a list without one (OPEN-QUESTIONS B4). Each address is `0x` plus 40
 hex digits in any case; the checksummed form from a block explorer is fine, it
 is folded to lowercase so one account cannot be journalled twice under two
 spellings. A malformed entry fails the load, naming its index.
+
+Generate it rather than curating it by hand — the frame for the §3.3 window is
+decided (the public trades feed, activity-selected; the leaderboard was
+rejected because it ranks on the very outcome being calibrated):
+
+```bash
+pip install 'websockets>=12.0'     # not an engine dependency; imported lazily
+python -m risk_engine.market.collect_addresses --minutes 30 \
+    --out deploy/addresses.json --force
+```
+
+That writes the `frame` text as well as the list. Editing the committed
+template by hand instead loses the address-format guidance next to the data,
+which is how the file in this directory already came to differ from what
+`shadow init-addresses` emits. Note that the file is bind-mounted read-only
+into both shadow containers while `SHADOW_ARGS` defaults to `--fixture`;
+flipping it to `--addresses /app/addresses.json` before the file has a frame
+fails both jobs at startup.
 
 The resolver runs hourly against a daily snapshot. That is not a mistake:
 a prediction resolves 24 h after it was made, and a resolution collected

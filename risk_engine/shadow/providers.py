@@ -6,7 +6,7 @@ The plumbing: `LiveSnapshotProvider` reads books and prices through the Info
 API, and charges every request against a shared weight budget so the
 background sweep yields to live users (§5.3, OPEN-QUESTIONS C6).
 
-The unsolved one: **where the address list comes from** (OPEN-QUESTIONS B4).
+The awkward one: **where the address list comes from** (OPEN-QUESTIONS B4).
 The Info API reads any address but enumerates none — there is no endpoint
 that returns a list of accounts. Every available source is biased, and the
 bias lands squarely on the variable being calibrated:
@@ -25,6 +25,16 @@ can do is force the choice to be explicit and recorded, so the eventual
 calibration score can state its sampling frame instead of implying it had
 none. Every source therefore carries a `frame` describing its bias, and the
 cron writes that into the run so it is attached to the numbers forever.
+
+The choice has since been made: **the trades feed**, on the grounds that its
+bias is awkward rather than circular — activity is not the quantity the score
+measures, whereas leaderboard rank is. `risk_engine.market.collect_addresses`
+harvests it and writes a file this module's `FileAddressSource` reads, with
+the frame generated rather than left to whoever runs it. That does not make
+`FileAddressSource` a legacy path: a hand-curated list remains the right
+thing for a one-off investigation, and the collector's output is one of these
+files rather than a separate kind of source. What is decided is the frame for
+the §3.3 window, not the only way an address may enter this system.
 """
 
 from __future__ import annotations

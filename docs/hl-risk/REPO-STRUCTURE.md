@@ -10,7 +10,8 @@ code with it. The two are independent top-level trees; nothing in
 risk_engine/                  # SERVICE 1 — Python. Phase 1 (built now).
   domain/                     #   value types: Book, Position, AssetSpec, RiskEstimate
   liquidation/                #   §1 — margin tiers, liq price, cross+N-isolated simulator
-  market/                     #   §5.1 — Info client, meta/state/candle/funding parsers
+  market/                     #   §5.1 — Info client, meta/state/candle/funding parsers,
+                              #   verification harness, B4 trades-feed address collector
   model/                      #   §2 — EWMA, Ledoit-Wolf, PSD, Student-t marginals, funding AR(1)
   sim/                        #   §2.3/2.5 — t-copula paths, Monte Carlo engine, CI statistics
   tools/                      #   §4 — portfolio_risk, pre_trade_delta, max_safe_size, funding_drag

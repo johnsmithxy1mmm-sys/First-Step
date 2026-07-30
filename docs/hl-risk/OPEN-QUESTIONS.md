@@ -424,7 +424,7 @@ volatility and no funding, which is the spirit of the baseline. Its `P(liq)`
 comes from the same draws run through the real liquidation model. Confirm
 this reading, or supply the intended one.
 
-### B4 `[BLOCKER]` No documented way to obtain the shadow address list
+### B4 `[BLOCKER — frame decided, feed shape unverified]` No documented way to obtain the shadow address list
 
 §3.3 requires snapshotting "200-500 active public addresses". The Info API
 reads any address but does not enumerate addresses — there is no endpoint
@@ -436,6 +436,72 @@ is a missing input, not an implementation detail: the shadow cron is built
 with a pluggable address source and ships with a file-backed one, so it runs
 today, but the sampling frame is undecided and it will bias the calibration
 score if chosen carelessly.
+
+**Decision, 2026-07-30: the frame is the public trades feed.** The
+leaderboard is rejected, and the reason is not that its bias is larger but
+that its bias is of a different kind. The leaderboard ranks on realised
+performance, and realised performance is the variable the calibration score
+measures. Sampling on the outcome makes the model appear mis-calibrated in
+whichever direction the sample was skewed — calibrated against winners it
+looks wrong on losers, and there is no correction downstream, because the
+defect is in what the sample *is*, not in how it was scored. The trades feed
+selects on trading activity instead. That is awkward rather than circular:
+activity is not the quantity being measured, so the bias can be stated,
+carried alongside the score and reasoned about by a reader.
+
+Implemented by `risk_engine/market/collect_addresses.py`:
+
+```bash
+python -m risk_engine.market.collect_addresses --minutes 30 --out addresses.json
+```
+
+It subscribes to the trades WebSocket, harvests the accounts named on each
+trade, folds them through `normalise_address`, and emits the JSON
+`FileAddressSource` already reads — with the `frame` field generated rather
+than left blank, because an operator handed a blank field writes "trades
+feed", which satisfies the loader's check and states nothing. The generated
+frame names the window, the coins, the activity bias in both directions, the
+leaderboard argument above, and the B2 tension below. It refuses to write
+fewer addresses than `ShadowProgress.required_addresses` without
+`--allow-short`, and refuses an empty list unconditionally.
+
+**What this does not fix, and must not be read as fixing:**
+
+- **The bias is stated, not removed.** The gate is read off the
+  book-unchanged cohort (B2), which discards any account whose book moved
+  during the observation day — precisely the accounts an activity-selected
+  frame contains. The usable sample therefore shrinks in a way correlated
+  with how it was drawn, and the effective n behind the published score is
+  materially smaller than the list length. This is the cost of the decision.
+  It is written into every frame string the collector generates so it cannot
+  be lost between the address list and the published number.
+- **The message shape is still unverified.** Nothing in this repository has
+  ever spoken Hyperliquid's WebSocket protocol. The URL comes from C4's
+  UNCHECKABLE note, the subscribe envelope from C4's snippet, and the claim
+  that a public trade names its participants is the very thing this entry
+  said "need[s] to be verified" — `git grep` finds no JSON field named
+  `users` anywhere, and there is no fixture. The API is 403 at this
+  environment's proxy (E5), so the collector cannot be run here at all.
+  Instead of assuming, it asserts: a trade record carrying no address where
+  one is expected aborts the run quoting the frame verbatim, an
+  acknowledged-but-undelivered subscription aborts, silence on connect
+  aborts, and no path reaches a written file with zero addresses. The failure
+  it is built to prevent is the quiet one — a valid, empty, confidently
+  framed list that loads cleanly, sweeps nothing, and surfaces three weeks
+  later as a gate that never advanced.
+- **More addresses still buy almost nothing.** B1 measured it: 200 → 500 per
+  day moves the clustered half-width from 3.60 to 3.43 pp. Days are the
+  lever. `--target` defaults to 500 for headroom against the accounts the
+  sweep drops (flat books, non-positive equity, stale resolution), not
+  because a bigger sample tightens the interval.
+- **One sweep may not cover a long list.** C6's arithmetic still applies: at
+  ~20 weight per address against the 25% of the 1200/minute budget the sweep
+  is allowed, a 500-entry list takes over two minutes of continuous sweeping,
+  and `ShadowCron` reports truncation rather than waiting.
+
+E4 stays open until the shape is confirmed against the live venue: what is
+settled is which frame to use and what to say about it, not that this
+collector reads the real feed correctly.
 
 ### B5 `[RESOLVED]` §0.2 and §3.2 disagree about which baseline decides
 
@@ -777,6 +843,6 @@ in the risk number, and is recorded in the journal's model version.
 | E1 | Builder address + its ≥100 USDC perp balance (§5.5) | Phase 4 |
 | E2 | KMS/age key material and the agent-key encryption boundary (§5.4) | Phase 4 |
 | E3 | Postgres DSN / deployment target | Shadow persistence at scale |
-| E4 | The shadow address sampling frame (B4) | Phase 4 gate validity |
+| E4 | ~~The shadow address sampling frame~~ **DECIDED 2026-07-30** (B4): the public trades feed, activity-selected; the leaderboard rejected because it ranks on the outcome being calibrated. Implemented by `risk_engine.market.collect_addresses`, which generates the `frame` text as well as the list. Still open: the feed's message shape has never been observed from here (the API is 403 at this proxy), so the collector asserts it at runtime and aborts rather than writing an empty list. | Phase 4 gate validity — frame settled, one live run needed to confirm the shape |
 | E5 | ~~Live API access — every §5.1 parser written against fixtures, never exercised against the live schema~~ **RESOLVED 2026-07-29** by `python -m risk_engine.market.verify` run from a network where the API is reachable (it is still 403 at the build-environment proxy). All three parsers PASS on live mainnet: `meta` → 177 assets, 34 with multiple margin tiers; `candleSnapshot` → 720 hourly BTC returns, 0 gaps, hourly vol 0.00363; `clearinghouseState` → 10 positions, cross collateral $3,957,459.72. The documented response shapes were correct. | closed |
 | E6 | Historical liquidation frequencies by nominal leverage for Baseline A's `P(liq)` arm (B3) | Baseline A's probability output |
