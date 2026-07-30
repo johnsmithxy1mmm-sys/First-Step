@@ -29,6 +29,20 @@ so the probe aborts on any change in position size. A funding payment too
 small to distinguish from the residual noise in the balances is reported as
 inconclusive rather than resolved in whichever direction the arithmetic
 happened to land.
+
+Attribution reads the ISOLATED side in both directions, never the cross
+side. The pocket's `rawUsd` is ledger collateral — it moves on funding and
+on explicit margin transfers, not on mark prices — while the cross account
+value carries the unrealised PnL of every cross position, whose drift over
+the probe's multi-minute window dwarfs a funding payment. An earlier draft
+required `cross_delta ~= payment` for the cross-debit verdict; the audit
+showed that condition is unreachable under normal uPnL noise, which made the
+structurally dangerous world the one the probe could not detect. The pocket
+not paying IS the violation: the account demonstrably paid (userFunding) and
+the only other bucket is cross, however invisibly the payment lands in its
+noise. The stated assumption — checked against the venue's docs, not proven
+— is that isolated funding settles into pocket collateral rather than into
+the pocket's own unrealised PnL; the FAIL text names that assumption.
 """
 
 from __future__ import annotations
@@ -48,8 +62,12 @@ SETTLE_GRACE_S = 120.0
 #: Below this, a payment cannot be told from rounding in the reported
 #: balances, and a verdict either way would be arithmetic on noise.
 MIN_RESOLVABLE_USD = 0.01
-#: Fraction of the funding payment the moving balance must account for.
+#: The pocket paid its own funding: |pocket move| within this of the payment.
 ATTRIBUTION_TOLERANCE = 0.25
+#: The pocket demonstrably did NOT pay: it absorbed under this fraction of a
+#: payment the account provably made. The gap between the two bands reads as
+#: ambiguous rather than being rounded toward either verdict.
+ISOLATED_SILENT_BELOW = 0.25
 
 
 @dataclass
@@ -91,6 +109,14 @@ def _snapshot(client: InfoClient, address: str) -> Snapshot:
         lev = p.get("leverage") or {}
         if lev.get("type") == "isolated":
             raw = lev.get("rawUsd", p.get("marginUsed"))
+            if raw is None:
+                # Refuse at the BEFORE snapshot, loudly, rather than crashing
+                # on float(None) at the after snapshot -- an hour of waiting
+                # later (audit P-3).
+                raise ValueError(
+                    f"{coin}: isolated position exposes neither leverage.rawUsd "
+                    "nor marginUsed; the pocket's collateral cannot be observed"
+                )
             isolated[coin] = float(raw)
     return Snapshot(
         at=datetime.now(timezone.utc).isoformat(),
@@ -160,7 +186,13 @@ def probe(
         )
 
     try:
-        raw_payments = client.user_funding(address, start_ms - 3_600_000, end_ms)
+        # STRICTLY the observed window. The tick lands inside it by
+        # construction (start < top-of-hour < end). Widening the request by
+        # an hour -- an earlier draft did -- pulls in the PREVIOUS tick's
+        # payment, which the before-snapshot already contains: the payment
+        # sum doubles while the balance delta does not, and every realistic
+        # run reads as ambiguous (audit P-1).
+        raw_payments = client.user_funding(address, start_ms, end_ms)
     except Exception as exc:
         return ProbeResult(
             "UNCHECKABLE",
@@ -180,7 +212,7 @@ def probe(
         usdc = delta.get("usdc")
         if coin is None or usdc is None:
             continue
-        if not (start_ms - 3_600_000 <= int(row.get("time", 0)) <= end_ms):
+        if not (start_ms <= int(row.get("time", 0)) <= end_ms):
             continue
         # The venue reports what the account paid as a signed cash flow; the
         # sign convention is recorded rather than assumed, since the verdict
@@ -208,24 +240,34 @@ def probe(
             deltas=deltas, cross_delta=cross_delta,
         )
 
+    # Attribution reads the pocket, in BOTH directions. The pocket's rawUsd
+    # is ledger collateral -- funding and explicit transfers move it, mark
+    # prices do not -- while cross account value drifts with every cross
+    # position's unrealised PnL, drowning a funding-sized move within
+    # minutes. An earlier draft demanded cross_delta ~= payment for the
+    # cross verdict; under normal uPnL noise that condition is unreachable,
+    # which made the structurally dangerous world the undetectable one
+    # (audit P-2). The pocket refusing to pay IS the finding: the account
+    # provably paid (userFunding) and there is no third bucket.
     verdicts = []
     for coin, payment in resolvable.items():
-        moved_iso = abs(deltas.get(coin, 0.0))
-        share_iso = moved_iso / abs(payment)
-        share_cross = abs(cross_delta) / abs(payment)
+        share_iso = abs(deltas.get(coin, 0.0)) / abs(payment)
         if abs(share_iso - 1.0) <= ATTRIBUTION_TOLERANCE:
-            verdicts.append((coin, "isolated", share_iso, share_cross))
-        elif abs(share_cross - 1.0) <= ATTRIBUTION_TOLERANCE and share_iso < 0.25:
-            verdicts.append((coin, "cross", share_iso, share_cross))
+            verdicts.append((coin, "isolated", share_iso))
+        elif share_iso < ISOLATED_SILENT_BELOW:
+            verdicts.append((coin, "cross", share_iso))
         else:
-            verdicts.append((coin, "ambiguous", share_iso, share_cross))
+            verdicts.append((coin, "ambiguous", share_iso))
 
     lines = [
-        f"{c}: funding ${p:+.4f}, isolated margin moved "
-        f"{s_i:.0%} of it, cross value moved {s_c:.0%} -> {v}"
-        for (c, v, s_i, s_c), p in zip(verdicts, resolvable.values(), strict=True)
+        f"{c}: funding ${p:+.4f}, the pocket absorbed {s_i:.0%} of it -> {v}"
+        for (c, v, s_i), p in zip(verdicts, resolvable.values(), strict=True)
     ]
-    kinds = {v for _, v, _, _ in verdicts}
+    lines.append(
+        f"cross account value moved ${cross_delta:+.2f} over the window "
+        "(uPnL drift included; corroboration only, never the verdict)"
+    )
+    kinds = {v for _, v, _ in verdicts}
 
     if kinds == {"isolated"}:
         status, detail = "PASS", (
@@ -235,17 +277,21 @@ def probe(
         )
     elif "cross" in kinds:
         status, detail = "FAIL", (
-            "funding on an isolated position moved the CROSS balance. §1.1's "
-            "independence claim is false: an isolated position can drain the "
-            "cross pool through funding, and the simulator has no term for "
-            "that. This invalidates the isolated/cross separation, not just a "
-            "number.\n  " + "\n  ".join(lines)
+            "an isolated position's funding was NOT taken from its own margin: "
+            "the account paid (userFunding) while the pocket's collateral did "
+            "not move. The only other bucket is the cross pool, so §1.1's "
+            "independence claim is false -- an isolated position can drain "
+            "cross through funding, and the simulator has no term for that. "
+            "Stated assumption: the venue settles isolated funding into pocket "
+            "collateral (rawUsd); if it settles into the pocket's own uPnL "
+            "instead, confirm on testnet before treating this as final.\n  "
+            + "\n  ".join(lines)
         )
     else:
         status, detail = "INCONCLUSIVE", (
-            "the balance moves do not cleanly attribute to the funding "
-            "payments -- something else moved the account in the same window.\n  "
-            + "\n  ".join(lines)
+            "the pocket absorbed part of the payment but not within tolerance "
+            "of it -- an explicit margin transfer or venue rounding landed in "
+            "the same window.\n  " + "\n  ".join(lines)
         )
     return ProbeResult(status, detail, before=before, after=after,
                        payments=payments, deltas=deltas, cross_delta=cross_delta)

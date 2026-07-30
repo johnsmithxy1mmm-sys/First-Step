@@ -472,9 +472,15 @@ rather than shift a number, which makes it the one worth spending effort on.
 it UNCHECKABLE because no single read distinguishes the two, and the original
 note here assumed that meant opening a funded position. It does not:
 `clearinghouseState` exposes `leverage.rawUsd` per isolated position — the
-collateral in that pocket — alongside `crossMarginSummary.accountValue`, and
-`userFunding` gives what the account actually paid. Snapshot both sides of an
-hourly funding tick and see which balance moved by the payment:
+collateral in that pocket — and `userFunding` gives what the account actually
+paid. Snapshot both sides of an hourly funding tick and ask whether the
+pocket absorbed its own payment. The pocket is the only side worth reading:
+its `rawUsd` is ledger collateral (funding and explicit transfers move it,
+mark prices do not), while the cross account value drifts with every cross
+position's uPnL and buries a funding-sized move within minutes — an audit
+(P-2) showed a verdict that read the cross side could never return FAIL on a
+real account. A pocket that provably paid nothing while `userFunding` shows
+the account paid **is** the §1.1 violation: there is no third bucket.
 
 ```
 python -m risk_engine.market.probe_isolated_funding --address 0x... --report c5.json
