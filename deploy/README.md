@@ -78,9 +78,10 @@ docker compose -f deploy/docker-compose.yml run --rm engine \
   -m risk_engine.shadow progress --journal "$SHADOW_DSN"
 ```
 
-**Read `risk_engine/README.md` before you do.** A1, A8, C1, C2 and C5 all
-move the distribution, and §3.3 resets the window to zero when it moves. Days
-accumulated before those are settled are days that get thrown away.
+**Read `risk_engine/README.md` before you do.** A1 and A8 still move the
+distribution, and §3.3 resets the window to zero when it moves, so days
+accumulated before those two are settled are days that get thrown away.
+C1, C2 and C5 no longer block — all three were closed against live data.
 
 Live runs also need `deploy/addresses.json` filled in — both the list and the
 `frame` field describing what it is a sample *of*. `FileAddressSource`

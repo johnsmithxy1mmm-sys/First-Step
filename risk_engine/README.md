@@ -71,10 +71,16 @@ refuses a list that omits it rather than defaulting to something plausible.
 
 ### Before the shadow clock starts
 
-Changing the distribution resets the counter (§3.3, §10). Five open
-questions still move it — A1, A8, C1, C2 and C5 — so 21 days accumulated now
-are 21 days that will be thrown away when any of them is answered. Resolve
-them first, or accept the reset knowingly. Details in
+Changing the distribution resets the counter (§3.3, §10), so any question
+that moves it has to be settled before days start accumulating — otherwise
+they are days that get thrown away.
+
+As of 2026-07-30 that list is **A1 and A8**, both decisions rather than
+measurements. C1, C2 and C5 were closed against live data: C5 confirmed on
+testnet that isolated funding is debited from the position's own margin
+(§1.1 holds, no coupling term needed), C2 measured a mark-mid basis two
+orders of magnitude inside §1.4's threshold, and C1's clamp turned out not
+to bind the fitted AR(1) at all. Details and bounds in
 [`OPEN-QUESTIONS.md`](../docs/hl-risk/OPEN-QUESTIONS.md).
 
 ### Sizing the window first — a pilot that does not reset

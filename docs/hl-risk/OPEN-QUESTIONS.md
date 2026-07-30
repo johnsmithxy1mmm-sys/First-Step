@@ -225,8 +225,9 @@ supply — it takes real data, which is why it is swept rather than assumed.
 **Measuring it is `python -m risk_engine.shadow icc`**, and doing so does not
 burn the §3.3 counter: what makes two addresses breach together is the common
 market move, not the model version, so the estimate survives a version change
-to first order. A pilot can therefore run *before* A1, A8, C1, C2 and C5 are
-settled.
+to first order. A pilot can therefore run *before* the remaining
+distribution-affecting questions are settled — as of 2026-07-30 that is A1
+and A8, C1/C2/C5 having been closed against live data.
 
 Three things had to be got right for that command to mean anything, and each
 was measured rather than assumed:
@@ -457,16 +458,35 @@ asyncio.run(main())"
 
 An error response means it does not exist and §5.2 should say `webData2`.
 
-### C5 `[BLOCKER]` Isolated-position funding
+### C5 `[RESOLVED]` Isolated-position funding — confirmed on live testnet
 
 The model debits funding on an isolated position from that position's
 isolated margin (which is what makes isolated liquidations independent, per
-§1.1). Behaviour at the protocol level should be confirmed — if funding on
-isolated positions is instead debited from the cross pool, the independence
-claim in §1.1 is violated and the simulator needs a coupling term.
+§1.1). This was the only remaining open question that could invalidate
+**structure** rather than shift a number.
 
-This is the only remaining open question that can invalidate **structure**
-rather than shift a number, which makes it the one worth spending effort on.
+**Measured, 2026-07-30, Hyperliquid testnet.** One isolated BTC position
+observed across an hourly funding tick:
+
+```
+[PASS] C5
+  BTC: funding $-0.0621, the pocket absorbed 100% of it -> isolated
+  cross account value moved $+0.00 over the window
+```
+
+The pocket's own collateral absorbed the entire payment and the cross
+account value did not move at all. §1.1's independence claim holds and the
+simulator needs no coupling term — the code is correct as written.
+
+Bounds of the result, stated because a single clean observation is not a
+protocol guarantee: one tick, one asset, on testnet, on an idle account. It
+falsifies the dangerous hypothesis (cross-pool debit) rather than proving the
+mechanism for all cases. The probe stays in the tree and is cheap to re-run
+on mainnet against a larger position; a re-run is warranted if the venue ever
+changes its margin accounting. The stated assumption — that the venue settles
+isolated funding into pocket collateral (`rawUsd`) rather than into the
+pocket's own unrealised PnL — was borne out: the pocket's `rawUsd` moved by
+exactly the payment.
 
 **Answerable read-only, no capital required.** The `verify` harness reports
 it UNCHECKABLE because no single read distinguishes the two, and the original
