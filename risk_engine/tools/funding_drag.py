@@ -1,23 +1,34 @@
 """§4.4 `funding_drag` — what holding this book costs in funding.
 
 A distribution, not a point. §4.4 is explicit about that, and the reason is
-that the AR(1) with its protocol clamp (§1.5) produces a genuinely wide
-spread over a week: quoting a median alone would let a user plan around a
-number the model gives maybe even odds of beating.
+the AR(1) with its protocol clamp (§1.5): the rate is persistent, so a hold is
+dominated by wherever the rate happens to start, and a short one gives it no
+time to average out. Narrowing the default to a day therefore does not make a
+point estimate defensible -- on the fitted fixtures the 5th-95th band at 24h
+is about as wide as the median itself, wider in relative terms than the same
+band over a week, because mean reversion has had less of the horizon to work
+in. A median alone would let a user plan around a figure the model gives maybe
+even odds of beating.
+
+The default horizon is a day, not a week, and that is a risk decision rather
+than a convenience; the reasoning is on `horizon_hours` below and in
+OPEN-QUESTIONS A8.
 
 Two things this deliberately does not do:
 
 It does not net funding against price PnL. Funding is a contractual cash
 flow and the only non-zero drift the model permits (§2.4); mixing it with
 the price distribution would hide it inside a much larger number, which is
-exactly how a cost that compounds hourly goes unnoticed for a week.
+exactly how a cost that compounds hourly goes unnoticed over a hold.
 
 It does not condition funding on the price path. Rates and returns are
 drawn independently, which is a known simplification with an unresolved
 sign (OPEN-QUESTIONS A8) -- in reality funding tracks the perp-spot premium,
-so a falling market pushes it negative. The independence is stated on every
-result rather than buried, because a user planning a week-long hold is
-exactly who it misleads.
+so a falling market pushes it negative. The error that leaves grows with the
+horizon, which is why the default is a day: over 24h it is small beside the
+estimation error on the rate itself, over a week it is not. The independence
+is stated on every result rather than buried, because a user planning a long
+hold is exactly who it misleads.
 """
 
 from __future__ import annotations
@@ -37,6 +48,11 @@ from risk_engine.sim.engine import (
 from risk_engine.sim.stats import PredictiveDistribution, bootstrap_ci
 
 DAY_HOURS = 24
+#: Nothing defaults to a week any more (OPEN-QUESTIONS A8), but this stays
+#: exported: it is the named long horizon a caller passes to reach past the
+#: default, so it documents that the week is still supported rather than gone,
+#: and removing a public module constant would break an importer with an
+#: ImportError at a call site that has nothing to do with the decision.
 WEEK_HOURS = 24 * 7
 
 
@@ -59,11 +75,18 @@ class FundingDrag:
     start_equity: float
     provenance: SimulationProvenance
     #: OPEN-QUESTIONS A8, restated on every result rather than in a footnote.
+    #: The horizon clause is not padding: the default is now 24h but a week is
+    #: still reachable by explicit argument, so one static string is attached
+    #: to results at horizons whose bias magnitudes differ. A caveat that named
+    #: only the side would read as horizon-independent and let a caller who
+    #: asked for 168h believe the wording was written for their case.
     caveats: tuple[str, ...] = (
         "Funding is simulated independently of price. In reality it tracks the "
         "perp-spot premium, so a falling market pushes it negative; the sign of "
-        "the resulting bias differs between longs and shorts and is not "
-        "conservative either way (OPEN-QUESTIONS A8).",
+        "the resulting bias differs by side and by horizon and is not "
+        "conservative either way (OPEN-QUESTIONS A8). Over the 24h default it "
+        "is small beside the estimation error on the rate; it grows with the "
+        "horizon, so a longer hold is indicative rather than calibrated.",
         "Rates are clamped to the protocol bound, whose value is taken from "
         "documentation and has not been verified against the live API "
         "(OPEN-QUESTIONS C1).",
@@ -89,13 +112,38 @@ def funding_drag(
     spot: dict[str, float],
     bundle: ModelBundle,
     specs: dict[str, AssetSpec],
-    horizon_hours: int = WEEK_HOURS,
+    # A day, not a week (OPEN-QUESTIONS A8, decided 2026-07-30). Funding and
+    # price are drawn independently, and the sign of that bias is unresolved:
+    # under independence a long keeps paying funding through a crash in which
+    # the real rate would have turned negative, and a short keeps receiving it
+    # through a rally, so the error is not conservative for either side and
+    # §10 cannot be satisfied by arguing it errs the safe way. What bounds it
+    # instead is the horizon: over 24h the unmodelled correlation has one day
+    # to compound and the error sits below the estimation error on the rate;
+    # over 168h it does not. The real fix is a joint model of rate and return,
+    # which changes the predicted distribution and is therefore a §2 change --
+    # a MINOR/MAJOR bump, which resets the §3.3 shadow counter (see
+    # risk_engine/version.py) and discards every validation day accumulated so
+    # far. Narrowing the default is the honest interim position rather than a
+    # workaround: it neither hides the bias nor pays that price. A week stays
+    # reachable by passing horizon_hours=WEEK_HOURS; the change is that a
+    # caller has to ask, and the docstring says what asking accepts.
+    horizon_hours: int = DAY_HOURS,
     n_paths: int = DEFAULT_PATHS,
     seed: int | None = None,
     workers: int = DEFAULT_WORKERS,
     now: datetime | None = None,
 ) -> FundingDrag:
-    """Distribution of funding cost over the holding horizon (§4.4)."""
+    """Distribution of funding cost over the holding horizon (§4.4).
+
+    `horizon_hours` defaults to 24h. Longer horizons remain reachable -- pass
+    `horizon_hours=WEEK_HOURS` for a week -- but beyond roughly a day the
+    independence of funding and price (OPEN-QUESTIONS A8) degrades and the
+    result should be read as indicative rather than as a calibrated
+    distribution. It is not merely wider than it should be: the bias has a
+    sign that differs between longs and shorts, so a week-long figure is not
+    safe in either direction and must not be presented to a user as one.
+    """
     if not book.positions:
         raise ValueError("an empty book pays no funding")
     now = now or datetime.now(timezone.utc)

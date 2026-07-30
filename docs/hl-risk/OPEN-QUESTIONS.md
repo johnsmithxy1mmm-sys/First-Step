@@ -12,7 +12,7 @@ external data before the phase that depends on it can close.
 
 ## A. Mathematical contradictions
 
-### A1 `[BLOCKER]` Zero price drift is unattainable with Student-t marginals
+### A1 `[RESOLVED]` Zero price drift is unattainable with Student-t marginals
 
 §2.4 mandates zero drift **in price** under the real measure. §2.2 mandates
 Student-t marginals with `df` clamped as low as 2.1. These are mutually
@@ -33,9 +33,44 @@ vol that is 8 bp over 24 h — an order of magnitude below the estimation
 error on sigma itself, but it is a real one-sided choice and §10 forbids
 silent risk-understating choices, hence this entry.
 
-Decision needed: accept zero log-drift, or accept `-sigma^2/2` log-drift
-(price-martingale in the limit of finite moments) as the conservative option.
-The engine exposes this as `DriftConvention` with no default hidden in code.
+**Decided 2026-07-30: zero log-return drift** (`DriftConvention.ZERO_LOG_RETURN`,
+which is what the engine already defaults to — no code change).
+
+The reasoning, in the order it decides the question:
+
+1. **There is no uniformly conservative option, so §10 does not pick one.**
+   §10 forbids understating risk, and the reflex is therefore to take the
+   harsher constant. But `-sigma^2/2` is harsher only for longs; for shorts it
+   is *softer* by exactly the same amount, because the drift enters the two
+   sides with opposite sign. Neither convention dominates the other across a
+   book that holds both. Choosing `-sigma^2/2` would not be "the conservative
+   choice", it would be moving the understatement from longs to shorts while
+   claiming to have removed it. §10 is satisfied by disclosure here, which is
+   what this entry is.
+2. **The magnitude is an order of magnitude below the noise on `sigma`.** The
+   gap between the two conventions is `sigma^2/2` per horizon: 8 bp over 24 h
+   at a 4% daily vol. The EWMA/Ledoit-Wolf estimate of `sigma` itself carries
+   several percent of relative error (A5), so the choice is invisible next to
+   the input it modifies. Spending a one-sided distortion of the short book to
+   buy an 8 bp shift in the long book is not a trade worth making.
+3. **Symmetry is the property §2.4 is actually defending.** §2.4 exists to
+   stop the model expressing a market view. `E[r] = 0` treats up and down
+   identically under the stated convention; `-sigma^2/2` tilts every path set
+   down, which is a directional statement dressed as a moment condition, and
+   would have to be explained to a user as "we assume the price drifts down".
+
+Both readings remain implemented and `DriftConvention` stays a parameter, so
+`MEDIAN_PRESERVING_CONVEXITY` can be run as a challenger under §3.3 rather
+than argued about. What is decided is the default the shipped numbers use.
+
+**Why this had to be decided before the clock starts.** The drift convention
+changes the predicted distribution, so changing it later is a MINOR/MAJOR
+version bump, and the §3.3 shadow-day counter is keyed on the distribution
+version (`risk_engine/version.py`): a bump resets the accumulated validation
+window to zero and forces the new version through champion/challenger from
+scratch. Deciding this after days had started accumulating would have thrown
+every one of them away — the reason A1 gated the clock at all, despite being
+worth 8 bp.
 
 ### A2 `[RESOLVED]` The two liquidation-price formulas in §1.2 are not equivalent
 
@@ -118,7 +153,7 @@ implemented twice: for cross books the grid varies *effective* leverage
 (position size at fixed collateral), and for isolated positions it varies the
 set leverage `L`. Confirmation wanted that this is the intent.
 
-### A8 `[BLOCKER]` Funding is simulated independently of price
+### A8 `[RESOLVED]` Funding is simulated independently of price
 
 Funding shocks are drawn independently of price shocks. In reality the
 funding rate tracks the perp-spot premium, which correlates with recent
@@ -129,6 +164,54 @@ bias differs by side and by horizon, so it cannot be waved through as
 "conservative". Wanted: the empirical correlation between hourly funding and
 hourly returns per asset, measured over the shadow window; if it is
 material, the AR(1) needs a return-driven term.
+
+**Decided 2026-07-30: accept the independence, and narrow the horizon it is
+allowed to compound over.** `funding_drag`'s default `horizon_hours` changes
+from 168 to 24 (`risk_engine/tools/funding_drag.py`).
+
+What was accepted, stated plainly: the model draws funding independently of
+price and will ship that way. The bias is not conservative — under
+independence a long keeps paying through a crash where the real rate would
+have turned negative (overstating its cost), and a short keeps receiving
+through a rally (understating its cost) — so §10 is met by bounding and
+disclosing it, not by claiming it errs the safe way.
+
+The bound is the horizon. The error is an unmodelled correlation compounding
+hour by hour, so it grows with the number of hours; over 24 h it sits below
+the estimation error on the rate itself, over a week it does not. Narrowing
+the default therefore removes the case where the unquantified part of the
+number is large, without pretending the mechanism is modelled.
+
+Why not just model it: a return-driven term in the AR(1) is a §2 change, so it
+changes the predicted distribution, so it is a MINOR/MAJOR version bump — and
+the §3.3 shadow-day counter is keyed on the distribution version
+(`risk_engine/version.py`), so it resets the validation window to zero. Doing
+that now would mean the clock never starts. Narrowing the default is the
+honest interim position rather than a workaround: it makes the shipped default
+the horizon the simplification survives, and says so on every result.
+
+What is *not* fixed, and must not be read as fixed:
+
+- A week is still reachable (`horizon_hours=WEEK_HOURS`) because §4.4 asks for
+  the cost of a holding period and a week is a real one. Results there carry
+  the full bias; the docstring and the per-result caveat both say the number
+  is indicative rather than calibrated at that horizon.
+- The default flip does **not** touch `portfolio_risk`. Its 7-day arm walks
+  funding independently over 168 h inside the equity path, and that path
+  decides `p_liq_7d`, which the API and the UI publish. Funding is second
+  order there (≈0.8% of equity over a week on the fitted fixtures, against
+  price moves an order of magnitude larger) and the bias is a fraction of
+  that, but it is present and it is two-sided — conservative for longs,
+  anti-conservative for shorts. `funding_cost` is published at 24 h only, so
+  no *funding* figure reaches a user at a week.
+
+To revisit: measure the correlation between hourly funding and hourly returns
+per asset over the shadow window — the measurement this entry originally asked
+for, which does not need to precede the clock because it is a property of the
+market, not of the model version. If it is material, add the return-driven
+term to the AR(1), accept the MINOR bump and the counter reset, and widen the
+default back. Until that measurement exists there is nothing to decide with,
+which is why this is closed as a decision rather than left open as a gate.
 
 ### A9 `[RESOLVED]` §2.3 never says how the copula's degrees of freedom are chosen
 
@@ -226,8 +309,11 @@ supply — it takes real data, which is why it is swept rather than assumed.
 burn the §3.3 counter: what makes two addresses breach together is the common
 market move, not the model version, so the estimate survives a version change
 to first order. A pilot can therefore run *before* the remaining
-distribution-affecting questions are settled — as of 2026-07-30 that is A1
-and A8, C1/C2/C5 having been closed against live data.
+distribution-affecting questions are settled. As of 2026-07-30 there are none
+left: A1 (zero log-return drift) and A8 (independence accepted, default
+horizon narrowed to 24 h) were decided that day, C1/C2/C5 having already been
+closed against live data — so the real counter can start, and this pilot no
+longer has to precede it.
 
 Three things had to be got right for that command to mean anything, and each
 was measured rather than assumed:

@@ -82,8 +82,19 @@ Changing the distribution resets the counter (§3.3, §10), so any question
 that moves it has to be settled before days start accumulating — otherwise
 they are days that get thrown away.
 
-As of 2026-07-30 that list is **A1 and A8**, both decisions rather than
-measurements. C1, C2 and C5 were closed against live data: C5 confirmed on
+That list is now **empty**. The last two entries on it, **A1 and A8**, were
+decisions rather than measurements, and both were taken on 2026-07-30: A1
+keeps zero log-return drift (`DriftConvention.ZERO_LOG_RETURN`) on the
+grounds that no convention is uniformly conservative — `-sigma^2/2` is harsher
+for longs and softer for shorts — and that the 8 bp at stake over 24 h is an
+order of magnitude below the estimation error on `sigma`; A8 accepts that
+funding is simulated independently of price and bounds the resulting bias by
+narrowing `funding_drag`'s default horizon from a week to 24 h, a week
+remaining reachable by explicit argument and flagged as indicative there.
+Neither changed the distribution, so neither cost a counter reset — but either
+one taken *later* would have.
+
+C1, C2 and C5 were closed against live data: C5 confirmed on
 testnet that isolated funding is debited from the position's own margin
 (§1.1 holds, no coupling term needed), C2 measured a mark-mid basis two
 orders of magnitude inside §1.4's threshold, and C1's clamp turned out not

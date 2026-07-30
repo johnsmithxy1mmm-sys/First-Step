@@ -141,9 +141,9 @@ class TestRejections:
 
 
 class TestInfoClientNormalisesBeforeTheRequest:
-    """The API side of the choke point. `post` is replaced with a recorder, so
-    these assert on the payload the client would have put on the wire without
-    any of them making a request.
+    """The API side of the choke point. `post` is replaced with a recorder
+    (and, in the last test, `urlopen` is), so these assert on what the client
+    would have put on the wire without any of them making a request.
     """
 
     @staticmethod

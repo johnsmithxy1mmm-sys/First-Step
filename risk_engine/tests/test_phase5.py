@@ -13,7 +13,7 @@ from risk_engine.shadow.champion import compare
 from risk_engine.shadow.journal import VARIANT_MODEL, CalibrationJournal
 from risk_engine.shadow.metrics import COHORT_ALL
 from risk_engine.sim.stats import PredictiveDistribution
-from risk_engine.tools.funding_drag import funding_drag
+from risk_engine.tools.funding_drag import DAY_HOURS, WEEK_HOURS, funding_drag
 
 
 def addr(i: int) -> str:
@@ -49,6 +49,48 @@ class TestFundingDrag:
         assert out.quantile(0.95) > out.quantile(0.5) > out.quantile(0.05)
         assert out.expected.ci_low <= out.expected.point <= out.expected.ci_high
         assert "5th-95th" in out.summary()
+
+    def test_the_default_horizon_is_a_day(self, bundle, specs, spot, now):
+        """A caller who names no horizon gets 24h (OPEN-QUESTIONS A8).
+
+        Funding and price are drawn independently and the sign of that bias is
+        unresolved, so the only thing bounding it is the horizon: the default
+        has to be the one over which it is small. This is asserted rather than
+        left to the signature because nothing else in the repo reads the
+        default -- it could be widened back to a week by a one-token edit and
+        every other test here would still pass, while every result the tool
+        produced would silently carry a week of unmodelled funding/price
+        correlation. The provenance stamp is checked too: it is what a journal
+        row keeps, so a default that disagreed with it would make the horizon
+        of a recorded prediction unrecoverable after the fact.
+        """
+        out = funding_drag(long_book(now), spot, bundle, specs,
+                           n_paths=4_000, seed=9, now=now)
+        assert DAY_HOURS == 24
+        assert out.horizon_hours == DAY_HOURS
+        assert out.provenance.horizon_hours == DAY_HOURS
+        assert "over 24h" in out.summary()
+        # §4.4's distribution requirement has to hold at the default, not only
+        # at the week the module docstring was originally written around.
+        assert out.quantile(0.95) > out.quantile(0.5) > out.quantile(0.05)
+
+    def test_a_week_is_still_reachable_by_explicit_argument(
+        self, bundle, specs, spot, now
+    ):
+        """Narrowing the default must not amount to deleting the horizon.
+
+        §4.4 asks for the cost of holding a book, and a week is a real holding
+        period; A8's decision was to stop *defaulting* to it, not to refuse it.
+        A caller who asks for 168h gets 168h, stamped as 168h, with the caveat
+        that names the horizon dependence attached.
+        """
+        out = funding_drag(long_book(now), spot, bundle, specs,
+                           horizon_hours=WEEK_HOURS, n_paths=2_000, seed=10, now=now)
+        assert WEEK_HOURS == 168
+        assert out.horizon_hours == WEEK_HOURS
+        assert out.provenance.horizon_hours == WEEK_HOURS
+        assert "over 168h" in out.summary()
+        assert "by side and by horizon" in " ".join(out.caveats)
 
     def test_a_week_costs_more_than_a_day(self, bundle, specs, spot, now):
         book = long_book(now)

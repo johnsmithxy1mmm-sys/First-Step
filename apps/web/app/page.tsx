@@ -240,9 +240,17 @@ export default function Page() {
               <p className="text-xs text-neutral-500 tabular-nums">
                 5th–95th percentile {usd(v.funding_cost_24h.p05)} – {usd(v.funding_cost_24h.p95)}
               </p>
+              {/* The figure above is 24h (funding_cost_24h), so the copy has to
+                  justify 24h. It previously justified it with what funding does
+                  "over a week", which is a longer horizon than anything on this
+                  screen reports and reads as a claim about the number shown.
+                  Funding is also simulated independently of price, and that
+                  approximation degrades with the horizon (OPEN-QUESTIONS A8) --
+                  the reason the engine's own default is a day. */}
               <p className="text-xs leading-relaxed text-neutral-400">
-                Charged hourly and simulated on every step of every path, because over a
-                week it materially erodes collateral.
+                Charged hourly and simulated on every step of every path, because a cost
+                that accrues every hour erodes collateral without ever showing up as a
+                loss.
               </p>
             </div>
           )}
