@@ -463,22 +463,170 @@ def check_external_flow(client: InfoClient, address: str | None) -> Check:
             "Re-run against an address that has deposited or withdrawn.",
             evidence=evidence,
         )
+
+    # Net flow per type, not just the total. A single aggregate is unfalsifiable:
+    # a sign error on the dominant type produces a large plausible-looking number,
+    # and "-18,472,046.51" reads the same whether it is right or inverted.
+    #
+    # The breakdown is what makes it checkable, because the types differ in how
+    # much of this build's judgement they carry. `deposit`/`withdraw` are
+    # fixed-sign and were never in doubt; `send` is routed by dex and by which
+    # side the account was on, which is new logic decided from a single live
+    # record. Seeing which type dominates tells an operator how much of the
+    # total rests on the part most likely to be wrong.
+    by_type: dict[str, float] = {}
+    for kind in sorted(kinds):
+        of_kind = [r for r in rows if ((r.get("delta") or {}).get("type")) == kind]
+        by_type[kind] = net_external_flow(of_kind, since, until, address)
+    contributing = {k: v for k, v in by_type.items() if v}
+    # Per-type sums must reconstruct the total. They are computed by the same
+    # function over a partition of the same rows, so a mismatch means the
+    # accumulator is order-dependent -- worth catching here rather than in a
+    # calibration score three weeks later.
+    drift = abs(sum(by_type.values()) - total)
+    scale = max(1.0, abs(total))
+    if drift / scale > 1e-9:
+        return Check(
+            "B2", "can external flows be read and classified?", FAIL,
+            f"the per-type breakdown does not reconstruct the total "
+            f"({sum(by_type.values()):+,.2f} vs {total:+,.2f}). Flow is being "
+            f"double-counted or dropped depending on how rows are grouped.",
+            evidence=evidence | {"net_flow_usd": total, "net_flow_by_type": by_type},
+        )
+
+    parts = ", ".join(f"{k} {v:+,.2f}" for k, v in
+                      sorted(contributing.items(), key=lambda kv: -abs(kv[1])))
     return Check(
         "B2", "can external flows be read and classified?", PASS,
         f"{len(rows)} ledger records over {window_days}d, every delta type "
-        f"recognised ({', '.join(sorted(kinds))}); net flow {total:+,.2f} USD.",
-        evidence=evidence | {"net_flow_usd": total},
+        f"recognised ({', '.join(sorted(kinds))}); net flow {total:+,.2f} USD "
+        f"[{parts or 'no type moved perp equity'}].",
+        evidence=evidence | {"net_flow_usd": total, "net_flow_by_type": by_type},
     )
 
 
-def check_webdata3() -> Check:
+#: How long to wait for the venue to answer a subscribe. Long enough that a
+#: slow ack is not read as a rejection, short enough that a `verify` run does
+#: not stall: silence is the *inconclusive* outcome here, not a failure, so
+#: erring long costs only time.
+WEBDATA_PROBE_TIMEOUT_S = 8.0
+
+
+def _probe_subscription(ws_url: str, sub_type: str, address: str | None,
+                        timeout_s: float) -> tuple[bool | None, str]:
+    """Subscribe to one channel and report whether the venue accepted it.
+
+    Returns `(accepted, detail)`, where `accepted is None` means the venue
+    said nothing either way inside the timeout — genuinely inconclusive, and
+    distinct from a refusal.
+
+    `websockets` is imported through the collector's own lazy binding rather
+    than at module scope, for the reason stated there: it is not an engine
+    dependency and must not become one by way of this file.
+    """
+    import asyncio
+    import json as _json
+
+    from risk_engine.market.collect_addresses import _websockets_transport
+
+    payload: dict = {"method": "subscribe", "subscription": {"type": sub_type}}
+    if address:
+        payload["subscription"]["user"] = address
+
+    async def _run() -> tuple[bool | None, str]:
+        transport = _websockets_transport(ws_url)
+        async with transport.connect() as ws:
+            await ws.send(_json.dumps(payload))
+            deadline = asyncio.get_running_loop().time() + timeout_s
+            while True:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    return None, (
+                        f"connected and sent the {sub_type} subscribe, and the venue "
+                        f"neither acknowledged nor rejected it within {timeout_s:.0f}s. "
+                        f"Silence is not a refusal."
+                    )
+                raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+                msg = _json.loads(raw)
+                channel = msg.get("channel")
+                # An explicit error naming the subscription is the clearest
+                # possible answer, and the venue gives one for unknown types.
+                if channel == "error":
+                    return False, f"the venue rejected it: {msg.get('data')!r}"
+                if channel == "subscriptionResponse":
+                    got = ((msg.get("data") or {}).get("subscription") or {}).get("type")
+                    if got == sub_type:
+                        return True, f"the venue acknowledged the {sub_type} subscription"
+                # Data on the channel itself is acceptance by demonstration.
+                if channel == sub_type:
+                    return True, f"the venue delivered a {sub_type} frame"
+
+    try:
+        return asyncio.run(asyncio.wait_for(_run(), timeout=timeout_s + 10.0))
+    except ImportError as exc:
+        return None, f"cannot probe: {exc}"
+    except Exception as exc:
+        # Broad on purpose: a DNS failure, a TLS refusal and a protocol error
+        # are all "we did not get an answer", which is inconclusive rather
+        # than evidence about the subscription. Reported with its type, never
+        # swallowed -- and C4 is non-blocking, so a probe that cannot run must
+        # not take the whole verification down with it.
+        return None, f"the probe itself failed: {type(exc).__name__}: {exc}"
+
+
+def check_webdata3(ws_url: str | None = None, address: str | None = None,
+                   probe: bool = False) -> Check:
+    """C4, now answerable rather than merely described.
+
+    This returned UNCHECKABLE with the reason "this harness speaks only the
+    Info POST API". That was true when written and stopped being true when
+    `collect_addresses` shipped: the collector has since held a live
+    WebSocket session against this exact venue for 1 110 frames. The
+    capability existed in the tree and this check did not use it, which is the
+    same defect class as A10 — a stated limitation that had quietly become
+    false.
+
+    Off by default (`--probe-ws`) because it needs the `websockets` package,
+    which the engine deliberately does not depend on, and because a socket is
+    a different kind of cost from a POST. C4 is non-blocking either way: the
+    shard planner works against `webData2` regardless of the answer.
+    """
+    if not probe:
+        return Check(
+            "C4", "does the `webData3` subscription exist?", UNCHECKABLE,
+            "not probed. Pass --probe-ws to answer it: this harness can now open "
+            "the socket (the trades collector does, against the same venue), it "
+            "just needs `pip install 'websockets>=12.0'`, which the engine does "
+            "not depend on. `webData2` is the documented one and the shard "
+            "planner is agnostic either way.",
+            blocking=False,
+        )
+
+    from risk_engine.market.collect_addresses import MAINNET_WS_URL
+
+    url = ws_url or MAINNET_WS_URL
+    accepted, detail = _probe_subscription(
+        url, "webData3", address, WEBDATA_PROBE_TIMEOUT_S
+    )
+    evidence = {"ws_url": url, "subscription": "webData3", "accepted": accepted}
+    if accepted is True:
+        return Check(
+            "C4", "does the `webData3` subscription exist?", PASS,
+            f"{detail}. The shard planner may use it; it is not required to.",
+            blocking=False, evidence=evidence,
+        )
+    if accepted is False:
+        # A rejection is a real answer and NOT a failure of the model: `webData3`
+        # was only ever a maybe, and the planner is specified against `webData2`.
+        return Check(
+            "C4", "does the `webData3` subscription exist?", PASS,
+            f"answered: `webData3` does not exist on this venue — {detail}. "
+            f"The shard planner uses `webData2`, so nothing depends on it.",
+            blocking=False, evidence=evidence,
+        )
     return Check(
-        "C4", "does the `webData3` subscription exist?", UNCHECKABLE,
-        "a WebSocket question, and this harness speaks only the Info POST API. "
-        "Subscribe to {\"method\":\"subscribe\",\"subscription\":{\"type\":\"webData3\"}} "
-        "on wss://api.hyperliquid.xyz/ws and see whether it errors; `webData2` is "
-        "the documented one and the shard planner is agnostic either way.",
-        blocking=False,
+        "C4", "does the `webData3` subscription exist?", INCONCLUSIVE,
+        f"{detail}", blocking=False, evidence=evidence,
     )
 
 
@@ -498,7 +646,7 @@ def check_isolated_funding() -> Check:
 
 
 def run_all(address: str | None, coins: list[str], days: int, samples: int,
-            interval_s: float, testnet: bool) -> list[Check]:
+            interval_s: float, testnet: bool, probe_ws: bool = False) -> list[Check]:
     from risk_engine.market.info import MAINNET_URL, TESTNET_URL
 
     client = InfoClient(url=TESTNET_URL if testnet else MAINNET_URL)
@@ -524,7 +672,10 @@ def run_all(address: str | None, coins: list[str], days: int, samples: int,
     checks.append(check_external_flow(client, address))
     checks.append(check_funding_clamp(client, coins, days))
     checks.append(check_basis(client, coins, samples, interval_s, hourly_vol))
-    checks.append(check_webdata3())
+    # Testnet has its own socket. Inferring the URL was called out as a
+    # guess in `collect_addresses`, so it is not inferred here either --
+    # probing testnet needs the URL passed explicitly.
+    checks.append(check_webdata3(address=address, probe=probe_ws and not testnet))
     checks.append(check_isolated_funding())
     return checks
 
@@ -544,6 +695,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--interval-s", type=float, default=5.0,
                         help="seconds between C2 snapshots")
     parser.add_argument("--testnet", action="store_true")
+    parser.add_argument("--probe-ws", dest="probe_ws", action="store_true",
+                        help="answer C4 by opening a WebSocket and subscribing to "
+                             "webData3. Needs `pip install 'websockets>=12.0'`, which "
+                             "the engine deliberately does not depend on. Mainnet only "
+                             "-- the testnet socket URL is a guess this build will not "
+                             "make silently.")
     parser.add_argument("--report", help="write the full result as JSON")
     args = parser.parse_args(argv)
 
@@ -560,8 +717,14 @@ def main(argv: list[str] | None = None) -> int:
             address = normalise_address(args.address)
         except ValueError as exc:
             parser.error(str(exc))
+    if args.probe_ws and args.testnet:
+        parser.error(
+            "--probe-ws is mainnet only: the testnet WebSocket URL is not "
+            "documented here, and guessing it would report 'no such subscription' "
+            "for an endpoint that was simply never reached."
+        )
     checks = run_all(address, coins, args.days, args.samples,
-                     args.interval_s, args.testnet)
+                     args.interval_s, args.testnet, args.probe_ws)
 
     print(f"live-API verification against {'testnet' if args.testnet else 'mainnet'}\n")
     for check in checks:

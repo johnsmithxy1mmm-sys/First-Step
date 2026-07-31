@@ -379,10 +379,12 @@ class TestExternalFlow:
 
 
 class TestUncheckable:
-    def test_webdata3_says_what_would_answer_it(self):
+    def test_webdata3_unprobed_says_how_to_answer_it(self):
         check = verify.check_webdata3()
         assert check.status == UNCHECKABLE
-        assert "webData3" in check.detail
+        # It must name the flag, because "uncheckable" used to mean "this
+        # harness cannot" and now means "you did not ask it to".
+        assert "--probe-ws" in check.detail
         # Non-blocking: the shard planner works either way, and this must not
         # hold up a live path on its own.
         assert check.satisfied
@@ -393,6 +395,101 @@ class TestUncheckable:
         assert check.blocking and not check.satisfied
         assert "coupling term" in check.detail
 
+
+class TestWebData3Probe:
+    """C4 was UNCHECKABLE because "this harness speaks only the Info POST
+    API". That stopped being true when `collect_addresses` shipped — it has
+    since held a live socket to this exact venue for 1 110 frames. The
+    capability was in the tree and this check did not use it.
+
+    The probe is driven through a fake socket here: the point under test is
+    how each venue response is *interpreted*, and three of the four
+    interpretations (rejection, silence, transport failure) cannot be produced
+    on demand against a real venue.
+    """
+
+    @staticmethod
+    def _patched(monkeypatch, frames=(), raises=None):
+        """Install a fake `_websockets_transport` and a no-op `asyncio.run`."""
+        import json as _json
+
+        sent: list = []
+
+        def fake_probe(ws_url, sub_type, address, timeout_s):
+            if raises is not None:
+                return None, f"the probe itself failed: {type(raises).__name__}: {raises}"
+            sent.append((ws_url, sub_type, address))
+            for raw in frames:
+                msg = _json.loads(raw)
+                if msg.get("channel") == "error":
+                    return False, f"the venue rejected it: {msg.get('data')!r}"
+                if msg.get("channel") == "subscriptionResponse":
+                    got = ((msg.get("data") or {}).get("subscription") or {}).get("type")
+                    if got == sub_type:
+                        return True, f"the venue acknowledged the {sub_type} subscription"
+                if msg.get("channel") == sub_type:
+                    return True, f"the venue delivered a {sub_type} frame"
+            return None, "the venue neither acknowledged nor rejected it"
+
+        monkeypatch.setattr(verify, "_probe_subscription", fake_probe)
+        return sent
+
+    def test_an_acknowledgement_answers_it(self, monkeypatch):
+        self._patched(monkeypatch, frames=[
+            '{"channel":"subscriptionResponse",'
+            '"data":{"subscription":{"type":"webData3"}}}',
+        ])
+        check = verify.check_webdata3(probe=True)
+        assert check.status == PASS
+        assert check.evidence["accepted"] is True
+
+    def test_a_rejection_is_an_answer_and_not_a_failure(self, monkeypatch):
+        """`webData3` was only ever a maybe. The planner is specified against
+        `webData2`, so "no such subscription" settles C4 rather than breaking
+        anything — reporting it as FAIL would say the live data contradicted
+        the model, which is a much stronger claim than the truth."""
+        self._patched(monkeypatch, frames=[
+            '{"channel":"error","data":"Unknown subscription type webData3"}',
+        ])
+        check = verify.check_webdata3(probe=True)
+        assert check.status == PASS
+        assert check.evidence["accepted"] is False
+        assert "does not exist" in check.detail
+
+    def test_silence_is_inconclusive_not_a_rejection(self, monkeypatch):
+        self._patched(monkeypatch, frames=[])
+        check = verify.check_webdata3(probe=True)
+        assert check.status == INCONCLUSIVE
+        assert check.evidence["accepted"] is None
+
+    def test_a_transport_failure_does_not_masquerade_as_an_answer(self, monkeypatch):
+        """DNS, TLS and a refused connection are all "we did not get an
+        answer". Reporting any of them as "no such subscription" would record
+        a fact about the venue that was never established."""
+        self._patched(monkeypatch, raises=OSError("Name or service not known"))
+        check = verify.check_webdata3(probe=True)
+        assert check.status == INCONCLUSIVE
+        assert check.evidence["accepted"] is None
+        assert "probe itself failed" in check.detail
+
+    def test_it_stays_non_blocking_however_it_answers(self, monkeypatch):
+        """C4 must never be able to hold up a live path: the shard planner
+        works against `webData2` regardless."""
+        for frames in ([], ['{"channel":"error","data":"nope"}'],
+                       ['{"channel":"webData3","data":{}}']):
+            self._patched(monkeypatch, frames=frames)
+            assert verify.check_webdata3(probe=True).blocking is False
+
+    def test_the_probe_is_off_unless_asked_for(self, monkeypatch):
+        """A socket is a different kind of cost from a POST, and `websockets`
+        is not an engine dependency. Default runs must not open one."""
+        called: list = []
+        monkeypatch.setattr(
+            verify, "_probe_subscription",
+            lambda *a, **k: called.append(a) or (True, "should not happen"),
+        )
+        verify.check_webdata3()
+        assert called == []
 
 class TestExitCodes:
     """The exit code is the whole interface for a CI job or a deploy script,
