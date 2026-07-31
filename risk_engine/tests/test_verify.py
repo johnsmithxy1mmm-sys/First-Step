@@ -493,6 +493,104 @@ class TestWebData3Probe:
         verify.check_webdata3()
         assert called == []
 
+class TestFrameLedgerSweep:
+    """B2 across the sampling frame, because one address is not the cohort.
+
+    The shadow window resolves 200-500 addresses daily for 21 days. An
+    unclassifiable delta type on any one of them raises inside `resolve_due`,
+    is classified TRANSIENT by name, and is retried forever — so it withholds
+    that address's observations silently while the counter fails to advance.
+    Found on day 6, it costs the window. Found by this sweep, it costs a
+    minute.
+
+    That this is not paranoia is the record: one real account produced five
+    delta types, three of which had to be classified from live records, and
+    two of those were found one run apart on the SAME address."""
+
+    class _MultiClient(StubClient):
+        def __init__(self, ledgers, errors=None, **kw):
+            super().__init__(**kw)
+            self._ledgers = ledgers
+            self._errors = errors or {}
+
+        def non_funding_ledger_updates(self, address, start_ms, end_ms=None):
+            if address in self._errors:
+                raise self._errors[address]
+            return self._ledgers.get(address, [])
+
+    @staticmethod
+    def _row(kind, **extra):
+        import time as _t
+        return {"time": int(_t.time() * 1000) - HOUR_MS,
+                "delta": {"type": kind, "usdc": "100", **extra}}
+
+    def test_a_type_absent_from_the_first_address_is_still_found(self):
+        """The whole reason this exists. Address A looks clean; the type that
+        would break the window is on address B."""
+        client = self._MultiClient({
+            "0xa": [self._row("deposit")],
+            "0xb": [self._row("brandNewKind")],
+        })
+        check = verify.check_frame_ledger_types(client, ["0xa", "0xb"], 50)
+        assert check.status == FAIL
+        assert check.evidence["unreadable_types"] == ["brandNewKind"]
+        assert "brandNewKind" in check.evidence["examples"]
+
+    def test_a_clean_frame_passes_and_names_what_it_did_not_exercise(self):
+        """A PASS here is narrower than it looks: the known types this sample
+        never contained are precisely the ones that surface on day 9. Naming
+        them is the difference between 'checked' and 'checked, and here is
+        what remains untested'."""
+        client = self._MultiClient({
+            "0xa": [self._row("deposit")], "0xb": [self._row("withdraw")],
+        })
+        check = verify.check_frame_ledger_types(client, ["0xa", "0xb"], 50)
+        assert check.status == PASS
+        unseen = check.evidence["known_types_not_exercised"]
+        # The three that are filed as directional-needs-toPerp and have never
+        # been seen live — the landmine this whole check is aimed at.
+        assert "internalTransfer" in unseen
+        assert "subAccountTransfer" in unseen
+        assert "accountClassTransfer" in unseen
+        assert "remain untested" in check.detail
+
+    def test_one_dead_address_does_not_hide_the_rest(self):
+        """Aborting on the first unreachable account would let a single dead
+        address mask every type on the ones after it."""
+        client = self._MultiClient(
+            {"0xb": [self._row("brandNewKind")]},
+            errors={"0xa": RuntimeError("422")},
+        )
+        check = verify.check_frame_ledger_types(client, ["0xa", "0xb"], 50)
+        assert check.status == FAIL
+        assert check.evidence["unreadable_types"] == ["brandNewKind"]
+        assert check.evidence["addresses_unreachable"][0]["address"] == "0xa"
+        assert check.evidence["addresses_read"] == 1
+
+    def test_every_address_failing_is_reported_as_such(self):
+        """Zero readable addresses is the endpoint or the list, not the
+        classifier, and must not read as 'no bad types found'."""
+        client = self._MultiClient({}, errors={"0xa": RuntimeError("422")})
+        check = verify.check_frame_ledger_types(client, ["0xa"], 50)
+        assert check.status == FAIL
+        assert "not the classifier" in check.detail
+
+    def test_the_sample_is_a_deterministic_prefix(self):
+        """An operator re-running after a fix must see the same addresses. With
+        a random draw, a type that vanished is indistinguishable from a type
+        that was never sampled."""
+        client = self._MultiClient({"0xa": [self._row("deposit")]})
+        first = verify.check_frame_ledger_types(client, ["0xa", "0xb", "0xc"], 2)
+        again = verify.check_frame_ledger_types(client, ["0xa", "0xb", "0xc"], 2)
+        assert first.evidence["addresses_sampled"] == 2
+        assert first.evidence["types_seen"] == again.evidence["types_seen"]
+
+    def test_without_a_list_it_is_uncheckable_not_passed(self):
+        check = verify.check_frame_ledger_types(self._MultiClient({}), [], 50)
+        assert check.status == UNCHECKABLE
+        assert not check.passed
+
+
 class TestFundingClampCanActuallyClose:
     """C1 had two outcomes: FAIL and INCONCLUSIVE. There was no PASS.
 

@@ -371,6 +371,139 @@ def check_basis(client: InfoClient, coins: list[str], samples: int,
     )
 
 
+def check_frame_ledger_types(client: InfoClient, addresses: list[str],
+                             sample: int, window_days: int = 90) -> Check:
+    """B2 across the actual sampling frame, not one account (§3.3 pre-flight).
+
+    `check_external_flow` proves the ledger of *one* address is readable. The
+    shadow window resolves 200-500 of them, every day, for 21 days, and the
+    types a single account happens to have are not the types the cohort has.
+    One real account produced five (`deposit`, `withdraw`, `send`,
+    `spotTransfer`, `spotGenesis`) and each of the last three had to be
+    classified from a live record — two of them found one run apart, on the
+    same address.
+
+    What makes this worth a command rather than a note. `resolve_due` calls
+    `external_flow` per row; an unclassifiable type raises; `_permanent_reason`
+    classifies the failure by name and an unrecognised one lands in TRANSIENT;
+    a TRANSIENT failure is retried forever. So a single unknown delta type on
+    a single address, encountered on day 6, does not stop the run and does not
+    announce itself — it quietly withholds that address's observations while
+    the counter fails to advance, visible only as a repeating traceback in a
+    container log. The whole 21 days can be spent accumulating snapshots that
+    never resolve.
+
+    Three types are known-unproven and are the reason this is not paranoia:
+    `internalTransfer`, `subAccountTransfer` and `accountClassTransfer` are
+    all filed as directional-needs-`toPerp`, and the two dex-routed types that
+    HAVE been seen live (`send`, `spotTransfer`) both carried
+    `user`/`destination` instead. If those three follow the same shape they
+    will raise on first contact. None appeared on the one address checked so
+    far; across hundreds of accounts they are near-certain.
+
+    Costs `sample * 20` weight — about a minute for 50 addresses, against 21
+    days of window it would otherwise risk.
+    """
+    from risk_engine.market.parse import (
+        DEX_ROUTED_TYPES,
+        EXTERNAL_FLOW_SIGNS,
+        NON_FLOW_DELTA_TYPES,
+        net_external_flow,
+    )
+    from datetime import datetime as _dt
+    from datetime import timezone as _tz
+
+    if not addresses:
+        return Check(
+            "B2.frame", "can every ledger type in the sampling frame be read?",
+            UNCHECKABLE,
+            "no --addresses file given. B2 proves one account is readable; the "
+            "shadow window resolves hundreds, and an unknown type on any one of "
+            "them is retried forever rather than reported (§3.3).",
+        )
+
+    # Deterministic, and the first N rather than a random draw: an operator who
+    # re-runs after a fix must see the same addresses, or a type that vanished
+    # is indistinguishable from a type that was never sampled.
+    chosen = addresses[:sample]
+    now_ms = int(time.time() * 1000)
+    since = _dt.fromtimestamp((now_ms - window_days * 24 * HOUR_MS) / 1000, tz=_tz.utc)
+    until = _dt.fromtimestamp(now_ms / 1000, tz=_tz.utc)
+
+    kinds: dict[str, int] = {}
+    examples: dict[str, dict] = {}
+    failures: dict[str, str] = {}
+    unreachable: list[dict] = []
+    n_records = 0
+    n_read = 0
+
+    for addr in chosen:
+        try:
+            rows = list(client.non_funding_ledger_updates(
+                addr, now_ms - window_days * 24 * HOUR_MS, now_ms) or [])
+        except Exception as exc:
+            # One address failing is a fact about that address, not about the
+            # frame. Recorded and stepped over: aborting here would make a
+            # single dead account hide every type on the remaining ones.
+            unreachable.append({"address": addr, "error": f"{type(exc).__name__}: {exc}"})
+            continue
+        n_read += 1
+        n_records += len(rows)
+        for row in rows:
+            kind = ((row.get("delta") or {}).get("type")) or "<no delta.type>"
+            kinds[kind] = kinds.get(kind, 0) + 1
+            if kind in failures:
+                continue
+            try:
+                net_external_flow([row], since, until, addr)
+            except ValueError as exc:
+                failures[kind] = str(exc)
+                examples[kind] = row
+
+    known = set(EXTERNAL_FLOW_SIGNS) | set(NON_FLOW_DELTA_TYPES) | set(DEX_ROUTED_TYPES)
+    unseen = sorted(k for k in known if k not in kinds)
+    evidence = {
+        "addresses_sampled": len(chosen), "addresses_read": n_read,
+        "addresses_unreachable": unreachable, "n_records": n_records,
+        "types_seen": kinds, "unreadable_types": sorted(failures),
+        "known_types_not_exercised": unseen, "examples": examples,
+        "window_days": window_days,
+    }
+
+    if failures:
+        detail = "; ".join(f"{k}: {v}" for k, v in failures.items())
+        return Check(
+            "B2.frame", "can every ledger type in the sampling frame be read?", FAIL,
+            f"{len(failures)} delta type(s) across {n_read} sampled addresses cannot "
+            f"be read. Each one would fail its address's resolution silently and be "
+            f"retried forever, so the §3.3 counter would not advance and nothing "
+            f"would say why — {detail}",
+            evidence=evidence,
+        )
+
+    if n_read == 0:
+        return Check(
+            "B2.frame", "can every ledger type in the sampling frame be read?", FAIL,
+            f"none of the {len(chosen)} sampled addresses could be read at all. "
+            f"That is the endpoint or the address list, not the classifier.",
+            evidence=evidence,
+        )
+
+    # Not a PASS with a footnote: the types this sample did NOT contain are
+    # exactly the ones that will surface on day 9 of the window. Naming them is
+    # the difference between "checked" and "checked, and here is what remains
+    # untested".
+    note = (f" {len(unseen)} known type(s) never appeared and remain untested "
+            f"against live data: {', '.join(unseen)}." if unseen else "")
+    return Check(
+        "B2.frame", "can every ledger type in the sampling frame be read?", PASS,
+        f"{n_records} records across {n_read} of {len(chosen)} sampled addresses, "
+        f"{len(kinds)} distinct delta types, all readable "
+        f"({', '.join(sorted(kinds))}).{note}",
+        evidence=evidence,
+    )
+
+
 # -- C4, C5: not decidable from the Info API -----------------------------
 
 
@@ -757,7 +890,8 @@ def apply_recorded(check: Check, finding, now=None) -> Check:
 
 def run_all(address: str | None, coins: list[str], days: int, samples: int,
             interval_s: float, testnet: bool, probe_ws: bool = False,
-            findings: dict | None = None) -> list[Check]:
+            findings: dict | None = None, frame_addresses: list[str] | None = None,
+            frame_sample: int = 50) -> list[Check]:
     from risk_engine.market.info import MAINNET_URL, TESTNET_URL
 
     client = InfoClient(url=TESTNET_URL if testnet else MAINNET_URL)
@@ -781,6 +915,8 @@ def run_all(address: str | None, coins: list[str], days: int, samples: int,
 
     checks.append(check_clearinghouse(client, address))
     checks.append(check_external_flow(client, address))
+    if frame_addresses is not None:
+        checks.append(check_frame_ledger_types(client, frame_addresses, frame_sample))
     checks.append(check_funding_clamp(client, coins, days))
     checks.append(check_basis(client, coins, samples, interval_s, hourly_vol))
     # Testnet has its own socket. Inferring the URL was called out as a
@@ -818,6 +954,16 @@ def main(argv: list[str] | None = None) -> int:
                              "the engine deliberately does not depend on. Mainnet only "
                              "-- the testnet socket URL is a guess this build will not "
                              "make silently.")
+    parser.add_argument("--addresses", default=None,
+                        help="the shadow address list (as written by "
+                             "`collect_addresses`). Runs B2 across the actual "
+                             "sampling frame instead of one account — the types a "
+                             "single address happens to have are not the types 500 "
+                             "of them have, and an unknown one is retried forever "
+                             "rather than reported (§3.3).")
+    parser.add_argument("--frame-sample", dest="frame_sample", type=int, default=50,
+                        help="how many addresses from that list to scan "
+                             "(default 50; costs 20 weight each)")
     parser.add_argument("--report", help="write the full result as JSON")
     parser.add_argument("--findings", default=None,
                         help="JSON of verifications made outside this harness "
@@ -860,8 +1006,22 @@ def main(argv: list[str] | None = None) -> int:
             # an E5.3 FAIL.
             parser.error(str(exc))
 
+    frame_addresses: list[str] | None = None
+    if args.addresses:
+        # Loaded through the same source the cron uses, so a list this accepts
+        # is a list the sweep accepts -- including its refusal to run without a
+        # stated frame (B4). Loading it here also means a malformed list costs
+        # no §5.3 weight.
+        from risk_engine.shadow.providers import FileAddressSource
+
+        try:
+            frame_addresses = FileAddressSource(args.addresses).addresses()
+        except (OSError, ValueError) as exc:
+            parser.error(f"--addresses {args.addresses}: {exc}")
+
     checks = run_all(address, coins, args.days, args.samples,
-                     args.interval_s, args.testnet, args.probe_ws, findings)
+                     args.interval_s, args.testnet, args.probe_ws, findings,
+                     frame_addresses, args.frame_sample)
 
     print(f"live-API verification against {'testnet' if args.testnet else 'mainnet'}\n")
     for check in checks:
