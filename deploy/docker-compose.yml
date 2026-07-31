@@ -115,12 +115,41 @@ services:
     volumes:
       - ./addresses.json:/app/addresses.json:ro
     entrypoint: ["/bin/sh", "-c"]
+    # `sleep` for the REMAINDER of the interval, not the whole of it. The naive
+    # form -- run, then sleep 86400 -- makes the period `run + 86400`, and a
+    # 500-address sweep is ~33 minutes at §5.3's 25% share (20 weight each,
+    # 1200/min budget). That drifts the snapshot 33 minutes later every day, so
+    # 21 snapshots need 21.5 calendar days, and the drift compounds silently
+    # against a gate measured in days.
+    #
+    # Consecutive failures are COUNTED and escalate to a non-zero exit. The
+    # previous `|| echo` swallowed every failure into a log line while the
+    # container stayed healthy and `restart: unless-stopped` never fired: a
+    # cron failing every day for three weeks looked exactly like one that
+    # worked. That is the same shape as the TRANSIENT-retried-forever defect
+    # B2 exists to prevent, one layer up. Three in a row is the threshold
+    # because a single failed sweep is genuinely worth retrying -- the venue
+    # rate-limits, containers restart -- and three days of them is not.
     command:
       - |
+        fails=0
         while true; do
-          python3 -m risk_engine.shadow snapshot \
-            --journal "$$SHADOW_DSN" $$SHADOW_ARGS || echo "snapshot failed; retrying next cycle"
-          sleep "$$SHADOW_INTERVAL_S"
+          started=$$(date +%s)
+          if python3 -m risk_engine.shadow snapshot \
+               --journal "$$SHADOW_DSN" $$SHADOW_ARGS; then
+            fails=0
+          else
+            fails=$$((fails + 1))
+            echo "snapshot failed ($$fails consecutive)" >&2
+            if [ "$$fails" -ge 3 ]; then
+              echo "FATAL: $$fails consecutive snapshot failures; the shadow window is not advancing. Exiting so this is visible as a crash-looping container rather than a quiet log line." >&2
+              exit 1
+            fi
+          fi
+          elapsed=$$(( $$(date +%s) - started ))
+          remaining=$$(( SHADOW_INTERVAL_S - elapsed ))
+          [ "$$remaining" -lt 60 ] && remaining=60
+          sleep "$$remaining"
         done
     mem_limit: 2g
 
@@ -143,12 +172,33 @@ services:
     # day means a resolution can sit up to a day late, and the journal marks
     # a late resolution stale and drops it from the gate (audit A-04). The
     # window is the scarce thing here, not the API calls.
+    #
+    # Same drift correction and failure escalation as the snapshot job, with a
+    # higher threshold: this runs 24x more often, so three consecutive misses
+    # is three hours rather than three days, and a rate-limited hour is not a
+    # reason to crash-loop. Twelve in a row is half a day of resolutions going
+    # nowhere -- past the point where a stale-resolution drop starts costing
+    # observations (audit A-04).
     command:
       - |
+        fails=0
         while true; do
-          python3 -m risk_engine.shadow resolve \
-            --journal "$$SHADOW_DSN" $$SHADOW_ARGS || echo "resolve failed; retrying next cycle"
-          sleep "$$SHADOW_INTERVAL_S"
+          started=$$(date +%s)
+          if python3 -m risk_engine.shadow resolve \
+               --journal "$$SHADOW_DSN" $$SHADOW_ARGS; then
+            fails=0
+          else
+            fails=$$((fails + 1))
+            echo "resolve failed ($$fails consecutive)" >&2
+            if [ "$$fails" -ge 12 ]; then
+              echo "FATAL: $$fails consecutive resolve failures (~12h). Predictions are being written and never resolved; resolutions collected late are marked stale and dropped from the gate (audit A-04)." >&2
+              exit 1
+            fi
+          fi
+          elapsed=$$(( $$(date +%s) - started ))
+          remaining=$$(( SHADOW_INTERVAL_S - elapsed ))
+          [ "$$remaining" -lt 30 ] && remaining=30
+          sleep "$$remaining"
         done
     mem_limit: 1g
 

@@ -93,9 +93,54 @@ docker compose -f deploy/docker-compose.yml run --rm engine \
 
 **Read `risk_engine/README.md` before you do.** §3.3 resets the window to zero
 whenever the distribution moves, so every question that moves it has to be
-settled before days start accumulating. That list is now empty: A1 and A8 were
-the last two and both were decided on 2026-07-30 without changing the
-distribution, and C1, C2 and C5 were closed against live data.
+settled before days start accumulating.
+
+The last one was **A9, settled 2026-07-31**: the copula's degrees of freedom
+are now fitted rather than hardcoded, `MODEL_VERSION` is `0.3.0-phase1`, and
+that bump reset the counter. It cost nothing because the counter had not
+started — which is the entire reason it was done then rather than later. A1
+and A8 were decided on 2026-07-30 without moving the distribution; C2, C4, C5
+and B2 are closed against live data; C1 is open but non-blocking (the clamp
+sits ~1760× above anything the market has done, so it never activates and
+cannot move the distribution being accumulated).
+
+### Pre-flight, in order
+
+Each of these is cheap now and expensive once days are accumulating.
+
+```bash
+# 1. Every ledger delta type in the FRAME, not just one account. An
+#    unclassifiable type is retried forever rather than reported, so it
+#    withholds an address silently while the counter fails to advance.
+python -m risk_engine.market.verify --addresses deploy/addresses.json \
+  --frame-sample 50 --address 0x<any-account-with-history>
+
+# 2. The distribution is frozen at what the journal will record.
+python -c "from risk_engine.version import MODEL_VERSION; print(MODEL_VERSION)"
+
+# 3. The gate still passes under that version.
+python -m risk_engine.validation.cli benchmarks
+```
+
+Step 1 is the one that earns its keep. One real account produced five delta
+types, three of which had to be classified from live records — and two of
+those were found in consecutive runs *on the same address*. A second address
+would have found both at once; fifty finds what the cohort actually holds.
+
+### What the cron does when it fails
+
+`SHADOW_INTERVAL_S` (default 86400) is the **period**, not the gap between
+runs: the loop sleeps for the remainder after the sweep, because a 500-address
+sweep takes ~33 minutes at §5.3's 25% share and the naive form would drift the
+snapshot 33 minutes later every day — 21 snapshots would need 21.5 calendar
+days, compounding silently against a gate measured in days.
+
+Failures **escalate to a crash-looping container** rather than a log line:
+three consecutive snapshot failures, or twelve consecutive resolve failures
+(~12 h), exit non-zero. The previous form swallowed every failure into `echo`
+while the container stayed healthy, so a cron that failed for three weeks
+looked exactly like one that worked. Check `docker compose ps` and the exit
+code, not just that the container exists.
 
 Live runs also need `deploy/addresses.json` filled in — both the list and the
 `frame` field describing what it is a sample *of*. `FileAddressSource`
