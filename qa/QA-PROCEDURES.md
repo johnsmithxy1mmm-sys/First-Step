@@ -16,7 +16,30 @@ Every layer below was added because something got through the ones above it.
 | 7 | Lint (bug rules only) | `ruff check polymarket_bot` | review, not a hard block |
 | 8 | Dependency audit | `pip-audit` | review |
 
-Run all of them: `bash qa/run_all.sh`.
+Install the tooling first, then run all of them:
+
+```bash
+pip install -r qa/requirements-dev.txt
+bash qa/run_all.sh
+```
+
+**The install line is not boilerplate.** Until 2026-07-31 this table listed
+`pytest --cov` as a blocking gate while `pytest-cov` was installed nowhere and
+declared in no manifest, so gates 1, 2 and 5 could not run — and, worse, none
+of the three said why. Gate 1 died with argparse's `unrecognized arguments:
+--cov`, which reads as a typo in `run_all.sh`. Gate 5 passes `--no-cov`, so it
+failed identically and printed `baseline (unmutated suite must be green):
+FAILED` — a claim about the test suite, which was green, and which sends
+whoever ran it to debug tests that were fine. Three of eight documented gates
+unrunnable and misdiagnosed, in a file whose subject is how this codebase is
+verified.
+
+Both are now fixed at the cause rather than the symptom: `run_all.sh` checks
+for the plugin up front and refuses with the install command instead of
+producing three false failures, and `mutation_check.py` only passes `--no-cov`
+when the plugin that defines it is present (it is a speed measure, so dropping
+it changes nothing about what the check measures). With the plugin absent,
+gate 5 now runs clean: **33/33 mutants killed**.
 
 ## Why each layer exists
 

@@ -609,13 +609,64 @@ fewer addresses than `ShadowProgress.required_addresses` without
   lever. `--target` defaults to 500 for headroom against the accounts the
   sweep drops (flat books, non-positive equity, stale resolution), not
   because a bigger sample tightens the interval.
-- **One sweep may not cover a long list.** C6's arithmetic still applies: at
-  ~20 weight per address against the 25% of the 1200/minute budget the sweep
-  is allowed, a 500-entry list takes over two minutes of continuous sweeping,
-  and `ShadowCron` reports truncation rather than waiting.
+- **One sweep may not cover a long list.** C6's arithmetic still applies, and
+  this entry got it wrong by 16× until 2026-07-31 — it said "over two
+  minutes", which is not a conservative round-down of the real figure but a
+  different number entirely. From the shipped constants
+  (`INFO_REQUEST_WEIGHT = 20`, `WEIGHT_BUDGET_PER_MINUTE = 1200`,
+  `SHADOW_RESERVED_FRACTION = 0.75`, so 300 weight/min for the sweep):
 
-E4 stays open until the shape is confirmed against the live venue: what is
-settled is which frame to use and what to say about it, not that this
+  | list | weight | at the sweep's 25% share | at the whole budget |
+  |------|--------|--------------------------|---------------------|
+  | 200  | 4 000  | **13.3 min**             | 3.3 min             |
+  | 500  | 10 000 | **33.3 min**             | 8.3 min             |
+
+  C6's own text quotes the right-hand column (8.3 minutes of the *entire*
+  budget); this entry quoted neither. Thirty-three minutes is a different
+  operational fact from two: it is most of an hour of continuous sweeping for
+  one daily snapshot, it constrains how a cron may be scheduled, and it is
+  the reason `--target` defaulting to 500 has a cost worth stating. Read off
+  the left-hand column, because §5.3 reserves the other three quarters for
+  live users and the sweep never gets them. `ShadowCron` reports truncation
+  rather than waiting.
+
+**E4 is closed.** This paragraph used to end "E4 stays open until the shape
+is confirmed against the live venue", which contradicted the bullet sixty
+lines above it recording that exact confirmation, and the E4 row in §Register
+repeated the stale side ("the feed's message shape has never been observed
+from here"). Two live runs settled it, and the second is a full collection
+rather than a probe:
+
+| run | date | window | result |
+|-----|------|--------|--------|
+| `--dry-run`  | 2026-07-30 | 60 s   | 36 addresses / 30 records, field `users` |
+| `--minutes 30 --out` | 2026-07-31 | 3.2 min | **515 addresses / 2 989 records / 1 110 frames**, 0 unparseable, 0 anomalies, stopped on the 500-address target |
+
+The second run is the stronger evidence and not merely the larger one: 2 989
+consecutive records parsed with **zero** anomalies, where an anomaly is
+specifically a record that contradicts the shape after the first address has
+been read. A guessed field name does not survive three thousand records; a
+guessed URL, subscribe envelope or channel name does not produce any. Records
+arrived for all three subscribed coins (BTC 1 057, ETH 1 731, SOL 201), so
+the subscription is per-coin as assumed rather than silently global.
+
+Two things this does **not** establish, both still true and both narrower
+than the sentence they replace:
+
+- **No frame in this repository is a capture.** Every trade frame in the
+  tests and docstrings is stub-generated. The suite proves the parser matches
+  the specification, never that the specification matches the venue — that
+  link is carried by the runs above and by nothing in the tree. Anyone
+  extending `TRADE_ADDRESS_FIELDS` on the strength of a passing suite is
+  reading it wrong; re-run `--dry-run`.
+- **The collector's own frame text still says NOT VERIFIED**, and correctly
+  so: it describes the *runtime assertion* as a floor rather than a proof,
+  because once the first address is read the shape is treated as confirmed
+  and later contradictions are counted rather than aborting a window that
+  already produced a sample. That is a statement about the collector's
+  failure mode, not about whether the shape is known. It should stay.
+
+What is settled: which frame to use, what to say about it, and that this
 collector reads the real feed correctly.
 
 ### B5 `[RESOLVED]` §0.2 and §3.2 disagree about which baseline decides
@@ -953,19 +1004,51 @@ satisfies the 2 pp rule at the observed probability and treats that as the
 floor; if meeting it costs more than 300 ms, the result is returned late and
 the latency violation is counted in observability. A fast wrong number is the
 failure mode this whole document exists to prevent. Note that near `p = 0.5`
-the 2 pp rule alone requires ~9 600 paths, so the binding constraint is
-usually 20 000 anyway.
+the 2 pp rule alone requires **2 401** paths, so the binding constraint is
+20 000 everywhere, not merely "usually".
 
-### D2 `[RESOLVED]` `max_safe_size` may have no answer
+That figure was wrong here until 2026-07-31: it read ~9 600, which is the
+count for a **1 pp** half-width, not the 2 pp §2.5 actually specifies
+(`1.96² × 0.25 / 0.01² = 9 604`; at 0.02 it is `2 401`, and
+`paths_needed_for_half_width(0.5, 0.02)` returns exactly that). Both numbers
+support the same conclusion, which is why the error survived — but they
+support it by different margins, and the wrong one made the CI rule look
+like a live constraint on path count when it is nowhere near binding. That
+matters for reading §2.6: cutting paths under latency pressure is forbidden
+by a rule with an 8× margin at the worst case, not a 2× one.
+
+The same slack is why `mc_non_convergence` is structurally pinned at zero
+(see the note under §2.5's counter): at 20 000 paths the worst-case Wilson
+half-width is 0.0069, so `converged=False` is unreachable and the counter
+cannot fire. It is a real invariant, not a working metric.
+
+### D2 `[DECIDED, NOT IMPLEMENTED]` `max_safe_size` may have no answer
 
 §4.3 defines the answer as the largest size whose *upper CI bound* on
 `P(liq)` stays under the threshold. If the smallest tradable increment
 (`szDecimals`) already breaches the threshold, there is no safe size, and
 the type must be able to say so rather than returning zero — zero and "no
-safe size" are different statements to a user. The return type carries that
-case explicitly. Binary search over a noisy objective also needs common
-random numbers across iterations to stay monotone; the search fixes its base
-randomness per query.
+safe size" are different statements to a user. Binary search over a noisy
+objective also needs common random numbers across iterations to stay
+monotone, so the search must fix its base randomness per query.
+
+**This entry was tagged `[RESOLVED]` and written in the present tense —
+"the return type carries that case explicitly", "the search fixes its base
+randomness" — until 2026-07-31. There is no such return type and no such
+search.** `grep -rn "def max_safe_size" .` matches nothing; the only mentions
+in the codebase are a docstring cross-reference in `domain/types.py` and a
+comment in `sim/engine.py` naming a future caller. `max_safe_size` is a
+**Phase 4** deliverable and Phase 4 is gate-closed until shadow validation
+passes (`risk_engine/README.md`'s phase table has always said so, which is
+how the contradiction was found).
+
+What is settled is the *design*: the decision above is the one to build to.
+Nothing is settled about the code, because there is none. The tag is now
+`[DECIDED, NOT IMPLEMENTED]` — the only new status in this document, added
+because `[RESOLVED]` and `[BLOCKER]` cannot express "we know what to do and
+have deliberately not done it yet", and collapsing that into `[RESOLVED]`
+is what produced a documented safety property with no implementation behind
+it.
 
 ### D3 `[BLOCKER]` "Effective leverage" is unsigned (§4.1)
 
@@ -1101,6 +1184,6 @@ in the risk number, and is recorded in the journal's model version.
 | E1 | Builder address + its ≥100 USDC perp balance (§5.5) | Phase 4 |
 | E2 | KMS/age key material and the agent-key encryption boundary (§5.4) | Phase 4 |
 | E3 | Postgres DSN / deployment target | Shadow persistence at scale |
-| E4 | ~~The shadow address sampling frame~~ **DECIDED 2026-07-30** (B4): the public trades feed, activity-selected; the leaderboard rejected because it ranks on the outcome being calibrated. Implemented by `risk_engine.market.collect_addresses`, which generates the `frame` text as well as the list. Still open: the feed's message shape has never been observed from here (the API is 403 at this proxy), so the collector asserts it at runtime and aborts rather than writing an empty list. | Phase 4 gate validity — frame settled, one live run needed to confirm the shape |
+| E4 | ~~The shadow address sampling frame~~ **RESOLVED 2026-07-31** (B4): the public trades feed, activity-selected; the leaderboard rejected because it ranks on the outcome being calibrated. Implemented by `risk_engine.market.collect_addresses`, which generates the `frame` text as well as the list. The shape is confirmed against the live venue — a 60 s `--dry-run` on 2026-07-30 (36 addresses / 30 records, field `users`), then a full 2026-07-31 collection: 515 addresses from 2 989 records over 1 110 frames, 0 unparseable, 0 anomalies, records arriving for all three subscribed coins. This row said "never been observed from here" until that date, contradicting B4's own text. No frame in this repository is a capture, which is a separate and still-true caveat. | closed |
 | E5 | ~~Live API access — every §5.1 parser written against fixtures, never exercised against the live schema~~ **RESOLVED 2026-07-29** by `python -m risk_engine.market.verify` run from a network where the API is reachable (it is still 403 at the build-environment proxy). All three parsers PASS on live mainnet: `meta` → 177 assets, 34 with multiple margin tiers; `candleSnapshot` → 720 hourly BTC returns, 0 gaps, hourly vol 0.00363; `clearinghouseState` → 10 positions, cross collateral $3,957,459.72. The documented response shapes were correct. | closed |
 | E6 | Historical liquidation frequencies by nominal leverage for Baseline A's `P(liq)` arm (B3) | Baseline A's probability output |

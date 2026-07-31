@@ -37,8 +37,14 @@ Synthetic mode is labelled everywhere it could be mistaken for real: `/health`
 returns `synthetic_data: true`, and the frontend shows a banner saying the
 numbers describe a simulated market.
 
-**The live path has never been exercised end to end.** Every §5.1 parser is
-written against documented response shapes. Verify it before trusting it.
+**The live path has never been exercised end to end**, and that is now a
+narrower statement than it was: every §5.1 parser has been checked against
+real responses individually (E5, B2, E4, C2, C5 — see the status table in
+`risk_engine/README.md`), but nothing has run engine → service → backend →
+UI against the live venue in one pass. Parsers verified, pipeline not. Run
+`python -m risk_engine.market.verify --address 0x...` before trusting it, and
+pass `--address`: without it the ledger check is skipped, and that check is
+the one that has already caught a real defect.
 
 ## Running the pieces separately
 
@@ -58,14 +64,33 @@ BACKEND_URL=http://127.0.0.1:8080 npm run dev
 ## Tests
 
 ```bash
-pytest risk_engine/tests -q                        # 259 tests
+pytest risk_engine/tests -q                        # 546 collected, 10 skip by default
+pytest risk_engine/tests -q -m "not slow"          # 538, for a pre-commit loop
 python -m risk_engine.validation.cli benchmarks    # the §3.1 gate, 6/6
-cd services/backend && npm test                    # 23 tests, §6 contract
+cd services/backend && npm test                    # §6 contract
 cd services/backend && node scripts/degradation-check.mjs   # §9 Phase 3 acceptance
 
 # journal parity against a real server; the Postgres half skips without a DSN
 HL_TEST_POSTGRES_DSN=postgresql://user@host/db pytest risk_engine/tests/test_journal_backends.py -q
 ```
+
+The count said 259 until 2026-07-31, which was stale by more than half. It is
+quoted here as a rough scale check — if your run collects far fewer, you are
+running a subset — not as a number to keep in sync line by line.
+
+**`pytest risk_engine/tests` does not exclude the slow gate**, which the
+two-line layout above used to imply. `test_benchmarks.py` is marked `slow`
+and a plain run executes it; the marker means "excluded from the fast
+pre-commit run", and nothing excludes it for you unless you pass
+`-m "not slow"`. The `benchmarks` CLI line is a *different view* of the same
+§3.1 gate — it prints each criterion and its margin, which the pytest run
+does not — rather than a second suite. Running both is deliberate; the CLI is
+what you read when one fails.
+
+The 10 default skips are not failures and not a coverage gap to close here:
+nine need `HL_TEST_POSTGRES_DSN`, and one needs an unblocked route to
+`api.hyperliquid.xyz` (403 at this environment's proxy). Both print their
+reason under `-rs`.
 
 The last one is the Phase 3 acceptance criterion, run the way the criterion
 is phrased. It starts both real processes, SIGKILLs the risk engine, and

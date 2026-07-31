@@ -23,6 +23,7 @@ Exit code 1 if any mutant survives, so it can gate a release.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import pathlib
 import subprocess
 import sys
@@ -141,11 +142,35 @@ MUTANTS: list[tuple[str, str, str, str]] = [
 TEST_PATHS = ["polymarket_bot/tests"]
 
 
+def _have_pytest_cov() -> bool:
+    """Whether `--no-cov` is a flag pytest will accept.
+
+    It is only defined by the pytest-cov plugin. Passing it unconditionally
+    made this script fail with argparse's "unrecognized arguments: --no-cov"
+    whenever the plugin was absent -- which `main` then reported as
+    "baseline (unmutated suite must be green): FAILED", a statement about the
+    suite rather than about the environment. The suite was green. A mutation
+    check that misdiagnoses a missing plugin as a broken test suite sends
+    whoever ran it to debug the wrong thing entirely.
+    """
+    return importlib.util.find_spec("pytest_cov") is not None
+
+
 def run_tests() -> bool:
-    proc = subprocess.run(
-        [sys.executable, "-m", "pytest", *TEST_PATHS, "-x", "-q", "--no-header",
-         "-p", "no:cacheprovider", "--no-cov"],
-        cwd=ROOT, capture_output=True, text=True)
+    # `--no-cov` is a speed measure, not a correctness one: coverage
+    # instrumentation across dozens of mutant runs is the bulk of the wall
+    # clock. Dropping it when the plugin is absent changes nothing about what
+    # is measured.
+    cmd = [sys.executable, "-m", "pytest", *TEST_PATHS, "-x", "-q", "--no-header",
+           "-p", "no:cacheprovider"]
+    if _have_pytest_cov():
+        cmd.append("--no-cov")
+    # S603: every element of `cmd` is a literal or `sys.executable`; nothing
+    # here comes from a caller. check=False is the point -- a non-zero exit is
+    # the signal this function exists to report, not an error to raise on.
+    proc = subprocess.run(  # noqa: S603
+        cmd, cwd=ROOT, capture_output=True, text=True, check=False
+    )
     return proc.returncode == 0
 
 

@@ -165,29 +165,51 @@ in no file anywhere. Exit codes are distinct so that each one implies its own
 next move: `0` wrote it, `1` collected and refused to publish, `2` the feed
 did not match the assumed message shape, `3` no usable connection (`--ws-url`,
 DNS, TLS, refusal, or the missing package), `4` bad invocation, caught before
-anything connects.
+anything connects, `5` the harvest succeeded and the *write* failed — a full
+disk, a read-only mount, a bad `--out` path.
+
+`5` is the one worth reading carefully, and it was missing from this list
+until 2026-07-31. It is not a collection failure: the addresses exist and the
+window will not come back. **The complete file is printed to stdout** — not
+written to a fallback path, because any fallback is another write that can
+fail the same way — so redirect it or paste it somewhere writable. Another
+collection window is not needed, and spending thirty minutes on one is
+exactly the mistake collapsing `5` into `1` would cause.
 
 Two things to know before running it. `websockets` is **not** an engine
 dependency and is imported lazily — `pip install 'websockets>=12.0'`, and add
 the same line to `deploy/Dockerfile.engine` if the collector is to run in the
-container. And the message shape is an assumption, not an established fact:
-nothing in this repository has ever spoken Hyperliquid's WebSocket protocol
-(the URL is recorded as UNCHECKABLE in `market/verify.py`, the subscribe
-envelope comes from a snippet in C4 that has never been executed here). So
-the collector asserts the shape while collecting and aborts with the frame
-quoted verbatim if a trade carries no address where it expects one. It will
-never write an empty list and report success — that file would load cleanly,
-sweep nothing, and show up three weeks later as a gate that never advanced.
+container. And the message shape **was** an assumption; it is now an observed
+fact, which this paragraph denied for a day after the fact arrived. Two live
+runs from an operator's machine: 36 addresses from 30 records on 2026-07-30,
+then 515 addresses from 2 989 records over 1 110 frames on 2026-07-31 with
+zero unparseable records and zero anomalies. The URL, the subscribe envelope,
+the channel name and the `users` field all held. Records arrived for all
+three subscribed coins, so the subscription is per-coin as assumed.
+
+The runtime assertion stays regardless, because it guards the venue changing
+rather than the venue being unknown: the collector asserts the shape while
+collecting and aborts with the frame quoted verbatim if a trade carries no
+address where it expects one. It will never write an empty list and report
+success — that file would load cleanly, sweep nothing, and show up three
+weeks later as a gate that never advanced.
 
 That assertion is fatal **only until the first address is read**. After one
 has come out of the expected field the venue has demonstrated the shape, so a
 later odd record is counted, warned about on the progress line, and published
 in the frame and `_provenance` as a trade the list does not contain — not
 turned into an abort that discards a 300-address harvest while telling the
-operator the assumption "did not hold". Any output you see quoted in this
-repository, in the collector's tests or in a review of it is stub-generated:
-the live venue is 403 at this environment's proxy, so no example here is
-evidence that the shape is right.
+operator the assumption "did not hold".
+
+Any trade frame you see quoted in this repository, in the collector's tests
+or in a review of it is stub-generated — the live venue is 403 at this
+environment's proxy, so **no example in the tree is evidence that the shape
+is right**. That caveat survives the live runs above and is narrower than it
+looks: what carries the shape is the runs, recorded in OPEN-QUESTIONS B4/E4
+as summary lines, and nothing in the tree. So the suite proves the parser
+matches the specification, never that the specification matches the venue.
+Anyone extending `TRADE_ADDRESS_FIELDS` on the strength of a passing suite is
+reading it wrong; re-run `--dry-run`, it costs sixty seconds.
 
 ### Before the shadow clock starts
 
@@ -340,11 +362,30 @@ Benchmarks 2, 3 and 5 run under common random numbers. Without that,
 §3.1.2's 0.3 pp tolerance is one standard error at 20 000 paths, and
 "strictly increasing over 20 grid points" is a coin flip on a correct engine.
 
-## Not verified against the live API
+## What has and has not been verified against the live API
 
-`api.hyperliquid.xyz` was blocked at the proxy in the environment this was
-built in (HTTP 403). Every parser in `market/` is written against the
-documented response shapes and recorded fixtures, and **has not been
-exercised against a live response**. Re-verify before anything downstream of
-it is trusted. Same applies to the funding-rate protocol clamp in
-`model/funding.py` and to the mark-versus-trade price basis in §1.4.
+`api.hyperliquid.xyz` is blocked at the proxy in the environment this was
+built in (HTTP 403), so nothing here can be re-run from the build machine.
+It **has** been run from an operator's machine, and this section said
+otherwise — "has not been exercised against a live response" — for two days
+after that stopped being true. Current state, each line naming the command
+that produced it:
+
+| # | Assumption | Status | Evidence |
+|---|-----------|--------|----------|
+| E5 | `meta`, `candleSnapshot`, `clearinghouseState` parse | **PASS** 2026-07-29 | `market.verify`: 177 assets / 34 multi-tier; 720 hourly BTC returns, 0 gaps; 10 positions, cross collateral $4.5M |
+| E4 | trades-feed message shape | **PASS** 2026-07-31 | `collect_addresses`: 515 addresses from 2 989 records, 0 unparseable, 0 anomalies |
+| B2 | ledger delta types classify | **PASS** 2026-07-31 | `market.verify --address`, after `send` was added; it FAILED first and that is what found `send` |
+| C2 | mark ≈ mid within §1.4's threshold | **PASS** 2026-07-30 | 12-hour series: median \|basis\| 2.61e-05 against a 9.07e-04 threshold, 35× margin |
+| C5 | isolated funding debits the isolated pocket | **PASS** 2026-07-31 | `probe_isolated_funding` across a funding tick: pocket absorbed 100%, cross moved $0.00 |
+| C1 | the funding clamp is the documented constant | **INCONCLUSIVE** | no breach in 1 500 observations over 30 d, worst 0.1% of the cap — but a clamp is a protocol constant and no sample of realised rates can establish one. Needs the source, not more data. |
+| C4 | the `webData3` subscription exists | **UNCHECKABLE** here | a WebSocket question; `market.verify` speaks only the Info POST API. The shard planner is agnostic either way. |
+
+So: the §5.1 parsers are no longer unverified, and treating them as such
+would now be its own kind of wrong — it invites re-doing settled work and
+discounts a real result. What remains genuinely unestablished is C1, whose
+status will not improve with more observations, and C4.
+
+`market.verify` is the command that produces this table; run it rather than
+trusting the table, because a table is a claim about a past run and the venue
+can change under it.

@@ -57,15 +57,28 @@ exercises every moving part, validates nothing, and labels itself as
 synthetic everywhere it could be mistaken for real: `/health` returns
 `synthetic_data: true` and the frontend shows a banner.
 
-Before `--live`, run the verification harness — every §5.1 parser is written
-against documented response shapes and has never seen a live response:
+Before `--live`, run the verification harness. It checks the assumptions the
+live path rests on and exits non-zero while any is contradicted or unproven,
+naming each separately:
 
 ```bash
-python -m risk_engine.market.verify --report verify.json
+python -m risk_engine.market.verify --address 0x<an-account-you-can-read> --report verify.json
 ```
 
-It exits non-zero while anything is unverified, and names each assumption
-separately. See OPEN-QUESTIONS C1, C2, C4, C5, E5.
+Pass `--address`: without it the B2 check (ledger delta types) cannot run at
+all, and B2 is the one that has already caught a real defect — the venue
+returned a `send` type this build could not classify, which would have
+surfaced in production as a resolver failure retried forever behind a gate
+that never advanced. Any address with ledger history works; it is public
+read-only data.
+
+This README said the parsers "have never seen a live response" until
+2026-07-31. They have: E5 passed on 2026-07-29, B2 and E4 on 2026-07-31, C2
+and C5 on 2026-07-30/31. What is still unproven is C1 (a protocol constant no
+sample of realised rates can establish) and C4 (a WebSocket question this
+harness cannot ask). See OPEN-QUESTIONS C1, C2, C4, C5, E5 and the status
+table in `risk_engine/README.md`. Run the harness rather than trusting either
+— a table records a past run, and the venue can change under it.
 
 ## Starting the shadow clock
 
@@ -109,14 +122,19 @@ into both shadow containers while `SHADOW_ARGS` defaults to `--fixture`;
 flipping it to `--addresses /app/addresses.json` before the file has a frame
 fails both jobs at startup.
 
-Read the exit code rather than the fact that it was non-zero — they mean four
+Read the exit code rather than the fact that it was non-zero — they mean five
 different things and only one of them is fixed by a longer window: `1`
 collected but refused to publish (short of §3.3's 200, or `--out` exists), and
 the addresses are parked in `deploy/addresses.json.refused-<window-start>`
 rather than discarded; `2` the feed did not match the collector's assumed
 message shape, which is a code problem, not weather; `3` no usable connection
-at all — check `--ws-url` first, it has never been confirmed from here; `4` a
-bad invocation, caught before anything connects. A run that succeeds but
+at all — check `--ws-url` first; `4` a bad invocation, caught before anything
+connects; `5` the harvest succeeded and only the *write* failed (read-only
+mount, full disk, dangling symlink), in which case the complete file is on
+stdout and needs redirecting, **not** another collection window. `5` was
+missing from this list until 2026-07-31, and reading it as `1` is precisely
+the thirty-minute mistake the two codes are separate to prevent. A run that
+succeeds but
 prints a `NOTE:` line about anomalies harvested a list the feed partly
 disagreed with; the count and the offending records are in the file's
 `_provenance.anomalies`.
