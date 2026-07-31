@@ -446,3 +446,94 @@ class TestDexRoutedFlows:
             self._send(sourceDex="perp", user=self.ME.upper().replace("0X", "0x")),
             self.SINCE, self.UNTIL, self.ME,
         ) == pytest.approx(-206.575)
+
+
+class TestSpotOnlyTransfers:
+    """`spotTransfer`, and why a spot balance is not the predicted quantity.
+
+    The second live finding (2026-07-31, mainnet), surfaced by `verify` on the
+    same account one round after `send`:
+
+        {"type": "spotTransfer", "token": "UFART", "amount": "20.0",
+         "usdcValue": "4.9884", "user": "0x2000...010d",
+         "destination": "0xd475...", "fee": "0.0", ...}
+
+    An airdrop landing in a spot wallet. It was filed as
+    directional-needs-`toPerp`, the record carries no such flag, and B2
+    refused it. The classification is settled by what the model predicts, not
+    by what the transfer is called: `Book.equity` is cross collateral plus the
+    isolated pockets, so a spot balance is not in it and $4.99 of a memecoin
+    arriving there changes nothing being forecast.
+    """
+
+    ME = "0xd47587702a91731dc1089b5db0932cf820151a91"
+    SENDER = "0x200000000000000000000000000000000000010d"
+    SINCE = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    UNTIL = datetime(2027, 1, 1, tzinfo=timezone.utc)
+
+    def _spot_transfer(self, **overrides):
+        """The exact shape the venue returned, verbatim, with overrides."""
+        delta = {
+            "type": "spotTransfer", "token": "UFART", "amount": "20.0",
+            "usdcValue": "4.9884", "user": self.SENDER, "destination": self.ME,
+            "fee": "0.0", "nativeTokenFee": "0.0", "nonce": 1219326, "feeToken": "",
+        }
+        delta.update(overrides)
+        return [{"time": 1778067666017, "hash": "0x025c", "delta": delta}]
+
+    def test_the_live_record_is_not_a_perp_flow(self):
+        assert net_external_flow(
+            self._spot_transfer(), self.SINCE, self.UNTIL, self.ME
+        ) == pytest.approx(0.0)
+
+    def test_it_needs_no_address_to_classify(self):
+        """Unlike `send`, nothing about the direction matters: neither side is
+        the perp account, so there is no sign to get wrong."""
+        assert net_external_flow(
+            self._spot_transfer(), self.SINCE, self.UNTIL, None
+        ) == pytest.approx(0.0)
+
+    def test_a_spot_transfer_naming_the_perp_account_is_refused(self):
+        """The guard on the inference. Filing this as a non-flow rests on
+        'it only touches spot', which is read off a type name and a handful of
+        records — not guaranteed by the venue. If that ever stops being true,
+        silently skipping the record hides a real flow."""
+        with pytest.raises(ValueError, match="contradicts that"):
+            net_external_flow(
+                self._spot_transfer(toPerp=True), self.SINCE, self.UNTIL, self.ME
+            )
+
+    def test_the_guard_covers_dex_fields_too(self):
+        with pytest.raises(ValueError, match="sourceDex"):
+            net_external_flow(
+                self._spot_transfer(sourceDex="perp"), self.SINCE, self.UNTIL, self.ME
+            )
+
+    def test_a_liquidation_is_not_held_to_the_spot_only_guard(self):
+        """`liquidation` is also a non-flow, for an entirely different reason:
+        it is a perp event the model PREDICTS. Asserting it never names the
+        perp account would refuse correct records — which is why the guard is
+        scoped to SPOT_ONLY_NON_FLOW_TYPES rather than every non-flow."""
+        from risk_engine.market.parse import (
+            NON_FLOW_DELTA_TYPES,
+            SPOT_ONLY_NON_FLOW_TYPES,
+        )
+
+        assert "liquidation" in NON_FLOW_DELTA_TYPES
+        assert "liquidation" not in SPOT_ONLY_NON_FLOW_TYPES
+        rows = [{"time": int(self.UNTIL.timestamp() * 1000) - 1,
+                 "delta": {"type": "liquidation", "sourceDex": "perp"}}]
+        assert net_external_flow(
+            rows, self.SINCE, self.UNTIL, self.ME
+        ) == pytest.approx(0.0)
+
+    def test_a_spot_transfer_and_a_real_deposit_net_correctly(self):
+        """The whole point: the deposit counts, the airdrop does not."""
+        rows = [
+            *self._spot_transfer(),
+            {"time": 1778067666018,
+             "delta": {"type": "deposit", "usdc": "5000.0"}},
+        ]
+        assert net_external_flow(
+            rows, self.SINCE, self.UNTIL, self.ME
+        ) == pytest.approx(+5000.0)

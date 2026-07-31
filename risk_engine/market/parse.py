@@ -192,7 +192,6 @@ EXTERNAL_FLOW_SIGNS: dict[str, float] = {
     "subAccountTransfer": 0.0,
     "vaultDeposit": -1.0,
     "vaultWithdraw": +1.0,
-    "spotTransfer": 0.0,
 }
 
 #: Types that are NOT external flow: the model either predicts them or they do
@@ -202,7 +201,45 @@ NON_FLOW_DELTA_TYPES = frozenset({
     "liquidation",
     "rewardsClaim",
     "spotGenesis",
+    # A token moving between two SPOT balances. Observed 2026-07-31 on
+    # mainnet, an airdrop landing in a real account:
+    #
+    #     {"type": "spotTransfer", "token": "UFART", "amount": "20.0",
+    #      "usdcValue": "4.9884", "user": "0x2000...010d",
+    #      "destination": "0xd475...", "fee": "0.0", ...}
+    #
+    # It was filed under EXTERNAL_FLOW_SIGNS as directional-needs-`toPerp`,
+    # and the record carries no `toPerp` -- nor any `sourceDex`, nor any
+    # other field naming the perp account -- so B2 refused it.
+    #
+    # It is a non-flow, and the reason is what the model predicts rather than
+    # what the transfer is called. `Book.equity` is cross collateral plus the
+    # isolated pockets: the PERP account. A spot balance is not in it. Twenty
+    # UFART arriving in a spot wallet changes nothing the model forecasts, so
+    # scoring $4.99 as an external flow would corrupt the correction exactly
+    # as counting a spot-to-spot `send` would.
+    #
+    # `_assert_no_perp_leg` below is what keeps this from being the guess it
+    # would otherwise be: if the venue ever emits a `spotTransfer` carrying a
+    # `toPerp` or a perp dex, this refuses rather than skipping it.
+    "spotTransfer",
 })
+
+#: The subset of `NON_FLOW_DELTA_TYPES` that is non-flow *because it never
+#: touches the perp account*, as opposed to non-flow for a different reason.
+#: The distinction decides which records may be checked for a perp leg.
+#:
+#: `liquidation` is the reason this is a subset and not the whole set: it is a
+#: perp event, and it is excluded from external flow because the model
+#: PREDICTS it -- it is the outcome being forecast, not money arriving from
+#: outside. Asserting that a liquidation never names the perp account would
+#: refuse correct records.
+SPOT_ONLY_NON_FLOW_TYPES = frozenset({"spotTransfer", "spotGenesis"})
+
+#: Fields whose presence on a supposedly spot-only record would mean this
+#: build's reading of that type is wrong. Checked rather than assumed, because
+#: "spot" is being inferred from a type name and a handful of live records.
+PERP_LEG_FIELDS = ("toPerp", "sourceDex", "destinationDex")
 
 #: Types whose flow-ness cannot be decided from the type name at all, because
 #: the SAME type covers movements that touch the perp account and movements
@@ -252,6 +289,32 @@ def _dex_touches_perp(value: object, kind: str, row: object) -> bool:
         f"hide a real flow. Add it to PERP_DEX_VALUES or NON_PERP_DEX_VALUES in "
         f"market/parse.py once confirmed (OPEN-QUESTIONS B2). Record: {row!r}"
     )
+
+
+def _assert_no_perp_leg(delta: dict, kind: str, row: object) -> None:
+    """Refuse a supposedly spot-only record that names the perp account.
+
+    `spotTransfer` is filed as a non-flow because a spot balance is not in
+    `Book.equity`. That is an inference from a type name plus a handful of
+    live records, not a guarantee the venue has made, and the cost of it
+    being wrong is asymmetric: a perp-touching record silently skipped is a
+    real flow scored as model error, with nothing anywhere saying so.
+
+    So the inference is checked on every record rather than trusted once. If
+    a `spotTransfer` ever arrives with a `toPerp` or a `sourceDex`, this
+    stops the run and quotes it, which is how the reading gets corrected
+    instead of quietly rotting.
+    """
+    present = [f for f in PERP_LEG_FIELDS if delta.get(f) is not None]
+    if present:
+        raise ValueError(
+            f"{kind} is classified as a non-flow because it moves tokens between "
+            f"SPOT balances, which are not part of the perp equity this model "
+            f"predicts. This record contradicts that: it carries {present!r}. "
+            f"Either the venue changed the type or this build's reading of it was "
+            f"always wrong -- move it to DEX_ROUTED_TYPES in market/parse.py "
+            f"(OPEN-QUESTIONS B2). Record: {row!r}"
+        )
 
 
 def _delta_amount_usd(delta: dict, kind: str, row: object) -> float:
@@ -321,6 +384,12 @@ def net_external_flow(
                 f"flow or non-flow: {row!r}"
             )
         if kind in NON_FLOW_DELTA_TYPES:
+            # Verified per record rather than taken on trust, but only for the
+            # types whose non-flow status rests on never touching perp. A
+            # liquidation is a perp event and is excluded for a different
+            # reason (the model predicts it), so it is not checked here.
+            if kind in SPOT_ONLY_NON_FLOW_TYPES:
+                _assert_no_perp_leg(delta, kind, row)
             continue
 
         if kind in DEX_ROUTED_TYPES:

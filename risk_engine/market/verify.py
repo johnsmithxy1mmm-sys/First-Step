@@ -396,20 +396,62 @@ def check_external_flow(client: InfoClient, address: str | None) -> Check:
             "NON_FLOW_DELTA_TYPES in market/parse.py (OPEN-QUESTIONS B2).",
             evidence=evidence,
         )
-    try:
-        from datetime import datetime as _dt
-        from datetime import timezone as _tz
+    from datetime import datetime as _dt
+    from datetime import timezone as _tz
 
-        total = net_external_flow(
-            rows,
-            _dt.fromtimestamp((now_ms - window_days * 24 * HOUR_MS) / 1000, tz=_tz.utc),
-            _dt.fromtimestamp(now_ms / 1000, tz=_tz.utc),
-            address,
-        )
-    except ValueError as exc:
+    since = _dt.fromtimestamp((now_ms - window_days * 24 * HOUR_MS) / 1000, tz=_tz.utc)
+    until = _dt.fromtimestamp(now_ms / 1000, tz=_tz.utc)
+
+    # Every unreadable record, not the first one. `net_external_flow` raises on
+    # the first refusal by design -- a resolver must not proceed on a partial
+    # read -- but this harness is the opposite job: it exists so the whole
+    # ledger's worth of surprises is known BEFORE the clock starts.
+    #
+    # This was a real cost, not a hypothetical one. Two live rounds against the
+    # same account surfaced `send`, then `spotTransfer`, one per run, each
+    # needing a fix, a push, a pull and a re-run to reach the next. Ledger
+    # types are a long tail; discovering them one per round trip is the slowest
+    # possible way to find out, and it is the operator's time being spent.
+    #
+    # Each type is probed on its OWN records so one bad type cannot mask
+    # another, and every record of a type is tried before it is called good --
+    # `spotTransfer` was well-formed in some rows and not others.
+    per_type_failures: dict[str, str] = {}
+    for kind in sorted(kinds):
+        of_kind = [r for r in rows if ((r.get("delta") or {}).get("type")) == kind]
+        for row in of_kind:
+            try:
+                net_external_flow([row], since, until, address)
+            except ValueError as exc:
+                per_type_failures[kind] = str(exc)
+                # The FAILING record, overwriting any earlier example of this
+                # type: a well-formed row of the same type is what makes a
+                # refusal look inexplicable.
+                evidence["examples"][kind] = row
+                break
+
+    if per_type_failures:
+        detail = "; ".join(f"{k}: {v}" for k, v in per_type_failures.items())
         return Check(
             "B2", "can external flows be read and classified?", FAIL,
-            f"a ledger record could not be read: {exc}", evidence=evidence,
+            f"{len(per_type_failures)} of {len(kinds)} delta type(s) could not be "
+            f"read. ALL of them are listed here rather than one per run, so this "
+            f"can be fixed in a single pass — {detail}",
+            evidence=evidence | {"unreadable_types": sorted(per_type_failures)},
+        )
+
+    try:
+        total = net_external_flow(rows, since, until, address)
+    except ValueError as exc:
+        # Unreachable if the per-record probe above is faithful, which is
+        # exactly why it is worth catching: reaching here means whole-ledger
+        # evaluation refuses something no single record does, and reporting
+        # that as a traceback would hide a real defect in this harness.
+        return Check(
+            "B2", "can external flows be read and classified?", FAIL,
+            f"every record read individually, but the ledger as a whole did not: "
+            f"{exc}. That is a defect in this check rather than in the data.",
+            evidence=evidence,
         )
 
     if not rows:

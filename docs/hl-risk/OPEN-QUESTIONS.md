@@ -531,8 +531,45 @@ An unrecognised `dex` value raises rather than defaulting to "not perp", on
 the same reasoning as an unknown delta type: the default would hide a real
 flow, which is the §10-forbidden direction.
 
+**Second live finding, same day, same account: `spotTransfer`.**
+
+```json
+{"type": "spotTransfer", "token": "UFART", "amount": "20.0",
+ "usdcValue": "4.9884", "user": "0x2000...010d", "destination": "0xd475...", ...}
+```
+
+An airdrop landing in a spot wallet. It was filed under `EXTERNAL_FLOW_SIGNS`
+as directional-needs-`toPerp`; the record carries no `toPerp`, no `sourceDex`,
+and nothing else naming the perp account, so B2 refused it.
+
+It is a **non-flow**, and the reason is worth stating because it is the
+general rule the whole table should be read against: *what matters is whether
+a record moves the quantity the model predicts.* `Book.equity` is cross
+collateral plus the isolated pockets — the perp account. A spot balance is not
+in it. Twenty UFART arriving in a spot wallet changes nothing being forecast,
+so scoring $4.99 as external flow would corrupt the correction exactly as
+counting a spot-to-spot `send` would.
+
+That classification is an inference from a type name plus one record, so it is
+guarded rather than trusted: `_assert_no_perp_leg` refuses any `spotTransfer`
+or `spotGenesis` carrying `toPerp`, `sourceDex` or `destinationDex`. The guard
+is scoped to `SPOT_ONLY_NON_FLOW_TYPES` rather than every non-flow, because
+`liquidation` is also a non-flow and for a completely different reason — it is
+a perp event the model *predicts*. Asserting a liquidation never names the
+perp account would refuse correct records.
+
+**The harness itself was costing a round trip per type.** `check_external_flow`
+stopped at the first unreadable record, so `send` and `spotTransfer` surfaced
+one per run — each needing a fix, a push, a pull and a re-run to reach the
+next. Ledger delta types are a long tail and that is the slowest possible way
+to enumerate them. It now probes each type on its own records and reports
+**every** unreadable one in a single pass, with the failing record (not merely
+any record of that type) attached as evidence. `net_external_flow` still
+raises on the first refusal, which is correct for a resolver: it must not
+proceed on a partial read. The harness has the opposite job.
+
 This is the argument for running `verify --address` **before** starting the
-§3.3 clock rather than during it. Encountered live, this type would have
+§3.3 clock rather than during it. Encountered live, either type would have
 surfaced as a per-row resolver failure classified TRANSIENT, retried forever,
 and shown up only as a repeated traceback in a container log — with the
 21-day gate quietly never advancing.

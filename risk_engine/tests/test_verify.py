@@ -312,6 +312,60 @@ class TestExternalFlow:
         assert check.status == FAIL
         assert "toPerp" in check.detail
 
+    def test_every_unreadable_type_is_reported_in_one_pass(self):
+        """The harness used to stop at the first refusal, and that cost real
+        time: two live rounds against the same account surfaced `send`, then
+        `spotTransfer`, one per run — each needing a fix, a push, a pull and a
+        re-run to reach the next. Ledger types are a long tail, and finding
+        them one per round trip is the slowest possible way to find out.
+
+        `net_external_flow` still raises on the first bad record, correctly: a
+        resolver must not proceed on a partial read. This check has the
+        opposite job — know everything before the clock starts."""
+        client = StubClient(ledger=[
+            self._row("deposit", "1000"),
+            self._row("accountClassTransfer", "500"),      # no toPerp
+            self._row("internalTransfer", "700"),          # no toPerp either
+        ])
+        check = verify.check_external_flow(client, ADDRESS)
+        assert check.status == FAIL
+        assert check.evidence["unreadable_types"] == [
+            "accountClassTransfer", "internalTransfer",
+        ]
+        # Both named in the text, not just counted -- the operator fixes from
+        # this line, and a count sends them back to the report file.
+        assert "accountClassTransfer" in check.detail
+        assert "internalTransfer" in check.detail
+        assert "single pass" in check.detail
+
+    def test_one_bad_record_does_not_condemn_the_rest_of_its_type(self):
+        """A type is only reported once, against the record that failed --
+        and a well-formed record of a type that also has a bad one must not
+        make the type look fine."""
+        client = StubClient(ledger=[
+            self._row("accountClassTransfer", "500", toPerp=True),   # readable
+            self._row("accountClassTransfer", "900"),                # not
+        ])
+        check = verify.check_external_flow(client, ADDRESS)
+        assert check.status == FAIL
+        assert check.evidence["unreadable_types"] == ["accountClassTransfer"]
+        # The FAILING record is the example, not the well-formed one that
+        # happened to come first.
+        assert "toPerp" not in check.evidence["examples"]["accountClassTransfer"]["delta"]
+
+    def test_a_spot_transfer_no_longer_fails_the_check(self):
+        """The 2026-07-31 live finding. An airdrop into a spot wallet is not a
+        perp flow, so a ledger containing one is readable rather than a FAIL."""
+        client = StubClient(ledger=[
+            self._row("deposit", "1000"),
+            {"time": self._row("deposit")["time"],
+             "delta": {"type": "spotTransfer", "token": "UFART", "amount": "20.0",
+                       "usdcValue": "4.9884", "user": "0x2000", "destination": ADDRESS}},
+        ])
+        check = verify.check_external_flow(client, ADDRESS)
+        assert check.status == PASS
+        assert check.evidence["net_flow_usd"] == pytest.approx(1000.0)
+
     def test_an_endpoint_error_is_a_failure_naming_the_consequence(self):
         client = StubClient(ledger_error=RuntimeError("422 Unprocessable Entity"))
         check = verify.check_external_flow(client, ADDRESS)
