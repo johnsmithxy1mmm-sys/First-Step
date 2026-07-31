@@ -45,11 +45,19 @@ META = {
 class StubClient:
     """Answers the four calls the harness makes, with whatever we choose."""
 
-    def __init__(self, *, rates=None, basis=0.0, candles=True, meta=META):
+    def __init__(self, *, rates=None, basis=0.0, candles=True, meta=META,
+                 ledger=None, ledger_error=None):
         self._meta = meta
         self._rates = rates if rates is not None else [1e-5, -2e-5, 3e-5]
         self._basis = basis
         self._candles = candles
+        self._ledger = ledger if ledger is not None else []
+        self._ledger_error = ledger_error
+
+    def non_funding_ledger_updates(self, address, start_ms, end_ms=None):
+        if self._ledger_error is not None:
+            raise self._ledger_error
+        return self._ledger
 
     def meta(self):
         return self._meta
@@ -245,6 +253,75 @@ class TestParsers:
 
         check = verify.check_clearinghouse(Exploding(), "0xnot-an-address")
         assert check.status == UNCHECKABLE
+
+
+class TestExternalFlow:
+    """B2, and the reason it is checked BEFORE the shadow clock starts.
+
+    Without a readable ledger the resolver fails every row, `_permanent_reason`
+    classifies that as transient, and a live pilot accumulates fourteen days of
+    snapshots against a gate that can never advance. This check exists to turn
+    that into a one-command failure beforehand.
+    """
+
+    def _row(self, kind, usdc="1000", **extra):
+        # Mid-window: the check asks for the last 90 days, so "now" is safe.
+        import time as _t
+        return {"time": int(_t.time() * 1000) - HOUR_MS,
+                "delta": {"type": kind, "usdc": usdc, **extra}}
+
+    def test_a_readable_ledger_passes_and_reports_the_net(self):
+        client = StubClient(ledger=[
+            self._row("deposit", "50000"), self._row("withdraw", "20000"),
+        ])
+        check = verify.check_external_flow(client, ADDRESS)
+        assert check.status == PASS
+        assert check.evidence["net_flow_usd"] == pytest.approx(30_000.0)
+
+    def test_an_unknown_delta_type_fails_and_quotes_a_full_record(self):
+        """The live finding this was written for: a real account returned a
+        `send` type nobody here had seen. A count alone would say the type
+        exists and nothing about its fields, and a sign guessed from a name
+        already went wrong once -- `accountClassTransfer` needed a `toPerp`
+        flag this repo could not have invented."""
+        client = StubClient(ledger=[
+            self._row("deposit", "1000"),
+            self._row("someNewKind", "500", destination="0xabc"),
+        ])
+        check = verify.check_external_flow(client, ADDRESS)
+        assert check.status == FAIL
+        assert check.evidence["unknown_types"] == ["someNewKind"]
+        example = check.evidence["examples"]["someNewKind"]
+        # The whole record, not a summary -- the fields are the point.
+        assert example["delta"]["destination"] == "0xabc"
+        assert example["delta"]["usdc"] == "500"
+        assert "evidence.examples" in check.detail
+
+    def test_a_quiet_account_is_inconclusive_not_a_pass(self):
+        """An empty list is what a genuinely quiet account and a wrong request
+        type look like alike, so it cannot confirm the shape."""
+        check = verify.check_external_flow(StubClient(ledger=[]), ADDRESS)
+        assert check.status == INCONCLUSIVE
+        assert "never exercised" in check.detail
+
+    def test_an_unreadable_record_fails_rather_than_scoring_zero(self):
+        """A directional transfer with no direction: returning 0.0 would hide
+        a real transfer, which is the §10-forbidden direction here."""
+        client = StubClient(ledger=[self._row("accountClassTransfer", "1000")])
+        check = verify.check_external_flow(client, ADDRESS)
+        assert check.status == FAIL
+        assert "toPerp" in check.detail
+
+    def test_an_endpoint_error_is_a_failure_naming_the_consequence(self):
+        client = StubClient(ledger_error=RuntimeError("422 Unprocessable Entity"))
+        check = verify.check_external_flow(client, ADDRESS)
+        assert check.status == FAIL
+        assert "cannot resolve any observation" in check.detail
+
+    def test_without_an_address_it_is_unchecked_rather_than_passed(self):
+        check = verify.check_external_flow(StubClient(), None)
+        assert check.status == UNCHECKABLE
+        assert not check.satisfied
 
 
 class TestUncheckable:

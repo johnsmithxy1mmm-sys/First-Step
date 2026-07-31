@@ -367,13 +367,21 @@ def check_external_flow(client: InfoClient, address: str | None) -> Check:
 
     rows = list(raw or [])
     kinds: dict[str, int] = {}
+    examples: dict[str, dict] = {}
     for row in rows:
         kind = ((row.get("delta") or {}).get("type")) or "<no delta.type>"
         kinds[kind] = kinds.get(kind, 0) + 1
+        # One full record per type, verbatim. A count says a type exists; it
+        # says nothing about its fields, and guessing a sign from a name
+        # already went wrong once here -- `accountClassTransfer` needed a
+        # live `toPerp` flag this repo could not have invented. Public
+        # on-chain data, so nothing here needs redacting.
+        examples.setdefault(kind, row)
     known = set(EXTERNAL_FLOW_SIGNS) | set(NON_FLOW_DELTA_TYPES)
     unknown = sorted(k for k in kinds if k not in known)
     evidence = {"n_records": len(rows), "window_days": window_days,
-                "types_seen": kinds, "unknown_types": unknown}
+                "types_seen": kinds, "unknown_types": unknown,
+                "examples": {k: examples[k] for k in unknown}}
 
     if unknown:
         return Check(
@@ -381,9 +389,10 @@ def check_external_flow(client: InfoClient, address: str | None) -> Check:
             f"the venue returned delta types this build cannot classify: {unknown}. "
             "Each one is either an external flow or it is not, and guessing either "
             "way corrupts the calibration record — an unclassified transfer scored "
-            "as model error, or a real deposit hidden. Add each to "
-            "EXTERNAL_FLOW_SIGNS or NON_FLOW_DELTA_TYPES in market/parse.py once "
-            "its meaning is confirmed (OPEN-QUESTIONS B2).",
+            "as model error, or a real deposit hidden. A full example record for "
+            "each is in this check's `evidence.examples` (--report to see it) — "
+            "read the fields before adding it to EXTERNAL_FLOW_SIGNS or "
+            "NON_FLOW_DELTA_TYPES in market/parse.py (OPEN-QUESTIONS B2).",
             evidence=evidence,
         )
     try:
