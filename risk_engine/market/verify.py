@@ -65,6 +65,27 @@ UNCHECKABLE = "UNCHECKABLE"
 HOUR_MS = 3_600_000
 
 
+def _is_self_inflicted(exc: BaseException) -> bool:
+    """Whether a failure is this harness's own doing rather than the venue's.
+
+    `RateLimitExceeded` is raised by our OWN `WeightBudget` before a request
+    leaves the process: it means this run has spent its §5.3 allowance, not
+    that the venue said anything. Reporting it as FAIL claims live data
+    contradicted the model — the strongest verdict this tool has, worth exit
+    code 2 and "the model is wrong today" — on the strength of a self-imposed
+    limit.
+
+    Observed exactly that way: a 50-address frame sweep spent the minute's
+    budget, C2's next request was refused locally, and C2 came back FAIL
+    "contradicts a recorded PASS". Nothing about the basis had changed. The
+    module docstring already draws this line for a malformed `--address`;
+    a self-imposed rate limit is the same category and was not covered.
+    """
+    from risk_engine.market.info import RateLimitExceeded
+
+    return isinstance(exc, RateLimitExceeded)
+
+
 @dataclass
 class Check:
     id: str
@@ -294,6 +315,17 @@ def check_basis(client: InfoClient, coins: list[str], samples: int,
         try:
             payload = client.post({"type": "metaAndAssetCtxs"})
         except Exception as exc:
+            if _is_self_inflicted(exc):
+                return Check(
+                    "C2", "is mark ≈ mid, per §1.4's threshold?", UNCHECKABLE,
+                    f"this run spent its own §5.3 weight budget before C2 could "
+                    f"sample ({exc}). That is this harness rate-limiting itself, "
+                    f"not the venue answering — re-run C2 alone, or lower "
+                    f"--frame-sample. Reporting it as FAIL would claim live data "
+                    f"contradicted the model on the strength of a self-imposed "
+                    f"limit.",
+                    evidence={"samples_taken": i},
+                )
             return Check("C2", "is mark ≈ mid, per §1.4's threshold?", FAIL,
                          f"metaAndAssetCtxs failed: {type(exc).__name__}: {exc}")
         try:
@@ -437,11 +469,21 @@ def check_frame_ledger_types(client: InfoClient, addresses: list[str],
     n_records = 0
     n_read = 0
 
+    budget_stopped = False
     for addr in chosen:
         try:
             rows = list(client.non_funding_ledger_updates(
                 addr, now_ms - window_days * 24 * HOUR_MS, now_ms) or [])
         except Exception as exc:
+            if _is_self_inflicted(exc):
+                # Stop the sweep rather than burn through the rest as
+                # "unreachable", and stop it HERE rather than starving every
+                # check that runs after this one. A 50-address scan is 1000 of
+                # the 1200 weight a minute allows, so the first version of this
+                # check emptied the budget and C2 came back FAIL against a
+                # request that never left the process.
+                budget_stopped = True
+                break
             # One address failing is a fact about that address, not about the
             # frame. Recorded and stepped over: aborting here would make a
             # single dead account hide every type on the remaining ones.
@@ -460,14 +502,25 @@ def check_frame_ledger_types(client: InfoClient, addresses: list[str],
                 failures[kind] = str(exc)
                 examples[kind] = row
 
-    known = set(EXTERNAL_FLOW_SIGNS) | set(NON_FLOW_DELTA_TYPES) | set(DEX_ROUTED_TYPES)
+    from risk_engine.market.parse import (
+        PERP_ADDRESS_ROUTED_TYPES,
+        UNRECOGNISED_DEX_NAMES,
+    )
+
+    known = (set(EXTERNAL_FLOW_SIGNS) | set(NON_FLOW_DELTA_TYPES)
+             | set(DEX_ROUTED_TYPES) | set(PERP_ADDRESS_ROUTED_TYPES))
     unseen = sorted(k for k in known if k not in kinds)
     evidence = {
         "addresses_sampled": len(chosen), "addresses_read": n_read,
         "addresses_unreachable": unreachable, "n_records": n_records,
         "types_seen": kinds, "unreadable_types": sorted(failures),
         "known_types_not_exercised": unseen, "examples": examples,
-        "window_days": window_days,
+        "window_days": window_days, "budget_stopped": budget_stopped,
+        # Dex names treated as builder-deployed venues rather than the primary
+        # perp account. Reported because the one way that reading goes wrong is
+        # a future ALIAS of the primary dex being read as a builder one, which
+        # would hide a real outflow.
+        "unrecognised_dex_names": dict(UNRECOGNISED_DEX_NAMES),
     }
 
     if failures:
@@ -495,6 +548,16 @@ def check_frame_ledger_types(client: InfoClient, addresses: list[str],
     # untested".
     note = (f" {len(unseen)} known type(s) never appeared and remain untested "
             f"against live data: {', '.join(unseen)}." if unseen else "")
+    if budget_stopped:
+        note += (f" Stopped at {n_read} addresses: this run spent its §5.3 weight "
+                 f"budget. The types below are what {n_read} addresses hold, not "
+                 f"what {len(chosen)} do — re-run with a smaller --frame-sample, "
+                 f"or a minute later.")
+    if UNRECOGNISED_DEX_NAMES:
+        note += (f" Dex names read as builder-deployed venues rather than the "
+                 f"primary perp account: {sorted(UNRECOGNISED_DEX_NAMES)}. Transfers "
+                 f"to them count as outflows; if any of these is in fact an alias "
+                 f"for the primary dex, add it to PERP_DEX_VALUES.")
     return Check(
         "B2.frame", "can every ledger type in the sampling frame be read?", PASS,
         f"{n_records} records across {n_read} of {len(chosen)} sampled addresses, "
@@ -522,6 +585,7 @@ def check_external_flow(client: InfoClient, address: str | None) -> Check:
         DEX_ROUTED_TYPES,
         EXTERNAL_FLOW_SIGNS,
         NON_FLOW_DELTA_TYPES,
+        PERP_ADDRESS_ROUTED_TYPES,
         net_external_flow,
     )
 
@@ -556,7 +620,12 @@ def check_external_flow(client: InfoClient, address: str | None) -> Check:
         # live `toPerp` flag this repo could not have invented. Public
         # on-chain data, so nothing here needs redacting.
         examples.setdefault(kind, row)
-    known = set(EXTERNAL_FLOW_SIGNS) | set(NON_FLOW_DELTA_TYPES) | set(DEX_ROUTED_TYPES)
+    # Every table a type can legitimately live in. Missing one here reports a
+    # perfectly classifiable type as unknown -- which is how `internalTransfer`
+    # came back as "the venue returned a type this build cannot classify" the
+    # moment it was moved out of EXTERNAL_FLOW_SIGNS and into its own.
+    known = (set(EXTERNAL_FLOW_SIGNS) | set(NON_FLOW_DELTA_TYPES)
+             | set(DEX_ROUTED_TYPES) | set(PERP_ADDRESS_ROUTED_TYPES))
     unknown = sorted(k for k in kinds if k not in known)
     evidence = {"n_records": len(rows), "window_days": window_days,
                 "types_seen": kinds, "unknown_types": unknown,
