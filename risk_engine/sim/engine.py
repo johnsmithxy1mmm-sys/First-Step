@@ -150,6 +150,16 @@ class ModelBundle:
     copula_df: float | None
     drift: DriftConvention = DriftConvention.ZERO_LOG_RETURN
     model_version: str = MODEL_VERSION
+    #: §2.3's tail-asymmetry diagnostic, as measured on the returns this
+    #: bundle was fitted from. Empty when the bundle was assembled by hand
+    #: (tests, benchmarks) rather than from a return series.
+    #:
+    #: Carried on the bundle rather than discarded at build time because a
+    #: passing diagnostic is a *result*, not the absence of one: it says the
+    #: symmetric copula was checked against this particular market and found
+    #: adequate, and that claim expires when the market does. `assert_...`
+    #: below is what refuses; this is what lets an operator see the margin.
+    tail_diagnostics: tuple = ()
 
     def path_spec(self, coins: tuple[str, ...], independent: bool = False) -> PathSpec:
         with Timer("slice_submatrix"):

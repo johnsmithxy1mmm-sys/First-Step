@@ -64,9 +64,37 @@ class Metrics:
     psd_corrections: deque = field(default_factory=lambda: deque(maxlen=MAX_EVENT_SAMPLES))
     #: Every df clamp, with the raw MLE value (§2.2 wants each logged).
     df_clamps: deque = field(default_factory=lambda: deque(maxlen=MAX_EVENT_SAMPLES))
+    #: §2.3's tail-asymmetry diagnostic, one entry per asset pair per bundle
+    #: build. Kept even when every pair passes: "checked and adequate" is a
+    #: result with a shelf life, and an empty list here means the check did
+    #: not run rather than that it found nothing.
+    tail_diagnostics: deque = field(default_factory=lambda: deque(maxlen=MAX_EVENT_SAMPLES))
 
     def incr(self, name: str, by: float = 1.0) -> None:
         self.counters[name] += by
+
+    def record_tail_diagnostics(self, diagnostics) -> None:
+        """Record §2.3's diagnostic for every pair, and count the failures.
+
+        The counter is what an alert watches; the samples are what whoever
+        answers it reads. `tail_understated` firing at all is a stop-the-line
+        event (§2.3 calls it blocking), so it is deliberately not a rate.
+        """
+        for d in diagnostics:
+            understated = d.understates_lower_tail()
+            self.tail_diagnostics.append({
+                "pair": list(d.pair),
+                "threshold": d.threshold,
+                "empirical_lower": d.empirical_lower,
+                "empirical_upper": d.empirical_upper,
+                "model_at_threshold": d.model_at_threshold,
+                "asymmetry": d.asymmetry,
+                "n_lower_exceedances": d.n_lower_exceedances,
+                "understates_lower_tail": understated,
+            })
+            if understated:
+                self.incr("tail_understated")
+        self.incr("tail_diagnostics_run")
 
     def observe_latency(self, stage: str, ms: float) -> None:
         self.latencies_ms[stage].append(ms)
@@ -91,6 +119,7 @@ class Metrics:
             "latency": {stage: self.percentiles(stage) for stage in self.latencies_ms},
             "psd_corrections": list(self.psd_corrections),
             "df_clamps": list(self.df_clamps),
+            "tail_diagnostics": list(self.tail_diagnostics),
         }
 
     def reset(self) -> None:
@@ -98,6 +127,7 @@ class Metrics:
         self.latencies_ms.clear()
         self.psd_corrections.clear()
         self.df_clamps.clear()
+        self.tail_diagnostics.clear()
 
 
 METRICS = Metrics()

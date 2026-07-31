@@ -266,6 +266,18 @@ how strongly assets go extreme *together*. Implemented as a two-stage (IFM)
 MLE: correlation fixed at the shrunk estimate, copula `df` profiled over a
 grid by the copula likelihood on pseudo-observations.
 
+**`fit_copula_df` is implemented and tested, and no bundle uses it.** Both
+builders in `service/state.py` pass a hardcoded `copula_df=4.0`. Found
+2026-07-31 while wiring A10; deliberately left alone rather than fixed in the
+same change, because the two are not the same kind of edit. Wiring a check
+that can only refuse changes no number the product outputs; switching 4.0 for
+a fitted value changes **every** number, which is a distribution change, and
+§3.3/§10 make that reset the shadow counter. On the fixture the fitted value
+is 6.5 against the hardcoded 4.0 — a materially thinner tail, so this is not
+a rounding difference. It is the right change to make *before* the shadow
+clock starts and an expensive one to make after, which is the decision to
+take deliberately rather than as a side effect. Tracked here; not scheduled.
+
 ### A10 `[RESOLVED]` The §2.3 diagnostic must not compare against the asymptotic coefficient
 
 The natural implementation — compare the empirical lower-tail dependence
@@ -282,6 +294,41 @@ draws.
 Note the outcome §2.3 prescribes when the check does fire — switch to a
 skewed-t — is **not implemented in Phase 1**. The check raises rather than
 degrading quietly, per §9.
+
+**The check ran nowhere until 2026-07-31.** `diagnose_tail_asymmetry` and
+`assert_lower_tail_not_understated` were implemented, tested and called from
+no shipped path — every test in `TestCopula` invoked them directly, so all of
+them passed while production never did. Meanwhile `model/copula.py` described
+the assertion in the present tense as something that "turns it into a hard
+failure". That is the worse failure mode: an unguarded model that says so is
+at least honest, whereas this one read as guarded. Same defect class as the
+A8 caveats and the D2 entry above — prose asserting a mechanism nobody wired.
+
+Now called from both bundle builders, so it runs at every startup on the
+returns the copula was fitted from, and refuses the build when it fires.
+Three decisions worth recording:
+
+- **It refuses; there is no override flag.** A flag would be used the first
+  time it was inconvenient, and "the risk model understates crashes" is not a
+  condition anyone should be able to click past. §2.3 calls it blocking, §9
+  requires stopping and reporting, §10 forbids simplifications that understate
+  risk, and there is no skewed-t to fall back to. On the live path this can
+  therefore prevent the service starting — that is the intended behaviour and
+  not a bug to route around.
+- **The measurement is recorded before the assertion**, so a refused build
+  still leaves its numbers in `METRICS.tail_diagnostics`. Recording afterwards
+  would leave exactly the build whose numbers matter most unmeasured.
+- **The Gaussian baseline (`copula_df=None`) is exempt.** §3.2's baseline is
+  deliberately naive; holding it to the t-copula's criterion would refuse the
+  comparator for being what it is specified to be.
+
+The fixture path runs it too, though a symmetric one-factor market cannot
+trip it — a check that only runs where nobody exercises it offline is a check
+that rots. Cost measured at 0.78 s for six pairs at 200k draws, once per
+bundle build. `TestTheDiagnosticRunsOnTheShippedPath` asserts the wiring
+rather than the statistic, and was verified to fail when the wiring is
+removed; without that, the next refactor silently restores the original
+defect and the suite stays green.
 
 ---
 

@@ -30,6 +30,10 @@ from datetime import datetime, timezone
 import numpy as np
 
 from risk_engine.domain.types import AssetSpec
+from risk_engine.model.copula import (
+    assert_lower_tail_not_understated,
+    diagnose_tail_asymmetry,
+)
 from risk_engine.model.correlation import build_global_matrix
 from risk_engine.model.funding import FundingBounds, fit_ar1
 from risk_engine.model.marginals import fit_marginal
@@ -38,6 +42,50 @@ from risk_engine.sim.engine import ModelBundle
 from risk_engine.version import MODEL_VERSION
 
 log = logging.getLogger("risk_engine.service.state")
+
+
+def _checked_tail_diagnostics(returns: dict, matrix, copula_df: float | None) -> tuple:
+    """Run §2.3's tail-asymmetry diagnostic and refuse if it fires.
+
+    OPEN-QUESTIONS A10. `diagnose_tail_asymmetry` and
+    `assert_lower_tail_not_understated` existed, were tested, and were called
+    from **no shipped path** — while `model/copula.py` described the assertion
+    in the present tense as something that "turns it into a hard failure". The
+    mandated check was a function nobody invoked, which is worse than not
+    having it: the docstring made the model look guarded.
+
+    Why it refuses rather than warns. A t-copula's tail dependence is
+    symmetric by construction. Crypto is not — assets crash together harder
+    than they rally together. When the empirical lower tail exceeds what the
+    fitted copula produces, the model understates the probability of the
+    joint move that liquidates a leveraged book, which is the one direction
+    §10 forbids simplifying in. §2.3 names the remedy (a skewed-t) and Phase 1
+    does not implement it, so there is nothing to fall back to; §9 requires
+    an unmet criterion to stop and be reported rather than worked around.
+    Starting anyway would serve numbers that are wrong in the direction the
+    product exists to protect against.
+
+    There is deliberately no override flag. A flag would be used the first
+    time it was inconvenient, and "the risk model understates crashes" is not
+    a condition anyone should be able to click past.
+
+    A `copula_df` of None means the Gaussian baseline (§3.2), which is a
+    deliberately naive comparator rather than the shipped model; diagnosing it
+    against §2.3's criterion would refuse the baseline for being what it is
+    supposed to be.
+    """
+    if copula_df is None or len(matrix.assets) < 2:
+        return ()
+    series = np.column_stack([returns[a] for a in matrix.assets])
+    diagnostics = diagnose_tail_asymmetry(
+        series, tuple(matrix.assets), matrix.corr, copula_df
+    )
+    # Recorded BEFORE the assertion, so a bundle that is about to be refused
+    # still leaves the measurement behind. Otherwise the one build whose
+    # numbers matter most is the only one that reports nothing.
+    METRICS.record_tail_diagnostics(diagnostics)
+    assert_lower_tail_not_understated(diagnostics)
+    return tuple(diagnostics)
 
 
 class NotReady(RuntimeError):
@@ -208,9 +256,14 @@ def _build_fixture_bundle():
         c: fit_ar1(c, 1e-5 + 2e-5 * rng.standard_normal(30 * 24), bounds)
         for c in returns
     }
+    # The fixture is a symmetric one-factor market by construction, so this
+    # is expected to pass and is run anyway -- a check that only runs on the
+    # path nobody exercises offline is a check that rots. It also means the
+    # fixture asserts the diagnostic's own plumbing on every startup.
     bundle = ModelBundle(
         matrix=matrix, marginals=marginals, funding=funding,
         funding_bounds=bounds, copula_df=4.0,
+        tail_diagnostics=_checked_tail_diagnostics(returns, matrix, 4.0),
     )
     return bundle, specs, spot
 
@@ -262,8 +315,14 @@ def _build_live_bundle():
     }
     bounds = FundingBounds.documented_default()
     funding = {c: fit_ar1(c, r, bounds) for c, r in funding_hist.items()}
+    # This is the call §2.3 is actually about, and the one that may refuse to
+    # start the service. Ninety days of real hourly crypto returns is exactly
+    # the data a symmetric copula is least able to represent, so a failure
+    # here is a finding about the market and the model, not a bug -- and
+    # finding it at startup is the point. See `_checked_tail_diagnostics`.
     bundle = ModelBundle(
         matrix=matrix, marginals=marginals, funding=funding,
         funding_bounds=bounds, copula_df=4.0,
+        tail_diagnostics=_checked_tail_diagnostics(returns, matrix, 4.0),
     )
     return bundle, {c: specs[c] for c in universe}, spot

@@ -16,10 +16,24 @@ diagnostic therefore reports the defect rather than papering over it, and
 requires an unmet criterion to stop and be reported rather than be worked
 around.
 
+The caller is `service.state._checked_tail_diagnostics`, run from both bundle
+builders. **Naming it matters**: this paragraph made the same claim in the
+same present tense while nothing outside the test suite called either
+function (OPEN-QUESTIONS A10), so the model read as guarded by an assertion
+that production never reached. A docstring cannot establish that a check
+runs; a named caller can be grepped for, and `TestTheDiagnosticRunsOnTheShippedPath`
+fails if it goes away.
+
 §2.3 also does not say how the copula's degrees of freedom are chosen.
 `fit_copula_df` maximises the copula likelihood on pseudo-observations over
 a grid, holding the correlation matrix fixed at the shrunk estimate -- the
 standard two-stage (IFM) approach. Recorded as OPEN-QUESTIONS A9.
+
+**`fit_copula_df` has no shipped caller either**, and unlike the diagnostic
+that is not yet fixed: both bundles pass a hardcoded `copula_df=4.0`. Wiring
+a check that can only refuse changes no output; replacing 4.0 with a fitted
+value changes every output, which is a distribution change and resets the
+§3.3 shadow counter. Tracked under A9 as a decision to take deliberately.
 """
 
 from __future__ import annotations

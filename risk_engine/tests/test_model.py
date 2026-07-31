@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from itertools import pairwise
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -324,6 +325,83 @@ class TestCopula:
         assert lower_tail_dependence(4.0, 0.999999) == pytest.approx(1.0, abs=0.01)
         # Heavier copula tails mean more joint extremes at the same rho.
         assert lower_tail_dependence(3.0, 0.6) > lower_tail_dependence(20.0, 0.6)
+
+
+class TestTheDiagnosticRunsOnTheShippedPath:
+    """OPEN-QUESTIONS A10 — the check above ran nowhere.
+
+    Every test in `TestCopula` calls `diagnose_tail_asymmetry` directly, so
+    all of them passed while **no shipped code path invoked it**. The model
+    was documented as guarded by an assertion that only tests ever reached,
+    which is the worse failure: an unguarded model that says so is at least
+    honest about it.
+
+    These tests therefore assert the *wiring*, not the statistic. They are
+    deliberately written against the real bundle builder rather than a stub,
+    because a stub is exactly what let the gap exist — the thing being
+    checked is whether production calls this at all.
+    """
+
+    def test_building_the_fixture_bundle_runs_the_diagnostic(self):
+        from risk_engine.observability.metrics import METRICS
+        from risk_engine.service.state import _build_fixture_bundle
+
+        METRICS.reset()
+        bundle, _, _ = _build_fixture_bundle()
+
+        assert METRICS.counters.get("tail_diagnostics_run", 0) >= 1
+        assert METRICS.tail_diagnostics, "the measurement must survive a passing check"
+        # 4 assets -> 6 unordered pairs, every one measured rather than a sample.
+        assert len(bundle.tail_diagnostics) == 6
+        assert not METRICS.counters.get("tail_understated", 0)
+
+    @staticmethod
+    def _crash_together_market(seed: int):
+        """Two assets that fall together harder than they rise together.
+
+        The one market shape a t-copula provably cannot represent, so it is
+        what the §2.3 criterion must refuse. Returned in the shape the bundle
+        builders hand to `_checked_tail_diagnostics`.
+        """
+        rng = np.random.default_rng(seed)
+        n = 40_000
+        corr = np.array([[1.0, 0.6], [0.6, 1.0]])
+        z = rng.standard_normal((n, 2)) @ np.linalg.cholesky(corr).T
+        x = z / np.sqrt(rng.chisquare(6.0, size=(n, 1)) / 6.0)
+        crash = rng.random(n) < 0.05
+        x[crash, :] = -np.abs(x[crash, :]) - 3.0
+        return {"A": x[:, 0], "B": x[:, 1]}, SimpleNamespace(assets=["A", "B"], corr=corr)
+
+    def test_a_crash_together_market_stops_the_bundle_from_building(self):
+        """The behaviour §2.3 and §9 actually require. If this test can be
+        made to pass by any change that lets the service start on a market
+        whose lower tail the copula understates, that change is the defect."""
+        import risk_engine.service.state as state
+
+        returns, matrix = self._crash_together_market(34)
+        with pytest.raises(ValueError, match="understates lower-tail"):
+            state._checked_tail_diagnostics(returns, matrix, 6.0)
+
+    def test_the_measurement_is_recorded_even_when_the_build_is_refused(self):
+        """A refused bundle is the one whose numbers matter most. Recording
+        after the assertion would leave exactly that case unmeasured."""
+        import risk_engine.service.state as state
+        from risk_engine.observability.metrics import METRICS
+
+        returns, matrix = self._crash_together_market(35)
+        METRICS.reset()
+        with pytest.raises(ValueError):
+            state._checked_tail_diagnostics(returns, matrix, 6.0)
+        assert METRICS.counters.get("tail_understated", 0) >= 1
+        assert METRICS.tail_diagnostics[-1]["understates_lower_tail"] is True
+
+    def test_the_gaussian_baseline_is_not_held_to_the_t_copula_criterion(self):
+        """`copula_df=None` is §3.2's deliberately naive baseline. Refusing it
+        for being naive would block the comparator the model is scored against."""
+        import risk_engine.service.state as state
+
+        returns, matrix = self._crash_together_market(36)
+        assert state._checked_tail_diagnostics(returns, matrix, None) == ()
 
 
 class TestShrinkageIntensityMagnitude:
