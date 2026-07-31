@@ -607,6 +607,32 @@ surfaced as a per-row resolver failure classified TRANSIENT, retried forever,
 and shown up only as a repeated traceback in a container log — with the
 21-day gate quietly never advancing.
 
+**Two questions the 2026-07-31 audit raised and deliberately did NOT fix**,
+because both would change money math on a guess — the exact error class this
+module refuses. Each names the record that settles it:
+
+- **F-9: does `withdraw.usdc` include the withdrawal fee?** Hyperliquid
+  charges ~$1 per withdrawal. If the record's `usdc` is the gross amount and
+  the fee rides in a separate field, the correction understates every
+  withdrawal's outflow by the fee — small, but systematically one-signed
+  across a window. If `usdc` is already net, adding a fee would double-count
+  it. **Settled by:** one live `withdraw` record printed in full (any
+  `--report` from `verify --address` on an account that withdrew; the
+  record is in `evidence.examples` only when a type fails, so dump the raw
+  `userNonFundingLedgerUpdates` response and read the fields). Whichever
+  reading is true, the other is the bug.
+- **F-10: what does `subAccountTransfer` look like in a MASTER account's
+  ledger?** The classifier signs it by which side the queried account was on
+  and raises when it is neither. A transfer between two of a master's
+  sub-accounts, if it appears in the master's own ledger naming only the
+  subs, would raise on every resolution of that master — a permanent,
+  per-address resolver failure. The 30-address frame sweep passed, so no
+  sampled account hit it; masters with active sub-accounts remain untested.
+  **Settled by:** the ledger of one master account whose subs transferred
+  between themselves inside the window. If the shape appears, the likely
+  correct reading is "neither side is this account's perp → 0.0 flow", but
+  that is to be confirmed from the record, not assumed.
+
 ### B3 `[BLOCKER]` Baseline A is not a distribution
 
 §3.2 defines Baseline A as "the historical unconditional frequency of
