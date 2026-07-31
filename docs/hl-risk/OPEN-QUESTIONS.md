@@ -266,17 +266,50 @@ how strongly assets go extreme *together*. Implemented as a two-stage (IFM)
 MLE: correlation fixed at the shrunk estimate, copula `df` profiled over a
 grid by the copula likelihood on pseudo-observations.
 
-**`fit_copula_df` is implemented and tested, and no bundle uses it.** Both
-builders in `service/state.py` pass a hardcoded `copula_df=4.0`. Found
-2026-07-31 while wiring A10; deliberately left alone rather than fixed in the
-same change, because the two are not the same kind of edit. Wiring a check
-that can only refuse changes no number the product outputs; switching 4.0 for
-a fitted value changes **every** number, which is a distribution change, and
-§3.3/§10 make that reset the shadow counter. On the fixture the fitted value
-is 6.5 against the hardcoded 4.0 — a materially thinner tail, so this is not
-a rounding difference. It is the right change to make *before* the shadow
-clock starts and an expensive one to make after, which is the decision to
-take deliberately rather than as a side effect. Tracked here; not scheduled.
+**`fit_copula_df` was implemented, tested, and used by no bundle** — both
+builders in `service/state.py` passed a hardcoded `copula_df=4.0` while the
+paragraph above described the IFM estimator in the present tense. Found
+2026-07-31 while wiring A10, and **fixed 2026-07-31** as a separate change,
+because the two are not the same kind of edit: wiring a check that can only
+refuse changes no number the product outputs, whereas switching 4.0 for a
+fitted value changes every number.
+
+That makes it a distribution change, so `MODEL_VERSION` went to **0.3.0**
+(MINOR) and the §3.3 counter resets. **The timing was the whole point.** The
+counter had not started, so the change cost nothing; at any point after it
+would have cost up to twenty-one days, and the alternative was spending the
+window validating a magic constant nobody could source. On the fixture the
+fitted value is **6.5** against the 4.0 it replaces — a materially thinner
+joint tail, not a rounding difference.
+
+Three things this does not change, each worth stating because the obvious
+worry is wrong:
+
+- **Ongoing refits are not version changes.** The fitted df moves as new
+  returns arrive, exactly like the EWMA volatilities and marginal dfs beside
+  it. `DISTRIBUTION_VERSION` keys on the specification, and the specification
+  changed once, here. A parameter that tracked data *and* reset the counter
+  would make a 21-day window unreachable by construction.
+- **The §3.1 gate is unaffected.** `validation/benchmarks.py` builds its own
+  `PathSpec` with explicit inputs — it tests the engine's mathematics against
+  analytic properties, not the fitted model. Re-run under 0.3.0: **6/6**.
+- **The grid bounds it.** The df is profiled over `COPULA_DF_GRID`
+  (2.5–30.0), so it cannot run away. Landing on either end is recorded as a
+  `copula_df_at_grid_edge` counter and a `df_clamps` entry rather than
+  trusted: the floor means joint tails heavier than the grid can express, the
+  ceiling means dependence indistinguishable from Gaussian, and both are the
+  data outrunning the model family — the same reason §2.2's marginal clamps
+  are logged.
+
+**A9 and A10 are coupled, and the direction matters.** A fitted df is thinner-
+tailed than 4.0 wherever the data say so, and a thinner model tail sits
+further below the empirical one — which makes A10's assertion *more* likely
+to fire. On the fixture that moved the worst pair's gap from −0.011 to
+**+0.022** against a 0.05 margin: still passing, and now within 0.028 of
+refusing. If the live build starts refusing to come up, that is the two
+working as specified — a fitted copula that cannot represent real crypto
+crashes is precisely what §2.3 exists to catch — and not a regression to
+route around.
 
 ### A10 `[RESOLVED]` The §2.3 diagnostic must not compare against the asymptotic coefficient
 

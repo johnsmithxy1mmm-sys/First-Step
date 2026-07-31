@@ -31,7 +31,25 @@ Format: MAJOR.MINOR.PATCH-tag
 #: cares about, so the counter is not reset. Old seeds no longer reproduce
 #: old numbers, which is a provenance note rather than a calibration one --
 #: every journal row already stores the model version beside its seed.
-MODEL_VERSION = "0.2.1-phase1"
+#:
+#: 0.3.0 — the copula's degrees of freedom are FITTED rather than hardcoded
+#: (OPEN-QUESTIONS A9). MINOR, and this is the textbook case for it: the
+#: copula df sets how strongly assets go extreme together, so changing it
+#: changes the joint tail and therefore every P(liq) the model reports. On
+#: the fixture the fitted value is 6.5 against the 4.0 it replaces.
+#:
+#: Deliberately timed. This resets the §3.3 counter, and the counter had not
+#: started -- so the change cost nothing here and would have cost up to
+#: twenty-one days at any point after. The alternative was spending the
+#: window validating a constant nobody could source: `fit_copula_df` was
+#: implemented, tested and called from nowhere, while A9 described the
+#: two-stage IFM estimator in the present tense as though it were in use.
+#:
+#: What is NOT a version change: the fitted value moving as new returns
+#: arrive. That is an estimate tracking data, exactly like the EWMA
+#: volatilities and the marginal dfs beside it. The specification is what the
+#: counter keys on, and the specification changed once, here.
+MODEL_VERSION = "0.3.0-phase1"
 
 # Distribution-affecting prefix; the shadow counter keys on this, not on the
 # full string, so that PATCH releases keep accumulating validation days.

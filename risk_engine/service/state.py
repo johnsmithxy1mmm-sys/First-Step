@@ -31,8 +31,10 @@ import numpy as np
 
 from risk_engine.domain.types import AssetSpec
 from risk_engine.model.copula import (
+    COPULA_DF_GRID,
     assert_lower_tail_not_understated,
     diagnose_tail_asymmetry,
+    fit_copula_df,
 )
 from risk_engine.model.correlation import build_global_matrix
 from risk_engine.model.funding import FundingBounds, fit_ar1
@@ -42,6 +44,55 @@ from risk_engine.sim.engine import ModelBundle
 from risk_engine.version import MODEL_VERSION
 
 log = logging.getLogger("risk_engine.service.state")
+
+#: Only reachable with a single-asset universe, where there is no pair and so
+#: nothing to estimate. Named rather than written as a bare 4.0 so it cannot be
+#: mistaken for the pre-A9 hardcoded default it replaces.
+HL_FALLBACK_COPULA_DF = 4.0
+
+
+def _fitted_copula_df(returns: dict, matrix) -> float:
+    """The copula's degrees of freedom, estimated rather than assumed (A9).
+
+    Both bundle builders passed a hardcoded `copula_df=4.0` while
+    `fit_copula_df` sat implemented, tested and uncalled — and A9 described
+    the two-stage IFM estimator in the present tense as though it were in use.
+    On the fixture the fitted value is 6.5 against that 4.0: a materially
+    thinner joint tail, not a rounding difference.
+
+    Wiring it changes every number the model produces, which is why it is a
+    MINOR version bump and resets the §3.3 shadow counter (see version.py).
+    It was done before the clock started, when that costs nothing; afterwards
+    it costs up to 21 days, and the alternative was validating a magic
+    constant nobody could source.
+
+    The df is profiled over `COPULA_DF_GRID`, so it is bounded by
+    construction. Landing on either end is recorded rather than trusted: the
+    grid's floor means "heavier joint tails than this grid can express" and
+    its ceiling means "indistinguishable from Gaussian dependence", and both
+    are statements about the data outrunning the model family — the same
+    reason §2.2's marginal clamps are logged.
+    """
+    if len(matrix.assets) < 2:
+        # No pair, no dependence to estimate. Cannot happen on the live path
+        # (it requires BTC and ETH) but the fixture layout is editable.
+        return HL_FALLBACK_COPULA_DF
+    series = np.column_stack([returns[a] for a in matrix.assets])
+    df = float(fit_copula_df(series, matrix.corr))
+    lo, hi = float(COPULA_DF_GRID[0]), float(COPULA_DF_GRID[-1])
+    if df <= lo or df >= hi:
+        METRICS.incr("copula_df_at_grid_edge")
+        METRICS.df_clamps.append({
+            "which": "copula", "fitted": df, "grid_lo": lo, "grid_hi": hi,
+            "meaning": ("joint tails heavier than the grid can express"
+                        if df <= lo else "dependence indistinguishable from Gaussian"),
+        })
+        log.warning(
+            "copula df fitted to the edge of its grid (%.2f, grid %.2f-%.2f): %s",
+            df, lo, hi,
+            "tails heavier than representable" if df <= lo else "≈ Gaussian dependence",
+        )
+    return df
 
 
 def _checked_tail_diagnostics(returns: dict, matrix, copula_df: float | None) -> tuple:
@@ -256,14 +307,15 @@ def _build_fixture_bundle():
         c: fit_ar1(c, 1e-5 + 2e-5 * rng.standard_normal(30 * 24), bounds)
         for c in returns
     }
-    # The fixture is a symmetric one-factor market by construction, so this
-    # is expected to pass and is run anyway -- a check that only runs on the
-    # path nobody exercises offline is a check that rots. It also means the
-    # fixture asserts the diagnostic's own plumbing on every startup.
+    # The fixture is a symmetric one-factor market by construction, so the
+    # diagnostic is expected to pass and is run anyway -- a check that only
+    # runs on the path nobody exercises offline is a check that rots. It also
+    # means the fixture asserts the diagnostic's own plumbing on every startup.
+    copula_df = _fitted_copula_df(returns, matrix)
     bundle = ModelBundle(
         matrix=matrix, marginals=marginals, funding=funding,
-        funding_bounds=bounds, copula_df=4.0,
-        tail_diagnostics=_checked_tail_diagnostics(returns, matrix, 4.0),
+        funding_bounds=bounds, copula_df=copula_df,
+        tail_diagnostics=_checked_tail_diagnostics(returns, matrix, copula_df),
     )
     return bundle, specs, spot
 
@@ -320,9 +372,19 @@ def _build_live_bundle():
     # the data a symmetric copula is least able to represent, so a failure
     # here is a finding about the market and the model, not a bug -- and
     # finding it at startup is the point. See `_checked_tail_diagnostics`.
+    #
+    # The two are coupled and the direction is worth knowing before it
+    # happens: A9's fitted df is thinner-tailed than the 4.0 it replaced
+    # wherever the data say so, and a thinner model tail sits further below
+    # the empirical one, which makes A10 MORE likely to fire. On the fixture
+    # that moved the worst gap from -0.011 to +0.022 against a 0.05 margin.
+    # If the live build starts refusing, that is the two working as specified
+    # -- a fitted copula that cannot represent real crypto crashes is exactly
+    # what §2.3 exists to catch -- not a regression to route around.
+    copula_df = _fitted_copula_df(returns, matrix)
     bundle = ModelBundle(
         matrix=matrix, marginals=marginals, funding=funding,
-        funding_bounds=bounds, copula_df=4.0,
-        tail_diagnostics=_checked_tail_diagnostics(returns, matrix, 4.0),
+        funding_bounds=bounds, copula_df=copula_df,
+        tail_diagnostics=_checked_tail_diagnostics(returns, matrix, copula_df),
     )
     return bundle, {c: specs[c] for c in universe}, spot

@@ -342,6 +342,53 @@ class TestTheDiagnosticRunsOnTheShippedPath:
     checked is whether production calls this at all.
     """
 
+    def test_the_bundle_fits_its_copula_df_rather_than_hardcoding_it(self):
+        """OPEN-QUESTIONS A9, the sibling defect to A10. `fit_copula_df` was
+        implemented, tested and called from nowhere while both builders passed
+        a literal 4.0 — and A9 described the IFM estimator in the present
+        tense as though it were in use.
+
+        The assertion is against the hardcoded value specifically, not against
+        6.5: pinning the fitted number would make this a change-detector on
+        the fixture's random seed. What must hold is that the number came from
+        the data."""
+        from risk_engine.model.copula import COPULA_DF_GRID
+        from risk_engine.service.state import _build_fixture_bundle
+
+        bundle, _, _ = _build_fixture_bundle()
+        assert bundle.copula_df != 4.0, "still the pre-A9 hardcoded constant"
+        assert COPULA_DF_GRID[0] <= bundle.copula_df <= COPULA_DF_GRID[-1]
+
+    def test_the_diagnostic_judges_the_df_the_bundle_actually_uses(self):
+        """A10 asks whether *this* copula understates the lower tail, so it
+        must be handed the fitted df. Diagnosing 4.0 while simulating 6.5
+        would clear a model that was never checked — and in the reassuring
+        direction, because a fatter assumed tail makes the gap look smaller
+        than it is.
+
+        Checked by recomputing the model-implied tail dependence directly from
+        the pair's rho at both dfs, and asserting the recorded value matches
+        the fitted one."""
+        from risk_engine.model.copula import model_tail_dependence_at_threshold
+        from risk_engine.service.state import _build_fixture_bundle
+
+        bundle, _, _ = _build_fixture_bundle()
+        assets = list(bundle.matrix.assets)
+        diag = bundle.tail_diagnostics[0]
+        i, j = assets.index(diag.pair[0]), assets.index(diag.pair[1])
+        rho = float(bundle.matrix.corr[i, j])
+
+        at_fitted = model_tail_dependence_at_threshold(
+            bundle.copula_df, rho, diag.threshold, n_sim=200_000, seed=i * 1000 + j)
+        at_old = model_tail_dependence_at_threshold(
+            4.0, rho, diag.threshold, n_sim=200_000, seed=i * 1000 + j)
+
+        assert abs(at_fitted - at_old) > 0.01, (
+            "the two dfs give indistinguishable tail dependence here, so this "
+            "test cannot tell which one was diagnosed"
+        )
+        assert diag.model_at_threshold == pytest.approx(at_fitted, abs=1e-9)
+
     def test_building_the_fixture_bundle_runs_the_diagnostic(self):
         from risk_engine.observability.metrics import METRICS
         from risk_engine.service.state import _build_fixture_bundle
