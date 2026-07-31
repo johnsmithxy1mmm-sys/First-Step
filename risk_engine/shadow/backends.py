@@ -40,7 +40,13 @@ _TYPE_MAP = (
 
 
 def canonical_ddl() -> str:
-    return SCHEMA_SQL.read_text()
+    # encoding="utf-8" explicitly: schema.sql carries `§` section references in
+    # its comments, and the platform default is cp1251 on a Russian-locale
+    # Windows box. The DDL would still execute -- the mojibake lands in
+    # comments -- but the schema is the thing a reader consults to understand
+    # the journal, and shipping it garbled on one platform is a defect of the
+    # documentation that matters most.
+    return SCHEMA_SQL.read_text(encoding="utf-8")
 
 
 def sqlite_ddl() -> str:

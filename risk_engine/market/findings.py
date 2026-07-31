@@ -97,7 +97,14 @@ def load_findings(path: Path | str | None = None) -> dict[str, RecordedFinding]:
     if not p.exists():
         return {}
     try:
-        payload = json.loads(p.read_text())
+        # encoding="utf-8" explicitly. Without it `read_text` uses the platform
+        # locale. This file holds literal `§` characters (U+00A7, UTF-8 bytes
+        # C2 A7); under cp1251 those two bytes decode as U+0412 followed by
+        # U+00A7, so every section reference in a recorded finding rendered as
+        # mojibake on an operator's console -- text written to be read. Under a
+        # stricter locale it is worse than ugly: an ASCII default raises
+        # UnicodeDecodeError and the whole command dies.
+        payload = json.loads(p.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise ValueError(f"{p}: not valid JSON ({exc}). ") from exc
     if not isinstance(payload, dict):

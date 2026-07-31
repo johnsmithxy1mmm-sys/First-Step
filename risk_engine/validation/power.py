@@ -309,7 +309,7 @@ def main(argv: list[str] | None = None) -> int:
         last = cell.days
 
     if args.report:
-        with open(args.report, "w") as fh:
+        with open(args.report, "w", encoding="utf-8") as fh:
             json.dump([asdict(c) for c in cells], fh, indent=2)
         print(f"\nwrote {args.report}")
 

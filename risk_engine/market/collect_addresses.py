@@ -1339,7 +1339,7 @@ def write_address_list(
     # indent=2 with a trailing newline, matching `shadow init-addresses`, so a
     # generated list and a hand-filled template diff against each other
     # without a whitespace storm hiding the change that matters.
-    path.write_text(json.dumps(payload, indent=2) + "\n")
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     return payload
 
 
@@ -1366,7 +1366,8 @@ def _write_rescue_copy(result: HarvestResult, path: Path, required: int, refusal
     rescue = path.parent / f"{path.name}.refused-{stamp}"
     try:
         rescue.write_text(
-            json.dumps(build_payload(result, required, refusal=refusal), indent=2) + "\n"
+            json.dumps(build_payload(result, required, refusal=refusal), indent=2) + "\n",
+            encoding="utf-8",
         )
     except OSError as exc:
         return (

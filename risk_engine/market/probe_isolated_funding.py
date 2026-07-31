@@ -356,7 +356,7 @@ def main(argv: list[str] | None = None) -> int:
     print(result.render())
 
     if args.report:
-        with open(args.report, "w") as fh:
+        with open(args.report, "w", encoding="utf-8") as fh:
             json.dump(asdict(result), fh, indent=2, default=str)
         print(f"wrote {args.report}")
 

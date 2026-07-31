@@ -385,7 +385,12 @@ def cmd_frame(args) -> int:
             },
             indent=2,
         )
-        + "\n"
+        + "\n",
+        # This template exists to be hand-edited, and the field an operator
+        # fills in is prose. Writing it in the platform locale means a frame
+        # typed on Windows and read in the Linux container is a different
+        # string, or an outright UnicodeDecodeError at cron startup.
+        encoding="utf-8",
     )
     print(f"wrote {path}; fill in 'frame' and 'addresses'")
     return 0

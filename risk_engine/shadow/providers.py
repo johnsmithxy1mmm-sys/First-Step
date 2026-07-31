@@ -92,7 +92,13 @@ class FileAddressSource:
         return self._frame or self._load()["frame"]
 
     def _load(self) -> dict:
-        payload = json.loads(Path(self.path).read_text())
+        # encoding="utf-8" explicitly. A collector-written file is pure ASCII
+        # today only because `json.dumps` escapes non-ASCII by default -- an
+        # accident, not a guarantee. This file is also meant to be hand-edited
+        # (the whole point of `frame` is that an operator writes it), and the
+        # moment someone types `§3.3` into it, a locale-decoded read turns the
+        # sampling frame into mojibake and journals it that way permanently.
+        payload = json.loads(Path(self.path).read_text(encoding="utf-8"))
         if "addresses" not in payload:
             raise ValueError(f"{self.path}: expected an 'addresses' key")
         frame = payload.get("frame", "").strip()
