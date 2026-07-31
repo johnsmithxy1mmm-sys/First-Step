@@ -112,6 +112,11 @@ def load_findings(path: Path | str | None = None) -> dict[str, RecordedFinding]:
 
     out: dict[str, RecordedFinding] = {}
     required = ("status", "observed_utc", "command", "network", "detail")
+    # Audit F-6: `Check.passed` is a prefix test ("PASS (recorded)" must count),
+    # so an unvalidated status here let "PASSS" — an operator's typo — satisfy
+    # a blocking check. The file is hand-edited by design; hand-edited means
+    # typos are the expected input, not the surprising one.
+    valid_statuses = ("PASS", "FAIL", "INCONCLUSIVE")
     for check_id, raw in payload.items():
         if check_id.startswith("_"):
             continue  # room for a "_comment" key without inventing a schema
@@ -127,6 +132,13 @@ def load_findings(path: Path | str | None = None) -> dict[str, RecordedFinding]:
                 f"without these is a claim rather than evidence: 'command' is how "
                 f"the next person reproduces it, 'observed_utc' is how it expires, "
                 f"and 'network' is what it is a claim about."
+            )
+        if raw["status"] not in valid_statuses:
+            raise ValueError(
+                f"{p}: {check_id} status {raw['status']!r} is not one of "
+                f"{valid_statuses}. The harness matches statuses by prefix so a "
+                f"typo here would silently satisfy (or silently fail) a blocking "
+                f"check rather than being noticed."
             )
         try:
             datetime.fromisoformat(raw["observed_utc"])

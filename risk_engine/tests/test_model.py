@@ -442,6 +442,46 @@ class TestTheDiagnosticRunsOnTheShippedPath:
         assert METRICS.counters.get("tail_understated", 0) >= 1
         assert METRICS.tail_diagnostics[-1]["understates_lower_tail"] is True
 
+    def test_unequal_series_lengths_do_not_kill_the_bundle(self):
+        """Audit F-2 (PoC-7). `build_global_matrix` aligns series on their
+        common tail because live candles differ in length whenever one coin
+        has a gap — E5.2 counts gaps precisely because they happen. The A9/A10
+        wiring stacked the raw dict instead, so ONE missing candle on ONE coin
+        over ninety days killed the live service at startup with a shape
+        ValueError: an availability failure introduced by the code meant to
+        guard the model, on a condition the matrix builder already survives."""
+        import risk_engine.service.state as state
+
+        returns, matrix = self._crash_together_market(37)
+        returns["A"] = returns["A"][1:]  # one gap on one coin
+        df = state._fitted_copula_df(returns, matrix)
+        assert 2.0 <= df <= 31.0
+        with pytest.raises(ValueError, match="understates lower-tail"):
+            state._checked_tail_diagnostics(returns, matrix, 6.0)
+
+    def test_provenance_records_the_copula_df_that_produced_the_number(self):
+        """Audit F-7. Since A9 the df refits on every five-minute bundle
+        rebuild, so `seed + model_version` no longer reproduces a number on
+        their own — the same seed under 6.5 and 4.0 gives different tails.
+        §2.5 calls provenance 'everything needed to reproduce'; the parameter
+        now rides with every result, read off the SPEC so baseline B's
+        Gaussian rows record None rather than the bundle's fitted value."""
+        from risk_engine.sim.engine import MonteCarloEngine
+        from risk_engine.service.state import _build_fixture_bundle
+        from risk_engine.domain.types import Book, MarginMode, Position
+
+        bundle, specs, spot = _build_fixture_bundle()
+        book = Book("0x" + "c" * 40, 50_000.0, (
+            Position("BTC", 0.1, spot["BTC"], MarginMode.CROSS, 20.0),
+        ), datetime.now(timezone.utc))
+        engine = MonteCarloEngine(bundle, specs)
+        result = engine.run(book, spot, 24, n_paths=2_000, seed=7)
+        assert f"copula_df={bundle.copula_df}" in result.provenance.notes
+        # Baseline B simulates independently through the same engine: its rows
+        # must record the Gaussian copula (None), not the bundle's fitted df.
+        indep = engine.run(book, spot, 24, n_paths=2_000, seed=7, independent=True)
+        assert "copula_df=None" in indep.provenance.notes
+
     def test_the_gaussian_baseline_is_not_held_to_the_t_copula_criterion(self):
         """`copula_df=None` is §3.2's deliberately naive baseline. Refusing it
         for being naive would block the comparator the model is scored against."""

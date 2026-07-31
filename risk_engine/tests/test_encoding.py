@@ -44,7 +44,10 @@ import pytest
 #: Only shipped code. Tests read and write their own tmp files and never
 #: exchange them with another machine, so the property does not apply and
 #: enforcing it there would be noise that gets the sweep switched off.
-ROOTS = ("risk_engine", "qa")
+#: `scripts/` is here because its files are operator tools run on exactly the
+#: machines where the locale differs from the container's — the audit found
+#: it excluded (F-13), which is the one directory the sweep exists for.
+ROOTS = ("risk_engine", "qa", "scripts")
 
 TEXT_IO = ("read_text", "write_text", "open")
 

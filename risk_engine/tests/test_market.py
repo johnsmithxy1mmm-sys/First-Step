@@ -574,6 +574,110 @@ class TestTheFrameSweepFindings:
         assert got != pytest.approx(+310.0)
 
 
+class TestAuditFindings:
+    """Regressions for the 2026-07-31 adversarial audit (F-1, F-4, F-5, F-8).
+
+    Every test here reproduces a PoC that succeeded against the shipped code:
+    these are not hypothetical inputs, they are inputs that silently produced
+    a wrong number (or a wrong silence) before the fix.
+    """
+
+    ME = "0x" + "a" * 40
+    OTHER = "0x" + "b" * 40
+    SINCE = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    UNTIL = datetime(2027, 1, 1, tzinfo=timezone.utc)
+
+    def _flow(self, delta, me=None, t=1779457645318):
+        return net_external_flow([{"time": t, "hash": "0x0", "delta": delta}],
+                                 self.SINCE, self.UNTIL,
+                                 self.ME if me is None else me)
+
+    # -- F-1: toPerp must be a bool, not merely truthy
+
+    def test_a_stringified_false_does_not_flip_the_sign(self):
+        """PoC-1: toPerp='false' is truthy, so a perp->spot transfer of $1000
+        scored +1000 — a 2x-the-amount error per record, with no exception
+        anywhere. The frame sweep cannot catch this class: it proves records
+        read without raising, and a sign flip does not raise."""
+        with pytest.raises(ValueError, match="not a boolean"):
+            self._flow({"type": "accountClassTransfer", "usdc": "1000.0",
+                        "toPerp": "false"})
+
+    def test_a_stringified_true_is_refused_the_same_way(self):
+        """The value that happens to give the right answer is refused too:
+        accepting 'true' while refusing 'false' would mean the check only
+        fires on half the schema drift, the half that was already wrong."""
+        with pytest.raises(ValueError, match="not a boolean"):
+            self._flow({"type": "accountClassTransfer", "usdc": "1000.0",
+                        "toPerp": "true"})
+
+    def test_real_booleans_still_work_both_ways(self):
+        assert self._flow({"type": "accountClassTransfer", "usdc": "1000.0",
+                           "toPerp": True}) == pytest.approx(+1000.0)
+        assert self._flow({"type": "accountClassTransfer", "usdc": "1000.0",
+                           "toPerp": False}) == pytest.approx(-1000.0)
+
+    # -- F-4: the fee's denomination comes from feeToken
+
+    def test_a_token_denominated_fee_is_not_read_as_dollars(self):
+        """PoC-2: fee='5.0', feeToken='HYPE' was subtracted as $5 — mistaking
+        ~$200 of HYPE for five dollars, the same category error as reading a
+        token amount as USD, one field over. A token fee is paid from a token
+        balance, which is not in Book.equity: its perp contribution is zero,
+        exactly like nativeTokenFee."""
+        got = self._flow({"type": "send", "user": self.ME, "destination": self.OTHER,
+                          "sourceDex": "", "destinationDex": "spot", "token": "USDC",
+                          "amount": "100.0", "usdcValue": "100.0",
+                          "fee": "5.0", "feeToken": "HYPE"})
+        assert got == pytest.approx(-100.0)
+
+    def test_a_usdc_fee_still_debits_the_sender(self):
+        for fee_token in ("", "USDC", "usdc"):
+            got = self._flow({"type": "send", "user": self.ME,
+                              "destination": self.OTHER, "sourceDex": "",
+                              "destinationDex": "spot", "token": "USDC",
+                              "amount": "100.0", "usdcValue": "100.0",
+                              "fee": "5.0", "feeToken": fee_token})
+            assert got == pytest.approx(-105.0), fee_token
+
+    # -- F-5: a record without `time` cannot bypass classification
+
+    def test_a_timeless_record_is_refused_not_skipped(self):
+        """PoC-3: the window filter sat before classification, so an
+        unclassifiable $9,999 delta with no `time` scored a silent zero and
+        the frame sweep marked its type 'readable' without ever parsing it."""
+        with pytest.raises(ValueError, match="no 'time'"):
+            net_external_flow(
+                [{"hash": "0x0", "delta": {"type": "absolutelyUnknownKind",
+                                           "usdc": "9999"}}],
+                self.SINCE, self.UNTIL, self.ME,
+            )
+
+    def test_an_out_of_window_record_is_still_skipped(self):
+        """The refusal is for missing time, not for out-of-range time — a
+        record from before the window genuinely does not belong to it."""
+        assert net_external_flow(
+            [{"time": 1, "delta": {"type": "absolutelyUnknownKind"}}],
+            self.SINCE, self.UNTIL, self.ME,
+        ) == pytest.approx(0.0)
+
+    # -- F-8: rewardsClaim is now falsifiable
+
+    def test_a_rewards_claim_carrying_perp_collateral_is_refused(self):
+        """PoC-4: rewardsClaim sat outside the guarded set with zero live
+        records behind it, so a rewards programme paying into perp USDC would
+        have been a hidden inflow scored as model error. The model does not
+        predict rewards, so liquidation's exemption does not apply; the only
+        honest basis for non-flow is spot denomination, which the guard now
+        checks per record."""
+        with pytest.raises(ValueError, match="contradicts that"):
+            self._flow({"type": "rewardsClaim", "usdc": "500.0"})
+
+    def test_a_spot_denominated_rewards_claim_is_still_a_non_flow(self):
+        assert self._flow({"type": "rewardsClaim", "token": "PURR",
+                           "amount": "12.5"}) == pytest.approx(0.0)
+
+
 class TestSpotOnlyTransfers:
     """`spotTransfer`, and why a spot balance is not the predicted quantity.
 

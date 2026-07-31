@@ -284,6 +284,16 @@ SPOT_ONLY_NON_FLOW_TYPES = frozenset({
     # because it is denominated in a spot asset, and the guard refuses any of
     # them that turns up carrying perp collateral instead.
     "gossipPriorityGasAuction", "cStakingTransfer", "borrowLend",
+    # Audit F-8. `rewardsClaim` sat in NON_FLOW_DELTA_TYPES from the start,
+    # OUTSIDE this guarded subset, with not one live record behind it — so
+    # its classification was unfalsifiable: a rewards programme paying into
+    # perp USDC would have been skipped silently, a hidden inflow scored as
+    # model error. The model does not predict rewards, so "the model
+    # predicts it" (liquidation's exemption) does not apply; the only honest
+    # basis for non-flow is spot denomination, and that basis is exactly
+    # what this guard checks per record. In here, a perp-denominated
+    # rewardsClaim refuses loudly instead.
+    "rewardsClaim",
 })
 
 #: Fields whose presence on a supposedly spot-only record would mean this
@@ -462,10 +472,17 @@ def _transfer_fee_usd(delta: dict) -> float:
     window — small per record, and systematically one-signed, which is the
     kind of bias a calibration score is least able to absorb.
 
-    Only USD-denominated fees are counted. `nativeTokenFee` is paid in HYPE
-    from a spot balance and does not touch `Book.equity`, so counting it would
-    be the same category error as reading a token `amount` as dollars.
+    Only USD-denominated fees are counted, and `feeToken` is what decides
+    (audit F-4): `send` names the fee's denomination explicitly, and reading
+    `fee: "5.0", feeToken: "HYPE"` as five dollars mistakes ~$200 of HYPE for
+    $5 — the same category error as reading a token `amount` as dollars, one
+    field over. A token-denominated fee is paid from a token balance, which
+    is not in `Book.equity`, so its correct contribution to the perp flow is
+    zero — the same treatment `nativeTokenFee` has always had.
     """
+    fee_token = str(delta.get("feeToken") or "").strip().upper()
+    if fee_token not in ("", "USDC"):
+        return 0.0
     try:
         return abs(float(delta.get("fee") or 0.0))
     except (TypeError, ValueError):
@@ -510,7 +527,18 @@ def net_external_flow(
     total = 0.0
     for row in updates or []:
         when = row.get("time")
-        if when is None or not (start_ms <= int(when) <= end_ms):
+        if when is None:
+            # Audit F-5: this used to `continue`, and the window filter sits
+            # BEFORE classification — so a timeless record bypassed the
+            # unknown-type refusal entirely. An unclassifiable $9,999 delta
+            # with no `time` scored a silent zero, and the frame sweep marked
+            # its type "readable" without ever parsing it. A record that
+            # cannot be placed in any window cannot be excluded from this one.
+            raise ValueError(
+                f"ledger update carries no 'time', so it cannot be placed inside "
+                f"or outside the window and cannot be skipped as out-of-range: {row!r}"
+            )
+        if not (start_ms <= int(when) <= end_ms):
             continue
         delta = row.get("delta") or {}
         kind = delta.get("type")
@@ -598,6 +626,22 @@ def net_external_flow(
                 raise ValueError(
                     f"{kind} is directional but carries no 'toPerp' flag, so which way "
                     f"the money went cannot be read: {row!r}"
+                )
+            # Audit F-1: a strict bool, not truthiness. The direction is the
+            # only thing computed here, and truthiness gets it silently wrong
+            # on exactly the inputs a schema drift would produce: the STRING
+            # "false" is truthy, so a venue that started emitting stringified
+            # booleans would flip every perp->spot transfer into an inflow —
+            # a 2x-the-amount error per record, with no exception anywhere.
+            # The frame sweep cannot catch that class: it proves records read
+            # without raising, and a sign flip does not raise.
+            if not isinstance(to_perp, bool):
+                raise ValueError(
+                    f"{kind} carries toPerp={to_perp!r} ({type(to_perp).__name__}), "
+                    f"not a boolean. Guessing direction from truthiness flips the "
+                    f"sign on stringified booleans ('false' is truthy). If the venue "
+                    f"changed its schema, confirm the new encoding before mapping "
+                    f"it (OPEN-QUESTIONS B2). Record: {row!r}"
                 )
             sign = +1.0 if to_perp else -1.0
         total += sign * amount

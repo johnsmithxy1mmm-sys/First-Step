@@ -86,6 +86,31 @@ def _is_self_inflicted(exc: BaseException) -> bool:
     return isinstance(exc, RateLimitExceeded)
 
 
+def _self_limited(check_id: str, question: str, exc: BaseException) -> "Check | None":
+    """The UNCHECKABLE result for a self-inflicted failure, or None.
+
+    Audit F-3: only C2 and the frame sweep had this guard; `check_meta`,
+    `check_candles`, `check_clearinghouse`, `check_funding_clamp` and
+    `check_external_flow` all reported a self-imposed rate limit through
+    their generic `except → FAIL` — exit 2, "the model is wrong today",
+    about a request that never left the process. C1 escaped that fate in
+    the live run that exposed this only because the sweep's budget had
+    partially refilled by the time it ran: luck, not code. One helper,
+    called first from every venue-touching except site, so the next check
+    added cannot quietly reintroduce the hole.
+    """
+    if not _is_self_inflicted(exc):
+        return None
+    return Check(
+        check_id, question, UNCHECKABLE,
+        f"this run spent its own §5.3 weight budget before the request could "
+        f"be made ({exc}). That is this harness rate-limiting itself, not the "
+        f"venue answering — re-run this check alone, or lower --frame-sample. "
+        f"FAIL here would claim live data contradicted the model on the "
+        f"strength of a self-imposed limit.",
+    )
+
+
 @dataclass
 class Check:
     id: str
@@ -123,7 +148,11 @@ class Check:
         return self.passed or not self.blocking
 
     def render(self) -> str:
-        return f"[{self.status:15}] {self.id:6} {self.question}\n                  {self.detail}"
+        # 23 = len("INCONCLUSIVE (recorded)"), the widest constructible status
+        # (F-6 pins the recordable set to PASS/FAIL/INCONCLUSIVE). Sized to
+        # the widest rather than the common case so the columns hold whatever
+        # combination a run produces.
+        return f"[{self.status:23}] {self.id:6} {self.question}\n" + " " * 26 + self.detail
 
 
 # -- E5: the parsers have never seen a live response ---------------------
@@ -134,6 +163,8 @@ def check_meta(client: InfoClient) -> tuple[Check, dict | None]:
         raw = client.meta()
         specs = parse_meta(raw)
     except Exception as exc:
+        if (c := _self_limited("E5.1", "does `meta` parse into margin tiers?", exc)):
+            return c, None
         return Check(
             "E5.1", "does `meta` parse into margin tiers?", FAIL,
             f"{type(exc).__name__}: {exc}",
@@ -156,6 +187,8 @@ def check_candles(client: InfoClient, coin: str) -> tuple[Check, np.ndarray | No
         candles = client.candle_snapshot(coin, "1h", now_ms - 30 * 24 * HOUR_MS, now_ms)
         times, returns = parse_candles_to_log_returns(candles)
     except Exception as exc:
+        if (c := _self_limited("E5.2", f"does `candleSnapshot` parse for {coin}?", exc)):
+            return c, None
         return Check("E5.2", f"does `candleSnapshot` parse for {coin}?", FAIL,
                      f"{type(exc).__name__}: {exc}"), None
     if not np.isfinite(returns).all():
@@ -208,6 +241,8 @@ def check_clearinghouse(client: InfoClient, address: str | None) -> Check:
         raw = client.clearinghouse_state(address)
         book = parse_clearinghouse_state(raw, address)
     except Exception as exc:
+        if (c := _self_limited("E5.3", "does `clearinghouseState` parse into a Book?", exc)):
+            return c
         return Check("E5.3", "does `clearinghouseState` parse into a Book?", FAIL,
                      f"{type(exc).__name__}: {exc}")
     return Check(
@@ -235,6 +270,8 @@ def check_funding_clamp(client: InfoClient, coins: list[str], days: int) -> Chec
             history = client.funding_history(coin, now_ms - days * 24 * HOUR_MS, now_ms)
             _, rates = parse_funding_history(history)
         except Exception as exc:
+            if (c := _self_limited("C1", "is the documented funding clamp real?", exc)):
+                return c
             return Check("C1", "is the documented funding clamp real?", FAIL,
                          f"could not read funding history for {coin}: "
                          f"{type(exc).__name__}: {exc}")
@@ -602,6 +639,8 @@ def check_external_flow(client: InfoClient, address: str | None) -> Check:
             address, now_ms - window_days * 24 * HOUR_MS, now_ms
         )
     except Exception as exc:
+        if (c := _self_limited("B2", "can external flows be read and classified?", exc)):
+            return c
         return Check(
             "B2", "can external flows be read and classified?", FAIL,
             f"userNonFundingLedgerUpdates failed: {type(exc).__name__}: {exc}. The "

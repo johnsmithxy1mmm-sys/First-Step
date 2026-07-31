@@ -492,6 +492,15 @@ class MonteCarloEngine:
                     )
 
         notes: list[str] = []
+        # Audit F-7: the copula df is FITTED since A9 and refits on every
+        # five-minute bundle rebuild, so `seed + model_version` no longer
+        # reproduces a number on their own — the same seed under a df of 6.5
+        # and 4.0 gives different tails. §2.5 says provenance is "everything
+        # needed to reproduce", so the parameter rides with every result.
+        # Read off the SPEC, not the bundle: baseline B simulates with
+        # copula_df=None through this same engine, and recording the bundle's
+        # value against the baseline's rows would attribute the wrong model.
+        notes.append(f"copula_df={spec.copula_df}")
         target = n_paths
         raws: dict[int, _RawOutcome] = {}
         converged = False

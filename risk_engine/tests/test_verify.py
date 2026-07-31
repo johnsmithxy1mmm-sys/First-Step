@@ -613,6 +613,53 @@ class TestFrameLedgerSweep:
         assert not check.passed
 
 
+class TestSelfInflictedLimitsNeverReadAsFail:
+    """Audit F-3. `RateLimitExceeded` comes from our OWN WeightBudget before a
+    byte leaves the process; only C2 and the frame sweep knew that. The other
+    five venue-touching checks reported it through their generic `except → FAIL`
+    — exit 2, "the model is wrong today", about a request that was never made.
+    C1 escaped in the live run that exposed this only because the sweep's
+    budget had partially refilled by the time it ran: luck, not code."""
+
+    @staticmethod
+    def _limited_client():
+        from risk_engine.market.info import RateLimitExceeded
+
+        class Limited(StubClient):
+            def _boom(self, *a, **k):
+                raise RateLimitExceeded("weight 20 exceeds remaining 0")
+            meta = _boom
+            candle_snapshot = _boom
+            clearinghouse_state = _boom
+            funding_history = _boom
+            non_funding_ledger_updates = _boom
+            post = _boom
+        return Limited()
+
+    def test_no_check_converts_a_self_limit_into_a_venue_verdict(self):
+        client = self._limited_client()
+        results = [
+            verify.check_meta(client)[0],
+            verify.check_candles(client, "BTC")[0],
+            verify.check_clearinghouse(client, ADDRESS),
+            verify.check_funding_clamp(client, ["BTC"], 30),
+            verify.check_external_flow(client, ADDRESS),
+            verify.check_basis(client, ["BTC"], 2, 0.0, 0.004),
+        ]
+        for check in results:
+            assert check.status == UNCHECKABLE, f"{check.id}: {check.status}"
+            assert not check.failed, check.id
+            # The remedy is named, because "uncheckable" without a next move
+            # is a dead end for the operator reading it.
+            assert "budget" in check.detail, check.id
+
+    def test_a_real_venue_error_still_fails(self):
+        """The guard must not soften genuine failures: a 500 from the venue is
+        exactly what FAIL exists for."""
+        client = StubClient(ledger_error=RuntimeError("500 Internal Server Error"))
+        assert verify.check_external_flow(client, ADDRESS).status == FAIL
+
+
 class TestFundingClampCanActuallyClose:
     """C1 had two outcomes: FAIL and INCONCLUSIVE. There was no PASS.
 
@@ -791,6 +838,23 @@ class TestRecordedFindings:
         }}))
         with pytest.raises(ValueError, match="command"):
             load_findings(p)
+
+    def test_a_typo_status_is_refused_not_silently_passed(self, tmp_path):
+        """Audit F-6 (PoC-6): `Check.passed` matches by prefix so that
+        'PASS (recorded)' counts — which meant 'PASSS', an operator's typo in
+        a hand-edited file, satisfied a blocking check. Hand-edited means
+        typos are the expected input, not the surprising one."""
+        import json as _json
+        from risk_engine.market.findings import load_findings
+
+        for bad in ("PASSS", "pass", "ok", "PASSED"):
+            p = tmp_path / f"v-{bad}.json"
+            p.write_text(_json.dumps({"C5": {
+                "status": bad, "observed_utc": "2026-07-31T00:00:00+00:00",
+                "command": "x 1", "network": "testnet", "detail": "d",
+            }}), encoding="utf-8")
+            with pytest.raises(ValueError, match="not one of"):
+                load_findings(p)
 
     def test_an_unparseable_date_is_refused(self, tmp_path):
         import json as _json

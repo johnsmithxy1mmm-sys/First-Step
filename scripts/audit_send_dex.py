@@ -63,8 +63,17 @@ def main(argv: list[str] | None = None) -> int:
         d = row.get("delta") or {}
         if d.get("type") != "send":
             continue
-        src = str(d.get("sourceDex", "")).strip().lower()
-        dst = str(d.get("destinationDex", "")).strip().lower()
+        # Audit F-11: `.get(..., "")` conflated a MISSING field with the
+        # explicit empty string — but the empty string is exactly the value
+        # under audit ("" = primary perp). The classifier in parse.py raises
+        # on a missing dex; this tool, which exists to audit that classifier,
+        # was silently bucketing the missing case into the primary-perp bin,
+        # i.e. it was looser than the code it judges. A missing field is its
+        # own bucket, and the decisive test skips it rather than counting it
+        # for either side.
+        raw_src, raw_dst = d.get("sourceDex"), d.get("destinationDex")
+        src = "<missing>" if raw_src is None else str(raw_src).strip().lower()
+        dst = "<missing>" if raw_dst is None else str(raw_dst).strip().lower()
         token = str(d.get("token") or "?")
         try:
             usd = abs(float(d.get("usdcValue") or 0.0))
@@ -72,7 +81,7 @@ def main(argv: list[str] | None = None) -> int:
             usd = 0.0
         side = "sent" if str(d.get("user", "")).lower() == address.lower() else "received"
 
-        key = (src or "<empty>", dst or "<empty>", side)
+        key = (src if src else "<empty>", dst if dst else "<empty>", side)
         pairs[key]["n"] += 1
         pairs[key]["usd"] += usd
         pairs[key]["tokens"].add(token)

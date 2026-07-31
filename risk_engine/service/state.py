@@ -51,6 +51,24 @@ log = logging.getLogger("risk_engine.service.state")
 HL_FALLBACK_COPULA_DF = 4.0
 
 
+def _aligned_series(returns: dict, assets) -> np.ndarray:
+    """The return series stacked on their common tail (audit F-2).
+
+    `build_global_matrix` aligns on the common tail deliberately
+    (`window = min(...)` in correlation.py) — live candle series differ in
+    length whenever one coin has a gap, and E5.2 counts gaps precisely
+    because they happen. The A9/A10 wiring stacked the RAW dict instead, so
+    a single missing candle on a single coin over ninety days would have
+    killed the live service at startup with a shape ValueError — an
+    availability failure introduced by the very code meant to guard the
+    model, on a data condition the matrix builder already survives.
+    """
+    window = min(np.asarray(returns[a]).size for a in assets)
+    return np.column_stack(
+        [np.asarray(returns[a], dtype=np.float64)[-window:] for a in assets]
+    )
+
+
 def _fitted_copula_df(returns: dict, matrix) -> float:
     """The copula's degrees of freedom, estimated rather than assumed (A9).
 
@@ -77,7 +95,7 @@ def _fitted_copula_df(returns: dict, matrix) -> float:
         # No pair, no dependence to estimate. Cannot happen on the live path
         # (it requires BTC and ETH) but the fixture layout is editable.
         return HL_FALLBACK_COPULA_DF
-    series = np.column_stack([returns[a] for a in matrix.assets])
+    series = _aligned_series(returns, matrix.assets)
     df = float(fit_copula_df(series, matrix.corr))
     lo, hi = float(COPULA_DF_GRID[0]), float(COPULA_DF_GRID[-1])
     if df <= lo or df >= hi:
@@ -127,7 +145,7 @@ def _checked_tail_diagnostics(returns: dict, matrix, copula_df: float | None) ->
     """
     if copula_df is None or len(matrix.assets) < 2:
         return ()
-    series = np.column_stack([returns[a] for a in matrix.assets])
+    series = _aligned_series(returns, matrix.assets)
     diagnostics = diagnose_tail_asymmetry(
         series, tuple(matrix.assets), matrix.corr, copula_df
     )
