@@ -173,3 +173,97 @@ def parse_funding_history(history: list) -> tuple[np.ndarray, np.ndarray]:
         np.array([int(h["time"]) for h in rows], dtype=np.int64),
         np.array([float(h["fundingRate"]) for h in rows], dtype=np.float64),
     )
+
+
+#: `userNonFundingLedgerUpdates` delta types that move USDC in or out of the
+#: perp account, with the sign the account experiences: +1 means equity
+#: arrived, -1 means it left. Anything not listed here is not a flow and is
+#: ignored -- but `net_external_flow` refuses an UNKNOWN type rather than
+#: ignoring it, because a type this table has never seen is exactly how a new
+#: kind of transfer becomes a silent scoring error (OPEN-QUESTIONS B2).
+EXTERNAL_FLOW_SIGNS: dict[str, float] = {
+    "deposit": +1.0,
+    "withdraw": -1.0,
+    # Spot<->perp movements are external to the perp book the model predicts,
+    # even though they never leave the venue. `usdClassTransfer` carries a
+    # `toPerp` flag that decides the direction.
+    "accountClassTransfer": 0.0,
+    "internalTransfer": 0.0,
+    "subAccountTransfer": 0.0,
+    "vaultDeposit": -1.0,
+    "vaultWithdraw": +1.0,
+    "spotTransfer": 0.0,
+}
+
+#: Types that are NOT external flow: the model either predicts them or they do
+#: not touch perp equity. Listed explicitly so an unknown type is genuinely
+#: unknown rather than silently falling through this set.
+NON_FLOW_DELTA_TYPES = frozenset({
+    "liquidation",
+    "rewardsClaim",
+    "spotGenesis",
+})
+
+
+def net_external_flow(updates: list, since: datetime, until: datetime) -> float:
+    """`userNonFundingLedgerUpdates` -> net USD into the perp account.
+
+    Positive means equity arrived from outside; negative means it left. This
+    is the quantity B2 needs subtracted before an equity change can be scored
+    as model error, and getting it wrong in the quiet direction -- returning
+    0.0 for something unrecognised -- turns a deposit into a spectacular
+    apparent miss in the calibration record.
+
+    So an unrecognised `type` RAISES. That is deliberate and it is the whole
+    design: the venue can add a transfer type at any time, and the failure
+    mode of ignoring one is invisible, permanent (journal rows are written
+    once) and lands in the direction that makes the model look wrong. A
+    resolver failure naming the record is recoverable; a silently dropped
+    $50k is not.
+
+    Signed from the ACCOUNT's perspective, and the sign convention is read
+    from the record rather than assumed: a directional transfer carries a
+    flag saying which way it went, and guessing it from the type name alone
+    would be a coin flip on half the cases.
+    """
+    start_ms = int(since.timestamp() * 1000)
+    end_ms = int(until.timestamp() * 1000)
+    total = 0.0
+    for row in updates or []:
+        when = row.get("time")
+        if when is None or not (start_ms <= int(when) <= end_ms):
+            continue
+        delta = row.get("delta") or {}
+        kind = delta.get("type")
+        if kind is None:
+            raise ValueError(
+                f"ledger update carries no delta.type, so it cannot be classified as "
+                f"flow or non-flow: {row!r}"
+            )
+        if kind in NON_FLOW_DELTA_TYPES:
+            continue
+        if kind not in EXTERNAL_FLOW_SIGNS:
+            raise ValueError(
+                f"unknown ledger delta type {kind!r}. It is neither a known external "
+                f"flow nor a known non-flow, and guessing would either score a real "
+                f"transfer as model error or hide one. Add it to EXTERNAL_FLOW_SIGNS "
+                f"or NON_FLOW_DELTA_TYPES in market/parse.py once its meaning is "
+                f"confirmed (OPEN-QUESTIONS B2). Record: {row!r}"
+            )
+        amount = delta.get("usdc")
+        if amount is None:
+            raise ValueError(f"{kind} record carries no usdc amount: {row!r}")
+        sign = EXTERNAL_FLOW_SIGNS[kind]
+        if sign == 0.0:
+            # A directional transfer. The venue states the direction; inferring
+            # it from the type name would be a guess on exactly the records
+            # where being wrong flips the sign of the correction.
+            to_perp = delta.get("toPerp")
+            if to_perp is None:
+                raise ValueError(
+                    f"{kind} is directional but carries no 'toPerp' flag, so which way "
+                    f"the money went cannot be read: {row!r}"
+                )
+            sign = +1.0 if to_perp else -1.0
+        total += sign * abs(float(amount))
+    return total

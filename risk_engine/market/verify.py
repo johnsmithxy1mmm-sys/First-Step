@@ -329,6 +329,95 @@ def check_basis(client: InfoClient, coins: list[str], samples: int,
 # -- C4, C5: not decidable from the Info API -----------------------------
 
 
+def check_external_flow(client: InfoClient, address: str | None) -> Check:
+    """B2's correction: can deposits and withdrawals actually be read?
+
+    The shadow harness cannot resolve a single observation without this. An
+    equity change is only model error once the flows the model does not
+    predict have been subtracted, so `resolve_due` calls `external_flow` on
+    every row — and a provider that cannot answer fails every row, is
+    classified transient, and retries forever. That is fourteen days of
+    snapshots against a gate that never advances, which is why this is
+    checked before the clock starts rather than discovered during it.
+    """
+    from risk_engine.market.parse import (
+        EXTERNAL_FLOW_SIGNS,
+        NON_FLOW_DELTA_TYPES,
+        net_external_flow,
+    )
+
+    if not address:
+        return Check(
+            "B2", "can external flows be read and classified?", UNCHECKABLE,
+            "no --address given. Without this the shadow harness resolves nothing, "
+            "so it is worth passing an address that has deposited or withdrawn.",
+        )
+    now_ms = int(time.time() * 1000)
+    window_days = 90
+    try:
+        raw = client.non_funding_ledger_updates(
+            address, now_ms - window_days * 24 * HOUR_MS, now_ms
+        )
+    except Exception as exc:
+        return Check(
+            "B2", "can external flows be read and classified?", FAIL,
+            f"userNonFundingLedgerUpdates failed: {type(exc).__name__}: {exc}. The "
+            "shadow harness cannot resolve any observation without it.",
+        )
+
+    rows = list(raw or [])
+    kinds: dict[str, int] = {}
+    for row in rows:
+        kind = ((row.get("delta") or {}).get("type")) or "<no delta.type>"
+        kinds[kind] = kinds.get(kind, 0) + 1
+    known = set(EXTERNAL_FLOW_SIGNS) | set(NON_FLOW_DELTA_TYPES)
+    unknown = sorted(k for k in kinds if k not in known)
+    evidence = {"n_records": len(rows), "window_days": window_days,
+                "types_seen": kinds, "unknown_types": unknown}
+
+    if unknown:
+        return Check(
+            "B2", "can external flows be read and classified?", FAIL,
+            f"the venue returned delta types this build cannot classify: {unknown}. "
+            "Each one is either an external flow or it is not, and guessing either "
+            "way corrupts the calibration record — an unclassified transfer scored "
+            "as model error, or a real deposit hidden. Add each to "
+            "EXTERNAL_FLOW_SIGNS or NON_FLOW_DELTA_TYPES in market/parse.py once "
+            "its meaning is confirmed (OPEN-QUESTIONS B2).",
+            evidence=evidence,
+        )
+    try:
+        from datetime import datetime as _dt
+        from datetime import timezone as _tz
+
+        total = net_external_flow(
+            rows,
+            _dt.fromtimestamp((now_ms - window_days * 24 * HOUR_MS) / 1000, tz=_tz.utc),
+            _dt.fromtimestamp(now_ms / 1000, tz=_tz.utc),
+        )
+    except ValueError as exc:
+        return Check(
+            "B2", "can external flows be read and classified?", FAIL,
+            f"a ledger record could not be read: {exc}", evidence=evidence,
+        )
+
+    if not rows:
+        return Check(
+            "B2", "can external flows be read and classified?", INCONCLUSIVE,
+            f"the endpoint answered and this account has no ledger activity in "
+            f"{window_days}d, so the response shape was never exercised. An empty "
+            "list is what a quiet account and a wrong request type look like alike. "
+            "Re-run against an address that has deposited or withdrawn.",
+            evidence=evidence,
+        )
+    return Check(
+        "B2", "can external flows be read and classified?", PASS,
+        f"{len(rows)} ledger records over {window_days}d, every delta type "
+        f"recognised ({', '.join(sorted(kinds))}); net flow {total:+,.2f} USD.",
+        evidence=evidence | {"net_flow_usd": total},
+    )
+
+
 def check_webdata3() -> Check:
     return Check(
         "C4", "does the `webData3` subscription exist?", UNCHECKABLE,
@@ -379,6 +468,7 @@ def run_all(address: str | None, coins: list[str], days: int, samples: int,
     hourly_vol = float(np.std(returns)) if returns is not None else None
 
     checks.append(check_clearinghouse(client, address))
+    checks.append(check_external_flow(client, address))
     checks.append(check_funding_clamp(client, coins, days))
     checks.append(check_basis(client, coins, samples, interval_s, hourly_vol))
     checks.append(check_webdata3())

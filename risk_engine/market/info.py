@@ -195,6 +195,32 @@ class InfoClient:
             req["endTime"] = end_ms
         return self.post(req)  # type: ignore[return-value]
 
+    def non_funding_ledger_updates(
+        self, address: str, start_ms: int, end_ms: int | None = None
+    ) -> list:
+        """Deposits, withdrawals and transfers — everything that moves equity
+        for a reason the model does not predict (OPEN-QUESTIONS B2).
+
+        Named `userNonFundingLedgerUpdates` by the venue, and the "non
+        funding" is the point: `user_funding` above covers the payments the
+        model DOES predict, and this covers the ones it must not be scored
+        on. A $50k deposit landing inside a 24-hour observation window is a
+        spectacular apparent model failure if it is scored as an equity move.
+
+        Shape is written from documentation and asserted by the caller rather
+        than trusted here — see `LiveSnapshotProvider.external_flow`, which
+        refuses a record it cannot read instead of treating it as zero.
+        """
+        address = normalise_address(address)
+        req: dict = {
+            "type": "userNonFundingLedgerUpdates",
+            "user": address,
+            "startTime": start_ms,
+        }
+        if end_ms is not None:
+            req["endTime"] = end_ms
+        return self.post(req)  # type: ignore[return-value]
+
     def funding_history(self, coin: str, start_ms: int, end_ms: int | None = None) -> list:
         req = {"type": "fundingHistory", "coin": coin, "startTime": start_ms}
         if end_ms is not None:

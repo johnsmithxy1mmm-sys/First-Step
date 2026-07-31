@@ -18,6 +18,7 @@ import pytest
 from risk_engine.domain.types import MarginMode
 from risk_engine.market.info import InfoClient
 from risk_engine.market.parse import (
+    net_external_flow,
     parse_candles_to_log_returns,
     parse_clearinghouse_state,
     parse_funding_history,
@@ -229,3 +230,87 @@ class TestParserStrictness:
         }
         with pytest.raises(ValueError, match="not finite"):
             parse_meta(meta)
+
+
+class TestExternalFlow:
+    """B2's correction: equity moves the model does not predict.
+
+    The dangerous direction here is silence. A deposit scored as an equity
+    change is a spectacular apparent model failure, and journal rows are
+    written once -- so a flow missed at resolution time is missed forever.
+    Every test below is about refusing rather than guessing.
+    """
+
+    SINCE = datetime(2026, 7, 30, 0, 0, tzinfo=timezone.utc)
+    UNTIL = datetime(2026, 7, 31, 0, 0, tzinfo=timezone.utc)
+
+    def _row(self, kind, usdc, *, at=None, **extra):
+        at = at or datetime(2026, 7, 30, 12, 0, tzinfo=timezone.utc)
+        return {
+            "time": int(at.timestamp() * 1000),
+            "delta": {"type": kind, "usdc": str(usdc), **extra},
+        }
+
+    def test_a_deposit_is_positive_and_a_withdrawal_negative(self):
+        flow = net_external_flow(
+            [self._row("deposit", 50_000), self._row("withdraw", 20_000)],
+            self.SINCE, self.UNTIL,
+        )
+        assert flow == pytest.approx(30_000.0)
+
+    def test_the_sign_is_read_from_the_record_not_the_type_name(self):
+        """A directional transfer's name says nothing about which way it went.
+        Inferring it would be a coin flip on exactly the records where being
+        wrong flips the sign of the correction."""
+        into = net_external_flow(
+            [self._row("accountClassTransfer", 1_000, toPerp=True)], self.SINCE, self.UNTIL
+        )
+        out = net_external_flow(
+            [self._row("accountClassTransfer", 1_000, toPerp=False)], self.SINCE, self.UNTIL
+        )
+        assert into == pytest.approx(1_000.0)
+        assert out == pytest.approx(-1_000.0)
+
+    def test_a_directional_transfer_without_a_direction_is_refused(self):
+        with pytest.raises(ValueError, match="no 'toPerp' flag"):
+            net_external_flow(
+                [self._row("accountClassTransfer", 1_000)], self.SINCE, self.UNTIL
+            )
+
+    def test_an_unknown_delta_type_raises_rather_than_being_ignored(self):
+        """The finding this whole parser is shaped around. The venue can add a
+        transfer type whenever it likes; ignoring one is invisible, permanent,
+        and lands in the direction that makes the model look wrong."""
+        with pytest.raises(ValueError, match="unknown ledger delta type"):
+            net_external_flow(
+                [self._row("someNewTransferKind", 50_000)], self.SINCE, self.UNTIL
+            )
+
+    def test_a_known_non_flow_is_ignored_without_complaint(self):
+        """Liquidation moves equity and the model DOES predict it -- counting
+        it as external flow would subtract the very thing being scored."""
+        assert net_external_flow(
+            [self._row("liquidation", 9_999)], self.SINCE, self.UNTIL
+        ) == pytest.approx(0.0)
+
+    def test_records_outside_the_window_do_not_count(self):
+        before = datetime(2026, 7, 29, 12, 0, tzinfo=timezone.utc)
+        after = datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc)
+        assert net_external_flow(
+            [self._row("deposit", 1_000, at=before), self._row("deposit", 2_000, at=after)],
+            self.SINCE, self.UNTIL,
+        ) == pytest.approx(0.0)
+
+    def test_an_empty_ledger_is_zero_flow_not_an_error(self):
+        """The overwhelmingly common case: most accounts deposit nothing on
+        most days, and that genuinely is zero rather than unknown."""
+        assert net_external_flow([], self.SINCE, self.UNTIL) == pytest.approx(0.0)
+        assert net_external_flow(None, self.SINCE, self.UNTIL) == pytest.approx(0.0)
+
+    def test_a_record_with_no_amount_is_refused(self):
+        with pytest.raises(ValueError, match="no usdc amount"):
+            net_external_flow(
+                [{"time": int(self.UNTIL.timestamp() * 1000) - 1,
+                  "delta": {"type": "deposit"}}],
+                self.SINCE, self.UNTIL,
+            )

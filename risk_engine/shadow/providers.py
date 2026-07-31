@@ -48,7 +48,11 @@ from typing import Protocol
 
 from risk_engine.domain.types import AssetSpec, Book, normalise_address
 from risk_engine.market.info import InfoClient, WeightBudget
-from risk_engine.market.parse import parse_clearinghouse_state, parse_meta
+from risk_engine.market.parse import (
+    net_external_flow,
+    parse_clearinghouse_state,
+    parse_meta,
+)
 
 
 class AddressSource(Protocol):
@@ -252,13 +256,28 @@ class LiveSnapshotProvider:
 
         Refuses rather than returning zero (audit A-04's neighbour): a silent
         zero turns a $50k deposit into a spectacular model failure in the
-        calibration score. `userNonFundingLedgerUpdates` is the documented
-        source; it is not wired because it has never been seen, and guessing
-        its shape here would produce exactly the silent zero this is meant to
-        prevent.
+        calibration score.
+
+        This used to raise `NotImplementedError` unconditionally, and that was
+        worse than the silent zero it avoided. `resolve_due` catches per-row
+        failures and `_permanent_reason` classifies an unimplemented
+        `external_flow` as TRANSIENT by name, so a live shadow run resolved
+        zero observations and retried them forever: fourteen days of snapshots
+        accumulating against a gate that could never advance, with the reason
+        visible only as a repeated traceback in a container log.
+
+        So it is wired, from `userNonFundingLedgerUpdates`, and the shape is
+        ASSERTED rather than trusted — the same discipline the trades-feed
+        collector uses, for the same reason. A record this cannot read raises
+        with the record quoted, which surfaces as a resolver failure naming
+        the prediction; it never becomes a zero. `verify --address` checks the
+        endpoint's shape in one command, and doing that before starting the
+        clock is the difference between finding out now and finding out in
+        three weeks.
         """
-        raise NotImplementedError(
-            "external_flow needs userNonFundingLedgerUpdates, whose response shape has "
-            "not been verified against the live API (OPEN-QUESTIONS E5). Returning 0.0 "
-            "instead would score every deposit as a model error."
+        raw = self.client.non_funding_ledger_updates(
+            normalise_address(address),
+            int(since.timestamp() * 1000),
+            int(until.timestamp() * 1000),
         )
+        return net_external_flow(raw, since, until)
