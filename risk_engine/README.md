@@ -209,9 +209,12 @@ one taken *later* would have.
 
 C1, C2 and C5 were closed against live data: C5 confirmed on
 testnet that isolated funding is debited from the position's own margin
-(§1.1 holds, no coupling term needed), C2 measured a mark-mid basis two
-orders of magnitude inside §1.4's threshold, and C1's clamp turned out not
-to bind the fitted AR(1) at all. Details and bounds in
+(§1.1 holds, no coupling term needed), C2 measured a mark-mid basis 35×
+inside §1.4's threshold over a 12-hour window — and, more usefully, found
+that the `BasisModel` guard C2 claimed to have never existed, so the
+approximation was silent all along and is now justified by measurement
+rather than by a mechanism — and C1's clamp turned out not to bind the
+fitted AR(1) at all. Details and bounds in
 [`OPEN-QUESTIONS.md`](../docs/hl-risk/OPEN-QUESTIONS.md).
 
 ### Sizing the window first — a pilot that does not reset

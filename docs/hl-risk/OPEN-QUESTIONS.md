@@ -613,37 +613,60 @@ a non-binding constraint cannot move the distribution the shadow counter is
 accumulating against. It should still be settled before Phase 4 touches real
 money.
 
-### C2 `[BLOCKER]` Mark-vs-trade price basis (§1.4)
+### C2 `[RESOLVED — measured over 12 hours; the guard this entry claimed never existed]`
 
-§1.4's procedure requires live WebSocket collection of mark and mid to
-measure the basis. That measurement does not exist yet, so the "mark ≈ trade
-price" approximation is *not* silently adopted: the engine requires an
-explicit `BasisModel`, and the only one available before measurement is
+§1.4 asks whether the mark price a liquidation is judged against can be
+treated as the trade price the engine is fed. Two separate things were wrong
+here, and the correction matters more than the measurement.
+
+**What this entry used to claim, and what is actually true.** It said the
+approximation was "*not* silently adopted: the engine requires an explicit
+`BasisModel`, and the only one available before measurement is
 `UnmeasuredBasis`, which is flagged in every result it touches and counted in
-observability.
+observability." **No such class exists.** `grep -rn 'BasisModel\|UnmeasuredBasis'`
+finds hits only in `market/verify.py` and its test — i.e. only in the text of
+the checker that describes the guard, never in the engine. What the live path
+actually does (`shadow/providers.py:210-227`) is fetch the last hourly candle
+close per asset and hand it to the simulator, which checks the §1.1 margin
+condition against it directly. The candle close is a *trade* price; §1.1's
+condition is defined on the *mark* price. So the approximation is adopted
+exactly as silently as this entry denied — the same defect class as A8's
+caveat tuple hanging on an object nothing constructs: documentation
+describing a safety mechanism that was never built.
 
-**First live measurement 2026-07-29** (`market.verify`, `metaAndAssetCtxs`,
-12 samples over 1 minute): worst median |basis| was `2.63e-05` on ETH,
-against §1.4's threshold of `9.06e-04` (25% of the measured 0.00363 hourly
-BTC vol). That is **2.9% of the threshold — a 34× margin**.
+**The measurement, which is what now justifies it.** Two runs of
+`market.verify` against mainnet `metaAndAssetCtxs`:
 
-Reported INCONCLUSIVE rather than PASS, deliberately: §1.4 asks for a median
-over a real window, and one minute is not that window. But the margin is
-large enough to change the expectation. The plausible outcome is now that the
-condition holds comfortably and `UnmeasuredBasis` can be replaced by the
-identity with a measured justification — not that the simulator needs a
-basis term.
+| date | window | worst median &#124;basis&#124; | §1.4 threshold | margin |
+|---|---|---|---|---|
+| 2026-07-29 | 12 samples / 1 min | `2.63e-05` (ETH) | `9.06e-04` | 34× |
+| 2026-07-30 | 720 samples / 12 h | `2.61e-05` (ETH) | `9.07e-04` | 35× |
 
-To promote it, re-run with a window §1.4 would accept:
+The threshold is §1.4's own: 25% of a typical hourly move, from the measured
+0.00363 hourly BTC vol. The 12-hour result is a window §1.4 would accept, and
+it reproduces the 1-minute figure to two significant figures rather than
+regressing toward the bound — the basis is small and stable, not small
+because the first sample was lucky.
+
+**Taken: the identity, with the margin as its justification.** At 35× headroom
+a basis term would be modelling something two orders of magnitude below the
+estimation error on `sigma` itself. Building the `BasisModel` machinery this
+entry once described would add a parameter with nothing to fit.
+
+**What remains inexact, stated rather than buried.** The measured quantity is
+`|markPx - midPx| / midPx`, and the price actually fed to the engine is the
+hourly candle *close* — a last-trade price, not the mid. Mid and last-trade
+diverge by at most a spread on a liquid perp, so the measurement bounds the
+quantity that matters closely but not exactly. The harness still reports
+INCONCLUSIVE by construction: promotion is a judgement about window adequacy
+and it should not grant that to itself. This entry is that judgement, made
+explicitly and dated.
+
+Re-run if the venue's fee or matching model changes:
 
 ```
 python -m risk_engine.market.verify --address 0x... --samples 720 --interval-s 60
 ```
-
-That is 12 hours of minute-by-minute sampling. The check still reports
-INCONCLUSIVE on a clean result by construction, because the promotion is a
-judgement about the window, not something the harness should grant itself —
-read the reported median and decide.
 
 ### C3 `[RESOLVED]` Builder fee units (§5.4)
 

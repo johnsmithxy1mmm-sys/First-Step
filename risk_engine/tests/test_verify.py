@@ -124,7 +124,14 @@ class TestBasis:
             hourly_vol=0.004,
         )
         assert check.status == FAIL
-        assert "UnmeasuredBasis" in check.detail
+        # The failure must say what the engine actually does -- feed a trade
+        # price into a mark-price condition with no basis term -- rather than
+        # name a guard to un-set. An earlier version pointed at an
+        # `UnmeasuredBasis` class that exists nowhere in the engine, which
+        # would send a reader looking for a switch instead of building the
+        # missing term.
+        assert "no basis term" in check.detail
+        assert "silently" in check.detail
 
     def test_a_small_basis_over_minutes_is_still_inconclusive(self):
         """§1.4 asks for a median over a real window. Twelve samples over a

@@ -307,8 +307,13 @@ def check_basis(client: InfoClient, coins: list[str], samples: int,
             "C2", "is mark ≈ mid, per §1.4's threshold?", FAIL,
             f"median |basis| {worst:.6g} on {worst_coin} exceeds 25% of a typical "
             f"hourly move ({threshold:.6g}). §1.4's own condition for treating "
-            "mark as trade price does not hold, so `UnmeasuredBasis` must not be "
-            "replaced by the identity — the simulator needs a basis term.",
+            "mark as trade price does NOT hold. Note what that means concretely: "
+            "the engine is fed the last hourly candle close (a trade price) and "
+            "checks §1.1's margin condition against it as though it were the mark "
+            "price, with no basis term anywhere — so this is not a guard to "
+            "un-set, it is an approximation the simulator makes silently and "
+            "which this result has just falsified. A basis term has to be built "
+            "before the liquidation numbers can be trusted (OPEN-QUESTIONS C2).",
             evidence=evidence,
         )
     return Check(
