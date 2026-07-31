@@ -433,9 +433,14 @@ def main(argv: list[str] | None = None) -> int:
     icc.add_argument("--direct-interval", dest="direct_interval", action="store_true",
                      help="also invert the test on the breach data alone (slow, wide)")
     icc.add_argument("--direct-sims", dest="direct_sims", type=int, default=200)
+    # `%%`, not `%`: argparse runs every help string through `%` expansion, so
+    # a literal percent is a format spec. "95% lower" parses as `% lo` -- space
+    # flag, `l` length modifier, `o` octal -- and `--help` died with
+    # "TypeError: %o format: an integer is required, not dict". The subcommand
+    # was unusable by anyone who asked it what it did.
     icc.add_argument("--trials", type=int, default=500,
                      help="Monte Carlo trials per day count; the go/no-go decision "
-                          "is read off a 95% lower confidence bound on power, and "
+                          "is read off a 95%% lower confidence bound on power, and "
                           "that bound needs this many trials to be worth reading "
                           "(too few makes the recommendation itself a coin flip)")
     icc.add_argument("--seed", type=int, default=0)
