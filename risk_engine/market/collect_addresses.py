@@ -102,39 +102,45 @@ from typing import Any, NoReturn
 from risk_engine.domain.types import normalise_address
 
 #: The only WebSocket URL recorded anywhere in this repository, and it is
-#: recorded as an instruction nobody has been able to follow: `verify.py`'s
-#: `check_webdata3` returns UNCHECKABLE because the harness speaks only the
-#: Info POST API and the host is blocked at this environment's proxy. Treat it
-#: as unconfirmed. There is deliberately no testnet constant to match
+#: CONFIRMED 2026-07-30 by `--dry-run` from an operator's machine: the
+#: connection opened and the subscription was acknowledged and delivered. It
+#: stays blocked at this environment's proxy, so `verify.py`'s
+#: `check_webdata3` still returns UNCHECKABLE from here — that is a fact about
+#: this sandbox, not about the URL. There is deliberately no testnet constant to match
 #: `info.TESTNET_URL`: inferring `wss://api.hyperliquid-testnet.xyz/ws` from
 #: the Info host convention is a guess, and a guessed URL that happens to
 #: resolve to something is worse than `--ws-url` typed by an operator who
 #: knows what they are connecting to.
 MAINNET_WS_URL = "wss://api.hyperliquid.xyz/ws"
 
-#: The subscription and channel name for public trades. ASSUMED. C4 records
-#: `{"method": "subscribe", "subscription": {"type": "webData3"}}` as the only
-#: envelope anyone has written down here, so the outer `method`/`subscription`
-#: shape is borrowed from it and the inner `type`/`coin` pair is inference. If
-#: the venue names either differently the subscription is either rejected --
-#: which surfaces as an error frame, and as a loud abort while nothing has been
-#: collected -- or acknowledged and never delivered, which surfaces as the
-#: no-trade-records abort below. Both of those are the same fault seen from two
-#: sides, and neither can be told from a quiet market without asserting.
+#: The subscription and channel name for public trades. CONFIRMED 2026-07-30:
+#: the envelope was inferred -- the outer `method`/`subscription` shape
+#: borrowed from C4's `webData3` snippet, the inner `type`/`coin` pair pure
+#: inference -- and a live `--dry-run` had it acknowledged and delivering
+#: within seconds. The two failure modes it was written against (rejected,
+#: surfacing as an error frame; or acknowledged and never delivered,
+#: surfacing as the no-trade-records abort) both stay guarded, because
+#: neither can be told from a quiet market without asserting, and a venue
+#: that renames a channel does not announce it.
 TRADES_CHANNEL = "trades"
 
-#: Where a trade record is expected to carry the accounts that traded. This is
-#: THE unverified assumption of the whole module: `git grep -E '\busers\b'`
-#: over this repository finds only English prose, never a JSON field, so there
-#: is no fixture, no documentation and no observation behind this tuple.
-#: `users` first because a trade has two sides; `user` accepted because the
-#: webData2 subscription is conventionally keyed on a singular `user` and a
-#: trade record may well mirror it. Whichever one is actually found is
-#: recorded in the result and stated in the generated frame, so a reader of
-#: the address list can tell which shape the venue really produced. Extend
-#: this tuple when the live shape is known -- do not paper over a different
-#: field name further downstream, where it becomes an address list nobody can
-#: account for.
+#: Where a trade record carries the accounts that traded. This was THE
+#: unverified assumption of the whole module -- B4's own words were that a
+#: public trade naming its participants "needs to be verified", and nothing
+#: in this repository had ever spoken the protocol.
+#:
+#: CONFIRMED 2026-07-30, mainnet, 60-second `--dry-run`: 36 distinct addresses
+#: from 30 trade records, read from `users`. The plural won, as guessed, and
+#: for the guessed reason -- a trade has two sides. `user` stays in the tuple
+#: as a fallback rather than being pruned to the observed value: one minute of
+#: one venue on one day is thin evidence for deleting a branch, and the
+#: singular is what the webData2 subscription is conventionally keyed on.
+#:
+#: Whichever field is actually found is recorded in the result and stated in
+#: the generated frame, so a reader of the address list can tell which shape
+#: the venue really produced on the day it was collected. Extend this tuple if
+#: the shape changes -- do not paper over a different field name further
+#: downstream, where it becomes an address list nobody can account for.
 TRADE_ADDRESS_FIELDS = ("users", "user")
 
 #: The coins to watch. Defaulted to `LiveSnapshotProvider`'s default universe

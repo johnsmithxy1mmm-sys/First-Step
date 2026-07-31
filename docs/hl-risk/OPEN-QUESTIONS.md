@@ -10,14 +10,16 @@ external data before the phase that depends on it can close.
 
 A label may carry an em-dash suffix, and the suffix is the load-bearing part:
 it names what the label does *not* cover. `[BLOCKER — downgraded]` (C1) still
-wants provenance but no longer gates anything; `[BLOCKER — frame decided, feed
-shape unverified]` (B4) has the decision and not the data; `[RESOLVED — at the
-24h default, ...]` (A8) settles one horizon and leaves the others carrying the
+wants provenance but no longer gates anything; `[RESOLVED — at the 24h
+default, ...]` (A8) settles one horizon and leaves the others carrying the
 bias. An unqualified `[RESOLVED]` is a claim that nothing is outstanding, so it
 is only correct where the entry needed a convention and not a measurement —
-A1 is the clean case. Where an entry's own text still asks for external data,
-the suffix has to say so, otherwise the legend and the entry disagree and the
-reader believes the legend.
+A1 is the clean case, and B4 reached it in two steps rather than one: the
+frame was a decision, the feed shape was a measurement that came in
+separately once an operator could reach the venue this environment's proxy
+blocks. Where an entry's own text still asks for external data, the suffix
+has to say so, otherwise the legend and the entry disagree and the reader
+believes the legend.
 
 ---
 
@@ -467,7 +469,7 @@ volatility and no funding, which is the spirit of the baseline. Its `P(liq)`
 comes from the same draws run through the real liquidation model. Confirm
 this reading, or supply the intended one.
 
-### B4 `[BLOCKER — frame decided, feed shape unverified]` No documented way to obtain the shadow address list
+### B4 `[RESOLVED]` No documented way to obtain the shadow address list
 
 §3.3 requires snapshotting "200-500 active public addresses". The Info API
 reads any address but does not enumerate addresses — there is no endpoint
@@ -518,21 +520,28 @@ fewer addresses than `ShadowProgress.required_addresses` without
   materially smaller than the list length. This is the cost of the decision.
   It is written into every frame string the collector generates so it cannot
   be lost between the address list and the published number.
-- **The message shape is still unverified.** Nothing in this repository has
-  ever spoken Hyperliquid's WebSocket protocol. The URL comes from C4's
-  UNCHECKABLE note, the subscribe envelope from C4's snippet, and the claim
-  that a public trade names its participants is the very thing this entry
-  said "need[s] to be verified" — `git grep` finds no JSON field named
-  `users` anywhere, and there is no fixture. The API is 403 at this
-  environment's proxy (E5), so the collector cannot be run here at all.
-  Instead of assuming, it asserts: a trade record carrying no address where
-  one is expected aborts the run quoting the frame verbatim, an
+- **The message shape — verified 2026-07-30, on mainnet, from an operator's
+  machine (this environment's proxy is still 403 on the venue; see E5).**
+  `python -m risk_engine.market.collect_addresses --dry-run` against
+  `wss://api.hyperliquid.xyz/ws`, 60 seconds, `trades` subscription: 36
+  distinct addresses from 30 trade records, read from a field named `users`.
+  Every load-bearing assumption held on the first live attempt — the URL, the
+  subscribe envelope, the channel name, and the claim (this entry's own
+  words) that "a public trade names its participants." That claim was the
+  one part of B4 no reasoning could settle in advance; it needed the venue to
+  answer, and now it has.
+
+  The abort machinery that was written for the case this *didn't* hold stays
+  in place regardless — a trade record carrying no address where one is
+  expected aborts the run quoting the frame verbatim, an
   acknowledged-but-undelivered subscription aborts, silence on connect
   aborts, a connection that never opens aborts naming `--ws-url`, and no path
   reaches a written file with zero addresses. The failure it is built to
   prevent is the quiet one — a valid, empty, confidently framed list that
   loads cleanly, sweeps nothing, and surfaces three weeks later as a gate
-  that never advanced.
+  that never advanced. `--dry-run` is the cheap way to re-check this if the
+  venue ever changes its message shape: sixty seconds against a real
+  collection window's thirty minutes.
 
   **Those assertions are fatal only until the first address is read**, and
   that boundary is deliberate rather than a softening. Before an address has
@@ -549,11 +558,16 @@ fewer addresses than `ShadowProgress.required_addresses` without
   zero and a count of nine thousand produce identical address lists
   otherwise.
 
-  **No example frame in this repository is a capture.** Every trade frame,
-  counter, timestamp and address in the collector's tests, in its docstrings
-  and in any review of it is stub-generated — the suite drives it through a
-  scripted socket and a fake clock. Nothing here can be cited as evidence
-  that the shape is right; only a live run can.
+  **No example frame in this repository is a capture, and that is still
+  true after the live run.** Every trade frame, counter, timestamp and
+  address in the collector's tests and docstrings is stub-generated — the
+  suite drives a scripted socket and a fake clock. The 2026-07-30 dry run
+  confirmed the shape but nothing from it was recorded here: what is written
+  down is the summary line (36 addresses, 30 records, field `users`), not a
+  frame. So the tests still prove only that the *parser* behaves as
+  specified, never that the specification matches the venue. Anyone
+  extending `TRADE_ADDRESS_FIELDS` on the strength of a passing suite is
+  reading it wrong; re-run `--dry-run`.
 - **More addresses still buy almost nothing.** B1 measured it: 200 → 500 per
   day moves the clustered half-width from 3.60 to 3.43 pp. Days are the
   lever. `--target` defaults to 500 for headroom against the accounts the

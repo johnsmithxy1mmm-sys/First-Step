@@ -693,8 +693,10 @@ class TestTheDependencyAndTheCLI:
     def test_a_dry_run_surfaces_a_shape_mismatch_as_the_finding_it_is(
         self, monkeypatch, capsys
     ):
-        """The case the mode exists for. A mismatch here is B4/C4's unverified
-        assumption failing, found for the price of a minute, and the message
+        """The case the mode exists for. B4's feed-shape assumption held on the
+        first live attempt (2026-07-30, 36 addresses from 30 trades on
+        mainnet) -- this guards the day it stops holding, if the venue ever
+        changes the schema. Found for the price of a minute, and the message
         has to point at the constant to change rather than read as a crash."""
         def _shape_fault(**kwargs):
             raise UnexpectedFeedShape("a trade record carried no account address")
