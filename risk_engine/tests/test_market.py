@@ -373,13 +373,46 @@ class TestDexRoutedFlows:
         assert flow == pytest.approx(-206.575)
         assert flow != pytest.approx(-5.0)
 
-    def test_an_unrecognised_dex_raises_rather_than_assuming_not_perp(self):
-        """Defaulting to 'not perp' would hide a real outflow, which is the
-        §10-forbidden direction."""
-        with pytest.raises(ValueError, match="does not recognise"):
-            net_external_flow(
-                self._send(sourceDex="somethingNew"), self.SINCE, self.UNTIL, self.ME
-            )
+    def test_the_empty_dex_is_the_primary_perp_account(self):
+        """The 2026-07-31 frame sweep's most expensive record. Hyperliquid
+        names the primary perp dex with the empty string; `""` was filed as
+        non-perp, so this $25,000 outflow scored **zero** — a $25k unexplained
+        equity drop blamed on the model, in the §10-forbidden direction.
+
+        The venue's own spelling settles it: the same field carries the
+        literal "spot" in one record and "" in another, and a venue that
+        writes "spot" when it means spot does not also write ""."""
+        rows = self._send(
+            sourceDex="", destinationDex="xyz", token="USDC",
+            amount="25000.0", usdcValue="25000.0",
+        )
+        assert net_external_flow(
+            rows, self.SINCE, self.UNTIL, self.ME
+        ) == pytest.approx(-25_000.0)
+
+    def test_a_builder_dex_is_external_to_the_account_being_modelled(self):
+        """A named dex is a HIP-3 builder venue: perp in the ordinary sense,
+        and a different margin space from the one `clearinghouseState`
+        returns. Receiving into it does not credit the modelled book."""
+        assert net_external_flow(
+            self._send(user=self.OTHER, destination=self.ME,
+                       sourceDex="spot", destinationDex="xyz"),
+            self.SINCE, self.UNTIL, self.ME,
+        ) == pytest.approx(0.0)
+
+    def test_an_unknown_dex_name_is_recorded_rather_than_silently_accepted(self):
+        """It no longer raises — new venues are a thing third parties create,
+        and raising would break the §3.3 window on whichever address first
+        touched one. But the reading has exactly one failure mode: a future
+        ALIAS of the primary dex read as a builder venue would hide a real
+        outflow. So the names are tallied for `verify` to surface."""
+        from risk_engine.market.parse import UNRECOGNISED_DEX_NAMES
+
+        UNRECOGNISED_DEX_NAMES.clear()
+        net_external_flow(
+            self._send(sourceDex="somethingNew"), self.SINCE, self.UNTIL, self.ME
+        )
+        assert UNRECOGNISED_DEX_NAMES.get("somethingnew") == 1
 
     def test_a_dex_routed_record_without_an_address_raises(self):
         """Direction depends on which side this account was on, which cannot
@@ -446,6 +479,99 @@ class TestDexRoutedFlows:
             self._send(sourceDex="perp", user=self.ME.upper().replace("0X", "0x")),
             self.SINCE, self.UNTIL, self.ME,
         ) == pytest.approx(-206.575)
+
+
+class TestTheFrameSweepFindings:
+    """The eight delta types the 2026-07-31 frame sweep found on 50 addresses.
+
+    One address had five types; fifty had thirteen. Every record below is
+    verbatim from that run, and each is classified by its FIELDS rather than
+    its name — the rule that did the work being: a record carrying `usdc`
+    moves perp collateral, while one carrying `token` and `amount` is
+    denominated in a spot asset and does not.
+    """
+
+    ME = "0x706bb519b05b7dc01d048af9a5e29d1ef5d6d9e3"
+    OTHER = "0x399965e15d4e61ec3529cc98b7f7ebb93b733336"
+    SINCE = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    UNTIL = datetime(2027, 1, 1, tzinfo=timezone.utc)
+
+    def _rows(self, delta):
+        return [{"time": 1779457645318, "hash": "0x0", "delta": delta}]
+
+    def _flow(self, delta, me=None):
+        return net_external_flow(self._rows(delta), self.SINCE, self.UNTIL,
+                                 self.ME if me is None else me)
+
+    # -- perp USDC moved between two accounts, signed by which side we are on
+
+    def test_a_sub_account_transfer_is_signed_by_side(self):
+        d = {"type": "subAccountTransfer", "usdc": "2000.0",
+             "user": self.ME, "destination": self.OTHER}
+        assert self._flow(d) == pytest.approx(-2000.0)
+        assert self._flow(d, self.OTHER) == pytest.approx(+2000.0)
+
+    def test_an_internal_transfer_debits_the_sender_the_fee_as_well(self):
+        """`fee: 1.0` beside `usdc: 40.0`: the sender loses 41, the recipient
+        gains 40. Dropping the fee leaves $1 of real, explained outflow
+        looking like model error on every transfer — small per record and
+        systematically one-signed, which is the bias a calibration score is
+        least able to absorb."""
+        d = {"type": "internalTransfer", "usdc": "40.0", "fee": "1.0",
+             "user": self.ME, "destination": self.OTHER}
+        assert self._flow(d) == pytest.approx(-41.0)
+        assert self._flow(d, self.OTHER) == pytest.approx(+40.0)
+
+    def test_a_native_token_fee_is_not_counted_as_usd(self):
+        """`nativeTokenFee` is paid in HYPE from a spot balance. Counting it
+        as dollars is the same category error as reading a token `amount` as
+        a USD figure."""
+        d = {"type": "internalTransfer", "usdc": "40.0", "fee": "0.0",
+             "nativeTokenFee": "3.5", "user": self.ME, "destination": self.OTHER}
+        assert self._flow(d) == pytest.approx(-40.0)
+
+    # -- spot-denominated: token + amount, no `usdc`, no perp movement
+
+    @pytest.mark.parametrize("delta", [
+        {"type": "gossipPriorityGasAuction", "token": "HYPE", "amount": "0.34223973"},
+        {"type": "cStakingTransfer", "token": "HYPE", "amount": "25.0",
+         "isDeposit": False},
+        {"type": "borrowLend", "token": "USDC", "operation": "withdraw",
+         "amount": "1000.0", "interestAmount": "0.93372645"},
+    ], ids=["gas-auction", "staking", "borrow-lend"])
+    def test_spot_denominated_records_move_no_perp_equity(self, delta):
+        assert self._flow(delta) == pytest.approx(0.0)
+
+    def test_borrow_lend_naming_usdc_is_still_not_perp_collateral(self):
+        """The subtle one. `token: "USDC"` is not the same thing as `usdc:`.
+        A perp-side movement of the same size would carry a USDC figure
+        directly; this carries a token and a quantity, which is the spot
+        convention throughout this ledger."""
+        d = {"type": "borrowLend", "token": "USDC", "operation": "withdraw",
+             "amount": "1000.0", "interestAmount": "0.93372645"}
+        assert self._flow(d) == pytest.approx(0.0)
+        # And the reading is falsifiable rather than merely plausible.
+        with pytest.raises(ValueError, match="contradicts that"):
+            self._flow({**d, "usdc": "1000.0"})
+
+    # -- vault movements
+
+    def test_a_vault_distribution_is_an_inflow(self):
+        d = {"type": "vaultDistribution", "vault": "0x4342", "usdc": "88.985153"}
+        assert self._flow(d) == pytest.approx(+88.985153)
+
+    def test_a_vault_withdrawal_credits_what_arrived_not_what_was_requested(self):
+        """Two USD figures and only one of them arrived. `requestedUsd` is
+        310, `netWithdrawnUsd` is 294.66 after commission — reading the former
+        would credit the account with $15.34 it never received, on every vault
+        withdrawal in the window."""
+        d = {"type": "vaultWithdraw", "vault": "0xd6e5", "user": self.ME,
+             "requestedUsd": "310.0", "commission": "15.336366",
+             "closingCost": "0.0", "basis": "156.636333",
+             "netWithdrawnUsd": "294.663634"}
+        got = self._flow(d)
+        assert got == pytest.approx(+294.663634)
+        assert got != pytest.approx(+310.0)
 
 
 class TestSpotOnlyTransfers:

@@ -326,8 +326,8 @@ class TestExternalFlow:
         opposite job — know everything before the clock starts."""
         client = StubClient(ledger=[
             self._row("deposit", "1000"),
-            self._row("accountClassTransfer", "500"),      # no toPerp
-            self._row("internalTransfer", "700"),          # no toPerp either
+            self._row("accountClassTransfer", "500"),   # directional, no toPerp
+            self._row("internalTransfer", "700"),       # names neither side
         ])
         check = verify.check_external_flow(client, ADDRESS)
         assert check.status == FAIL
@@ -339,6 +339,28 @@ class TestExternalFlow:
         assert "accountClassTransfer" in check.detail
         assert "internalTransfer" in check.detail
         assert "single pass" in check.detail
+
+    def test_a_classifiable_type_is_not_reported_as_unknown(self):
+        """`internalTransfer` moved out of EXTERNAL_FLOW_SIGNS into its own
+        table, and the `known` set here was not updated with it — so a type
+        this build classifies correctly came back as "the venue returned a
+        type this build cannot classify". Every table a type may live in has
+        to be listed, and this asserts the list is complete."""
+        from risk_engine.market.parse import (
+            DEX_ROUTED_TYPES,
+            EXTERNAL_FLOW_SIGNS,
+            NON_FLOW_DELTA_TYPES,
+            PERP_ADDRESS_ROUTED_TYPES,
+        )
+
+        every_table = (set(EXTERNAL_FLOW_SIGNS) | set(NON_FLOW_DELTA_TYPES)
+                       | set(DEX_ROUTED_TYPES) | set(PERP_ADDRESS_ROUTED_TYPES))
+        for kind in sorted(every_table):
+            client = StubClient(ledger=[self._row(kind, "100")])
+            check = verify.check_external_flow(client, ADDRESS)
+            assert check.evidence.get("unknown_types") == [], (
+                f"{kind} lives in a classification table but is reported unknown"
+            )
 
     def test_one_bad_record_does_not_condemn_the_rest_of_its_type(self):
         """A type is only reported once, against the record that failed --
