@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -396,13 +397,40 @@ def cmd_frame(args) -> int:
     return 0
 
 
+def _journal_arg(p):
+    """`--journal`, defaulting to $SHADOW_DSN.
+
+    Every one of these commands is normally run inside the compose stack,
+    where the DSN is already in the environment. Requiring it on the command
+    line meant the documented one-off,
+
+        docker compose run --rm engine -m risk_engine.shadow progress \\
+          --journal "$SHADOW_DSN"
+
+    could not work: the shell that expands `$SHADOW_DSN` is the OPERATOR's,
+    where it is empty, not the container's. The image has no shell in its
+    entrypoint to expand it either. So the variable is read here, where it is
+    actually in scope.
+
+    Still overridable, because a local SQLite journal is a path and not a DSN,
+    and that is the normal case outside the stack.
+    """
+    default = os.environ.get("SHADOW_DSN") or None
+    p.add_argument(
+        "--journal", required=default is None, default=default,
+        help="calibration journal: a SQLite path, or a Postgres DSN. Defaults "
+             "to $SHADOW_DSN, which the compose stack already sets.",
+    )
+    return p
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="risk_engine.shadow")
     parser.add_argument("--verbose", action="store_true")
     sub = parser.add_subparsers(dest="command", required=True)
 
     def common(p):
-        p.add_argument("--journal", required=True, help="path to the calibration journal")
+        _journal_arg(p)
         p.add_argument("--fixture", action="store_true",
                        help="synthetic market and books; validates nothing, runs everything")
         p.add_argument("--addresses", help="JSON address list (required for a live run)")
@@ -418,13 +446,13 @@ def main(argv: list[str] | None = None) -> int:
     res.set_defaults(func=cmd_resolve)
 
     prog = sub.add_parser("progress", help="report the §3.3 window and calibration")
-    prog.add_argument("--journal", required=True)
+    _journal_arg(prog)
     prog.set_defaults(func=cmd_progress)
 
     icc = sub.add_parser(
         "icc", help="measure the intra-day correlation and size the window (B1)"
     )
-    icc.add_argument("--journal", required=True)
+    _journal_arg(icc)
     icc.add_argument("--version", help=f"distribution version (default {DISTRIBUTION_VERSION})")
     icc.add_argument("--cohort", default=COHORT_BOOK_UNCHANGED, choices=list(COHORTS))
     icc.add_argument("--addresses-per-day", dest="addresses_per_day", type=int, default=200)

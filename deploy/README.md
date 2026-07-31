@@ -85,11 +85,36 @@ table in `risk_engine/README.md`. Run the harness rather than trusting either
 The shadow jobs sit behind a compose profile, so `up` does not start them.
 Starting the §3.3 counter is a decision, not a side effect:
 
+`deploy/.env` must exist first — it is gitignored, so it does not arrive with
+a `git pull`, and compose refuses with `required variable RISK_SERVICE_TOKEN
+is missing a value` before starting anything. That refusal is the design (see
+above) but it is not obviously about a missing file, so:
+
+```bash
+cp deploy/.env.example deploy/.env
+python3 -c 'import secrets; print(secrets.token_urlsafe(32))'   # RISK_SERVICE_TOKEN
+python3 -c 'import secrets; print(secrets.token_urlsafe(24))'   # POSTGRES_PASSWORD
+# then, for a live run, also set in deploy/.env:
+#   ENGINE_MODE=--live
+#   SHADOW_ARGS=--addresses /app/addresses.json
+```
+
+Then:
+
 ```bash
 docker compose -f deploy/docker-compose.yml --profile shadow up -d
 docker compose -f deploy/docker-compose.yml run --rm engine \
-  -m risk_engine.shadow progress --journal "$SHADOW_DSN"
+  -m risk_engine.shadow progress
 ```
+
+No `--journal`. It defaults to `$SHADOW_DSN`, which the compose stack sets on
+the container. This README used to print `--journal "$SHADOW_DSN"`, which
+could not work: the shell expanding that variable is **yours**, where it is
+empty, not the container's — and the image has no shell in its entrypoint to
+expand it either. The command failed on a missing journal argument, directly
+after compose had refused for an unrelated missing token, which is the kind
+of stacked failure that reads as "the deployment is broken" rather than "two
+things are unset".
 
 **Read `risk_engine/README.md` before you do.** §3.3 resets the window to zero
 whenever the distribution moves, so every question that moves it has to be

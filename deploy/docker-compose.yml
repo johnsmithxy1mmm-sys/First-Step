@@ -28,6 +28,19 @@ services:
       # a compose network from quietly getting an unauthenticated engine.
       RISK_SERVICE_TOKEN: ${RISK_SERVICE_TOKEN:?set RISK_SERVICE_TOKEN in deploy/.env}
       RISK_ENGINE_WORKERS: ${RISK_ENGINE_WORKERS:-2}
+      # Present so the documented one-off commands actually run:
+      #
+      #   docker compose run --rm engine -m risk_engine.shadow progress \
+      #     --journal "$$SHADOW_DSN"
+      #
+      # deploy/README.md printed exactly that and it could not work. The DSN
+      # was defined only on the two shadow services, so `$SHADOW_DSN` expanded
+      # to empty in the operator's own shell and the command failed on a
+      # missing journal argument -- after the compose file had already refused
+      # for an unrelated missing token, which is the kind of stacked failure
+      # that reads as "the deployment is broken" rather than "one variable is
+      # unset". The serving path does not use it; the report commands do.
+      SHADOW_DSN: postgresql://${POSTGRES_USER:-risk}:${POSTGRES_PASSWORD:-}@journal:5432/${POSTGRES_DB:-shadow}
     command: ["--host", "0.0.0.0", "--port", "8787", "${ENGINE_MODE:---fixture}"]
     # No `ports:`. The engine is reachable only from this network; the
     # backend is the sole consumer and owns rate limiting (§5.3). Publishing
