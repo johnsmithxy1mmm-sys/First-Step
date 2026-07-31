@@ -341,6 +341,7 @@ def check_external_flow(client: InfoClient, address: str | None) -> Check:
     checked before the clock starts rather than discovered during it.
     """
     from risk_engine.market.parse import (
+        DEX_ROUTED_TYPES,
         EXTERNAL_FLOW_SIGNS,
         NON_FLOW_DELTA_TYPES,
         net_external_flow,
@@ -377,7 +378,7 @@ def check_external_flow(client: InfoClient, address: str | None) -> Check:
         # live `toPerp` flag this repo could not have invented. Public
         # on-chain data, so nothing here needs redacting.
         examples.setdefault(kind, row)
-    known = set(EXTERNAL_FLOW_SIGNS) | set(NON_FLOW_DELTA_TYPES)
+    known = set(EXTERNAL_FLOW_SIGNS) | set(NON_FLOW_DELTA_TYPES) | set(DEX_ROUTED_TYPES)
     unknown = sorted(k for k in kinds if k not in known)
     evidence = {"n_records": len(rows), "window_days": window_days,
                 "types_seen": kinds, "unknown_types": unknown,
@@ -403,6 +404,7 @@ def check_external_flow(client: InfoClient, address: str | None) -> Check:
             rows,
             _dt.fromtimestamp((now_ms - window_days * 24 * HOUR_MS) / 1000, tz=_tz.utc),
             _dt.fromtimestamp(now_ms / 1000, tz=_tz.utc),
+            address,
         )
     except ValueError as exc:
         return Check(

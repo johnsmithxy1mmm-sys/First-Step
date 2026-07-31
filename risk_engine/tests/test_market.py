@@ -308,9 +308,141 @@ class TestExternalFlow:
         assert net_external_flow(None, self.SINCE, self.UNTIL) == pytest.approx(0.0)
 
     def test_a_record_with_no_amount_is_refused(self):
-        with pytest.raises(ValueError, match="no usdc amount"):
+        with pytest.raises(ValueError, match="no USD amount"):
             net_external_flow(
                 [{"time": int(self.UNTIL.timestamp() * 1000) - 1,
                   "delta": {"type": "deposit"}}],
                 self.SINCE, self.UNTIL,
             )
+
+
+class TestDexRoutedFlows:
+    """`send`, and why a type name is not enough to classify a transfer.
+
+    The live finding (2026-07-31, mainnet): a real account's ledger carried a
+    `send` this build had never seen. The record decided it -- spot to spot,
+    so no perp equity moved -- but the SAME type with `sourceDex: "perp"` is
+    a real outflow. Filing `send` wholesale under either table would have
+    been wrong half the time, and the wrong half would have been invisible.
+    """
+
+    ME = "0xd47587702a91731dc1089b5db0932cf820151a91"
+    OTHER = "0xd048870caa5a3037f507583b4762a7598251a2fc"
+    SINCE = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    UNTIL = datetime(2027, 1, 1, tzinfo=timezone.utc)
+
+    def _send(self, **overrides):
+        """The exact shape the venue returned, verbatim, with overrides."""
+        delta = {
+            "type": "send", "user": self.ME, "destination": self.OTHER,
+            "sourceDex": "spot", "destinationDex": "spot", "token": "HYPE",
+            "amount": "5.0", "usdcValue": "206.575", "fee": "0.0",
+            "nativeTokenFee": "0.0", "nonce": 1777910139749, "feeToken": "",
+        }
+        delta.update(overrides)
+        return [{"time": 1777910224883, "hash": "0x3ef2", "delta": delta}]
+
+    def test_the_live_record_is_not_a_perp_flow(self):
+        """Spot to spot: perp equity did not move, so subtracting it would
+        corrupt the very correction B2 exists to make."""
+        assert net_external_flow(
+            self._send(), self.SINCE, self.UNTIL, self.ME
+        ) == pytest.approx(0.0)
+
+    def test_the_same_type_out_of_perp_is_an_outflow(self):
+        assert net_external_flow(
+            self._send(sourceDex="perp"), self.SINCE, self.UNTIL, self.ME
+        ) == pytest.approx(-206.575)
+
+    def test_the_same_type_into_perp_is_an_inflow(self):
+        """Received rather than sent, so the direction comes from
+        destinationDex and the sign flips."""
+        assert net_external_flow(
+            self._send(user=self.OTHER, destination=self.ME, destinationDex="perp"),
+            self.SINCE, self.UNTIL, self.ME,
+        ) == pytest.approx(+206.575)
+
+    def test_the_usd_value_is_used_not_the_token_amount(self):
+        """`amount` is 5.0 HYPE and `usdcValue` is $206.575. Reading the
+        token quantity as dollars would be a silent 40x error, and the old
+        code looked only for `usdc` -- which this record does not carry --
+        so it would have raised on a perfectly well-formed row."""
+        flow = net_external_flow(
+            self._send(sourceDex="perp"), self.SINCE, self.UNTIL, self.ME
+        )
+        assert flow == pytest.approx(-206.575)
+        assert flow != pytest.approx(-5.0)
+
+    def test_an_unrecognised_dex_raises_rather_than_assuming_not_perp(self):
+        """Defaulting to 'not perp' would hide a real outflow, which is the
+        §10-forbidden direction."""
+        with pytest.raises(ValueError, match="does not recognise"):
+            net_external_flow(
+                self._send(sourceDex="somethingNew"), self.SINCE, self.UNTIL, self.ME
+            )
+
+    def test_a_dex_routed_record_without_an_address_raises(self):
+        """Direction depends on which side this account was on, which cannot
+        be read off the record alone."""
+        with pytest.raises(ValueError, match="no address was supplied"):
+            net_external_flow(self._send(), self.SINCE, self.UNTIL, None)
+
+    def test_a_send_involving_neither_side_raises(self):
+        """A record in this account's ledger naming neither side is a shape
+        this build does not understand; silently skipping it would be a guess."""
+        with pytest.raises(ValueError, match="neither this account"):
+            net_external_flow(
+                self._send(user=self.OTHER, destination="0x" + "9" * 40),
+                self.SINCE, self.UNTIL, self.ME,
+            )
+
+    def test_a_perp_to_perp_self_transfer_nets_to_zero(self):
+        """Both legs are this account's perp account, so no equity entered or
+        left it. Evaluated as if/elif the outflow leg would fire and the
+        inflow leg would never be reached, scoring a phantom -$206 outflow --
+        which the model would then have to explain as a prediction error."""
+        assert net_external_flow(
+            self._send(destination=self.ME, sourceDex="perp", destinationDex="perp"),
+            self.SINCE, self.UNTIL, self.ME,
+        ) == pytest.approx(0.0)
+
+    def test_a_perp_to_spot_self_transfer_is_a_real_outflow(self):
+        """The same account on both sides, but only one side is perp: equity
+        genuinely left the account this model predicts."""
+        assert net_external_flow(
+            self._send(destination=self.ME, sourceDex="perp", destinationDex="spot"),
+            self.SINCE, self.UNTIL, self.ME,
+        ) == pytest.approx(-206.575)
+
+    def test_a_spot_to_perp_self_transfer_is_a_real_inflow(self):
+        assert net_external_flow(
+            self._send(destination=self.ME, sourceDex="spot", destinationDex="perp"),
+            self.SINCE, self.UNTIL, self.ME,
+        ) == pytest.approx(+206.575)
+
+    def test_a_non_perp_send_is_skipped_before_its_amount_is_read(self):
+        """Spot to spot carries no perp flow, so a record missing the USD
+        field must not be refused: refusing it would fail the whole resolution
+        over a value this correction never uses."""
+        row = self._send()
+        del row[0]["delta"]["usdcValue"]
+        assert net_external_flow(row, self.SINCE, self.UNTIL, self.ME) == pytest.approx(0.0)
+
+    def test_only_the_involved_side_s_dex_has_to_parse(self):
+        """This account received; the sender's dex is a field about someone
+        else's account and an unrecognised value there must not fail the run."""
+        assert net_external_flow(
+            self._send(
+                user=self.OTHER, destination=self.ME,
+                sourceDex="somethingNew", destinationDex="perp",
+            ),
+            self.SINCE, self.UNTIL, self.ME,
+        ) == pytest.approx(+206.575)
+
+    def test_address_comparison_is_case_insensitive(self):
+        """Ledger records and address lists disagree on case constantly; a
+        checksummed spelling must not read as 'neither side'."""
+        assert net_external_flow(
+            self._send(sourceDex="perp", user=self.ME.upper().replace("0X", "0x")),
+            self.SINCE, self.UNTIL, self.ME,
+        ) == pytest.approx(-206.575)

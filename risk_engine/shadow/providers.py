@@ -280,4 +280,4 @@ class LiveSnapshotProvider:
             int(since.timestamp() * 1000),
             int(until.timestamp() * 1000),
         )
-        return net_external_flow(raw, since, until)
+        return net_external_flow(raw, since, until, address)

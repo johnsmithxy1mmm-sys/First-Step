@@ -454,6 +454,42 @@ The gate should be read off the book-unchanged cohort. Note this filters out
 precisely the most active traders, which is a selection effect worth stating
 in any public calibration score (§3.4).
 
+**Live finding, 2026-07-31 (mainnet).** `verify --address` on a real account
+returned a `userNonFundingLedgerUpdates` delta type this build could not
+classify: `send`. The record settled it, and it is worth recording *why* it
+could not be filed under either existing table:
+
+```json
+{"type": "send", "sourceDex": "spot", "destinationDex": "spot",
+ "token": "HYPE", "amount": "5.0", "usdcValue": "206.575", ...}
+```
+
+That instance is a HYPE transfer between two spot accounts — no perp equity
+moved, so subtracting it would corrupt the very correction B2 exists to make.
+But the same type with `sourceDex: "perp"` is $206 leaving the perp account,
+which must be subtracted. **A type name is not sufficient to classify a
+transfer**; `send` is routed by its `sourceDex`/`destinationDex` fields and by
+which side of the transfer the queried account was on. Two consequences worth
+carrying forward:
+
+  - the amount lives in `usdcValue`, not `usdc`. The old code read `usdc`
+    only and would have *raised* on this well-formed row. `amount` is a token
+    quantity — treating 5.0 HYPE as $5 would have been a silent 40× error, so
+    only USD-denominated fields are accepted;
+  - the two legs are summed independently rather than chained, because an
+    account can be on both sides. A perp→perp self-transfer moves no equity
+    and nets to zero; chained, it would have scored a phantom $206 outflow.
+
+An unrecognised `dex` value raises rather than defaulting to "not perp", on
+the same reasoning as an unknown delta type: the default would hide a real
+flow, which is the §10-forbidden direction.
+
+This is the argument for running `verify --address` **before** starting the
+§3.3 clock rather than during it. Encountered live, this type would have
+surfaced as a per-row resolver failure classified TRANSIENT, retried forever,
+and shown up only as a repeated traceback in a container log — with the
+21-day gate quietly never advancing.
+
 ### B3 `[BLOCKER]` Baseline A is not a distribution
 
 §3.2 defines Baseline A as "the historical unconditional frequency of

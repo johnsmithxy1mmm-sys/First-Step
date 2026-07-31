@@ -204,8 +204,78 @@ NON_FLOW_DELTA_TYPES = frozenset({
     "spotGenesis",
 })
 
+#: Types whose flow-ness cannot be decided from the type name at all, because
+#: the SAME type covers movements that touch the perp account and movements
+#: that never go near it. They are routed by their `sourceDex`/`destinationDex`
+#: fields instead.
+#:
+#: `send` is the live example, and it is why this category exists. Observed
+#: 2026-07-31 on mainnet:
+#:
+#:     {"type": "send", "user": "0xd475...", "destination": "0xd048...",
+#:      "sourceDex": "spot", "destinationDex": "spot", "token": "HYPE",
+#:      "amount": "5.0", "usdcValue": "206.575", ...}
+#:
+#: That one is a HYPE transfer between two spot accounts — it does not touch
+#: perp equity and must not be subtracted. But the same type with
+#: `sourceDex: "perp"` is $206 leaving the perp account, which must be. Filing
+#: `send` wholesale under either table would have been wrong half the time,
+#: and the half it got wrong would be invisible.
+DEX_ROUTED_TYPES = frozenset({"send"})
 
-def net_external_flow(updates: list, since: datetime, until: datetime) -> float:
+#: The `dex` values that mean "the perpetuals account this model predicts".
+#: An unrecognised value raises rather than defaulting to non-perp, on the
+#: same reasoning as an unknown delta type.
+PERP_DEX_VALUES = frozenset({"perp", "perps"})
+NON_PERP_DEX_VALUES = frozenset({"spot", ""})
+
+
+def _dex_touches_perp(value: object, kind: str, row: object) -> bool:
+    """Whether a `sourceDex`/`destinationDex` names the perp account.
+
+    Raises on anything unrecognised rather than defaulting to "not perp",
+    which would silently drop a real perp outflow -- the same reasoning as an
+    unknown delta type, and the same direction of harm.
+    """
+    if value is None:
+        raise ValueError(
+            f"{kind} is routed by dex but the record does not say which: {row!r}"
+        )
+    text = str(value).strip().lower()
+    if text in PERP_DEX_VALUES:
+        return True
+    if text in NON_PERP_DEX_VALUES:
+        return False
+    raise ValueError(
+        f"{kind} names a dex this build does not recognise: {value!r}. It is "
+        f"either the perp account or it is not, and defaulting to 'not' would "
+        f"hide a real flow. Add it to PERP_DEX_VALUES or NON_PERP_DEX_VALUES in "
+        f"market/parse.py once confirmed (OPEN-QUESTIONS B2). Record: {row!r}"
+    )
+
+
+def _delta_amount_usd(delta: dict, kind: str, row: object) -> float:
+    """The USD value of a delta, whichever field this type carries it in.
+
+    `deposit`/`withdraw` carry `usdc`; a `send` of a non-USDC token carries
+    `amount` in that token plus `usdcValue` in dollars, and reading `usdc`
+    there would have raised "no usdc amount" on a perfectly well-formed
+    record. Only USD-denominated fields are accepted -- `amount` alone is a
+    token quantity and treating 5.0 HYPE as $5 would be a silent 40x error.
+    """
+    for field in ("usdc", "usdcValue"):
+        value = delta.get(field)
+        if value is not None:
+            return abs(float(value))
+    raise ValueError(
+        f"{kind} record carries no USD amount (looked for 'usdc' and "
+        f"'usdcValue'): {row!r}"
+    )
+
+
+def net_external_flow(
+    updates: list, since: datetime, until: datetime, address: str | None = None
+) -> float:
     """`userNonFundingLedgerUpdates` -> net USD into the perp account.
 
     Positive means equity arrived from outside; negative means it left. This
@@ -221,13 +291,23 @@ def net_external_flow(updates: list, since: datetime, until: datetime) -> float:
     resolver failure naming the record is recoverable; a silently dropped
     $50k is not.
 
-    Signed from the ACCOUNT's perspective, and the sign convention is read
-    from the record rather than assumed: a directional transfer carries a
-    flag saying which way it went, and guessing it from the type name alone
-    would be a coin flip on half the cases.
+    Signed from the ACCOUNT's perspective, and every sign is read from the
+    record rather than inferred from the type name. Three shapes, and the
+    third is why `address` is a parameter:
+
+      - fixed-sign types (`deposit`, `withdraw`, `vaultDeposit`, ...);
+      - directional types carrying a `toPerp` flag;
+      - dex-routed types (`send`), where the SAME type covers a transfer that
+        touches the perp account and one that never goes near it. Direction
+        needs to know whether this account was the sender or the recipient,
+        which cannot be read off the record alone.
+
+    `address` may be omitted only when no dex-routed record is present; a
+    `send` without it raises rather than being guessed at.
     """
     start_ms = int(since.timestamp() * 1000)
     end_ms = int(until.timestamp() * 1000)
+    me = address.strip().lower() if address else None
     total = 0.0
     for row in updates or []:
         when = row.get("time")
@@ -242,6 +322,49 @@ def net_external_flow(updates: list, since: datetime, until: datetime) -> float:
             )
         if kind in NON_FLOW_DELTA_TYPES:
             continue
+
+        if kind in DEX_ROUTED_TYPES:
+            # Whether this moved perp equity depends on which side of the
+            # transfer this account was on, and on which dex each side names.
+            # Observed live as spot->spot (no perp involvement); the same type
+            # with sourceDex "perp" is a real outflow.
+            if me is None:
+                raise ValueError(
+                    f"{kind} is routed by dex and its direction depends on whether this "
+                    f"account sent or received, but no address was supplied to compare "
+                    f"against: {row!r}"
+                )
+            sender = str(delta.get("user") or "").strip().lower()
+            recipient = str(delta.get("destination") or "").strip().lower()
+            if me not in (sender, recipient):
+                raise ValueError(
+                    f"{kind} names neither this account as sender nor as recipient, so "
+                    f"it cannot be signed: queried {me!r}, record {row!r}"
+                )
+            # The two legs are evaluated INDEPENDENTLY rather than as
+            # if/elif, because an account can be on both sides of the same
+            # record: a self-transfer names this address as sender and as
+            # recipient. Chained, the send leg would fire and the receive leg
+            # would never be reached, so a perp->perp self-send -- which moves
+            # no perp equity at all -- would score as a full outflow. Summing
+            # both legs makes it cancel, which is what actually happened.
+            #
+            # Each leg reads only the dex on its own side, so a record where
+            # this account is on one side only never forces the other side's
+            # field to parse.
+            left = me == sender and _dex_touches_perp(delta.get("sourceDex"), kind, row)
+            arrived = me == recipient and _dex_touches_perp(
+                delta.get("destinationDex"), kind, row
+            )
+            # Amount is read only if a leg fired: a spot-to-spot transfer moves
+            # no perp equity, and refusing it for a missing USD field would
+            # reject records this correction does not even use.
+            if left:
+                total -= _delta_amount_usd(delta, kind, row)
+            if arrived:
+                total += _delta_amount_usd(delta, kind, row)
+            continue
+
         if kind not in EXTERNAL_FLOW_SIGNS:
             raise ValueError(
                 f"unknown ledger delta type {kind!r}. It is neither a known external "
@@ -250,9 +373,7 @@ def net_external_flow(updates: list, since: datetime, until: datetime) -> float:
                 f"or NON_FLOW_DELTA_TYPES in market/parse.py once its meaning is "
                 f"confirmed (OPEN-QUESTIONS B2). Record: {row!r}"
             )
-        amount = delta.get("usdc")
-        if amount is None:
-            raise ValueError(f"{kind} record carries no usdc amount: {row!r}")
+        amount = _delta_amount_usd(delta, kind, row)
         sign = EXTERNAL_FLOW_SIGNS[kind]
         if sign == 0.0:
             # A directional transfer. The venue states the direction; inferring
@@ -265,5 +386,5 @@ def net_external_flow(updates: list, since: datetime, until: datetime) -> float:
                     f"the money went cannot be read: {row!r}"
                 )
             sign = +1.0 if to_perp else -1.0
-        total += sign * abs(float(amount))
+        total += sign * amount
     return total
