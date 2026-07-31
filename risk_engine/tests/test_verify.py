@@ -14,6 +14,8 @@ into confirmation is the §10-forbidden direction.
 
 from __future__ import annotations
 
+import datetime as _dt
+
 import numpy as np
 import pytest
 
@@ -490,6 +492,146 @@ class TestWebData3Probe:
         )
         verify.check_webdata3()
         assert called == []
+
+class TestRecordedFindings:
+    """Verifications that happened outside a run, folded back in.
+
+    The harness reported "3 assumption(s) still unconfirmed: C1, C2, C5" for
+    days after C2 and C5 had been answered — by commands that cannot fit
+    inside one run (C2 needs hours, C5 needs a funded account across a funding
+    tick). A summary that overstates what is open invites redoing settled work
+    and teaches an operator to discount the line, which is the same defect the
+    READMEs had when they claimed the live API had never been reached.
+
+    The danger is the opposite one: a recorded PASS is a claim that can outlive
+    its evidence. These tests are mostly about the ways it must not be
+    trusted."""
+
+    @staticmethod
+    def _finding(**over):
+        from risk_engine.market.findings import RecordedFinding
+
+        base = {
+            "id": "C5", "status": PASS,
+            "observed_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            "command": "python -m risk_engine.market.probe_isolated_funding",
+            "network": "testnet", "detail": "the pocket absorbed 100%",
+            "evidence": {},
+        }
+        base.update(over)
+        return RecordedFinding(**base)
+
+    def test_a_recorded_result_fills_an_uncheckable_gap(self):
+        merged = verify.apply_recorded(
+            verify.check_isolated_funding(), self._finding()
+        )
+        assert merged.passed and merged.satisfied
+        assert merged.evidence["recorded"]["network"] == "testnet"
+
+    def test_a_recorded_pass_never_renders_as_a_live_pass(self):
+        """The whole point. An operator skimming the output must be able to
+        see, without opening the report, that this rests on history."""
+        merged = verify.apply_recorded(
+            verify.check_isolated_funding(), self._finding()
+        )
+        assert merged.status == "PASS (recorded)"
+        assert merged.status != PASS
+        assert "recorded 20" in merged.detail          # the date
+        assert "probe_isolated_funding" in merged.detail  # the command
+        assert "testnet" in merged.detail                 # what it is a claim about
+
+    def test_live_data_outranks_a_recording(self):
+        """A recording exists to fill a gap, not to answer a question the
+        venue has already answered today."""
+        live = verify.Check("C5", "q", PASS, "measured live just now")
+        merged = verify.apply_recorded(live, self._finding())
+        assert merged.status == PASS
+        assert "recorded" not in merged.status
+
+    def test_a_contradiction_is_surfaced_rather_than_hidden(self):
+        """The one event this harness most needs to shout about: something
+        that was true when recorded and is not true now."""
+        live = verify.Check("C5", "q", FAIL, "the cross pool absorbed it")
+        merged = verify.apply_recorded(live, self._finding(status=PASS))
+        assert merged.failed
+        assert "contradicts a recorded PASS" in merged.detail
+        assert merged.evidence["contradicted_recording"] == PASS
+
+    def test_a_stale_recording_vouches_for_nothing(self):
+        """Venues change. A finding that cannot expire is a claim that becomes
+        permanent by neglect."""
+        from risk_engine.market.findings import STALE_AFTER_DAYS
+
+        old = (_dt.datetime.now(_dt.timezone.utc)
+               - _dt.timedelta(days=STALE_AFTER_DAYS + 1)).isoformat()
+        merged = verify.apply_recorded(
+            verify.check_isolated_funding(), self._finding(observed_utc=old)
+        )
+        assert merged.status == INCONCLUSIVE
+        assert not merged.satisfied
+        assert "no longer vouches" in merged.detail
+
+    def test_a_recorded_fail_still_exits_two(self):
+        """An out-of-band check that found the venue contradicting the model is
+        exactly as disqualifying as an in-run one."""
+        merged = verify.apply_recorded(
+            verify.check_isolated_funding(), self._finding(status=FAIL)
+        )
+        assert merged.failed and not merged.satisfied
+
+    def test_no_findings_file_is_normal_and_not_an_error(self, tmp_path):
+        from risk_engine.market.findings import load_findings
+
+        assert load_findings(tmp_path / "nope.json") == {}
+
+    def test_a_finding_without_its_command_is_refused(self, tmp_path):
+        """A verification whose reproduction is folklore is not evidence, and
+        recording it would make it permanent."""
+        import json as _json
+        from risk_engine.market.findings import load_findings
+
+        p = tmp_path / "v.json"
+        p.write_text(_json.dumps({"C5": {
+            "status": PASS, "observed_utc": "2026-07-31T00:00:00+00:00",
+            "network": "testnet", "detail": "trust me",
+        }}))
+        with pytest.raises(ValueError, match="command"):
+            load_findings(p)
+
+    def test_an_unparseable_date_is_refused(self, tmp_path):
+        import json as _json
+        from risk_engine.market.findings import load_findings
+
+        p = tmp_path / "v.json"
+        p.write_text(_json.dumps({"C5": {
+            "status": PASS, "observed_utc": "last Tuesday", "command": "x",
+            "network": "testnet", "detail": "d",
+        }}))
+        with pytest.raises(ValueError, match="ISO-8601"):
+            load_findings(p)
+
+    def test_the_shipped_file_loads_and_is_not_stale(self):
+        """The file in the tree is read by every operator run, so a typo in it
+        is a broken command for everyone. This also fails when a shipped
+        finding ages out, which is the reminder to re-run it."""
+        from risk_engine.market.findings import load_findings
+
+        findings = load_findings()
+        assert set(findings) >= {"C2", "C5"}
+        for f in findings.values():
+            assert not f.is_stale(), f"{f.id} recorded {f.observed_utc} is stale"
+            assert f.command.strip() and f.network.strip()
+
+    def test_the_shipped_c5_finding_states_it_is_testnet(self):
+        """C5 was observed on testnet. That is evidence about testnet, and
+        promoting it silently to a mainnet claim is the laundering this file
+        exists to prevent."""
+        from risk_engine.market.findings import load_findings
+
+        c5 = load_findings()["C5"]
+        assert c5.network == "testnet"
+        assert "TESTNET" in c5.detail.upper()
+
 
 class TestExitCodes:
     """The exit code is the whole interface for a CI job or a deploy script,

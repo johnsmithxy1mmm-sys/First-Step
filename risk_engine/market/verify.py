@@ -47,6 +47,7 @@ from typing import Any
 import numpy as np
 
 from risk_engine.domain.types import normalise_address
+from risk_engine.market.findings import STALE_AFTER_DAYS, load_findings
 from risk_engine.market.info import InfoClient
 from risk_engine.market.parse import (
     parse_candles_to_log_returns,
@@ -75,11 +76,33 @@ class Check:
     evidence: dict[str, Any] = field(default_factory=dict)
 
     @property
+    def passed(self) -> bool:
+        """PASS whether reached live or carried over from a recorded finding.
+
+        The suffix is deliberately part of the status string rather than a
+        separate flag: it renders everywhere the status renders, so there is
+        no display path on which a recorded result can be mistaken for a live
+        one. That makes an exact `== PASS` comparison wrong, and this property
+        is what every caller must use instead.
+        """
+        return self.status.startswith(PASS)
+
+    @property
+    def failed(self) -> bool:
+        """FAIL live, or carried over from a recorded out-of-band check.
+
+        A recorded FAIL still exits 2. An out-of-band check that found the
+        venue contradicting the model is exactly as disqualifying as an
+        in-run one; the only difference is where it was measured.
+        """
+        return self.status.startswith(FAIL)
+
+    @property
     def satisfied(self) -> bool:
-        return self.status == PASS or not self.blocking
+        return self.passed or not self.blocking
 
     def render(self) -> str:
-        return f"[{self.status:12}] {self.id:6} {self.question}\n               {self.detail}"
+        return f"[{self.status:15}] {self.id:6} {self.question}\n                  {self.detail}"
 
 
 # -- E5: the parsers have never seen a live response ---------------------
@@ -642,11 +665,77 @@ def check_isolated_funding() -> Check:
     )
 
 
+# -- recorded findings ----------------------------------------------------
+
+
+#: How a recorded status renders, so it can never be read as a live result.
+RECORDED_SUFFIX = " (recorded)"
+
+
+def apply_recorded(check: Check, finding, now=None) -> Check:
+    """Fold an out-of-band verification into a live check's result.
+
+    The rules, in the order they matter:
+
+    1. **A live verdict wins.** If this run reached PASS or FAIL, the venue
+       answered today and history is not needed. When the two *disagree*, the
+       disagreement is the finding — reported on the live verdict rather than
+       hidden behind it, because a recorded PASS now contradicted is the exact
+       event this whole harness exists to surface.
+    2. **A recording only fills a gap.** It is consulted when the live check
+       came back INCONCLUSIVE or UNCHECKABLE, which is the case it was written
+       for: C2 needs hours, C5 needs a funded account across a funding tick,
+       and neither fits inside one CLI run.
+    3. **A stale recording vouches for nothing.** Past `STALE_AFTER_DAYS` it
+       degrades to INCONCLUSIVE with its age stated, rather than standing in
+       for a fact that may have moved.
+    """
+    if finding is None:
+        return check
+
+    prov = finding.provenance(now)
+
+    if check.status in (PASS, FAIL):
+        if finding.status != check.status:
+            return Check(
+                check.id, check.question, check.status,
+                f"{check.detail} NOTE: this contradicts a recorded "
+                f"{finding.status} — {prov}. The live venue is the authority; "
+                f"the recording is stale, wrong, or the venue changed.",
+                blocking=check.blocking,
+                evidence=check.evidence | {"contradicted_recording": finding.status},
+            )
+        return check
+
+    if finding.is_stale(now):
+        return Check(
+            check.id, check.question, INCONCLUSIVE,
+            f"{check.detail} A recorded {finding.status} exists but is older than "
+            f"{STALE_AFTER_DAYS} days and no longer vouches for anything — "
+            f"{prov}. Re-run it.",
+            blocking=check.blocking,
+            evidence=check.evidence | {"stale_recording": finding.status},
+        )
+
+    return Check(
+        check.id, check.question, finding.status + RECORDED_SUFFIX,
+        f"{finding.detail} [{prov}] — not checked by this run: {check.detail}",
+        blocking=check.blocking,
+        evidence=check.evidence | {"recorded": {
+            "status": finding.status, "observed_utc": finding.observed_utc,
+            "command": finding.command, "network": finding.network,
+            "age_days": round(finding.age_days(now), 1),
+            **({"evidence": finding.evidence} if finding.evidence else {}),
+        }},
+    )
+
+
 # -- driver ---------------------------------------------------------------
 
 
 def run_all(address: str | None, coins: list[str], days: int, samples: int,
-            interval_s: float, testnet: bool, probe_ws: bool = False) -> list[Check]:
+            interval_s: float, testnet: bool, probe_ws: bool = False,
+            findings: dict | None = None) -> list[Check]:
     from risk_engine.market.info import MAINNET_URL, TESTNET_URL
 
     client = InfoClient(url=TESTNET_URL if testnet else MAINNET_URL)
@@ -677,7 +766,13 @@ def run_all(address: str | None, coins: list[str], days: int, samples: int,
     # probing testnet needs the URL passed explicitly.
     checks.append(check_webdata3(address=address, probe=probe_ws and not testnet))
     checks.append(check_isolated_funding())
-    return checks
+
+    # Folded in last, over the finished list, so every check is written and
+    # tested as a pure live check that knows nothing about recorded history.
+    # A check that consulted the file itself could not be tested for what it
+    # does when the file disagrees with it.
+    recorded = findings if findings is not None else {}
+    return [apply_recorded(c, recorded.get(c.id)) for c in checks]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -702,6 +797,15 @@ def main(argv: list[str] | None = None) -> int:
                              "-- the testnet socket URL is a guess this build will not "
                              "make silently.")
     parser.add_argument("--report", help="write the full result as JSON")
+    parser.add_argument("--findings", default=None,
+                        help="JSON of verifications made outside this harness "
+                             "(default docs/hl-risk/VERIFIED.json). C2 needs hours "
+                             "and C5 needs a funded account across a funding tick, "
+                             "so neither fits in one run; without this the summary "
+                             "reports settled questions as open forever.")
+    parser.add_argument("--no-findings", dest="no_findings", action="store_true",
+                        help="ignore recorded findings and report only what this "
+                             "run established")
     args = parser.parse_args(argv)
 
     coins = [c.strip().upper() for c in args.coins.split(",") if c.strip()]
@@ -723,8 +827,19 @@ def main(argv: list[str] | None = None) -> int:
             "documented here, and guessing it would report 'no such subscription' "
             "for an endpoint that was simply never reached."
         )
+    findings: dict = {}
+    if not args.no_findings:
+        try:
+            findings = load_findings(args.findings)
+        except ValueError as exc:
+            # A malformed findings file is the operator's own input, so it is
+            # a usage error and not evidence about the venue -- the same
+            # reasoning that makes a bad `--address` a usage error rather than
+            # an E5.3 FAIL.
+            parser.error(str(exc))
+
     checks = run_all(address, coins, args.days, args.samples,
-                     args.interval_s, args.testnet, args.probe_ws)
+                     args.interval_s, args.testnet, args.probe_ws, findings)
 
     print(f"live-API verification against {'testnet' if args.testnet else 'mainnet'}\n")
     for check in checks:
@@ -736,8 +851,9 @@ def main(argv: list[str] | None = None) -> int:
             json.dump([asdict(c) for c in checks], fh, indent=2, default=str)
         print(f"wrote {args.report}")
 
-    failed = [c for c in checks if c.status == FAIL]
-    unconfirmed = [c for c in checks if not c.satisfied and c.status != FAIL]
+    failed = [c for c in checks if c.failed]
+    unconfirmed = [c for c in checks if not c.satisfied and not c.failed]
+    carried = [c for c in checks if c.status.endswith(RECORDED_SUFFIX)]
     if failed:
         print(f"\n{len(failed)} assumption(s) CONTRADICTED by live data: "
               f"{', '.join(c.id for c in failed)}. The model is wrong today; "
@@ -747,7 +863,19 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\n{len(unconfirmed)} assumption(s) still unconfirmed: "
               f"{', '.join(c.id for c in unconfirmed)}. Nothing here contradicts "
               "the model, and nothing here establishes it either.")
+        if carried:
+            # Said even on the failure path: an operator reading "1 unconfirmed"
+            # needs to know which of the satisfied ones rest on history rather
+            # than on this run, or the line understates what is being assumed.
+            print(f"{len(carried)} rest(s) on a recorded finding rather than on "
+                  f"this run: {', '.join(c.id for c in carried)}. Re-run those "
+                  f"commands if anything about the venue may have changed.")
         return 1
+    if carried:
+        print(f"\nEvery blocking assumption satisfied, but {len(carried)} of them "
+              f"({', '.join(c.id for c in carried)}) rest on a recorded finding "
+              f"rather than on this run. That is not the same as verified today.")
+        return 0
     print("\nEvery blocking assumption confirmed against live data.")
     return 0
 
