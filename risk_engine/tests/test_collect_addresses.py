@@ -663,6 +663,63 @@ class TestTheDependencyAndTheCLI:
         assert "pip install 'websockets>=12.0'" in message
         assert "Dockerfile.engine" in message
 
+    def test_a_dry_run_reports_and_writes_nothing(self, tmp_path, monkeypatch, capsys):
+        """The point of the mode: learn in a minute what a 30-minute run would
+        teach, without producing a file anyone could mistake for a sample."""
+        frames = [_frame([_trade([_addr(1), _addr(2)])])]
+        result, _, _ = _run(frames, target=1)
+        monkeypatch.setattr(collect, "harvest", lambda **kw: result)
+
+        assert collect.main(["--dry-run", "--dry-run-seconds", "60"]) == collect.EXIT_OK
+        printed = capsys.readouterr().out
+        assert "DRY RUN" in printed
+        assert "Nothing will be written" in printed
+        assert "VERDICT: the feed behaves as assumed" in printed
+        # It must name the field it actually read, since that is the constant
+        # an operator edits when the guess is wrong.
+        assert result.address_field in printed
+        assert list(tmp_path.iterdir()) == []
+
+    def test_a_dry_run_needs_no_out_but_a_real_run_does(self, monkeypatch, capsys):
+        """--out is what a real run refuses to start without; requiring it for
+        a probe that writes nothing would be asking for a path to ignore."""
+        monkeypatch.setattr(collect, "harvest", lambda **kw: pytest.fail(
+            "a bare invocation connected instead of refusing"
+        ))
+        with pytest.raises(SystemExit):
+            collect.main([])
+        assert "--out is required" in capsys.readouterr().err
+
+    def test_a_dry_run_surfaces_a_shape_mismatch_as_the_finding_it_is(
+        self, monkeypatch, capsys
+    ):
+        """The case the mode exists for. A mismatch here is B4/C4's unverified
+        assumption failing, found for the price of a minute, and the message
+        has to point at the constant to change rather than read as a crash."""
+        def _shape_fault(**kwargs):
+            raise UnexpectedFeedShape("a trade record carried no account address")
+
+        monkeypatch.setattr(collect, "harvest", _shape_fault)
+        assert collect.main(["--dry-run"]) == collect.EXIT_FEED_SHAPE
+        printed = capsys.readouterr().out
+        assert "FEED SHAPE MISMATCH" in printed
+        assert "TRADE_ADDRESS_FIELDS" in printed
+        assert "30 minutes" in printed
+
+    def test_a_dry_run_that_cannot_connect_says_nothing_was_learned(
+        self, monkeypatch, capsys
+    ):
+        """An unreachable URL teaches nothing about the message shape, and
+        saying otherwise would send an operator to edit the wrong constant."""
+        def _unreachable(**kwargs):
+            raise collect.FeedUnreachable("could not open a WebSocket connection to wss://x")
+
+        monkeypatch.setattr(collect, "harvest", _unreachable)
+        assert collect.main(["--dry-run"]) == collect.EXIT_UNREACHABLE
+        printed = capsys.readouterr().out
+        assert "COULD NOT CONNECT" in printed
+        assert "nothing was learned about the message shape" in printed
+
     def test_the_output_path_is_checked_before_the_collection_window(
         self, tmp_path, monkeypatch, capsys
     ):

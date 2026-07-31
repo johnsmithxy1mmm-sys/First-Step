@@ -1397,6 +1397,96 @@ class _ExitCodeParser(argparse.ArgumentParser):
         raise SystemExit(EXIT_USAGE)
 
 
+def _dry_run(args, parser) -> int:
+    """Probe the feed briefly and report, writing nothing.
+
+    Every fact this module relies on about the venue is unverified here: the
+    WebSocket URL, the subscribe envelope, the channel name, and the claim
+    that a public trade names its participants. All four come from one
+    UNCHECKABLE note and a snippet nobody has executed, because the API is 403
+    at this environment's proxy. The full command spends thirty minutes before
+    an operator learns whether any of them hold; this spends one.
+
+    It deliberately reuses `harvest` rather than re-implementing a lighter
+    probe. A separate code path would be testing a different set of
+    assumptions from the one the real run makes -- which is precisely the
+    failure mode this whole module is built around -- so the dry run is the
+    real collector with a short window and no write, and its verdict
+    transfers exactly.
+
+    A `target` of one address is deliberate: this asks whether the wiring
+    works, not whether the sample is big enough. Sample size is what
+    `--minutes` buys, and it is a different question with a different answer.
+    """
+    seconds = max(args.dry_run_seconds, 1.0)
+    print(
+        f"DRY RUN: {seconds:.0f}s against {args.ws_url}, coins {', '.join(args.coins)}. "
+        "Nothing will be written.\n"
+    )
+    try:
+        result = harvest(
+            coins=args.coins,
+            minutes=seconds / 60.0,
+            target=1,
+            ws_url=args.ws_url,
+            progress_every_s=max(seconds / 4.0, 5.0),
+            # The graces are what turn "acknowledged but silent" into a loud
+            # fault, and they are sized for a 30-minute run. Cap them at the
+            # window so a 60-second probe cannot spend its whole budget
+            # waiting for a grace that was never going to expire in time.
+            first_frame_grace_s=min(FIRST_FRAME_GRACE_S, seconds),
+            first_trade_grace_s=min(FIRST_TRADE_GRACE_S, seconds),
+        )
+    except FeedUnreachable as exc:
+        print(f"COULD NOT CONNECT: {exc}")
+        print(
+            "\nVERDICT: the URL or the network is wrong, and nothing was learned about "
+            "the message shape. A real run would fail the same way in its first seconds."
+        )
+        return EXIT_UNREACHABLE
+    except ImportError as exc:
+        print(str(exc))
+        return EXIT_UNREACHABLE
+    except UnexpectedFeedShape as exc:
+        print(f"FEED SHAPE MISMATCH: {exc}")
+        print(
+            "\nVERDICT: the connection works and the feed is not what this module "
+            "assumes. This is the finding OPEN-QUESTIONS B4 and C4 said needed "
+            "verification, and a real run would have wasted 30 minutes to reach it. "
+            "The quoted frame above is the evidence for whichever constant needs "
+            "changing -- TRADES_CHANNEL, the subscribe envelope, or "
+            "TRADE_ADDRESS_FIELDS."
+        )
+        return EXIT_FEED_SHAPE
+
+    n = len(result.addresses)
+    print(
+        f"\nVERDICT: the feed behaves as assumed. {n} distinct "
+        f"address{'' if n == 1 else 'es'} from {result.trade_records} trade "
+        f"record{'' if result.trade_records == 1 else 's'} in {seconds:.0f}s, "
+        f"read from the '{result.address_field}' field."
+    )
+    if result.anomalies.total:
+        print(
+            f"  {result.anomalies.total} anomaly/anomalies were counted rather than "
+            "aborted on, because addresses were already arriving. A real run publishes "
+            "these in the frame; read them before trusting the sample."
+        )
+    rate = n / seconds * 60.0 if seconds else 0.0
+    if rate > 0:
+        needed = gate_required_addresses()
+        print(
+            f"  Roughly {rate:.0f} new addresses/minute at this moment, so §3.3's "
+            f"{needed} would take on the order of {needed / rate:.0f} minutes if the "
+            "rate held. It will not hold -- distinct addresses saturate as the active "
+            "traders repeat -- so treat that as a floor on the window, not an estimate "
+            f"of it, and prefer --minutes 30 over the arithmetic."
+        )
+    print("\nReady to collect:\n    python -m risk_engine.market.collect_addresses "
+          "--minutes 30 --out addresses.json")
+    return EXIT_OK
+
+
 def main(argv: Iterable[str] | None = None) -> int:
     parser = _ExitCodeParser(
         prog="risk_engine.market.collect_addresses",
@@ -1412,7 +1502,16 @@ def main(argv: Iterable[str] | None = None) -> int:
             "TLS, refusal, or the missing 'websockets' package); 4 bad invocation."
         ),
     )
-    parser.add_argument("--out", required=True, help="where to write the address list")
+    parser.add_argument("--out", help="where to write the address list "
+                                      "(not needed with --dry-run)")
+    parser.add_argument(
+        "--dry-run", dest="dry_run", action="store_true",
+        help="connect, subscribe and read for --dry-run-seconds, report what the feed "
+             "actually looks like, write nothing. Run this BEFORE a real collection: "
+             "every assumption this module makes about the venue is unverified, and a "
+             "minute now is cheaper than finding out at minute 30",
+    )
+    parser.add_argument("--dry-run-seconds", dest="dry_run_seconds", type=float, default=60.0)
     parser.add_argument("--minutes", type=float, default=30.0,
                         help="time budget for the collection window (default 30)")
     parser.add_argument("--target", type=int, default=DEFAULT_TARGET,
@@ -1430,6 +1529,11 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--force", action="store_true", help="overwrite an existing --out")
     parser.add_argument("--progress-seconds", dest="progress_seconds", type=float, default=15.0)
     args = parser.parse_args(argv)
+
+    if args.dry_run:
+        return _dry_run(args, parser)
+    if not args.out:
+        parser.error("--out is required (or pass --dry-run to probe the feed first)")
 
     out = Path(args.out)
     required = gate_required_addresses()
