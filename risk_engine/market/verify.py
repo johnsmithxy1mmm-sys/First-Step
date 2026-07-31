@@ -228,6 +228,7 @@ def check_funding_clamp(client: InfoClient, coins: list[str], days: int) -> Chec
     evidence = {
         "configured_cap_per_hour": bounds.cap_per_hour,
         "source": bounds.source,
+        "source_confirmed": bounds.confirmed,
         "observed_max_abs_rate": worst,
         "worst_coin": worst_coin,
         "n_observations": total,
@@ -243,14 +244,35 @@ def check_funding_clamp(client: InfoClient, coins: list[str], days: int) -> Chec
             "reality away (§1.5).",
             evidence=evidence | {"breaches": breaches},
         )
+    sample = (f"no breach in {total} observations over {days}d; worst was "
+              f"{worst:.6g}/h on {worst_coin}, "
+              f"{worst / bounds.cap_per_hour:.1%} of the configured cap")
+
+    if bounds.confirmed:
+        # Two independent things, and PASS needs both. The citation says the
+        # constant is what the protocol specifies; the sample says the venue
+        # has not been observed contradicting it. Either alone is weaker than
+        # it looks — a citation can be stale, and a quiet month proves nothing
+        # about a bound nothing approached.
+        return Check(
+            "C1", "is the documented funding clamp real?", PASS,
+            f"the cap is confirmed against a protocol reference — {bounds.source} — "
+            f"and live data is consistent with it: {sample}. The sample does not "
+            f"establish the bound and is not asked to; it would have falsified it.",
+            evidence=evidence,
+        )
+
     return Check(
         "C1", "is the documented funding clamp real?", INCONCLUSIVE,
-        f"no breach in {total} observations over {days}d; worst was {worst:.6g}/h on "
-        f"{worst_coin}, {worst / bounds.cap_per_hour:.1%} of the configured cap. "
-        "This falsifies nothing and confirms nothing: a clamp is a protocol "
-        "constant and no sample of realised rates can establish it. Confirm the "
-        "value from protocol documentation or source and record it as the "
-        "`source` field.",
+        f"{sample}. This falsifies nothing and confirms nothing: a clamp is a "
+        f"protocol constant and no sample of realised rates can establish it — "
+        f"the largest rate seen is {worst / bounds.cap_per_hour:.2%} of the cap, so "
+        f"the venue has never been near it. Read the value out of Hyperliquid's "
+        f"documentation or source and record it with "
+        f"`FundingBounds.from_protocol_source(cap, '<url or file:line>')`, which "
+        f"is what makes this check able to PASS. Until 2026-07-31 it could not: "
+        f"it built its own unconfirmed default, so following this instruction "
+        f"changed nothing about its output. Current source: {bounds.source}",
         evidence=evidence,
     )
 

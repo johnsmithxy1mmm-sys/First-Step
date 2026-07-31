@@ -791,12 +791,58 @@ Two consequences, and together they change what this question is worth:
   low would truncate reality and understate, which is forbidden; at 1760×
   headroom, too-low is not the plausible failure.
 
-What remains is provenance, not calibration: the `source` field still says
-"unverified against live API". Confirm 0.04/h from protocol documentation or
-source and rewrite that string. **This no longer blocks the pilot**, because
-a non-binding constraint cannot move the distribution the shadow counter is
-accumulating against. It should still be settled before Phase 4 touches real
-money.
+What remains is provenance, not calibration. **This no longer blocks the
+pilot**, because a non-binding constraint cannot move the distribution the
+shadow counter is accumulating against. It should still be settled before
+Phase 4 touches real money.
+
+**The check could not be closed at all until 2026-07-31.** It told an operator
+to "confirm the value from protocol documentation and record it as the
+`source` field" — and then built its own `FundingBounds.documented_default()`
+and returned INCONCLUSIVE whenever nothing breached the cap. Following the
+instruction exactly produced identical output. C1 had two reachable outcomes,
+FAIL and INCONCLUSIVE, and no PASS; an assumption that cannot be closed is one
+that gets ignored rather than resolved. Same defect class as `mc_non_convergence`
+being structurally pinned at zero and A10's diagnostic never being called.
+
+Closing it is now a real action:
+
+```python
+FundingBounds.from_protocol_source(0.04, "<url or file:line> (read <date>)")
+```
+
+`confirmed` is a field rather than a convention about the wording of `source`,
+because prose cannot be checked and this is what the check turns on.
+`documented_default()` cannot set it — a default that arrives pre-confirmed is
+a default nobody ever confirms — and the citation must contain something
+re-checkable, so "Hyperliquid docs" is refused. PASS requires **both** the
+citation and a non-contradicting sample: a citation can be stale, and a quiet
+month proves nothing about a bound nothing approached. Confirmation does not
+excuse a breach — a confirmed-but-contradicted bound fails louder, which is
+the correct ordering.
+
+**Secondary corroboration, recorded as such (2026-07-31).** `api.hyperliquid.xyz`
+and `hyperliquid.gitbook.io` are both 403 at this environment's proxy, so the
+primary source could not be read from here. Several independent third-party
+write-ups agree that the documented cap is **4%/hour**, matching
+`HL_DOCUMENTED_HOURLY_CAP = 0.04`, and quote the docs as saying the formula
+computes an 8-hour rate paid hourly at one eighth. **That is not the bar this
+entry asks for and the flag stays off**: agreement among secondary sources is
+how a value nobody verified becomes a value everybody trusts, which is exactly
+what §1.5 exists to prevent.
+
+One trap for whoever does read the primary source. The published formula
+contains **two different clamps**, and recording the wrong one would be a
+100× error in the wrong direction:
+
+| clamp | value | what it bounds |
+|-------|-------|----------------|
+| overall funding cap | **4%/hour** | the realised rate — this is `cap_per_hour` |
+| interest-rate term | ±0.0005 | the `clamp(interest − premium, …)` component *inside* the formula |
+
+`cap_per_hour` is used to clip simulated funding paths, so it is the overall
+cap. Recording ±0.0005 there would truncate reality at 1/80th of the true
+bound — the §10-forbidden direction.
 
 ### C2 `[RESOLVED — measured over 12 hours; the guard this entry claimed never existed]`
 

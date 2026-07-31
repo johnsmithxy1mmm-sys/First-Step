@@ -40,6 +40,14 @@ HL_DOCUMENTED_HOURLY_CAP = 0.04
 class FundingBounds:
     cap_per_hour: float
     source: str
+    #: Whether `source` names a protocol reference someone actually read, as
+    #: opposed to a value carried forward on trust.
+    #:
+    #: A separate field rather than a convention about the wording of `source`,
+    #: because prose cannot be checked and this is the thing C1 turns on. It is
+    #: also why `documented_default` cannot set it: a default that arrives
+    #: pre-confirmed is a default nobody ever confirms.
+    confirmed: bool = False
 
     def __post_init__(self) -> None:
         if self.cap_per_hour <= 0:
@@ -63,6 +71,40 @@ class FundingBounds:
             cap_per_hour=HL_DOCUMENTED_HOURLY_CAP,
             source="Hyperliquid docs (unverified against live API; OPEN-QUESTIONS C1)",
         )
+
+    @classmethod
+    def from_protocol_source(cls, cap_per_hour: float, source: str) -> FundingBounds:
+        """A cap someone read out of the protocol's own documentation or code.
+
+        This is the only way to reach `confirmed=True`, and it exists because
+        C1 could not be closed at all before it. The check told an operator to
+        "confirm the value from protocol documentation and record it as the
+        `source` field" — and recording it changed nothing, because the check
+        built its own `documented_default()` and returned INCONCLUSIVE
+        whenever no observation breached the cap. The instruction was
+        unactionable: following it exactly produced identical output. Same
+        defect class as a counter that cannot fire and a diagnostic nothing
+        calls.
+
+        `source` must be specific enough to re-check: a URL, a doc section, a
+        file and line in the protocol's source. "Hyperliquid docs" is not, and
+        is refused, because the whole value of a confirmed bound is that the
+        next person can confirm it again rather than inherit the belief.
+
+        Note what confirmation does NOT do: it does not make the bound true.
+        `validate_against_history` still refuses a rate that exceeds it, and a
+        confirmed-but-wrong bound fails louder than an unconfirmed one, which
+        is the correct ordering.
+        """
+        if len(source.strip()) < 12 or not any(ch.isdigit() for ch in source):
+            raise ValueError(
+                "a confirmed funding bound must cite something re-checkable — a "
+                "URL, a dated doc section, or a file and line in the protocol's "
+                "source. Got: " + repr(source) + ". An unspecific citation is how "
+                "a value nobody verified becomes a value everybody trusts (§1.5, "
+                "OPEN-QUESTIONS C1)."
+            )
+        return cls(cap_per_hour=cap_per_hour, source=source.strip(), confirmed=True)
 
 
 @dataclass(frozen=True, slots=True)

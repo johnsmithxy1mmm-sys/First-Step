@@ -493,6 +493,80 @@ class TestWebData3Probe:
         verify.check_webdata3()
         assert called == []
 
+class TestFundingClampCanActuallyClose:
+    """C1 had two outcomes: FAIL and INCONCLUSIVE. There was no PASS.
+
+    The INCONCLUSIVE text told an operator to "confirm the value from protocol
+    documentation and record it as the `source` field" — and the check built
+    its own `FundingBounds.documented_default()` and returned INCONCLUSIVE
+    whenever nothing breached the cap. Recording the source changed nothing.
+    The instruction was unactionable, and an assumption that cannot be closed
+    is one that gets ignored rather than resolved.
+
+    Same defect class as a counter pinned at zero and a diagnostic nothing
+    calls: a mechanism whose success path does not exist.
+    """
+
+    def _client(self, rate=2.27e-05):
+        # Realistic magnitude: the live worst over 30 days on this venue was
+        # 2.27e-05/h, about 0.06% of the 0.04/h cap.
+        return StubClient(rates=[rate, -rate, rate / 2])
+
+    def test_an_unconfirmed_source_is_inconclusive_however_quiet_the_data(self):
+        """Absence of a breach is not evidence for a protocol constant, and no
+        volume of it becomes evidence."""
+        check = verify.check_funding_clamp(self._client(), ["BTC"], 30)
+        assert check.status == INCONCLUSIVE
+        assert check.evidence["source_confirmed"] is False
+        # It must name the call that closes it, not just ask for a "source".
+        assert "from_protocol_source" in check.detail
+
+    def test_a_confirmed_source_plus_consistent_data_passes(self, monkeypatch):
+        from risk_engine.model.funding import FundingBounds
+
+        monkeypatch.setattr(
+            FundingBounds, "documented_default",
+            classmethod(lambda cls: FundingBounds.from_protocol_source(
+                0.04, "https://example.invalid/docs/funding#cap (read 2026-07-31)")),
+        )
+        check = verify.check_funding_clamp(self._client(), ["BTC"], 30)
+        assert check.status == PASS
+        assert check.evidence["source_confirmed"] is True
+
+    def test_a_confirmed_source_does_not_excuse_a_breach(self, monkeypatch):
+        """Confirmation says what the protocol specifies; it cannot say the
+        venue obeys it. A confirmed-but-contradicted bound must fail LOUDER,
+        not quieter — clamping reality away is the §10-forbidden direction."""
+        from risk_engine.model.funding import FundingBounds
+
+        monkeypatch.setattr(
+            FundingBounds, "documented_default",
+            classmethod(lambda cls: FundingBounds.from_protocol_source(
+                0.04, "https://example.invalid/docs/funding#cap (read 2026-07-31)")),
+        )
+        check = verify.check_funding_clamp(self._client(rate=0.5), ["BTC"], 30)
+        assert check.status == FAIL
+        assert "do not clamp" in check.detail
+
+    def test_a_vague_citation_is_refused(self):
+        """"Hyperliquid docs" is what the unconfirmed default already says.
+        Accepting it as confirmation would let the flag be flipped without
+        anyone reading anything."""
+        from risk_engine.model.funding import FundingBounds
+
+        for bad in ("Hyperliquid docs", "the docs", "confirmed", ""):
+            with pytest.raises(ValueError, match=r"re-checkable|provenance"):
+                FundingBounds.from_protocol_source(0.04, bad)
+
+    def test_the_shipped_default_is_not_confirmed(self):
+        """The value in the tree is carried on trust and must say so. This
+        test fails the day someone flips it without a citation — which is the
+        point of it existing."""
+        from risk_engine.model.funding import FundingBounds
+
+        assert FundingBounds.documented_default().confirmed is False
+
+
 class TestRecordedFindings:
     """Verifications that happened outside a run, folded back in.
 
