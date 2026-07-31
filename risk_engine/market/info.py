@@ -10,14 +10,31 @@ built against recorded fixtures and the response shapes are taken from the
 documentation rather than observed. This is OPEN-QUESTIONS E5 and must be
 re-verified where the API is reachable before anything downstream is trusted.
 
-Two things §5.1 flags that are enforced here rather than left to the caller:
+One thing §5.1 flags that IS enforced here rather than left to the caller:
+the margin tier table comes from `meta`, never from a constant.
 
-  - `clearinghouseState` must be queried with the REAL account address, not
-    the agent address. An agent address returns a well-formed *empty* state,
-    which silently reads as "this user has no positions" -- the most
-    dangerous possible failure for a risk tool. `fetch_clearinghouse_state`
-    refuses an address flagged as an agent.
-  - the margin tier table comes from `meta`, never from a constant.
+The other one is NOT, and the distinction matters enough to state at length
+because this docstring used to claim otherwise. §5.1 warns that
+`clearinghouseState` must be queried with the REAL account address, not an
+agent address: an agent address returns a well-formed *empty* state, which
+reads as "this user has no positions" — the most dangerous possible failure
+for a risk tool, since a flat book and an unreadable one are indistinguishable
+downstream.
+
+`clearinghouse_state` takes an `is_agent_address` flag and refuses when it is
+set, but **nothing detects the case**. The flag is an assertion the caller
+makes, it defaults to False, and no shipped caller passes it — the shadow
+provider, `verify` and the C5 probe all use the one-argument form. So the
+footgun is open on every live path.
+
+It is open because it cannot be closed here. The venue returns byte-identical
+responses for an agent address and a genuinely flat account; there is no
+read-only signal to branch on, and inventing one would mean guessing. What
+narrows it instead is where addresses come from: `collect_addresses` harvests
+them from the public trades feed, so every address in a generated list is an
+account that *traded*, which an agent address does not do on its own behalf.
+A hand-assembled list carries the full risk, and `--allow-short` plus a
+hand-written `frame` is exactly the path that skips the collector.
 
 A third, for the same reason as the first: no address reaches the wire in a
 spelling this module has not canonicalised. `normalise_address` runs in every

@@ -77,7 +77,11 @@ CREATE TABLE IF NOT EXISTS calibration_outcomes (
     -- forecast scored against a 72h realisation is not a model error, it is
     -- an infrastructure gap, and scoring it silently corrupts the calibration
     -- record (audit A-04). Stale rows are excluded from every cohort by
-    -- default and counted in observability.
+    -- default. They are also counted -- but into the metrics registry of the
+    -- short-lived `shadow resolve` process, which exits immediately after,
+    -- so that counter reaches no scraper. What an operator actually sees is
+    -- the resolver's own stdout ("N flagged stale") in the container log.
+    -- Read that, not `/metrics`, when the window stops advancing.
     resolution_lag_s     DOUBLE PRECISION NOT NULL,
     stale_resolution     BOOLEAN     NOT NULL
 );

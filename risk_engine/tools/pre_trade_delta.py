@@ -173,7 +173,10 @@ class PreTradeDelta:
 
     @property
     def publishable(self) -> bool:
-        """§2.5: an under-resolved probability is shown to nobody."""
+        """§2.5's flag. NOT a refusal — see `PortfolioRisk.publishable`: the
+        withholding happens in the Node backend, not here, and this object
+        carries a full set of numbers regardless of what this returns.
+        """
         return self.converged
 
     def summary(self) -> str:

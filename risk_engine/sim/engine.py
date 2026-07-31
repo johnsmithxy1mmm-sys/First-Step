@@ -9,9 +9,28 @@ regressed.
 Path count is adaptive, not fixed. §2.5 wants 20 000 paths *and* a 95%
 interval on P(liq) no wider than 2 pp; when those disagree the interval
 wins and the run is extended (OPEN-QUESTIONS D1). A result that could not
-reach the target interval is returned with `converged=False`, and callers in
-`tools/` refuse to publish it rather than shipping a number the engine knows
-is under-resolved.
+reach the target interval is returned with `converged=False`.
+
+Two corrections to what this docstring used to claim, both measured:
+
+**Nothing in `tools/` refuses to publish it.** `portfolio_risk` and
+`pre_trade_delta` return the full result with every point estimate populated
+and expose `publishable` alongside; the service serves it at HTTP 200. The
+refusal is real but lives at the TypeScript boundary
+(`services/backend/src/risk/client.ts`, `staleness/contract.ts`), which is
+also where §6's degradation contract lives, so a Python consumer added later
+inherits no protection at all.
+
+**At shipped defaults `converged=False` is unreachable.** With
+`DEFAULT_PATHS = 20_000` the worst-case Wilson half-width over every possible
+success count is 0.0069, well inside the 0.02 target, so the first pass always
+converges and the escalation loop never reaches `MAX_PATHS`. The flag can only
+fire on a caller-supplied path count below ~2 400. That is not a defect —
+§2.5's rule being satisfied by construction is the desired outcome — but it
+means `mc_non_convergence` is pinned at zero, and "the counter is quiet
+because all is well" is indistinguishable from "the counter cannot fire".
+Anyone tightening `DEFAULT_TARGET_HALF_WIDTH` or lowering `MAX_PATHS` re-opens
+the path and should re-read the paragraph above about where the refusal is.
 """
 
 from __future__ import annotations

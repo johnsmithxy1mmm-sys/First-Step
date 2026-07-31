@@ -175,10 +175,21 @@ class LiveSnapshotProvider:
     the request shapes come from documentation and this class has never made
     a real call. The fixture path is what the tests drive.
 
-    §5.1's named footgun is enforced by `InfoClient`: an agent address
-    returns a well-formed *empty* state, which reads as "no positions". For a
-    shadow sweep that would silently fill the calibration journal with
-    flat books.
+    §5.1's named footgun is NOT enforced by `InfoClient`, contrary to what
+    this docstring said before it was checked. An agent address returns a
+    well-formed *empty* state that reads as "no positions", and nothing
+    detects it — `is_agent_address` is a flag the caller asserts and this
+    provider never passes. Nor can it be detected: the venue's response is
+    identical to a genuinely flat account's.
+
+    What actually happens to such an address here is worth knowing, because
+    it is not the failure the old wording implied. `ShadowCron.run_once`
+    skips books with no open positions, so an agent address does not fill the
+    journal with flat books — it silently *leaves the sample*, reported as
+    "no open positions", byte-identical to a real account that closed out.
+    §3.3's 200-address count then comes up short for a reason that appears in
+    no output. Addresses from `collect_addresses` are accounts that traded,
+    which narrows this; a hand-assembled list does not.
     """
 
     def __init__(

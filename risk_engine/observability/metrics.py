@@ -1,8 +1,31 @@
 """Counters and latency histograms (§7).
 
 Deliberately dependency-free: a dict of counters and a list of samples,
-exported as plain data. Whatever scrapes this (Prometheus in
-`deploy/prometheus.yml`, the health endpoint, a test) reads the snapshot.
+exported as plain data, so whatever wants them reads `snapshot()`.
+
+**Nothing scrapes this today, and the two readers this docstring used to name
+were both wrong.** `deploy/prometheus.yml` targets `bot:9090` — the
+Polymarket bot in the *root* compose file, a different project that shares
+this repository; the risk-engine stack in `deploy/docker-compose.yml` has no
+prometheus service at all. And `/health` carries model version, matrix age
+and readiness, never the snapshot. The only way to read these counters in a
+deployment is to curl the engine's `/metrics` with the bearer token, on a
+port published to nothing (`expose`, not `ports`).
+
+That matters most for the counters whose whole job is to reveal a problem —
+`matrix_rebuild_failures`, `pre_trade_budget_exceeded`,
+`psd_projection_corrections`, `df_clamps`. A counter nobody collects is a
+counter that reads as zero. Adding a scraper means a prometheus service on
+the engine's network with the token in its `authorization` header; until
+then, treat these as available for a test and for a human with the token,
+not as monitoring.
+
+Two further gaps worth knowing before relying on a number here:
+`mc_non_convergence` cannot fire at shipped defaults at all (see
+`sim/engine.py` — 20 000 paths meet §2.5's 2 pp bound for every possible
+outcome), and counters incremented inside the short-lived `shadow snapshot`
+and `shadow resolve` processes die with them, since those are separate
+containers from the one serving `/metrics`.
 
 The metrics §7 asks for that are *not* here belong to the Node service or to
 the shadow harness and are recorded there:

@@ -56,7 +56,14 @@ class PortfolioRisk:
 
     @property
     def publishable(self) -> bool:
-        """§2.5: an under-resolved probability is not shown to anyone."""
+        """§2.5's flag. NOT a refusal — this object still carries every point
+        estimate when it is False, and the service serves it at HTTP 200.
+
+        What honours it is `services/backend/src/risk/client.ts`, which
+        withholds the value the same way it withholds a stale one. A Python
+        caller that reads `.p_liq_24h_any` without checking this gets an
+        under-resolved number with no complaint.
+        """
         return self.converged
 
     @property
