@@ -35,7 +35,21 @@ EXPOSE 8080
 # different questions. This asks the first; the second is what /api/health
 # reports to the frontend, and it stays 200 during an engine outage by
 # design — an outage is a state the contract describes, not a crash.
+# Probes the container's own HOSTNAME, not 127.0.0.1 — so a loopback-only
+# bind FAILS this check instead of passing it.
+#
+# The 127.0.0.1 version reported `healthy` for a backend bound to loopback,
+# which is reachable from inside the container and from nowhere else: every
+# request from `web` got ECONNREFUSED while compose showed three green
+# services. A healthcheck that can pass while every real client fails is
+# worse than no healthcheck, because it is believed.
+#
+# `hostname` inside a compose container resolves on the compose network, so
+# this reaches the service the same way a client does. It stays a
+# self-contained probe with no extra tooling: still one `node -e`, still no
+# curl or wget in the image (neither is present — `wget` is what an operator
+# reaches for first and it is not there).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+    CMD node -e "fetch('http://'+require('os').hostname()+':'+(process.env.PORT||8080)+'/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
 CMD ["node", "dist/main.js"]

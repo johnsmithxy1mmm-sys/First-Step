@@ -58,6 +58,22 @@ services:
     restart: unless-stopped
     environment:
       PORT: 8080
+      # Without this the backend binds 127.0.0.1 (its default, which is the
+      # right one for a laptop) and is then reachable only from inside its own
+      # container: `web` gets ECONNREFUSED on every request and renders §6's
+      # "risk engine unavailable" for a backend that is running perfectly.
+      #
+      # Nothing surfaced it. The healthcheck passed because it runs INSIDE the
+      # container against loopback, so compose reported `healthy` for a
+      # service no client could reach; the engine's own logs showed only
+      # /health, and the backend's showed only remoteAddress 127.0.0.1. Three
+      # green signals and one dead path.
+      #
+      # The engine avoids this by taking `--host 0.0.0.0` explicitly in its
+      # `command:` below, and refuses that bind without a token. The backend
+      # is not published to the host either (`expose`, not `ports`), so the
+      # compose network is the boundary here.
+      HOST: 0.0.0.0
       RISK_SERVICE_URL: http://engine:8787
       RISK_SERVICE_TOKEN: ${RISK_SERVICE_TOKEN:?set RISK_SERVICE_TOKEN in deploy/.env}
     depends_on:
