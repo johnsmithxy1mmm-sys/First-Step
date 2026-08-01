@@ -109,6 +109,33 @@ class FakeProvider:
         return self._flows.get(address, 0.0)
 
 
+class _BudgetedProvider(FakeProvider):
+    """A provider whose `book()` charges a rate limit, like the real client.
+
+    `allow` calls succeed, then `book()` raises `RateLimitExceeded` — exactly
+    as `InfoClient.post` does when the §5.3 window is spent. `release_after`
+    counts refusals and starts allowing again once that many have been seen,
+    modelling a sliding window that refills while the sweep waits.
+    """
+
+    def __init__(self, books, spot, specs, *, allow=0, release_after=None):
+        super().__init__(books, spot, specs)
+        self._allowed = allow
+        self._release_after = release_after
+        self._refusals = 0
+
+    def book(self, address):
+        if self._allowed > 0:
+            self._allowed -= 1
+            return super().book(address)
+        self._refusals += 1
+        if self._release_after is not None and self._refusals >= self._release_after:
+            self._allowed = 1_000_000  # window refilled
+            self._allowed -= 1
+            return super().book(address)
+        raise RateLimitExceeded("weight 20 exceeds remaining 0")
+
+
 @pytest.fixture
 def books(now):
     return {
@@ -209,30 +236,44 @@ class TestShadowSweep:
         assert [a for a, _ in report.skipped] == [ADDR_FLAT]
         journal.close()
 
-    def test_yields_to_live_users_when_the_budget_runs_out(
+    def test_the_sweep_waits_on_the_budget_the_api_actually_charges(
         self, bundle, specs, spot, books, naive, now
     ):
-        """§5.3: the background sweep must never spend into the reserve.
+        """The §5.3 limit is enforced by the InfoClient's budget, charged
+        INSIDE `book()`. The sweep must wait on that, not on a counter of its
+        own — an earlier fix waited on a cron-owned budget while the real
+        request charged a different object, so the true limit surfaced as a
+        `RateLimitExceeded` skip and the address was dropped. This drives the
+        real mechanism: a provider whose `book()` refuses until released.
 
-        The sweep now WAITS for the window rather than abandoning the list
-        (truncating made §3.3's gate unreachable — see
-        `TestTheSweepPacesRatherThanTruncating`), so this pins the invariant
-        that survives that change: the reserve is never touched, and the run
-        still ends at its ceiling rather than sleeping forever. A ceiling of
-        zero reaches it on the first refusal, which keeps the test instant.
-        """
-        budget = WeightBudget(limit_per_minute=100, reserved_fraction=0.75)
-        provider = FakeProvider(books, spot, specs)
+        Ceiling 0 so a refusal ends the run immediately (instant test); with
+        no ceiling it would wait and eventually succeed."""
+        provider = _BudgetedProvider(books, spot, specs, allow=0)
         journal = CalibrationJournal()
         report = ShadowCron(
-            provider, bundle, journal, naive, n_paths=500, budget=budget,
-            max_sweep_seconds=0.0,
+            provider, bundle, journal, naive, n_paths=500, max_sweep_seconds=0.0,
         ).run_once(now)
         assert report.budget_exhausted
-        assert report.written < len(books)
-        # The reserve is what §5.3 protects: 25 of 100 usable, and not one
-        # unit past it however long the sweep runs.
-        assert budget.spent() <= int(100 * 0.25)
+        assert report.written == 0  # every book() refused, none dropped as a skip
+        # The refusals are NOT recorded as per-address skips: a rate limit is a
+        # pacing signal, not a property of the address.
+        assert not any("RateLimit" in reason for _, reason in report.skipped)
+        journal.close()
+
+    def test_a_transient_rate_limit_is_waited_through_not_skipped(
+        self, bundle, specs, spot, books, naive, now
+    ):
+        """The whole point of the fix: an address refused once is retried, not
+        lost. `book()` refuses the first call and succeeds after, and the
+        address must end up written."""
+        provider = _BudgetedProvider(books, spot, specs, allow=0, release_after=1)
+        journal = CalibrationJournal()
+        report = ShadowCron(
+            provider, bundle, journal, naive, n_paths=500,
+            max_sweep_seconds=60.0, budget_wait_seconds=0.0,
+        ).run_once(now)
+        assert report.written == len(books)
+        assert not report.budget_exhausted
         journal.close()
 
     def test_budget_refuses_to_dip_into_the_reserve(self):

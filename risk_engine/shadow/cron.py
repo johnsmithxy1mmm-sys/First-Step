@@ -13,10 +13,12 @@ address after 24 h no matter what happened, so every observation carries
 information. P(liq) is then checked as a consistent by-product of the same
 distribution rather than as a separate rare-event test.
 
-Rate limits (§5.3): the job holds a `WeightBudget` with a large reserved
-fraction, so it refuses to spend into the headroom that live users need.
-Running out of budget mid-sweep truncates the sweep and is reported -- it is
-not an error, and it must not be retried into the reserve.
+Rate limits (§5.3): the `WeightBudget` that enforces the reserve lives on the
+`InfoClient` inside the provider, and every API call charges it before the
+request. The sweep does not keep a budget of its own -- it waits on the call
+that spends the real one (`book()`), so a minute's worth of weight paces the
+sweep rather than truncating it. Only when the whole-sweep ceiling is reached
+is the run reported as truncated.
 
 Two failure channels, and the difference between them is load-bearing:
 
@@ -43,7 +45,7 @@ from typing import Protocol
 import numpy as np
 
 from risk_engine.domain.types import AssetSpec, Book
-from risk_engine.market.info import RateLimitExceeded, WeightBudget
+from risk_engine.market.info import RateLimitExceeded
 from risk_engine.shadow.journal import (
     VARIANT_BASELINE_A,
     VARIANT_BASELINE_B,
@@ -131,7 +133,6 @@ class ShadowCron:
         naive: NaiveBaseline,
         n_paths: int = 20_000,
         horizon_hours: int = 24,
-        budget: WeightBudget | None = None,
         max_sweep_seconds: float = MAX_SWEEP_SECONDS,
         budget_wait_seconds: float = BUDGET_WAIT_SECONDS,
     ) -> None:
@@ -141,9 +142,13 @@ class ShadowCron:
         self.naive = naive
         self.n_paths = n_paths
         self.horizon_hours = horizon_hours
-        self.budget = budget or WeightBudget(reserved_fraction=SHADOW_RESERVED_FRACTION)
         self.max_sweep_seconds = max_sweep_seconds
         self.budget_wait_seconds = budget_wait_seconds
+        # No budget of its own, deliberately. §5.3's weight is owned by the
+        # InfoClient inside the provider, and the sweep waits on the call that
+        # spends it (see run_once). A budget object here previously looked
+        # like it gated the sweep and did not -- the real limit was on a
+        # different object entirely -- so it is gone rather than dormant.
 
     def run_once(self, now: datetime | None = None, seed: int | None = None) -> SweepReport:
         now = now or datetime.now(timezone.utc)
@@ -202,36 +207,49 @@ class ShadowCron:
 
         deadline = time.monotonic() + self.max_sweep_seconds
         for address in addresses:
-            # WAIT for the budget, do not abandon the sweep on it.
+            # WAIT on the call that actually spends the budget, and do not
+            # abandon the sweep on it.
             #
-            # This used to `break`, and that made §3.3's gate unreachable by
-            # construction. The budget is a sliding minute at 25% of 1200
-            # (§5.3), so 300 weight/min buys 15 addresses/min; the first live
-            # run wrote 6 of 515 and stopped. §3.3 wants 200 addresses a DAY,
-            # and a daily job that gives up after one minute delivers 15.
+            # Two separate corrections, and the second was itself a bug in the
+            # first version of this fix.
             #
-            # Breaking was never the polite option either. §5.3 asks the sweep
-            # to yield to live users, and sleeping until the window refills IS
-            # yielding — it just also finishes the work. At 20 weight each,
-            # 515 addresses is ~34 minutes of mostly waiting, which is what
-            # OPEN-QUESTIONS B4's own arithmetic always said the sweep cost.
-            # The table was right about the cost and wrong about the code.
-            while True:
-                try:
-                    self.budget.charge(20)
-                    break
-                except RateLimitExceeded:
-                    if time.monotonic() >= deadline:
-                        # A real ceiling, so a pathological list cannot pin a
-                        # container in a sleep loop forever. Reported as
-                        # truncation exactly as before.
-                        exhausted = True
-                        break
-                    time.sleep(self.budget_wait_seconds)
-            if exhausted:
-                break
+            # (a) Break -> wait. Truncating on the budget made §3.3's gate
+            #     unreachable: a sliding minute at 25% of 1200 (§5.3) buys 15
+            #     addresses, the loop stopped, and a daily job delivered 15
+            #     against a per-day requirement of 200. The first live run
+            #     wrote 6 of 515. Sleeping until the window refills IS the
+            #     yield §5.3 asks for -- it just also finishes the work.
+            #
+            # (b) Wait on the RIGHT budget. The first version charged a budget
+            #     the cron OWNED, while the real request charges the
+            #     InfoClient's budget -- two different objects (cli.py builds
+            #     them separately and never wires them together). So the wait
+            #     was on a phantom counter: the real §5.3 limit was hit inside
+            #     `book()`, surfaced as a `RateLimitExceeded` that the outer
+            #     handler filed as a permanent skip, and the address was
+            #     dropped rather than retried. Measured: with the client budget
+            #     80 weight ahead (meta + candles at startup) it exhausted ~4
+            #     addresses before the cron's, so those addresses were lost to
+            #     the very skips the wait was meant to prevent. `book()` POSTs
+            #     `clearinghouseState` and `InfoClient` charges the budget
+            #     BEFORE the request, so a refused call spends nothing and is
+            #     safe to retry.
+            book = None
             try:
-                book = self.provider.book(address)
+                while True:
+                    try:
+                        book = self.provider.book(address)
+                        break
+                    except RateLimitExceeded:
+                        if time.monotonic() >= deadline:
+                            # A real ceiling, so a pathological list cannot pin
+                            # the container in a sleep loop until the next daily
+                            # run collides with it. Reported as truncation.
+                            exhausted = True
+                            break
+                        time.sleep(self.budget_wait_seconds)
+                if exhausted:
+                    break
                 if not book.positions:
                     skipped.append((address, "no open positions"))
                     continue
