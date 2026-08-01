@@ -706,6 +706,54 @@ class TestTheLiveCliSpendsNoWeightItNeedNot:
         assert calls == ["BTC"], "spot() re-fetched prices it had just been given"
 
 
+class TestResolverPacesRatherThanDroppingToStale:
+    """The resolver had the snapshot's bug, made worse by staleness.
+
+    Each resolution spends ~40 weight (book + external_flow); a fresh hourly
+    process resolves ~8 before the §5.3 window refuses, then filed the rest as
+    failed. Against ~200 due per day inside a 2-hour staleness window, ~15
+    landed and ~185 aged out and were dropped from the gate (A-04). §3.3 was
+    unreachable from the resolution side, same root cause as the snapshot:
+    a rate limit treated as a failure instead of a pace.
+    """
+
+    def _seed(self, journal, bundle, specs, spot, books, naive, now):
+        ShadowCron(FakeProvider(books, spot, specs), bundle, journal, naive,
+                   n_paths=1_000).run_once(now)
+        return now + timedelta(hours=24)
+
+    def test_a_rate_limited_resolution_is_waited_through_not_failed(
+        self, bundle, specs, spot, books, naive, now
+    ):
+        journal = CalibrationJournal()
+        later = self._seed(journal, bundle, specs, spot, books, naive, now)
+        # book() refuses on the first call of the run, then the window refills.
+        provider = _BudgetedProvider(books, spot, specs, allow=0, release_after=1)
+        report = resolve_due(journal, provider, later,
+                             max_resolve_seconds=60.0, budget_wait_seconds=0.0)
+        assert report.resolved > 0
+        assert not report.budget_exhausted
+        # A rate limit must NOT appear as a per-row failure: those rows would
+        # be counted against the batch and, on a real run, age into staleness.
+        assert not any("RateLimit" in reason for _, reason in report.failed)
+        journal.close()
+
+    def test_the_run_stops_at_its_ceiling_rather_than_sleeping_forever(
+        self, bundle, specs, spot, books, naive, now
+    ):
+        journal = CalibrationJournal()
+        later = self._seed(journal, bundle, specs, spot, books, naive, now)
+        provider = _BudgetedProvider(books, spot, specs, allow=0)  # never releases
+        report = resolve_due(journal, provider, later, max_resolve_seconds=0.0)
+        assert report.budget_exhausted
+        assert report.resolved == 0
+        # The un-resolved rows are still due, to be continued next run — not
+        # failed, not stale, just deferred.
+        assert not any("RateLimit" in reason for _, reason in report.failed)
+        assert journal.due(later)  # still pending
+        journal.close()
+
+
 class TestResolve:
     def test_fills_in_the_outcome_a_day_later(
         self, bundle, specs, spot, books, naive, now

@@ -59,6 +59,7 @@ they spend no §5.3 weight, only a line of output.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Protocol
@@ -66,9 +67,15 @@ from typing import Protocol
 import numpy as np
 
 from risk_engine.domain.types import Book, normalise_address
+from risk_engine.market.info import RateLimitExceeded
 from risk_engine.observability.metrics import METRICS, Metrics
 from risk_engine.shadow.cron import position_fingerprint
 from risk_engine.shadow.journal import CalibrationJournal
+
+#: Returned by the pacing wrapper when the whole-run ceiling is reached, so a
+#: `None` from a legitimate call can never be mistaken for the truncation
+#: signal.
+_CEILING = object()
 
 
 class OutcomeProvider(Protocol):
@@ -92,6 +99,14 @@ class OutcomeProvider(Protocol):
 #: `resolves_at`; the honest response is to flag, not to score.
 DEFAULT_STALE_AFTER_S = 2 * 3600.0
 
+#: Ceiling on one resolve run's wall clock, and how long to wait when the §5.3
+#: weight window is spent. Each resolution costs ~40 weight (book +
+#: external_flow) against 300/min, so 200 due rows need ~27 minutes of
+#: mostly-waiting; 50 minutes leaves headroom while staying inside the hourly
+#: cadence so runs do not overlap.
+DEFAULT_MAX_RESOLVE_SECONDS = 50 * 60.0
+DEFAULT_BUDGET_WAIT_SECONDS = 5.0
+
 
 @dataclass(frozen=True, slots=True)
 class ResolveReport:
@@ -103,6 +118,11 @@ class ResolveReport:
     #: A subset rather than a separate bucket on purpose -- these rows did
     #: fail this run, and a caller that iterates `failed` must still see them.
     permanent: list[tuple[int, str]] = field(default_factory=list)
+    #: The run hit its wall-clock ceiling with rows still due. Not an error and
+    #: not a per-row failure -- the remaining rows stay pending and the next
+    #: run continues them. Reported so a run that stopped short is
+    #: distinguishable from one that genuinely emptied the queue.
+    budget_exhausted: bool = False
 
     def __str__(self) -> str:
         tail = f", {self.stale} flagged stale" if self.stale else ""
@@ -112,9 +132,14 @@ class ResolveReport:
             if self.permanent
             else ""
         )
+        truncated = (
+            " -- stopped at the time ceiling with rows still due, continues next run"
+            if self.budget_exhausted
+            else ""
+        )
         return (
             f"resolved {self.resolved} predictions, "
-            f"{len(self.failed)} failed{forever}{tail}"
+            f"{len(self.failed)} failed{forever}{tail}{truncated}"
         )
 
 
@@ -157,6 +182,8 @@ def resolve_due(
     now: datetime | None = None,
     stale_after_s: float = DEFAULT_STALE_AFTER_S,
     metrics: Metrics | None = None,
+    max_resolve_seconds: float = DEFAULT_MAX_RESOLVE_SECONDS,
+    budget_wait_seconds: float = DEFAULT_BUDGET_WAIT_SECONDS,
 ) -> ResolveReport:
     now = now or datetime.now(timezone.utc)
     metrics = metrics or METRICS
@@ -166,20 +193,54 @@ def resolve_due(
     failed: list[tuple[int, str]] = []
     permanent: list[tuple[int, str]] = []
 
+    # WAIT on the §5.3 weight, do not burst-and-drop. Each resolution spends
+    # ~40 weight (book + external_flow) against 300/min, and this loop used to
+    # process rows as fast as it could until `RateLimitExceeded`, then file
+    # the rest as failed. Combined with a fresh hourly process (empty window
+    # each run) that resolved ~8 rows before refusing, against ~200 coming due
+    # per day inside a 2-hour staleness window: ~15 landed, ~185 aged out and
+    # were dropped from the gate (A-04). §3.3 was unreachable from the
+    # resolution side exactly as it was from the snapshot side, and for the
+    # same reason -- a rate limit treated as a failure instead of a pace.
+    # Waiting resolves all 200 in ~27 minutes, well inside the window.
+    deadline = time.monotonic() + max_resolve_seconds
+    budget_exhausted = False
+
+    def _paced(call):
+        """Run an Info call, waiting through the §5.3 window rather than
+        letting a rate limit surface as a per-row failure. Charges happen
+        before the request, so a refused call spends nothing and retries
+        cleanly. Returns a sentinel when the whole-run ceiling is reached."""
+        nonlocal budget_exhausted
+        while True:
+            try:
+                return call()
+            except RateLimitExceeded:
+                if time.monotonic() >= deadline:
+                    budget_exhausted = True
+                    return _CEILING
+                time.sleep(budget_wait_seconds)
+
     # One address may have several pending rows (model plus both baselines);
     # they share a realised outcome, so it is fetched once per address.
     cache: dict[str, tuple[float, str]] = {}
 
     for pending in journal.due(now):
+        if budget_exhausted:
+            break
         try:
             if pending.address not in cache:
-                book = provider.book(pending.address)
+                book = _paced(lambda p=pending: provider.book(p.address))
+                if book is _CEILING:
+                    break
                 cache[pending.address] = (book.equity(spot), position_fingerprint(book))
             actual_equity, fingerprint = cache[pending.address]
 
-            flow = provider.external_flow(
-                pending.address, pending.predicted_at, pending.resolves_at
-            )
+            flow = _paced(lambda p=pending: provider.external_flow(
+                p.address, p.predicted_at, p.resolves_at
+            ))
+            if flow is _CEILING:
+                break
             # The model predicts the change due to market moves and funding.
             # Removing the external flow is what makes the comparison fair;
             # the raw flow is stored too, so the filtered and unfiltered
@@ -222,5 +283,6 @@ def resolve_due(
                 permanent.append((pending.id, reason))
 
     return ResolveReport(
-        resolved=resolved, failed=failed, stale=stale, permanent=permanent
+        resolved=resolved, failed=failed, stale=stale, permanent=permanent,
+        budget_exhausted=budget_exhausted,
     )
