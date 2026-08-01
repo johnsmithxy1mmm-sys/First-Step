@@ -419,6 +419,59 @@ class TestTheDiagnosticRunsOnTheShippedPath:
         x[crash, :] = -np.abs(x[crash, :]) - 3.0
         return {"A": x[:, 0], "B": x[:, 1]}, SimpleNamespace(assets=["A", "B"], corr=corr)
 
+    def test_the_refusal_is_scoped_by_consumer_not_softened(self):
+        """The diagnostic fired on live mainnet and took down the §3.3 shadow
+        harness with it — `shadow/cli.py` builds through the same
+        `_build_live_bundle`. Refusing to MEASURE a model because it is
+        unvalidated is circular, and it guarantees the defect is never
+        characterised.
+
+        So `fatal` splits by consumer. It is not an override flag: serving
+        keeps refusing, and the recording path still runs the check, still
+        records it, and still logs the refusal text."""
+        import risk_engine.service.state as state
+        from risk_engine.observability.metrics import METRICS
+
+        returns, matrix = self._crash_together_market(38)
+
+        # Serving: refuses, as before.
+        with pytest.raises(ValueError, match="understates lower-tail"):
+            state._checked_tail_diagnostics(returns, matrix, 6.0, fatal=True)
+
+        # Recording: proceeds, and says so rather than passing silently.
+        METRICS.reset()
+        diagnostics = state._checked_tail_diagnostics(
+            returns, matrix, 6.0, fatal=False)
+        assert diagnostics, "the measurement must still be produced"
+        assert state.understates_lower_tail(diagnostics)
+        assert METRICS.counters.get("tail_understated_recorded_anyway", 0) >= 1
+        # And the measurement itself is identical either way — `fatal` decides
+        # what happens to it, never what it says.
+        assert METRICS.tail_diagnostics[-1]["understates_lower_tail"] is True
+
+    def test_serving_is_the_default_so_a_thoughtless_caller_gets_the_refusal(self):
+        """A new caller that does not think about `fatal` must inherit the
+        strict behaviour. The permissive path has to be asked for by name."""
+        import inspect
+
+        import risk_engine.service.state as state
+
+        assert inspect.signature(
+            state._checked_tail_diagnostics).parameters["fatal"].default is True
+        assert inspect.signature(
+            state._build_live_bundle).parameters["serving"].default is True
+
+    def test_the_shadow_path_asks_for_the_recording_mode_explicitly(self):
+        """Pins the wiring: the shadow harness must pass `serving=False`. If a
+        refactor drops it, the harness starts refusing again and the §3.3
+        window silently stops advancing — the exact failure this split fixes."""
+        import inspect
+
+        import risk_engine.shadow.cli as shadow_cli
+
+        src = inspect.getsource(shadow_cli._live_world)
+        assert "_build_live_bundle(serving=False)" in src
+
     def test_a_crash_together_market_stops_the_bundle_from_building(self):
         """The behaviour §2.3 and §9 actually require. If this test can be
         made to pass by any change that lets the service start on a market

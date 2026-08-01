@@ -363,6 +363,87 @@ rather than the statistic, and was verified to fail when the wiring is
 removed; without that, the next refactor silently restores the original
 defect and the suite stays green.
 
+**It fired on live mainnet, 2026-08-01.** 90 days of hourly BTC/ETH/SOL:
+
+| pair | empirical lower | model @ q=0.05 | gap |
+|------|-----------------|----------------|-----|
+| ETH/SOL | 0.750 | 0.644 | +0.106 |
+| BTC/SOL | 0.704 | 0.637 | +0.067 |
+| BTC/ETH | 0.694 | 0.637 | +0.057 |
+
+The engine refused to build, which is the specified behaviour. What was NOT
+specified is what it took down with it: `shadow/cli.py` builds through the
+same `_build_live_bundle`, so the refusal also stopped the §3.3 shadow
+harness — **the instrument that measures whether an unvalidated model is any
+good.** Refusing to measure a model because it is unvalidated is circular,
+and it is the one outcome that guarantees the defect is never characterised.
+
+Resolved by scoping the refusal to the **consumer**, not by softening it:
+
+- a path that shows a number to a person keeps refusing (`fatal=True`, the
+  default, so a caller that does not think about it inherits strictness);
+- a path that only records observations runs (`fatal=False`), still runs the
+  check, still records it, still logs the refusal text at WARNING, and prints
+  a defect note on every sweep.
+
+`serving=False` appears exactly once, in `shadow/cli.py:_live_world`, and a
+test pins it there — dropping it would silently restart the refusal and stall
+the window again.
+
+**The days this records are NOT §3.3 gate-days**, and the note says so on
+every run. The remedy bumps `MODEL_VERSION` and resets the counter. They are
+diagnostic evidence, collected to answer a question that blocks the remedy's
+design — see A11.
+
+### A11 `[BLOCKER]` The skewed-t remedy is not uniformly conservative
+
+§2.3 prescribes a skewed-t when A10 fires, and the prescription is written as
+though the fix were obviously in the safe direction. An adversarial design
+review on 2026-08-01 (three independent designs, four refutation passes, all
+findings measured against this tree) established that it is not, and produced
+four blocking findings. They are recorded here because they must be answered
+BEFORE the remedy is built, not discovered inside it.
+
+1. **The sign of the error depends on the shape of the book.** `_any_liq`
+   (`sim/engine.py:610`) is a **union** over positions, and `Position.size`
+   is signed (`domain/types.py:247`). Heavier joint downside does not move a
+   hedged or mixed book's liquidation probability the way it moves a
+   long-only one — for a signed combination, co-movement cancels rather than
+   accumulates. So "tail-heavier is safer" is false as a blanket claim, and
+   §10 cannot be argued per-parameter; it has to be argued per-output. This
+   is the A1 situation again: where no uniformly conservative option exists,
+   §10 is satisfied by disclosure.
+
+2. **A shared skew silently overwrites the fitted correlation.** With one
+   mixing variable `W` and a shared `γ`, the term `γW` is a common component:
+   realised dependence is no longer the IFM/EWMA estimate, and there is a
+   hard floor `ρ_eff ≥ k(γ, ν)`. Fitting `γ` with the correlation matrix held
+   fixed is therefore not well-posed. Either fit `(ρ, γ)` jointly or invert
+   the distortion (`ρ* = (ρ − k)/(1 − k)`), and refuse — not clamp — when
+   `ρ < k`.
+
+3. **An unconditional conservatism margin has no null.** A `+1·SE` margin on
+   the tail-dependence target installs a spurious `γ` on data with zero true
+   skew in ~99% of replications. The margin must be conditional on first
+   rejecting symmetry, which is what §10's "a fit that is *uncertain* must
+   err toward a heavier lower tail" actually says.
+
+4. **λ_U is not monotone in γ**, so a two-sided absolute tail criterion is
+   unsatisfiable by any admissible member of the family (§10 permits only
+   `γ ≤ 0`). A guard no reachable model can pass is the A10 defect inverted.
+
+Latency is a separate constraint on the remedy and is already tight:
+`generate_log_returns` at 20 000 × 24 × 8 measures **301 ms**, the whole of
+§2.6's budget, with 221 ms of it in the quantile maps. A skew-t marginal is
+not odd, so `QuantileMap`'s half-table, `np.abs` and `copysign`
+(`sim/quantile_map.py:92-94, 122, 148`) are all invalid for it, and the two
+tails have different polynomial indices (`ν/2` toward the skew, `ν` away —
+confirmed by Hill estimation), so a single extrapolation slope reused across
+both would understate the far lower tail by a factor of two.
+
+What the shadow window under A10's recording mode is for: measuring the
+magnitude and the direction of (1) on real books.
+
 ---
 
 ## B. Validation-methodology problems

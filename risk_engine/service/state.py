@@ -113,8 +113,9 @@ def _fitted_copula_df(returns: dict, matrix) -> float:
     return df
 
 
-def _checked_tail_diagnostics(returns: dict, matrix, copula_df: float | None) -> tuple:
-    """Run §2.3's tail-asymmetry diagnostic and refuse if it fires.
+def _checked_tail_diagnostics(returns: dict, matrix, copula_df: float | None,
+                              fatal: bool = True) -> tuple:
+    """Run §2.3's tail-asymmetry diagnostic; refuse when `fatal`.
 
     OPEN-QUESTIONS A10. `diagnose_tail_asymmetry` and
     `assert_lower_tail_not_understated` existed, were tested, and were called
@@ -134,9 +135,39 @@ def _checked_tail_diagnostics(returns: dict, matrix, copula_df: float | None) ->
     Starting anyway would serve numbers that are wrong in the direction the
     product exists to protect against.
 
-    There is deliberately no override flag. A flag would be used the first
-    time it was inconvenient, and "the risk model understates crashes" is not
-    a condition anyone should be able to click past.
+    There is deliberately no override flag. `fatal` is NOT one, and the
+    difference is the whole point of it existing.
+
+    The diagnostic fired on live mainnet data on 2026-08-01, and the refusal
+    took down something it was never aimed at. `shadow/cli.py:149` builds its
+    bundle through the same `_build_live_bundle`, so the assertion blocked the
+    §3.3 shadow harness as well as the serving path — and the shadow harness
+    is the instrument that MEASURES whether an unvalidated model is any good.
+    Refusing to measure a model because it is unvalidated is circular, and it
+    is the one outcome that guarantees the defect is never characterised.
+
+    So the refusal is scoped by CONSUMER, not softened:
+
+      - a path that shows a number to a person keeps refusing (`fatal=True`).
+        §10 is engaged there: nobody may be served a figure from a model known
+        to understate the joint move that liquidates their book.
+      - a path that only RECORDS observations runs (`fatal=False`). No one is
+        told anything; the finding is stamped into the run's provenance and
+        travels with every row it produces.
+
+    What makes this worth doing rather than merely permissible: an adversarial
+    review of the skewed-t remedy established that the **sign** of the error
+    depends on the shape of the book -- `_any_liq` is a union over positions
+    and `Position.size` is signed, so heavier joint downside does not move a
+    hedged book's liquidation probability the same way it moves a long-only
+    one. Nobody knows the magnitude or the direction on real books. The shadow
+    window is what answers that, and skewed-t cannot be designed correctly
+    without the answer.
+
+    The days recorded this way do NOT count toward §3.3's gate: the remedy
+    will bump MODEL_VERSION and reset the counter. They are diagnostic
+    evidence, not gate-days, and calling them anything else would be the same
+    laundering this file's other guards exist to prevent.
 
     A `copula_df` of None means the Gaussian baseline (§3.2), which is a
     deliberately naive comparator rather than the shipped model; diagnosing it
@@ -153,8 +184,30 @@ def _checked_tail_diagnostics(returns: dict, matrix, copula_df: float | None) ->
     # still leaves the measurement behind. Otherwise the one build whose
     # numbers matter most is the only one that reports nothing.
     METRICS.record_tail_diagnostics(diagnostics)
-    assert_lower_tail_not_understated(diagnostics)
+    if fatal:
+        assert_lower_tail_not_understated(diagnostics)
+    else:
+        # Not a silent pass. The same text the refusal would have carried is
+        # logged at WARNING and counted, so a recording run says on every
+        # rebuild what it is recording under.
+        try:
+            assert_lower_tail_not_understated(diagnostics)
+        except ValueError as exc:
+            METRICS.incr("tail_understated_recorded_anyway")
+            log.warning(
+                "RECORDING UNDER A KNOWN §2.3 DEFECT (no number is being served "
+                "from this bundle): %s", exc,
+            )
     return tuple(diagnostics)
+
+
+def understates_lower_tail(diagnostics) -> bool:
+    """Whether §2.3's criterion is currently violated.
+
+    One predicate, so the serving path and the provenance stamp cannot drift
+    apart in what they call a defect.
+    """
+    return any(d.understates_lower_tail() for d in diagnostics)
 
 
 class NotReady(RuntimeError):
@@ -341,8 +394,14 @@ def _build_fixture_bundle():
 _build_fixture_bundle.is_fixture = True  # type: ignore[attr-defined]
 
 
-def _build_live_bundle():
+def _build_live_bundle(*, serving: bool = True):
     """Fetch from the Info API and fit (§5.1).
+
+    `serving` decides whether §2.3's tail-asymmetry criterion is fatal. It
+    defaults to True so that every existing caller — and every future one that
+    does not think about it — gets the refusal. The shadow harness passes
+    False deliberately; see `_checked_tail_diagnostics` for why measuring is
+    not serving.
 
     NOT EXERCISED against the live API: `api.hyperliquid.xyz` is blocked at
     the proxy in the environment this was written in (OPEN-QUESTIONS E5), so
@@ -403,6 +462,7 @@ def _build_live_bundle():
     bundle = ModelBundle(
         matrix=matrix, marginals=marginals, funding=funding,
         funding_bounds=bounds, copula_df=copula_df,
-        tail_diagnostics=_checked_tail_diagnostics(returns, matrix, copula_df),
+        tail_diagnostics=_checked_tail_diagnostics(
+            returns, matrix, copula_df, fatal=serving),
     )
     return bundle, {c: specs[c] for c in universe}, spot

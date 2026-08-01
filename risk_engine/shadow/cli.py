@@ -146,7 +146,20 @@ def _live_world(args, *, load_addresses: bool = True):
                 f"address list refused, and nothing was fetched: {exc}"
             ) from exc
 
-    bundle, specs, spot = _build_live_bundle()
+    # `serving=False`: this path shows no number to anyone, it records
+    # observations. §2.3's criterion is still run and still logged, but it does
+    # not refuse the build here -- the shadow harness is the instrument that
+    # measures whether an unvalidated model is any good, and refusing to
+    # measure a model because it is unvalidated is circular. The refusal stays
+    # where a person would see the number: `EngineState`, via the default.
+    #
+    # An adversarial review of the skewed-t remedy found that the SIGN of the
+    # error depends on the shape of the book (`_any_liq` is a union and
+    # `Position.size` is signed), so the magnitude and direction on real books
+    # are unknown. This window is what establishes them. The days it records
+    # do NOT count toward §3.3's gate -- the remedy bumps MODEL_VERSION and
+    # resets the counter -- and `_defect_note` below says so on every run.
+    bundle, specs, spot = _build_live_bundle(serving=False)
     budget = WeightBudget(reserved_fraction=SHADOW_RESERVED_FRACTION)
     provider = LiveSnapshotProvider(source, budget=budget, universe=tuple(spot))
     # Reuse the freshly-built bundle's view of the venue rather than
@@ -173,6 +186,35 @@ def _live_world(args, *, load_addresses: bool = True):
     return provider, bundle, NaiveBaseline(historical_24h_log_returns(np.asarray(hourly)))
 
 
+def _print_defect_note(bundle) -> None:
+    """Say, on every run, what this window is recording under.
+
+    The shadow path builds with `serving=False`, so a §2.3 violation no longer
+    stops it. That is only defensible if the violation is impossible to
+    overlook afterwards: a journal of observations collected under a known
+    model defect, indistinguishable from a clean one, is worse than no journal
+    — it would be read as gate progress.
+    """
+    from risk_engine.service.state import understates_lower_tail
+
+    diagnostics = getattr(bundle, "tail_diagnostics", ())
+    if not diagnostics or not understates_lower_tail(diagnostics):
+        return
+    worst = max(diagnostics, key=lambda d: d.empirical_lower - d.model_at_threshold)
+    print(
+        f"  RECORDED UNDER A KNOWN §2.3 DEFECT: the fitted copula understates "
+        f"lower-tail dependence (worst pair {worst.pair[0]}/{worst.pair[1]}, "
+        f"empirical {worst.empirical_lower:.3f} against model "
+        f"{worst.model_at_threshold:.3f}).\n"
+        f"  These observations are DIAGNOSTIC EVIDENCE, not §3.3 gate-days: the "
+        f"remedy is a skewed-t, which changes the predicted distribution, bumps "
+        f"MODEL_VERSION and resets the counter. They exist to measure how much "
+        f"the asymmetry moves P(liq) on real books, and in which direction — an "
+        f"adversarial review established the sign depends on book shape, so it "
+        f"is not known. No number from this bundle is served to anyone."
+    )
+
+
 def cmd_snapshot(args) -> int:
     provider, bundle, naive = (
         _fixture_world() if args.fixture else _live_world(args)
@@ -195,6 +237,7 @@ def cmd_snapshot(args) -> int:
             )
             return 2
         print(f"  sampling frame: {getattr(provider, 'frame', 'UNSTATED')}")
+        _print_defect_note(bundle)
         for address, reason in report.skipped:
             print(f"  skipped {address}: {reason}")
         if report.budget_exhausted:
