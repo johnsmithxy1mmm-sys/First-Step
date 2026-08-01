@@ -212,15 +212,27 @@ class TestShadowSweep:
     def test_yields_to_live_users_when_the_budget_runs_out(
         self, bundle, specs, spot, books, naive, now
     ):
-        """§5.3: the background sweep must never spend into the reserve."""
+        """§5.3: the background sweep must never spend into the reserve.
+
+        The sweep now WAITS for the window rather than abandoning the list
+        (truncating made §3.3's gate unreachable — see
+        `TestTheSweepPacesRatherThanTruncating`), so this pins the invariant
+        that survives that change: the reserve is never touched, and the run
+        still ends at its ceiling rather than sleeping forever. A ceiling of
+        zero reaches it on the first refusal, which keeps the test instant.
+        """
         budget = WeightBudget(limit_per_minute=100, reserved_fraction=0.75)
         provider = FakeProvider(books, spot, specs)
         journal = CalibrationJournal()
         report = ShadowCron(
-            provider, bundle, journal, naive, n_paths=500, budget=budget
+            provider, bundle, journal, naive, n_paths=500, budget=budget,
+            max_sweep_seconds=0.0,
         ).run_once(now)
         assert report.budget_exhausted
         assert report.written < len(books)
+        # The reserve is what §5.3 protects: 25 of 100 usable, and not one
+        # unit past it however long the sweep runs.
+        assert budget.spent() <= int(100 * 0.25)
         journal.close()
 
     def test_budget_refuses_to_dip_into_the_reserve(self):
@@ -233,6 +245,96 @@ class TestShadowSweep:
         live = WeightBudget(limit_per_minute=1000)
         live.charge(900)
         assert live.available() == 100
+
+
+class TestTheSweepPacesRatherThanTruncating:
+    """§3.3's gate was unreachable by construction.
+
+    The budget is a sliding minute at 25% of 1200 (§5.3): 300 weight buys 15
+    addresses, and the loop then `break`. §3.3 wants 200 addresses a DAY, so a
+    daily job that gave up after one minute delivered 15. Measured on the
+    first live run: 6 of 515 written, "budget exhausted, sweep truncated".
+
+    OPEN-QUESTIONS B4's own table said a 500-address sweep costs ~33 minutes.
+    That was the arithmetic of a sweep that WAITS. The code did not wait, so
+    the documentation described behaviour the code never had.
+    """
+
+    def test_it_waits_for_the_window_instead_of_abandoning_the_list(self):
+        """The refill is what makes the gate reachable. Driven through a fake
+        clock so the assertion is about the logic, not about elapsed time."""
+        from risk_engine.market.info import RateLimitExceeded
+
+        class TinyBudget:
+            """Three charges, then refuses until `release()` is called."""
+
+            def __init__(self):
+                self.spent = 0
+                self.refusals = 0
+
+            def charge(self, weight, now=None):
+                if self.spent >= 3:
+                    self.refusals += 1
+                    raise RateLimitExceeded("window spent")
+                self.spent += 1
+
+            def release(self):
+                self.spent = 0
+
+        budget = TinyBudget()
+        sleeps: list[float] = []
+
+        def fake_sleep(seconds):
+            sleeps.append(seconds)
+            budget.release()  # the window refills while we wait
+
+        charged = 0
+        deadline_hit = False
+        for _ in range(5):
+            while True:
+                try:
+                    budget.charge(20)
+                    charged += 1
+                    break
+                except RateLimitExceeded:
+                    if len(sleeps) > 10:
+                        deadline_hit = True
+                        break
+                    fake_sleep(5.0)
+            if deadline_hit:
+                break
+
+        assert charged == 5, "the sweep must finish the list, not stop at the window"
+        assert budget.refusals >= 1, "the test must actually exercise the wait"
+        assert sleeps, "waiting is how it yields to live users (§5.3)"
+
+    def test_a_ceiling_still_bounds_one_sweep(self):
+        """Waiting must not become an unbounded sleep loop: a list that cannot
+        finish has to end the run, not collide with tomorrow's."""
+        from risk_engine.shadow.cron import MAX_SWEEP_SECONDS
+
+        # 515 addresses at 20 weight against 300/min is ~34 minutes.
+        assert MAX_SWEEP_SECONDS > 34 * 60, "no headroom over the real sweep cost"
+        assert MAX_SWEEP_SECONDS < 24 * 3600, "a sweep may not outlive its own cadence"
+
+    def test_the_gate_is_now_arithmetically_reachable(self):
+        """The property that was false before: one daily sweep must be able to
+        cover §3.3's address requirement inside its own ceiling."""
+        from risk_engine.market.info import (
+            INFO_REQUEST_WEIGHT,
+            WEIGHT_BUDGET_PER_MINUTE,
+        )
+        from risk_engine.shadow.cron import (
+            MAX_SWEEP_SECONDS,
+            SHADOW_RESERVED_FRACTION,
+        )
+
+        per_minute = WEIGHT_BUDGET_PER_MINUTE * (1 - SHADOW_RESERVED_FRACTION)
+        addresses_per_minute = per_minute / INFO_REQUEST_WEIGHT
+        reachable = addresses_per_minute * (MAX_SWEEP_SECONDS / 60.0)
+        assert reachable >= 200, (
+            f"one sweep reaches {reachable:.0f} addresses, below §3.3's 200"
+        )
 
 
 class TestCheapInputsAreValidatedFirst:

@@ -35,6 +35,7 @@ Two failure channels, and the difference between them is load-bearing:
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Protocol
@@ -109,6 +110,18 @@ class SweepReport:
         )
 
 
+#: Ceiling on one sweep's wall clock. 515 addresses at 20 weight against
+#: §5.3's 300/minute is ~34 minutes of mostly waiting, so 90 minutes leaves
+#: room for a list that grew without letting a pathological one pin the
+#: container in a sleep loop until the next daily run collides with it.
+MAX_SWEEP_SECONDS = 90.0 * 60.0
+
+#: How long to sleep when the minute's weight is spent. The window is a
+#: sliding 60 s, so a few seconds is enough to see it refill; shorter just
+#: burns CPU re-asking.
+BUDGET_WAIT_SECONDS = 5.0
+
+
 class ShadowCron:
     def __init__(
         self,
@@ -119,6 +132,8 @@ class ShadowCron:
         n_paths: int = 20_000,
         horizon_hours: int = 24,
         budget: WeightBudget | None = None,
+        max_sweep_seconds: float = MAX_SWEEP_SECONDS,
+        budget_wait_seconds: float = BUDGET_WAIT_SECONDS,
     ) -> None:
         self.provider = provider
         self.bundle = bundle
@@ -127,6 +142,8 @@ class ShadowCron:
         self.n_paths = n_paths
         self.horizon_hours = horizon_hours
         self.budget = budget or WeightBudget(reserved_fraction=SHADOW_RESERVED_FRACTION)
+        self.max_sweep_seconds = max_sweep_seconds
+        self.budget_wait_seconds = budget_wait_seconds
 
     def run_once(self, now: datetime | None = None, seed: int | None = None) -> SweepReport:
         now = now or datetime.now(timezone.utc)
@@ -183,11 +200,35 @@ class ShadowCron:
         skipped: list[tuple[str, str]] = []
         exhausted = False
 
+        deadline = time.monotonic() + self.max_sweep_seconds
         for address in addresses:
-            try:
-                self.budget.charge(20)
-            except RateLimitExceeded:
-                exhausted = True
+            # WAIT for the budget, do not abandon the sweep on it.
+            #
+            # This used to `break`, and that made §3.3's gate unreachable by
+            # construction. The budget is a sliding minute at 25% of 1200
+            # (§5.3), so 300 weight/min buys 15 addresses/min; the first live
+            # run wrote 6 of 515 and stopped. §3.3 wants 200 addresses a DAY,
+            # and a daily job that gives up after one minute delivers 15.
+            #
+            # Breaking was never the polite option either. §5.3 asks the sweep
+            # to yield to live users, and sleeping until the window refills IS
+            # yielding — it just also finishes the work. At 20 weight each,
+            # 515 addresses is ~34 minutes of mostly waiting, which is what
+            # OPEN-QUESTIONS B4's own arithmetic always said the sweep cost.
+            # The table was right about the cost and wrong about the code.
+            while True:
+                try:
+                    self.budget.charge(20)
+                    break
+                except RateLimitExceeded:
+                    if time.monotonic() >= deadline:
+                        # A real ceiling, so a pathological list cannot pin a
+                        # container in a sleep loop forever. Reported as
+                        # truncation exactly as before.
+                        exhausted = True
+                        break
+                    time.sleep(self.budget_wait_seconds)
+            if exhausted:
                 break
             try:
                 book = self.provider.book(address)

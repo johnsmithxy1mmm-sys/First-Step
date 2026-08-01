@@ -851,8 +851,24 @@ fewer addresses than `ShadowProgress.required_addresses` without
   one daily snapshot, it constrains how a cron may be scheduled, and it is
   the reason `--target` defaulting to 500 has a cost worth stating. Read off
   the left-hand column, because §5.3 reserves the other three quarters for
-  live users and the sweep never gets them. `ShadowCron` reports truncation
-  rather than waiting.
+  live users and the sweep never gets them.
+
+  **This table described a sweep the code did not implement, until
+  2026-08-01.** The last line here used to read "`ShadowCron` reports
+  truncation rather than waiting" — and truncating is exactly what made the
+  arithmetic above fiction. A sliding minute at 300 weight buys **15
+  addresses**, and the loop then broke. §3.3 wants 200 a *day*, so the gate
+  was unreachable by construction; the first live sweep wrote **6 of 515**
+  and stopped. The 33 minutes was always the cost of the sweep §3.3 needs,
+  and the code gave up 32 of them in.
+
+  `ShadowCron` now sleeps until the window refills, bounded by
+  `MAX_SWEEP_SECONDS` (90 min) so a pathological list cannot pin a container
+  until the next daily run collides with it. Truncation is still reported,
+  and still means what it said — it is now reached at the ceiling rather than
+  at the first refusal. Waiting was never the impolite option: §5.3 asks the
+  sweep to yield to live users, and sleeping while their reserve refills *is*
+  yielding, it simply also finishes the work.
 
 **E4 is closed.** This paragraph used to end "E4 stays open until the shape
 is confirmed against the live venue", which contradicted the bullet sixty
