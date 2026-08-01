@@ -22,6 +22,7 @@ only place the difference is allowed to exist.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -32,6 +33,8 @@ import numpy as np
 from risk_engine.domain.types import normalise_address
 from risk_engine.shadow.backends import Backend, canonical_ddl, open_backend, sqlite_ddl
 from risk_engine.sim.stats import PredictiveDistribution
+
+log = logging.getLogger("risk_engine.shadow.journal")
 
 VARIANT_MODEL = "model"
 VARIANT_BASELINE_A = "baseline_a"
@@ -220,6 +223,46 @@ class CalibrationJournal:
         )
         self.backend.commit()
         return int(rows[0]["id"])
+
+    def record_sweep(
+        self,
+        swept_at: datetime,
+        distribution_version: str,
+        attempted: int,
+        written: int,
+        budget_exhausted: bool,
+        skipped_by_reason: dict[str, int],
+    ) -> None:
+        """Persist one sweep's census (OPEN-QUESTIONS B6).
+
+        The per-address drop reasons were printed and nowhere durable, so a
+        score computed weeks later could not state how selective its cohort
+        was. This makes the disclosure travel with the data. Best-effort: a
+        census write must never take down the sweep that produced real
+        predictions, so a failure here is logged, not raised -- the census is
+        provenance about the run, not the run's product.
+        """
+        try:
+            self._query(
+                """
+                INSERT INTO calibration_sweeps (
+                    swept_at, observation_day, distribution_version,
+                    attempted, written, budget_exhausted, skipped_by_reason
+                ) VALUES (?,?,?,?,?,?,?)
+                """,
+                (
+                    _iso(swept_at),
+                    swept_at.astimezone(timezone.utc).date().isoformat(),
+                    distribution_version, int(attempted), int(written),
+                    bool(budget_exhausted), json.dumps(skipped_by_reason),
+                ),
+            )
+            self.backend.commit()
+        except Exception as exc:
+            # Broad on purpose: the census is provenance about the run, not
+            # the run's product. A DB hiccup writing it must not discard the
+            # predictions the sweep just paid §5.3 weight to produce.
+            log.warning("sweep census not recorded (predictions are unaffected): %s", exc)
 
     def record_outcome(
         self,

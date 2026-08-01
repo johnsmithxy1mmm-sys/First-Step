@@ -88,3 +88,33 @@ CREATE TABLE IF NOT EXISTS calibration_outcomes (
 
 CREATE INDEX IF NOT EXISTS calibration_outcomes_day_idx
     ON calibration_outcomes (observation_day);
+
+-- Per-day sweep census (OPEN-QUESTIONS B6). The calibration score is only
+-- honest about its cohort if it can say how selective that cohort was, and
+-- the selection happens HERE: an address holding a coin outside the model
+-- universe (BTC/ETH/SOL in Phase 1) is dropped whole, a flat book is dropped,
+-- a non-positive equity is dropped. Those drops are conservative (modelling a
+-- partial book would understate risk, §10) but they narrow the scored cohort
+-- to "accounts holding only in-universe coins", which is a stricter set than
+-- the trades-feed frame the score cites (B4).
+--
+-- The skip reasons were printed to the sweep's stdout and nowhere durable, so
+-- a score computed weeks later had no record of how its cohort was selected.
+-- This table is that record: one row per sweep, with the reason tally, so the
+-- disclosure travels with the data instead of scrolling off a container log.
+CREATE TABLE IF NOT EXISTS calibration_sweeps (
+    id                   BIGSERIAL PRIMARY KEY,
+    swept_at             TIMESTAMPTZ NOT NULL,
+    observation_day      DATE        NOT NULL,
+    distribution_version TEXT        NOT NULL,
+    attempted            INTEGER     NOT NULL,
+    written              INTEGER     NOT NULL,
+    budget_exhausted     BOOLEAN     NOT NULL,
+    -- {reason: count}. Reason strings come straight from the sweep report, so
+    -- "KeyError: 'ATOM'" and "no open positions" are distinguishable and the
+    -- off-universe drop rate is recoverable per day.
+    skipped_by_reason    JSONB       NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS calibration_sweeps_day_idx
+    ON calibration_sweeps (observation_day, distribution_version);

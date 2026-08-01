@@ -197,21 +197,44 @@ class ShadowCron:
                 address_source_error=f"{type(exc).__name__}: {exc}",
             )
 
-        specs = self.provider.specs()
-        spot = self.provider.spot()
-        rng = np.random.default_rng(seed if seed is not None else int(now.timestamp()))
-
         written = 0
         skipped: list[tuple[str, str]] = []
         exhausted = False
 
+        # The deadline is set BEFORE the first weight-spending call, and
+        # `specs()`/`spot()` are paced too. They charge ~80 weight (meta plus
+        # a candle per coin) and used to run unguarded: on a fresh daily
+        # process the window is empty so they succeed, but a `RateLimitExceeded`
+        # from them would have escaped `run_once` entirely rather than pacing.
+        # That is the same rate-limit-as-error footgun the loop below fixes, so
+        # it is closed here rather than left latent for the day the process is
+        # made long-lived.
         deadline = time.monotonic() + self.max_sweep_seconds
+
+        def _paced(call):
+            nonlocal exhausted
+            while True:
+                try:
+                    return call()
+                except RateLimitExceeded:
+                    if time.monotonic() >= deadline:
+                        exhausted = True
+                        return None
+                    time.sleep(self.budget_wait_seconds)
+
+        specs = _paced(self.provider.specs)
+        spot = _paced(self.provider.spot)
+        if exhausted:
+            # The window was already spent before the sweep proper began. No
+            # addresses were attempted, so this is truncation, not a bad list.
+            return SweepReport(started_at=now, attempted=len(addresses),
+                               written=0, budget_exhausted=True)
+        rng = np.random.default_rng(seed if seed is not None else int(now.timestamp()))
+
         for address in addresses:
             # WAIT on the call that actually spends the budget, and do not
-            # abandon the sweep on it.
-            #
-            # Two separate corrections, and the second was itself a bug in the
-            # first version of this fix.
+            # abandon the sweep on it. Two corrections, and the second was a
+            # bug in the first version of this fix:
             #
             # (a) Break -> wait. Truncating on the budget made §3.3's gate
             #     unreachable: a sliding minute at 25% of 1200 (§5.3) buys 15
@@ -222,33 +245,20 @@ class ShadowCron:
             #
             # (b) Wait on the RIGHT budget. The first version charged a budget
             #     the cron OWNED, while the real request charges the
-            #     InfoClient's budget -- two different objects (cli.py builds
-            #     them separately and never wires them together). So the wait
+            #     InfoClient's budget -- two different objects (cli.py built
+            #     them separately and never wired them together). So the wait
             #     was on a phantom counter: the real §5.3 limit was hit inside
-            #     `book()`, surfaced as a `RateLimitExceeded` that the outer
-            #     handler filed as a permanent skip, and the address was
-            #     dropped rather than retried. Measured: with the client budget
-            #     80 weight ahead (meta + candles at startup) it exhausted ~4
-            #     addresses before the cron's, so those addresses were lost to
-            #     the very skips the wait was meant to prevent. `book()` POSTs
-            #     `clearinghouseState` and `InfoClient` charges the budget
-            #     BEFORE the request, so a refused call spends nothing and is
-            #     safe to retry.
-            book = None
+            #     `book()`, surfaced as a `RateLimitExceeded` the outer handler
+            #     filed as a permanent skip, and the address was dropped rather
+            #     than retried. `book()` POSTs `clearinghouseState` and the
+            #     client charges the budget BEFORE the request, so a refused
+            #     call spends nothing and is safe to retry -- which `_paced`
+            #     does, the same wrapper `specs()`/`spot()` above use.
             try:
-                while True:
-                    try:
-                        book = self.provider.book(address)
-                        break
-                    except RateLimitExceeded:
-                        if time.monotonic() >= deadline:
-                            # A real ceiling, so a pathological list cannot pin
-                            # the container in a sleep loop until the next daily
-                            # run collides with it. Reported as truncation.
-                            exhausted = True
-                            break
-                        time.sleep(self.budget_wait_seconds)
+                book = _paced(lambda a=address: self.provider.book(a))
                 if exhausted:
+                    # Ceiling reached mid-wait: a pathological list cannot pin
+                    # the container in a sleep loop until the next daily run.
                     break
                 if not book.positions:
                     skipped.append((address, "no open positions"))

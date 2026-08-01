@@ -230,8 +230,21 @@ def cmd_snapshot(args) -> int:
             _fixture_world() if args.fixture else _live_world(args)
         )
         cron = ShadowCron(provider, bundle, journal, naive, n_paths=args.n_paths)
-        report = cron.run_once(datetime.now(timezone.utc))
+        swept_at = datetime.now(timezone.utc)
+        report = cron.run_once(swept_at)
         print(report)
+        # Census BEFORE the refused-list early return: a run that swept
+        # nothing because every address was off-universe is exactly the cohort
+        # selection B6 needs on record, and a `refused` run (bad list) is the
+        # one case with no census to write.
+        if not report.refused:
+            tally: dict[str, int] = {}
+            for _, reason in report.skipped:
+                tally[reason] = tally.get(reason, 0) + 1
+            journal.record_sweep(
+                swept_at, DISTRIBUTION_VERSION, report.attempted, report.written,
+                report.budget_exhausted, tally,
+            )
         if report.refused:
             # Non-zero, and loud. A daily cron that prints "0 addresses
             # written" and exits 0 is a §3.3 window that stops advancing

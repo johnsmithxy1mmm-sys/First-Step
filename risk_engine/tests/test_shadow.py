@@ -162,7 +162,7 @@ class TestJournalSchema:
 
         canonical = canonical_ddl()
         derived = sqlite_ddl()
-        for table in ("calibration_predictions", "calibration_outcomes"):
+        for table in ("calibration_predictions", "calibration_outcomes", "calibration_sweeps"):
             assert f"CREATE TABLE IF NOT EXISTS {table}" in canonical
             assert f"CREATE TABLE IF NOT EXISTS {table}" in derived
         # Postgres-only spellings must not survive the translation.
@@ -172,7 +172,7 @@ class TestJournalSchema:
     def test_every_declared_column_exists_in_the_live_sqlite_schema(self):
         sql = SCHEMA_SQL.read_text()
         journal = CalibrationJournal()
-        for table in ("calibration_predictions", "calibration_outcomes"):
+        for table in ("calibration_predictions", "calibration_outcomes", "calibration_sweeps"):
             block = re.search(
                 rf"CREATE TABLE IF NOT EXISTS {table} \((.*?)\n\);", sql, re.S
             )
@@ -188,6 +188,40 @@ class TestJournalSchema:
             }
             assert declared == live, f"{table}: {declared ^ live}"
         journal.close()
+
+    def test_the_sweep_census_records_cohort_selection(self, now):
+        """OPEN-QUESTIONS B6: the per-address drop reasons must be durable, so
+        a score computed later can state how selective its cohort was. Printed
+        and nowhere else, they scroll off a container log."""
+        journal = CalibrationJournal()
+        journal.record_sweep(
+            now, "0.3", attempted=515, written=340, budget_exhausted=False,
+            skipped_by_reason={
+                "KeyError: 'ATOM'": 40, "no open positions": 90,
+                "non-positive equity": 45,
+            },
+        )
+        rows = journal._query("SELECT * FROM calibration_sweeps")
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["attempted"] == 515 and row["written"] == 340
+        import json as _json
+        tally = _json.loads(row["skipped_by_reason"])
+        # The off-universe drop rate is recoverable per day, which is the whole
+        # point — a bare "175 skipped" could not distinguish B6 selection from
+        # flat books.
+        off_universe = sum(v for k, v in tally.items() if k.startswith("KeyError"))
+        assert off_universe == 40
+        assert row["observation_day"] == now.date().isoformat()
+        journal.close()
+
+    def test_a_census_write_failure_does_not_sink_the_sweep(self, now):
+        """The census is provenance, not product. A DB hiccup writing it must
+        not discard predictions the sweep paid §5.3 weight to produce."""
+        journal = CalibrationJournal()
+        journal.backend.close()  # force every subsequent write to raise
+        # Must not raise — the failure is logged and swallowed.
+        journal.record_sweep(now, "0.3", 1, 1, False, {})
 
     def test_prediction_is_immutable_once_written(self, now):
         """A prediction that could be edited after resolution would make the

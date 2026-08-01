@@ -942,14 +942,27 @@ addresses yield ~206 usable, right at §3.3's 200-address floor. The true rate
 across the full list is not yet known (the truncation bug that stopped that
 sweep at 15 is fixed), but the gate's reachability now depends on it.
 
-Not fixed, because both options are real decisions rather than corrections:
-expanding the universe is a model-scope change (more assets, more correlation
-structure, a distribution bump), and dropping fewer addresses would mean
-modelling partial books, which §10 forbids. What IS required before any score
-is published is **disclosure**: the drop reasons are currently printed in the
-sweep report but not journalled, so a score computed three weeks later has no
-record of how selective its cohort became. The per-address skip reasons need
-to travel with the calibration data, the same way B4's frame text does.
+The *narrowing* is not fixed, because both options are real decisions rather
+than corrections: expanding the universe is a model-scope change (more assets,
+more correlation structure, a distribution bump), and dropping fewer addresses
+would mean modelling partial books, which §10 forbids. That decision is still
+open.
+
+**The disclosure half is fixed (2026-08-01).** The drop reasons were printed
+in the sweep report and nowhere durable, so a score computed three weeks later
+had no record of how selective its cohort became. There is now a
+`calibration_sweeps` table: one row per sweep with `attempted`, `written`,
+`budget_exhausted` and a `{reason: count}` tally, written by `record_sweep`
+straight from the sweep report. Because the reason strings are verbatim
+(`"KeyError: 'ATOM'"` vs `"no open positions"`), the off-universe drop rate is
+recoverable per day, so any published score can state its cohort selection
+instead of implying it had none. The write is best-effort — a census failure
+logs and is swallowed, because the census is provenance about the run, not the
+predictions the run paid §5.3 weight to produce.
+
+What remains is the model-scope decision itself, and the empirical input for
+it: the true off-universe drop rate across all 515 addresses, which the first
+(pacing-truncated) run could not measure and this table now will.
 
 ---
 
