@@ -916,6 +916,41 @@ decisive one and that failing against B means simplifying. Both are computed
 and reported separately; the champion/challenger machinery treats B as the
 gate and A as context.
 
+### B6 `[BLOCKER — disclosure]` The 3-asset universe silently narrows the cohort
+
+Observed live 2026-08-01. The model universe is BTC/ETH/SOL (Phase 1). An
+account holding any other coin — `KeyError: 'ATOM'`, `'HYPE'`, `'XMR'`,
+`'XRP'`, `'BNB'` all appeared in one 15-address sample — fails
+`_predict_all` when the engine cannot find a marginal for the off-universe
+position, and the **whole address** is dropped as a per-address skip.
+
+Dropping is the conservative direction and must stay: modelling only the
+in-universe legs of a mixed book would ignore a position that contributes to
+liquidation, which understates risk (§10). The problem is not the drop, it is
+what the drop does to the **calibration cohort**. The surviving addresses are
+"accounts holding ONLY BTC/ETH/SOL" — a strict, less-diversified subset of
+the trades-feed frame (B4), and nothing in the published score would say so.
+The sampling frame the score cites (B4) describes accounts that *traded*
+those coins; the cohort that actually gets scored is the narrower set that
+*holds only* them.
+
+Two numbers make this concrete and worrying for §3.3. In the first live
+(truncated) sample, 5 of 9 skips were off-universe holdings — a ~33% drop
+rate on that account. Stacked with flat books, no-position and non-positive
+equity, the first sample wrote 6 of 15 attempted (40%). At that rate 515
+addresses yield ~206 usable, right at §3.3's 200-address floor. The true rate
+across the full list is not yet known (the truncation bug that stopped that
+sweep at 15 is fixed), but the gate's reachability now depends on it.
+
+Not fixed, because both options are real decisions rather than corrections:
+expanding the universe is a model-scope change (more assets, more correlation
+structure, a distribution bump), and dropping fewer addresses would mean
+modelling partial books, which §10 forbids. What IS required before any score
+is published is **disclosure**: the drop reasons are currently printed in the
+sweep report but not journalled, so a score computed three weeks later has no
+record of how selective its cohort became. The per-address skip reasons need
+to travel with the calibration data, the same way B4's frame text does.
+
 ---
 
 ## C. Hyperliquid integration — facts that must be verified, not assumed
