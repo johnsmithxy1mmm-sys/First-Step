@@ -216,10 +216,19 @@ def _print_defect_note(bundle) -> None:
 
 
 def cmd_snapshot(args) -> int:
-    provider, bundle, naive = (
-        _fixture_world() if args.fixture else _live_world(args)
-    )
+    # Journal FIRST, world second. The reverse order fitted a bundle and spent
+    # §5.3 API weight before discovering the journal could not be opened at
+    # all -- on the first live run that was a missing psycopg, reported as a
+    # bare ModuleNotFoundError traceback after two minutes of work, with the
+    # §2.3 defect warning scrolled off above it.
+    #
+    # This is the same fix `_live_world` already carries for the address list
+    # ("loaded and validated HERE: before `_build_live_bundle` and before the
+    # candle fetch"), applied to the other input that can fail for free.
     with CalibrationJournal(args.journal) as journal:
+        provider, bundle, naive = (
+            _fixture_world() if args.fixture else _live_world(args)
+        )
         cron = ShadowCron(provider, bundle, journal, naive, n_paths=args.n_paths)
         report = cron.run_once(datetime.now(timezone.utc))
         print(report)
@@ -257,10 +266,13 @@ def cmd_resolve(args) -> int:
     # is lost. Blocking the snapshot on a bad list costs a day of new
     # predictions; blocking the resolver on it destroys observations already
     # paid for.
-    provider, _, _ = (
-        _fixture_world() if args.fixture else _live_world(args, load_addresses=False)
-    )
+    # Journal first here too, and it matters more: this job runs hourly, so an
+    # unopenable journal would burn a bundle build and API weight every hour
+    # rather than once a day.
     with CalibrationJournal(args.journal) as journal:
+        provider, _, _ = (
+            _fixture_world() if args.fixture else _live_world(args, load_addresses=False)
+        )
         report = resolve_due(
             journal, provider, datetime.now(timezone.utc),
             stale_after_s=args.stale_after_s,

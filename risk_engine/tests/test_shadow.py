@@ -235,6 +235,66 @@ class TestShadowSweep:
         assert live.available() == 100
 
 
+class TestCheapInputsAreValidatedFirst:
+    """An input that can fail for free must fail before one that costs.
+
+    First live run: `psycopg` was missing from the engine image, and the
+    snapshot job discovered it *after* fitting a bundle and spending §5.3 API
+    weight — reported as a bare ModuleNotFoundError traceback with the §2.3
+    defect warning scrolled off above it. `_live_world` already carries this
+    exact fix for the address list; the journal never got it."""
+
+    @staticmethod
+    def _order_in(func) -> tuple[int, int]:
+        import inspect
+        src = inspect.getsource(func)
+        return src.index("CalibrationJournal("), src.index("_world(")
+
+    def test_the_snapshot_opens_the_journal_before_building_a_world(self):
+        from risk_engine.shadow.cli import cmd_snapshot
+
+        journal_at, world_at = self._order_in(cmd_snapshot)
+        assert journal_at < world_at, (
+            "the world is built before the journal is opened: an unopenable "
+            "journal then costs a bundle fit and API weight to discover"
+        )
+
+    def test_the_resolver_does_the_same(self):
+        """Hourly, so a wasted build costs 24x more than the snapshot's."""
+        from risk_engine.shadow.cli import cmd_resolve
+
+        journal_at, world_at = self._order_in(cmd_resolve)
+        assert journal_at < world_at
+
+    def test_a_missing_driver_names_the_fix_rather_than_the_import(self, monkeypatch):
+        """`ModuleNotFoundError: No module named 'psycopg'` reads as a broken
+        build. It was a lazily-imported driver absent from requirements while
+        the shipped compose stack pointed every shadow job at Postgres."""
+        import builtins
+
+        from risk_engine.shadow.backends import PostgresBackend
+
+        real_import = builtins.__import__
+
+        def no_psycopg(name, *a, **k):
+            if name.startswith("psycopg"):
+                raise ImportError("No module named 'psycopg'")
+            return real_import(name, *a, **k)
+
+        monkeypatch.setattr(builtins, "__import__", no_psycopg)
+        with pytest.raises(ImportError, match=r"psycopg\[binary\]"):
+            PostgresBackend("postgresql://x@y/z")
+
+    def test_the_driver_is_declared_where_the_image_installs_from(self):
+        """The lazy import was read as 'not a dependency of this image'. One
+        image serves the engine AND the shadow jobs (Dockerfile.engine says
+        two would let the journal record predictions attributed to a version
+        that never produced them), and that image is what every compose
+        deployment points at a real Postgres DSN."""
+        reqs = Path(__file__).resolve().parents[1] / "requirements.txt"
+        assert "psycopg" in reqs.read_text(encoding="utf-8")
+
+
 class TestARefusedAddressList:
     """A malformed list takes the whole sweep down, and must say so.
 

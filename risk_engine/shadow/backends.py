@@ -115,8 +115,25 @@ class PostgresBackend:
     placeholder = "%s"
 
     def __init__(self, dsn: str) -> None:
-        import psycopg
-        from psycopg.rows import dict_row
+        try:
+            import psycopg
+            from psycopg.rows import dict_row
+        except ImportError as exc:
+            # A bare ModuleNotFoundError here reads as a broken build. It is
+            # not: the driver is lazily imported by design so a sqlite-only
+            # deployment never pays for it, and it was simply absent from
+            # requirements.txt while the shipped compose stack pointed every
+            # shadow job at a real Postgres DSN.
+            raise ImportError(
+                "the calibration journal was given a Postgres DSN but psycopg is "
+                "not installed. It is imported lazily so a sqlite journal needs no "
+                "driver:\n"
+                "    pip install 'psycopg[binary]>=3.1'\n"
+                "It is in risk_engine/requirements.txt, so a container built "
+                "before 2026-08-01 predates the entry -- rebuild the image rather "
+                "than installing into a running one. To run without Postgres "
+                "entirely, pass a file path as --journal instead of a DSN."
+            ) from exc
 
         self.conn = psycopg.connect(dsn, row_factory=dict_row)
 

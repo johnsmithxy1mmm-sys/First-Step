@@ -4,10 +4,21 @@
 # httpx -- it issues one shape of request to one host, and the weight-budget
 # accounting in §5.3 has to be hand-rolled either way.
 #
-# Postgres is optional: the calibration journal (§3.4) runs on stdlib sqlite3
-# for local work and tests, against the same schema as shadow/schema.sql.
+# Postgres is optional in the sense that a sqlite DSN works with nothing
+# extra -- but the shipped compose stack runs the journal on Postgres, and
+# `PostgresBackend` (shadow/backends.py) imports psycopg lazily specifically
+# so a pure-sqlite deployment never pays for it. "Lazily imported" was read
+# as "not a dependency of this image" and the driver was left out of this
+# file entirely: the one image that serves the engine ALSO runs the shadow
+# jobs (deploy/Dockerfile.engine's own docstring: two images would let the
+# journal accumulate predictions attributed to a version that never produced
+# them), and that image is the one every compose deployment points at a real
+# Postgres DSN. `[binary]` pulls the prebuilt wheel -- no libpq headers, no
+# compiler in the image, consistent with why this file skips scipy's build
+# toolchain too.
 numpy>=1.26,<3
 scipy>=1.11,<2
+psycopg[binary]>=3.1,<4
 
 # Development
 pytest>=8.0
