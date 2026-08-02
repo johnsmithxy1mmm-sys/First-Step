@@ -29,11 +29,17 @@ fails if it goes away.
 a grid, holding the correlation matrix fixed at the shrunk estimate -- the
 standard two-stage (IFM) approach. Recorded as OPEN-QUESTIONS A9.
 
-**`fit_copula_df` has no shipped caller either**, and unlike the diagnostic
-that is not yet fixed: both bundles pass a hardcoded `copula_df=4.0`. Wiring
-a check that can only refuse changes no output; replacing 4.0 with a fitted
-value changes every output, which is a distribution change and resets the
-§3.3 shadow counter. Tracked under A9 as a decision to take deliberately.
+`fit_copula_df` IS the shipped path as of 0.3.0. Both bundle builders reach
+it through `service/state.py::_fitted_copula_df`; the hardcoded
+`copula_df=4.0` this paragraph used to describe is gone, and on the fixture
+the fitted value is 6.5. Replacing the constant changed every output, which
+is a distribution change, so it was taken as a MINOR version bump that resets
+the §3.3 shadow counter -- deliberately, before the clock started. A9.
+
+(This paragraph asserted the opposite for a release after it stopped being
+true, which is the defect class this file's other notes exist to catch: prose
+in the present tense describing wiring that has changed. It is cheap to write
+and expensive to trust.)
 """
 
 from __future__ import annotations

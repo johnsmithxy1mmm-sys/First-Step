@@ -199,7 +199,7 @@ def funding_drag(
         n_paths=n_paths,
         horizons=(horizon_hours,),
         seed=seed,
-        n_iso=max(len(b.isolated_positions) for b in (book, *singles)),
+        n_iso=len(coins),  # one bridge column per coin; keyed by universe index
         include_funding=True,
         workers=workers,
     )

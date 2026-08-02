@@ -214,6 +214,16 @@ class ShadowCron:
         def _paced(call):
             nonlocal exhausted
             while True:
+                # Checked BEFORE the call, not only in the rate-limit handler.
+                # The ceiling used to bound waiting rather than the run: a slow
+                # or failing venue never trips the weight limit (retries with
+                # 10s timeouts run at ~40 weight/min against a 300 allowance),
+                # so the deadline was never read and a sweep over 500 addresses
+                # could run for hours -- past its own daily cadence, with both
+                # docstrings claiming a ceiling that did not exist.
+                if time.monotonic() >= deadline:
+                    exhausted = True
+                    return None
                 try:
                     return call()
                 except RateLimitExceeded:

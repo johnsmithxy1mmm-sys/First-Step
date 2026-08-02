@@ -140,6 +140,19 @@ class InfoClient:
         )
         last: Exception | None = None
         for attempt in range(self.max_retries):
+            if attempt:
+                # Every retry is another request ON THE WIRE, and the venue
+                # counts requests, not intentions. Charging once before the
+                # loop meant up to `max_retries` real requests per 20-weight
+                # charge -- under network flakiness the shadow sweep's promised
+                # 300/min became as much as 900/min, eating the very reserve
+                # §5.3 sets aside for interactive users. A retry that cannot
+                # be paid for waits for the window rather than being sent.
+                #
+                # Note this makes `RateLimitExceeded` reachable from inside a
+                # retry, which is correct: the paced callers treat it as "wait
+                # and try again", which is what a spent window means.
+                self.budget.charge(weight)
             try:
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:  # noqa: S310
                     return json.load(resp)

@@ -401,6 +401,23 @@ class Book:
         closed = min(abs(prior.size), abs(position.size)) * prior.side
         realized = closed * (exec_price - prior.entry_price)
 
+        # An isolated pocket cannot lose more than the margin inside it -- that
+        # is the defining property of isolated margin, and a book where it did
+        # is not constructible on the venue, because the pocket would have been
+        # liquidated first. The partial-close branch below has always refused
+        # such a book; the full-close and flip branches did not, and returned
+        # one with the wallet debited for the excess (a 1,000 pocket losing
+        # 10,000 left `cross_collateral` 9,000 below where it started, and a
+        # flip drove it negative). Same condition, same refusal, all three.
+        if prior.mode is MarginMode.ISOLATED:
+            remaining = (prior.isolated_margin or 0.0) + realized
+            if remaining <= 0:
+                raise ValueError(
+                    f"{position.coin}: hypothetical close at {exec_price:.2f} leaves the "
+                    f"isolated pocket at {remaining:.2f} <= 0; the venue would have "
+                    "liquidated it first, so this book is not constructible"
+                )
+
         if size == 0:
             # Full close: realized PnL and any pocket margin return to the wallet.
             cash += realized + (prior.isolated_margin or 0.0)

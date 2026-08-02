@@ -27,7 +27,15 @@ def exact(x, source_df, target_df):
 
 @pytest.mark.parametrize(
     "source_df,target_df",
-    [(4.0, 2.5), (4.0, 12.0), (None, 3.0), (6.0, None), (4.0, 30.0), (2.5, 20.0)],
+    [
+        (4.0, 2.5), (4.0, 12.0), (None, 3.0), (6.0, None), (4.0, 30.0), (2.5, 20.0),
+        # Target df at the §2.2 clamp FLOOR. These are shipped configurations,
+        # not corner cases: `DF_MIN` is 2.1, a Gaussian copula (source None) is
+        # the §3.2 baseline, and 30.0 is the copula grid's ceiling. The grid
+        # above stopped at 2.5, so the map ran 28% over its own stated error
+        # budget in production without any test seeing it.
+        (None, 2.1), (30.0, 2.1), (6.5, 2.1), (None, 2.5),
+    ],
 )
 def test_body_accuracy(source_df, target_df):
     x = np.concatenate([np.linspace(-6, 6, 4001), np.array([0.0, 1e-9, -1e-9])])

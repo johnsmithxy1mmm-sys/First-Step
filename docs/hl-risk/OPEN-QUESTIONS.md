@@ -108,6 +108,20 @@ The Hyperliquid formula itself reproduces the exact result, provided
 *rate*. Read with a signed `position_size` it returns a below-spot
 liquidation price for shorts, which is nonsense; the code notes this.
 
+**Reopened and re-resolved (2026-08-02 audit).** "The exact form is
+implemented" was true only within a single maintenance tier, and this entry's
+closed status manufactured false confidence that the short side was done.
+Both closed forms held mmr fixed at one tier while §1.3's tables make mmr
+non-decreasing in notional, so a SHORT — which walks into heavier tiers as it
+loses — got a displayed liquidation price *beyond* the true one: measured at
+126 bp of entry on a 1490 BTC short over the real 150M tier boundary, with
+the stepped simulator liquidating inside the gap, and 21/21 shorts optimistic
+in a randomized sweep (0/29 longs). The margin.py caveat at the time named
+the LONG as the optimistic case — inverted. Both public functions now iterate
+the solve to the tier the answer lands in (`_tier_consistent`); the same
+sweep finds zero optimistic cases. The single-tier algebra above remains
+correct as the inner step.
+
 ### A3 `[RESOLVED]` Hourly-close monitoring understates liquidation
 
 The simulator steps hourly (§2.5), but liquidation is a continuous-time
@@ -1201,6 +1215,24 @@ live users. Daily snapshots are feasible; the resolver doubles the traffic.
 The cron is built with a weight-budget governor and an explicit low-priority
 lane, but the address count and the live-user headroom are coupled and should
 be sized against real traffic, not assumed.
+
+**Two 2026-08-02 audit findings sharpen this, one fixed, one open:**
+
+- *Fixed:* `InfoClient.post` charged the budget once and then retried network
+  failures up to 3x uncharged — under flakiness the sweep's promised 300/min
+  was up to 900/min on the wire, and a venue 429 (an `HTTPError`, which is a
+  `URLError` subclass) was itself retried on a 1–2s backoff. Every wire
+  attempt now charges, so a retry that cannot be paid for waits for the
+  window instead of being sent.
+- *Open (architectural):* the reserve is per-PROCESS. The snapshot job, the
+  resolve job and the serving engine each build their own `WeightBudget`
+  behind one egress IP: two shadow processes at 300/min each plus a serving
+  default of 1200/min is a combined ceiling above the venue's 1200, and
+  during the daily snapshot/resolve overlap the actual reserve is 50%, not
+  the promised 75%. Honest fix is a shared ledger (or one process
+  multiplexing both jobs); until then the deployed mitigation is cadence —
+  the compose loops are sequential per container and the sweeps are paced —
+  which bounds but does not eliminate the overlap.
 
 ### C7 `[BLOCKER — non-blocking in practice]` Is the Info API case-sensitive on `user`?
 

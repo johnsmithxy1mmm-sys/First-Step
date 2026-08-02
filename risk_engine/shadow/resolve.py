@@ -214,7 +214,6 @@ def resolve_due(
 ) -> ResolveReport:
     now = now or datetime.now(timezone.utc)
     metrics = metrics or METRICS
-    spot = provider.spot()
     resolved = 0
     stale = 0
     failed: list[tuple[int, str]] = []
@@ -253,6 +252,13 @@ def resolve_due(
         cleanly. Returns a sentinel when the whole-run ceiling is reached."""
         nonlocal budget_exhausted
         while True:
+            # Before the call, not only in the handler: a slow or failing
+            # venue never trips the weight limit, so a deadline consulted only
+            # on `RateLimitExceeded` bounds waiting rather than the run. See
+            # the same correction in `cron._paced`.
+            if time.monotonic() >= deadline:
+                budget_exhausted = True
+                return _CEILING
             try:
                 return call()
             except RateLimitExceeded:
@@ -273,6 +279,13 @@ def resolve_due(
     # day's observations are flagged stale and dropped from §3.3 -- the same
     # gate-unreachable failure the pacing rework fixed on the snapshot side.
     flow_cache: dict[tuple[str, datetime, datetime], float] = {}
+
+    # Paced like everything else -- the old top-of-function fetch ran before
+    # the deadline existed, so a rate limit there escaped as an error (the
+    # exact G-4 latency the cron side already closed).
+    spot = _paced(provider.spot)
+    if spot is _CEILING:
+        return ResolveReport(resolved=0, failed=[], budget_exhausted=True)
     spot_at = time.monotonic()
 
     for pending in journal.due(now):

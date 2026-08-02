@@ -265,13 +265,23 @@ def simulate_books_checkpointed(
         # pockets, from the same pool.
         uniforms = None
         if use_bridge:
-            n_iso = len(book.isolated_positions)
-            if base.bridge_iso.shape[2] < n_iso:
+            # Keyed by COIN, not by the pocket's position in the book.
+            # `Book.with_position` rebuilds the tuple as `(*others, merged)`,
+            # so an order touching a coin moves that pocket to the end: a book
+            # with isolated [SOL, ETH] becomes [ETH, SOL] after an order on
+            # SOL. Slicing `[:n_iso]` positionally then fed column 0 to SOL in
+            # the "before" book and to ETH in the "after" book, decoupling the
+            # interior-hit draws for exactly the paired walk `pre_trade_delta`
+            # exists to make pathwise. Costs variance, not bias -- the price
+            # paths were always shared -- but it widens the very interval D6
+            # measured as six times tighter.
+            iso_cols = [columns[p.coin] for p in book.isolated_positions]
+            if iso_cols and base.bridge_iso.shape[2] <= max(iso_cols):
                 raise ValueError(
                     f"randomness has {base.bridge_iso.shape[2]} isolated columns, "
-                    f"book needs {n_iso}"
+                    f"book needs a column for universe index {max(iso_cols)}"
                 )
-            uniforms = (base.bridge_cross, base.bridge_iso[:, :, :n_iso])
+            uniforms = (base.bridge_cross, base.bridge_iso[:, :, iso_cols])
         with Timer("liquidation_walk"):
             outs = sim.run_checkpointed(
                 prices, horizons, funding_paths=funding_paths, bridge=bridge,
@@ -480,7 +490,12 @@ class MonteCarloEngine:
         if missing_spot:
             raise KeyError(f"no spot price for {missing_spot}")
         spot_vec = np.array([spot[c] for c in coins], dtype=np.float64)
-        n_iso = len(book.isolated_positions)
+        # One bridge column per COIN in the universe, not per pocket in this
+        # book: the columns are keyed by universe index so the same coin gets
+        # the same draws in every book of a paired walk (see
+        # `simulate_books_checkpointed`). Unused columns cost one uniform per
+        # path-step and nothing else.
+        n_iso = len(coins)
         if include_funding:
             # Only coins the book actually holds; the factor column carries no
             # position, so it accrues no funding.

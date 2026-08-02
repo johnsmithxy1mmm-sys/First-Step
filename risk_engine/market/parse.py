@@ -183,7 +183,16 @@ def parse_clearinghouse_state(
 
 
 def parse_candles_to_log_returns(candles: list) -> tuple[np.ndarray, np.ndarray]:
-    """`candleSnapshot` -> (close timestamps in ms, hourly log returns).
+    """`candleSnapshot` -> (candle OPEN timestamps in ms, hourly log returns).
+
+    The stamps are `t`, the opening time of the candle whose close realises
+    each return -- Hyperliquid puts the close time in `T`. This docstring
+    used to say "close timestamps", which was wrong by one hour per label.
+    Today's consumers only difference the stamps (gap detection and the
+    timestamp alignment in §2.1's matrix build), for which a constant offset
+    cancels; anything JOINING these against another hourly series by absolute
+    time -- the A8 funding-vs-returns study is the named case -- must use
+    `t + 1h`, or switch this parser to `T`, or be off by one hour.
 
     Gaps are not interpolated. A missing hour means the return across it is
     a multi-hour return, which would understate the per-hour volatility if

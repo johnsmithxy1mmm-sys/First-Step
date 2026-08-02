@@ -31,6 +31,25 @@ DF_MAX = 30.0
 #: MLE search bounds, wider than the clamp so that a clamp is detectable.
 _SEARCH_LO, _SEARCH_HI = 1.05, 200.0
 
+#: Decimal places the fitted df is rounded to.
+#:
+#: `_neg_log_likelihood` has always said the shape parameter is one "we then
+#: clamp to one decimal place anyway", and the rounding did not exist. That
+#: was not merely a stale comment: `MAP_CACHE` keys quantile maps on
+#: (copula df, marginal df) and never evicts, so a raw optimiser float like
+#: 3.910558397096289 mints a fresh ~266 KB table on every rebuild. The service
+#: refits every five minutes off a candle window that gains an hour each time,
+#: so the df moves nearly every rebuild: measured at roughly 230 MB of
+#: unreclaimable heap per day, plus a cold map build on the warm request path
+#: after each one.
+#:
+#: One decimal bounds the key space to 280 values, which is what makes the
+#: cache's "build each once" premise true. The cost is nil: `fit_df`'s own
+#: optimiser tolerance is 1e-3, and the difference between a t(3.9) and a
+#: t(3.910558) tail is orders of magnitude below the estimation error on df
+#: itself.
+DF_DECIMALS = 1
+
 
 @dataclass(frozen=True, slots=True)
 class MarginalSpec:
@@ -96,8 +115,11 @@ def fit_df(returns: np.ndarray) -> tuple[float, float, bool]:
         options={"xatol": 1e-3},
     )
     raw = float(res.x)
-    clamped = float(np.clip(raw, DF_MIN, DF_MAX))
-    return clamped, raw, clamped != raw
+    # Rounded BEFORE the clamp so the clamp comparison is between the two
+    # values that are actually used, and a df that rounds onto a bound is not
+    # reported as clamped when it was not.
+    clamped = float(np.clip(round(raw, DF_DECIMALS), DF_MIN, DF_MAX))
+    return clamped, raw, clamped != round(raw, DF_DECIMALS)
 
 
 def fit_marginal(

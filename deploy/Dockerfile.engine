@@ -35,9 +35,16 @@ EXPOSE 8787
 # without RISK_SERVICE_TOKEN. That refusal is the point: an image that
 # silently served an unauthenticated engine to the compose network would be
 # the same defect as exposing it on a host interface.
+# Probes the container's own HOSTNAME, not 127.0.0.1 -- the same fix the
+# backend image already carries. A loopback-only bind answers a 127.0.0.1
+# probe perfectly well from inside the container while every peer on the
+# compose network gets ECONNREFUSED, so the check reported `healthy` for a
+# container nothing could reach. `serve` permits a loopback bind (it refuses
+# only a non-loopback one without a token), so an overridden `command` can
+# still produce exactly that, and the healthcheck has to be able to see it.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
-    CMD python3 -c "import urllib.request,sys; \
-sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8787/health', timeout=4).status==200 else 1)"
+    CMD python3 -c "import socket,urllib.request,sys; \
+sys.exit(0 if urllib.request.urlopen('http://'+socket.gethostname()+':8787/health', timeout=4).status==200 else 1)"
 
 ENTRYPOINT ["python3", "-m", "risk_engine.service"]
 CMD ["--host", "0.0.0.0", "--port", "8787"]

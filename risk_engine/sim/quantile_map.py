@@ -35,7 +35,22 @@ from scipy import stats
 #: survival probability actually observed is ~1e-7, so 1e-13 leaves six
 #: decades of headroom before extrapolation is used at all.
 _MIN_TAIL_P = 1e-13
-_N_NODES = 3000
+#: Accurate nodes, spaced geometrically in probability.
+#:
+#: 8000, not the original 3000. Probability spacing is coarse in log|x| near
+#: the median -- `p` moves geometrically while x moves almost linearly in
+#: (0.5 - p) -- so consecutive nodes there straddled decades of log|x|, and
+#: the linear interpolation across that gap WAS the whole error budget:
+#: 1.28e-5 at target df 2.1, against the 1e-5 this module asserts, peaking at
+#: |x| ~ 0.006. df 2.1 is the §2.2 clamp floor and a live serving
+#: configuration; the accuracy test's grid stopped at 2.5 and never saw it.
+#:
+#: This is the node count and not `_N_GRID` because the error is interpolation
+#: between NODES -- measured insensitive to the resample grid, which was tried
+#: first at 2x and 4x for no change at all. Nodes are temporary (only
+#: `grid_log_y` is retained), so this costs ~5 ms of one-time build per map
+#: and no memory. Worst case over every shipped pair falls to 1.4e-6.
+_N_NODES = 8000
 #: Uniform resampling grid. Dense enough that linear interpolation in
 #: log-log space stays far inside the accuracy budget asserted in
 #: tests/test_quantile_map.py, and cheap because lookup is O(1).
@@ -149,18 +164,41 @@ class QuantileMap:
 
 
 class QuantileMapCache:
-    """Maps are pure functions of (source df, target df); build each once."""
+    """Maps are pure functions of (source df, target df); build each once.
+
+    "Once" only holds if the key space is finite, and a raw MLE float is not:
+    each distinct df mints a permanent ~266 KB table in a process that lives
+    for months. `marginals.fit_df` rounds to `DF_DECIMALS` for this reason,
+    but the rounding is repeated here so the bound is a property of the cache
+    rather than of one caller's discipline -- a second caller passing a raw
+    float would otherwise reopen the leak silently.
+
+    Rounding the KEY only. The map itself is built for the rounded df, which
+    is the df the caller then gets back; nothing is silently fitted at one
+    shape and evaluated at another.
+    """
+
+    #: Matches `marginals.DF_DECIMALS`. Not imported, to keep `sim` from
+    #: depending on `model`; the test suite pins the two together.
+    KEY_DECIMALS = 1
 
     def __init__(self) -> None:
         self._cache: dict[tuple[float | None, float | None], QuantileMap] = {}
 
+    @classmethod
+    def _key_df(cls, df: float | None) -> float | None:
+        return None if df is None else round(float(df), cls.KEY_DECIMALS)
+
     def get(self, source_df: float | None, target_df: float | None) -> QuantileMap:
-        key = (source_df, target_df)
+        key = (self._key_df(source_df), self._key_df(target_df))
         hit = self._cache.get(key)
         if hit is None:
-            hit = QuantileMap.build(source_df, target_df)
+            hit = QuantileMap.build(key[0], key[1])
             self._cache[key] = hit
         return hit
+
+    def __len__(self) -> int:
+        return len(self._cache)
 
 
 MAP_CACHE = QuantileMapCache()

@@ -49,7 +49,31 @@ Format: MAJOR.MINOR.PATCH-tag
 #: arrive. That is an estimate tracking data, exactly like the EWMA
 #: volatilities and the marginal dfs beside it. The specification is what the
 #: counter keys on, and the specification changed once, here.
-MODEL_VERSION = "0.3.0-phase1"
+#:
+#: 0.4.0 — adversarial-audit fixes, three of which move the predicted
+#: distribution. MINOR, and again taken before the clock has started:
+#:
+#:   - the correlation matrix now aligns coins on shared candle TIMESTAMPS
+#:     rather than on trailing array index. One missing candle for one coin
+#:     shifted it against the others for the whole window and measured a
+#:     correlation of -0.022 where the truth was 0.9986, so this changes the
+#:     dependence structure on any window with a gap -- and the whole point is
+#:     that it was silently wrong before;
+#:   - the copula df and the §2.3 tail gate are now fitted on the assets whose
+#:     correlation row was actually ESTIMATED, over their common window, rather
+#:     than on every asset truncated to the youngest one's history. On a
+#:     40-hour young asset that moved the fitted df from 5.0 to 3.5;
+#:   - the marginal df is rounded to one decimal, which `_neg_log_likelihood`
+#:     always claimed and never did. Sub-0.1 changes in df are far below the
+#:     estimation error on df itself, but they are changes.
+#:
+#: Also here and NOT distribution-affecting in law, though it changes the
+#: sample a seed produces: bridge uniforms are keyed by coin instead of by the
+#: pocket's position in the book, because `with_position` reorders pockets and
+#: the paired pre-trade walk therefore disagreed with itself about which
+#: column belonged to which pocket. Same law, different draw -- the 0.2.1
+#: reasoning applies, and it rides along with the MINOR bump anyway.
+MODEL_VERSION = "0.4.0-phase1"
 
 # Distribution-affecting prefix; the shadow counter keys on this, not on the
 # full string, so that PATCH releases keep accumulating validation days.

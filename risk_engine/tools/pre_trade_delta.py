@@ -306,7 +306,12 @@ def pre_trade_delta(
                         f"no funding model for {c}; a position without funding history "
                         "would silently understate cost (§1.5)"
                     )
-        n_iso = max(len(book.isolated_positions), len(after_book.isolated_positions))
+        # One bridge column per coin in the shared universe. Sizing by pocket
+        # COUNT was safe; indexing by pocket POSITION was not -- `with_position`
+        # moves the touched coin to the end of the tuple, so the before/after
+        # books disagreed about which column belonged to which pocket, which is
+        # the one place this paired walk must not diverge.
+        n_iso = len(coins)
 
         target = n_paths
         converged = False
