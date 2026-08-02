@@ -155,6 +155,14 @@ class TailDiagnostic:
         threshold on a few thousand hourly observations the standard error on
         the empirical estimate is a few percentage points.
         """
+        if not np.isfinite(self.empirical_lower):
+            # NaN means the window held no lower-tail exceedances at all, so
+            # there is no measurement to compare. `NaN > margin` is False,
+            # which would let a §2.3 BLOCKING gate pass vacuously — the guard
+            # reporting "not understated" on the strength of no evidence. An
+            # unmeasurable tail is not a safe tail; say so, and let
+            # `assert_lower_tail_not_understated` refuse.
+            return True
         return self.empirical_lower - self.model_at_threshold > margin
 
     def __str__(self) -> str:
@@ -211,9 +219,17 @@ def assert_lower_tail_not_understated(
     bad = [d for d in diagnostics if d.understates_lower_tail(margin)]
     if bad:
         lines = "\n  ".join(str(d) for d in bad)
+        unmeasured = [d for d in bad if not np.isfinite(d.empirical_lower)]
+        note = (
+            "\nSome pairs have NO measurable lower tail in this window "
+            f"({', '.join('/'.join(d.pair) for d in unmeasured)}): too few joint "
+            "exceedances to estimate one. That is reported as a failure rather "
+            "than a pass -- an unmeasurable tail is not evidence of a safe one."
+            if unmeasured else ""
+        )
         raise ValueError(
             "the t-copula understates lower-tail dependence for:\n  "
             f"{lines}\n"
             "§2.3 classifies this as a blocking defect and prescribes a skewed-t, "
-            "which is not implemented. Report this rather than proceeding."
+            f"which is not implemented. Report this rather than proceeding.{note}"
         )

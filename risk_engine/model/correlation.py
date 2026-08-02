@@ -106,6 +106,52 @@ class GlobalCorrelationMatrix:
         return chol
 
 
+def align_on_timestamps(
+    returns: dict[str, np.ndarray],
+    timestamps: dict[str, np.ndarray],
+    assets: list[str] | tuple[str, ...],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Stack `assets` on the timestamps they actually share (audit H5).
+
+    Returns `(common_timestamps, x)` with `x` of shape (len(common), len(assets)).
+
+    Aligning on the trailing *index* instead — `series[k][-window:]` — is only
+    correct while every series covers the same hours. One missing candle for
+    one coin (an asset-specific halt, a venue gap, an unequal
+    `candleSnapshot` response) shifts that coin against the others by one
+    hour for the whole window, and the measured correlation collapses:
+    reproduced at 0.9986 -> -0.0073 on two series that are the same series.
+
+    Near-zero correlation between assets that in reality crash together
+    understates the joint move that liquidates a leveraged book — the one
+    direction §10 forbids — and §2.3's tail diagnostic cannot catch it,
+    because its empirical side reads the same misaligned columns and agrees.
+
+    The intersection is the honest window: an hour one coin did not trade is
+    an hour there is no cross-asset observation for, not an hour to pair with
+    a neighbouring one.
+    """
+    common = timestamps[assets[0]]
+    for a in assets[1:]:
+        common = np.intersect1d(common, timestamps[a], assume_unique=False)
+    if common.size == 0:
+        raise ValueError(
+            "the tracked assets share no common candle timestamps; their return "
+            "series cannot be aligned (§2.1)"
+        )
+    cols = []
+    for a in assets:
+        t = np.asarray(timestamps[a])
+        r = np.asarray(returns[a], dtype=np.float64)
+        if t.size != r.size:
+            raise ValueError(
+                f"{a}: {t.size} timestamps for {r.size} returns; they must come "
+                "from the same parse"
+            )
+        cols.append(r[np.isin(t, common)])
+    return common, np.column_stack(cols)
+
+
 def build_global_matrix(
     returns: dict[str, np.ndarray],
     now: datetime | None = None,
@@ -114,11 +160,19 @@ def build_global_matrix(
     gate_quantile: float = GATE_QUANTILE,
     anchor: str = ANCHOR,
     metrics: Metrics | None = None,
+    timestamps: dict[str, np.ndarray] | None = None,
 ) -> GlobalCorrelationMatrix:
     """Build the global matrix from per-asset hourly log-return series.
 
     Each series is oldest-first. Series may have different lengths; mature
-    assets are aligned on their common tail, and the rest go through the gate.
+    assets are aligned on the hours they actually share, and the rest go
+    through the gate.
+
+    `timestamps` carries the candle time of each return, and every live caller
+    passes it. Without it the mature assets are aligned on their trailing
+    index, which is only equivalent while no series has a gap — see
+    `align_on_timestamps` for what that costs when one does. It stays optional
+    because fixtures and benchmarks synthesise returns with no clock at all.
     """
     metrics = metrics or METRICS
     now = now or datetime.now(timezone.utc)
@@ -134,8 +188,21 @@ def build_global_matrix(
     if anchor not in mature:
         raise ValueError(f"{anchor} has {series[anchor].size}h of history, below the gate")
 
-    window = min(series[k].size for k in mature)
-    x = np.column_stack([series[k][-window:] for k in mature])
+    if timestamps is not None:
+        missing = [k for k in mature if k not in timestamps]
+        if missing:
+            raise ValueError(f"timestamps given but missing for {missing}")
+        _, x = align_on_timestamps(series, timestamps, mature)
+        window = x.shape[0]
+        if window < min_history_hours:
+            raise ValueError(
+                f"the mature assets share only {window}h of common candle "
+                f"timestamps, below the {min_history_hours}h gate (§2.1). One "
+                "coin's history has gaps where the others' do not."
+            )
+    else:
+        window = min(series[k].size for k in mature)
+        x = np.column_stack([series[k][-window:] for k in mature])
     if not np.isfinite(x).all():
         raise ValueError("return history contains NaN/inf; clean the candle series first")
 

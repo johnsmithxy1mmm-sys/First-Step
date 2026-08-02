@@ -27,7 +27,21 @@ def _f(value, field: str) -> float:
     """
     if value is None:
         raise ValueError(f"missing required numeric field {field!r}")
-    out = float(value)
+    # A list or dict where a number belongs raises TypeError from `float`, and
+    # TypeError is outside the contract every caller here documents and every
+    # harness probe catches -- `net_external_flow` promises ValueError, and the
+    # B2 checks catch only that. A wrong-typed field is a malformed record, not
+    # a different class of failure, so it is reported as one.
+    try:
+        out = float(value)
+    except (TypeError, ValueError) as exc:
+        # ValueError is re-raised too, purely to name the field: these messages
+        # are what the B2 sweep prints when it reports an unreadable record,
+        # and "could not convert string to float: 'garbage'" does not say which
+        # field of which record went wrong.
+        raise ValueError(
+            f"field {field!r} is not a number: {value!r} ({type(value).__name__})"
+        ) from exc
     if not math.isfinite(out):
         raise ValueError(f"field {field!r} is not finite: {value!r}")
     return out
@@ -66,8 +80,30 @@ def parse_meta(meta: dict) -> dict[str, AssetSpec]:
             continue
         max_lev = _f(asset.get("maxLeverage"), f"{name}.maxLeverage")
         table_id = asset.get("marginTableId")
-        tiers = tables.get(int(table_id)) if table_id is not None else None
-        if not tiers:
+        if table_id is not None:
+            # An asset that DECLARES a table and whose table we failed to read
+            # is not the same thing as an asset that carries only maxLeverage,
+            # and collapsing the two is a §10 violation rather than a
+            # robustness nicety: the fallback single tier is the most
+            # PERMISSIVE one (mmr = 0.5/maxLeverage at every size), so a large
+            # book silently gets the small-size maintenance rate. On the real
+            # BTC table that is 0.0125 instead of 0.05 at a $200M notional --
+            # maintenance margin understated 4x, liquidation modelled further
+            # away than it is, P(liq) understated. Silent, and in the one
+            # direction §10 forbids. Refuse instead; a venue shape change here
+            # must be seen, not absorbed.
+            tiers = tables.get(int(table_id))
+            if not tiers:
+                raise ValueError(
+                    f"{name} declares marginTableId {table_id!r} but no usable tier "
+                    f"table was parsed for it (known ids: {sorted(tables)}). Falling "
+                    "back to a single maxLeverage tier would understate maintenance "
+                    "margin for large positions (§1.3, §10), so this refuses instead."
+                )
+        else:
+            # The documented second shape: no table id at all, so the single
+            # implied tier IS the asset's published leverage -- a derivation,
+            # not a default.
             tiers = [MarginTier(0.0, max_lev)]
         specs[name] = AssetSpec(
             name=name,
@@ -157,7 +193,17 @@ def parse_candles_to_log_returns(candles: list) -> tuple[np.ndarray, np.ndarray]
     if not candles:
         raise ValueError("empty candle snapshot")
     rows = sorted(candles, key=lambda c: int(c["t"]))
-    closes = np.array([float(c["c"]) for c in rows], dtype=np.float64)
+    # `_f`, not a bare `float`: a `"NaN"` close parses happily and then evades
+    # the `closes <= 0` guard below (every comparison against NaN is False),
+    # so the poison reaches the EWMA, the copula fit and the §2.3 tail gate --
+    # where `understates_lower_tail` is `empirical - model > margin` and
+    # therefore ALSO False. A single bad candle would quietly disarm the one
+    # check that refuses to serve an understated tail. This is the module's
+    # stated contract (line 4) and `_f`'s own A-07 rationale; both parsers
+    # below simply were not using it.
+    closes = np.array(
+        [_f(c.get("c"), f"candle[{i}].c") for i, c in enumerate(rows)], dtype=np.float64
+    )
     times = np.array([int(c["t"]) for c in rows], dtype=np.int64)
     if (closes <= 0).any():
         raise ValueError("non-positive close price in candle snapshot")
@@ -169,9 +215,18 @@ def parse_funding_history(history: list) -> tuple[np.ndarray, np.ndarray]:
     if not history:
         raise ValueError("empty funding history")
     rows = sorted(history, key=lambda h: int(h["time"]))
+    # `_f` for the same reason as the candle closes: a NaN rate defeats
+    # `FundingBounds.validate_against_history` (`np.abs(r).max()` is NaN, and
+    # `NaN > cap` is False), so a genuine cap breach in the same series stops
+    # being reported -- the C1 check that exists to catch a stale funding bound
+    # can no longer fail. `fit_ar1` would then silently drop the NaN rows too.
     return (
         np.array([int(h["time"]) for h in rows], dtype=np.int64),
-        np.array([float(h["fundingRate"]) for h in rows], dtype=np.float64),
+        np.array(
+            [_f(h.get("fundingRate"), f"fundingHistory[{i}].fundingRate")
+             for i, h in enumerate(rows)],
+            dtype=np.float64,
+        ),
     )
 
 
@@ -456,7 +511,15 @@ def _delta_amount_usd(delta: dict, kind: str, row: object) -> float:
     for field in ("usdc", "usdcValue", "netWithdrawnUsd"):
         value = delta.get(field)
         if value is not None:
-            return abs(float(value))
+            # `_f`, not `float`: a NaN amount propagates to `net_external_flow`'s
+            # running total, and NaN survives every downstream guard --
+            # `verify`'s per-type reconstruction check (`> 1e-9` is False for
+            # NaN) reports PASS, and the resolver writes `actual_equity_change
+            # = NaN` into the write-once journal, where `pit()` returns a
+            # fabricated 1.0 (searchsorted puts NaN past the end) and CRPS is
+            # NaN forever. This function's own docstring says returning
+            # something quiet is the one failure it exists to prevent.
+            return abs(_f(value, f"{kind}.{field}"))
     raise ValueError(
         f"{kind} record carries no USD amount (looked for 'usdc', 'usdcValue' and "
         f"'netWithdrawnUsd'): {row!r}"
@@ -483,10 +546,15 @@ def _transfer_fee_usd(delta: dict) -> float:
     fee_token = str(delta.get("feeToken") or "").strip().upper()
     if fee_token not in ("", "USDC"):
         return 0.0
-    try:
-        return abs(float(delta.get("fee") or 0.0))
-    except (TypeError, ValueError):
+    raw = delta.get("fee")
+    if raw is None:
         return 0.0
+    # A malformed fee used to become $0 here, silently. That is the exact bias
+    # this docstring calls the kind "a calibration score is least able to
+    # absorb" -- one-signed and invisible -- applied to precisely the inputs
+    # every neighbouring parser refuses loudly. `_f` refuses instead, so a
+    # venue shape change surfaces as a B2 finding rather than as drift.
+    return abs(_f(raw, "transfer fee"))
 
 
 def net_external_flow(
@@ -538,7 +606,19 @@ def net_external_flow(
                 f"ledger update carries no 'time', so it cannot be placed inside "
                 f"or outside the window and cannot be skipped as out-of-range: {row!r}"
             )
-        if not (start_ms <= int(when) <= end_ms):
+        # `int(when)` on a list/dict raises TypeError, which escapes this
+        # function's documented ValueError contract -- and the two B2 harness
+        # probes catch only ValueError, so one malformed record crashed the
+        # very pass whose job is to report every malformed record. Convert it
+        # to the contract's error so the check reports FAIL instead of dying.
+        try:
+            when_ms = int(when)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"ledger update has an unreadable 'time' ({when!r}), so it cannot be "
+                f"placed inside or outside the window: {row!r}"
+            ) from exc
+        if not (start_ms <= when_ms <= end_ms):
             continue
         delta = row.get("delta") or {}
         kind = delta.get("type")

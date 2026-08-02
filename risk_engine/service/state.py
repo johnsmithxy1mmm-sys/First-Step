@@ -36,7 +36,7 @@ from risk_engine.model.copula import (
     diagnose_tail_asymmetry,
     fit_copula_df,
 )
-from risk_engine.model.correlation import build_global_matrix
+from risk_engine.model.correlation import align_on_timestamps, build_global_matrix
 from risk_engine.model.funding import FundingBounds, fit_ar1
 from risk_engine.model.marginals import fit_marginal
 from risk_engine.observability.metrics import METRICS
@@ -51,8 +51,47 @@ log = logging.getLogger("risk_engine.service.state")
 HL_FALLBACK_COPULA_DF = 4.0
 
 
-def _aligned_series(returns: dict, assets) -> np.ndarray:
+def _estimated_assets(matrix) -> tuple[str, ...]:
+    """The matrix assets whose correlation row was ESTIMATED, not imputed.
+
+    A9's copula fit and A10's tail gate both score a fitted dependence
+    structure against `matrix.corr`. For a young asset that row was never
+    estimated — §2.1's gate imputes it through the anchor precisely because a
+    three-week sample produces a correlation biased toward zero exactly when
+    the asset is most likely to move with everything else. Scoring a copula
+    against an imputed row measures the imputation, not the market.
+
+    Worse, the old code took `min(size)` over ALL assets, so one young asset
+    truncated the fit and the gate to its own short window: reproduced at a
+    fitted copula df of 3.5 against 5.0 on the mature window, and a fatal
+    §2.3 refusal fired off two joint observations. The young-asset gate exists
+    to keep short samples out of dependence estimation; this routed them back
+    in through the side door.
+    """
+    diagnostics = getattr(matrix, "diagnostics", None)
+    # getattr, not attribute access: benchmarks and tests build minimal matrix
+    # stubs that carry only `assets` and `corr`. A stub has no imputed rows by
+    # construction, so "no diagnostics" correctly means "all estimated".
+    imputed = set(getattr(diagnostics, "imputed_assets", ()) or ())
+    return tuple(a for a in matrix.assets if a not in imputed)
+
+
+def _corr_submatrix(matrix, assets) -> np.ndarray:
+    """`assets`'s principal submatrix of `matrix.corr`, stub-tolerant."""
+    if tuple(assets) == tuple(matrix.assets):
+        return np.asarray(matrix.corr, dtype=np.float64)
+    order = list(matrix.assets)
+    idx = np.array([order.index(a) for a in assets], dtype=np.intp)
+    return np.asarray(matrix.corr, dtype=np.float64)[np.ix_(idx, idx)]
+
+
+def _aligned_series(returns: dict, assets, timestamps: dict | None = None) -> np.ndarray:
     """The return series stacked on their common tail (audit F-2).
+
+    Aligns on shared candle timestamps when they are available (audit H5) and
+    falls back to the common trailing index when they are not — the same
+    ordering `build_global_matrix` uses, so the copula is fitted against the
+    correlation matrix on the same rows rather than on a one-hour shift.
 
     `build_global_matrix` aligns on the common tail deliberately
     (`window = min(...)` in correlation.py) — live candle series differ in
@@ -63,13 +102,16 @@ def _aligned_series(returns: dict, assets) -> np.ndarray:
     availability failure introduced by the very code meant to guard the
     model, on a data condition the matrix builder already survives.
     """
+    if timestamps is not None and all(a in timestamps for a in assets):
+        _, x = align_on_timestamps(returns, timestamps, list(assets))
+        return x
     window = min(np.asarray(returns[a]).size for a in assets)
     return np.column_stack(
         [np.asarray(returns[a], dtype=np.float64)[-window:] for a in assets]
     )
 
 
-def _fitted_copula_df(returns: dict, matrix) -> float:
+def _fitted_copula_df(returns: dict, matrix, timestamps: dict | None = None) -> float:
     """The copula's degrees of freedom, estimated rather than assumed (A9).
 
     Both bundle builders passed a hardcoded `copula_df=4.0` while
@@ -91,12 +133,16 @@ def _fitted_copula_df(returns: dict, matrix) -> float:
     are statements about the data outrunning the model family — the same
     reason §2.2's marginal clamps are logged.
     """
-    if len(matrix.assets) < 2:
+    # Estimated rows only: a copula fitted against an imputed correlation row
+    # is scoring the imputation (audit H5 / `_estimated_assets`).
+    assets = _estimated_assets(matrix)
+    if len(assets) < 2:
         # No pair, no dependence to estimate. Cannot happen on the live path
-        # (it requires BTC and ETH) but the fixture layout is editable.
+        # (it requires BTC and ETH, both mature) but the fixture layout is
+        # editable and a universe of only-young assets is conceivable.
         return HL_FALLBACK_COPULA_DF
-    series = _aligned_series(returns, matrix.assets)
-    df = float(fit_copula_df(series, matrix.corr))
+    series = _aligned_series(returns, assets, timestamps)
+    df = float(fit_copula_df(series, _corr_submatrix(matrix, assets)))
     lo, hi = float(COPULA_DF_GRID[0]), float(COPULA_DF_GRID[-1])
     if df <= lo or df >= hi:
         METRICS.incr("copula_df_at_grid_edge")
@@ -114,7 +160,7 @@ def _fitted_copula_df(returns: dict, matrix) -> float:
 
 
 def _checked_tail_diagnostics(returns: dict, matrix, copula_df: float | None,
-                              fatal: bool = True) -> tuple:
+                              fatal: bool = True, timestamps: dict | None = None) -> tuple:
     """Run §2.3's tail-asymmetry diagnostic; refuse when `fatal`.
 
     OPEN-QUESTIONS A10. `diagnose_tail_asymmetry` and
@@ -176,9 +222,15 @@ def _checked_tail_diagnostics(returns: dict, matrix, copula_df: float | None,
     """
     if copula_df is None or len(matrix.assets) < 2:
         return ()
-    series = _aligned_series(returns, matrix.assets)
+    # Estimated rows only, for the same reason as the copula fit: the gate
+    # compares an empirical tail against the model's tail at the pair's rho,
+    # and an imputed rho is a §2.1 assumption rather than a measurement.
+    assets = _estimated_assets(matrix)
+    if len(assets) < 2:
+        return ()
+    series = _aligned_series(returns, assets, timestamps)
     diagnostics = diagnose_tail_asymmetry(
-        series, tuple(matrix.assets), matrix.corr, copula_df
+        series, tuple(assets), _corr_submatrix(matrix, assets), copula_df
     )
     # Recorded BEFORE the assertion, so a bundle that is about to be refused
     # still leaves the measurement behind. Otherwise the one build whose
@@ -426,18 +478,22 @@ def _build_live_bundle(*, serving: bool = True):
     if "BTC" not in universe or "ETH" not in universe:
         raise RuntimeError("BTC and ETH must be present as risk factors (§2.1)")
 
-    returns, spot, funding_hist = {}, {}, {}
+    returns, spot, funding_hist, candle_times = {}, {}, {}, {}
     for coin in universe:
         candles = client.candle_snapshot(coin, "1h", now_ms - window_ms, now_ms)
-        _, rets = parse_candles_to_log_returns(candles)
+        times, rets = parse_candles_to_log_returns(candles)
         returns[coin] = rets
+        # Kept, not discarded (audit H5). Every caller used to throw these
+        # away, which left `build_global_matrix` aligning coins on trailing
+        # array index -- correct only while no coin has a candle gap.
+        candle_times[coin] = times
         spot[coin] = float(sorted(candles, key=lambda c: int(c["t"]))[-1]["c"])
         _, rates = parse_funding_history(
             client.funding_history(coin, now_ms - 30 * 24 * 3600 * 1000)
         )
         funding_hist[coin] = rates
 
-    matrix = build_global_matrix(returns)
+    matrix = build_global_matrix(returns, timestamps=candle_times)
     marginals = {
         c: fit_marginal(c, r, float(matrix.step_vol[matrix.assets.index(c)]))
         for c, r in returns.items()
@@ -458,11 +514,11 @@ def _build_live_bundle(*, serving: bool = True):
     # If the live build starts refusing, that is the two working as specified
     # -- a fitted copula that cannot represent real crypto crashes is exactly
     # what §2.3 exists to catch -- not a regression to route around.
-    copula_df = _fitted_copula_df(returns, matrix)
+    copula_df = _fitted_copula_df(returns, matrix, candle_times)
     bundle = ModelBundle(
         matrix=matrix, marginals=marginals, funding=funding,
         funding_bounds=bounds, copula_df=copula_df,
         tail_diagnostics=_checked_tail_diagnostics(
-            returns, matrix, copula_df, fatal=serving),
+            returns, matrix, copula_df, fatal=serving, timestamps=candle_times),
     )
     return bundle, {c: specs[c] for c in universe}, spot
