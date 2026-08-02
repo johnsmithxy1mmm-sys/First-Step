@@ -238,7 +238,18 @@ jobs:
         # The guard is unit-tested, but the image is what actually ships, and
         # an ENTRYPOINT or env mistake would leave an unauthenticated engine
         # listening on the container network with the unit test still green.
+        #
+        # `set -o pipefail` is load-bearing here, the same way journal-parity
+        # already needed it. Without it, `docker run ... | tee log.txt`'s exit
+        # status is `tee`'s — which succeeds even when `docker run` doesn't —
+        # so the `if` was always true and this step failed on EVERY run
+        # regardless of whether the guard actually worked. The traceback in a
+        # failed run's log always showed "refusing to bind" (the guard doing
+        # its job); the step failed anyway, on the good case, indistinguishably
+        # from how it would fail if the guard broke. A check that fails the
+        # same way on both outcomes checks nothing.
         run: |
+          set -o pipefail
           if docker run --rm hl-risk/engine:ci --host 0.0.0.0 --port 8787 --fixture 2>&1 | tee log.txt; then
             echo "engine started on 0.0.0.0 with no token — the bind guard is not reaching the image"
             exit 1
