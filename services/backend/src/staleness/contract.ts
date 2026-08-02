@@ -29,6 +29,40 @@ export const HIDE_AFTER_MS = 300_000;
  */
 export const MATRIX_STALE_AFTER_MS = 660_000;
 
+/**
+ * Beyond this the mark prices are withheld, not merely marked stale.
+ *
+ * The matrix clock needed a hide tier of its own. Before this, matrix age fed
+ * ONLY the execution gate, so an engine that was up with a matrix stuck for
+ * twenty minutes served its numbers labelled `fresh` — while `/api/health`
+ * went `ok:false` and the banner said "no risk numbers are being shown". Both
+ * halves wrong at once, and the numbers on screen were the stale ones.
+ *
+ * One missed cycle past the stale tier: at this point the engine has failed
+ * three consecutive rebuilds and its prices are no longer worth showing.
+ */
+export const MATRIX_HIDE_AFTER_MS = 960_000;
+
+/**
+ * One dated input a risk number was computed from, with the clock that
+ * applies to it.
+ *
+ * §6's tiers are about the age of the DATA. The engine's `computed_at` is
+ * stamped at `datetime.now()` on every request, so measuring against it
+ * always yielded ~0ms and `fresh` — the stale and hidden branches below were
+ * unreachable for the risk value, and a crash-time answer built on
+ * eleven-minute-old prices was served as confidently current. Inputs are
+ * dated separately because they arrive on genuinely different cadences: the
+ * book is per-request, the marks ride the five-minute rebuild.
+ */
+export interface DatedInput {
+  /** Named in the reason string a user reads, so it must be plain English. */
+  readonly label: string;
+  readonly at: Date | null;
+  readonly staleAfterMs: number;
+  readonly hideAfterMs: number;
+}
+
 export type Freshness = 'fresh' | 'stale' | 'hidden' | 'unavailable';
 
 /** A value the UI may display, together with how old it is. */
@@ -98,6 +132,77 @@ export function guard<T>(
     return { freshness: 'stale', value, computedAt: iso, ageMs, degraded: true };
   }
   return { freshness: 'fresh', value, computedAt: iso, ageMs, degraded: false };
+}
+
+/**
+ * Wrap a value in the contract, judged on every input it was built from.
+ *
+ * The verdict is the WORST across inputs: any input past its hide threshold
+ * hides the value, any input past its stale threshold marks it stale, and the
+ * reported `ageMs` belongs to whichever input drove that verdict — so the age
+ * on screen is the age of the thing that is actually out of date, not an
+ * average that hides it.
+ *
+ * A `null` timestamp means the input was never observed at all, which is
+ * withheld rather than assumed current.
+ */
+export function guardInputs<T>(
+  value: T,
+  inputs: readonly DatedInput[],
+  options: GuardOptions = {},
+): Guarded<T> {
+  const now = options.now ?? Date.now();
+  if (inputs.length === 0) {
+    throw new Error('guardInputs needs at least one dated input');
+  }
+
+  const missing = inputs.find((i) => i.at === null);
+  if (missing) {
+    return {
+      freshness: 'unavailable',
+      reason: `${missing.label} has never been observed, so its age is unknown`,
+      computedAt: null,
+      ageMs: null,
+      degraded: true,
+    };
+  }
+
+  const scored = inputs.map((i) => {
+    const ageMs = now - (i.at as Date).getTime();
+    return { input: i, ageMs, hidden: ageMs >= i.hideAfterMs, stale: ageMs >= i.staleAfterMs };
+  });
+
+  // Rank by severity, then by how far past its own threshold the input is --
+  // comparing raw ages across inputs with different clocks would let a
+  // routinely-old-but-fine matrix outrank a genuinely stale book.
+  const worst = scored.reduce((a, b) => {
+    const rank = (s: typeof a) => (s.hidden ? 2 : s.stale ? 1 : 0);
+    if (rank(b) !== rank(a)) return rank(b) > rank(a) ? b : a;
+    return b.ageMs / b.input.staleAfterMs > a.ageMs / a.input.staleAfterMs ? b : a;
+  });
+
+  const iso = (worst.input.at as Date).toISOString();
+  if (worst.hidden) {
+    return {
+      freshness: 'hidden',
+      reason: `${worst.input.label} is ${Math.round(worst.ageMs / 1000)}s old; beyond the ${Math.round(
+        worst.input.hideAfterMs / 1000,
+      )}s limit it is withheld rather than shown`,
+      computedAt: iso,
+      ageMs: worst.ageMs,
+      degraded: true,
+    };
+  }
+  if (worst.stale) {
+    return {
+      freshness: 'stale',
+      value,
+      computedAt: iso,
+      ageMs: worst.ageMs,
+      degraded: true,
+    };
+  }
+  return { freshness: 'fresh', value, computedAt: iso, ageMs: worst.ageMs, degraded: false };
 }
 
 export function unavailable(reason: string): WithheldPayload {

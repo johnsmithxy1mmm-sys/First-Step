@@ -60,6 +60,13 @@ class FakeEngine {
   computedAt = T0;
   publishable = true;
   matrixAgeS: number | null = 60;
+  /**
+   * Observation times of the data, separate from `computedAt`. Left undefined
+   * by default so the pre-existing cases still exercise the fallback path an
+   * engine build without these fields takes.
+   */
+  bookCapturedAt: Date | undefined = undefined;
+  pricesAsOf: Date | undefined = undefined;
 
   stop() {
     this.running = false;
@@ -82,7 +89,13 @@ class FakeEngine {
       },
       async portfolioRisk(): Promise<PortfolioRisk> {
         if (!engine.running) throw new RiskServiceError('connect ECONNREFUSED');
-        return { ...payload(engine.computedAt, engine.publishable), matrix_age_s: engine.matrixAgeS };
+        const body: PortfolioRisk = {
+          ...payload(engine.computedAt, engine.publishable),
+          matrix_age_s: engine.matrixAgeS,
+        };
+        if (engine.bookCapturedAt) body.book_captured_at = engine.bookCapturedAt.toISOString();
+        if (engine.pricesAsOf) body.prices_as_of = engine.pricesAsOf.toISOString();
+        return body;
       },
       async preTradeDelta(): Promise<never> {
         throw new RiskServiceError('not used in this test');
@@ -171,6 +184,78 @@ describe('§9 Phase 3: stopping the risk service', () => {
     expect(body.freshness).toBe('fresh');
     expect(body.execution.allowed).toBe(false);
     expect(body.execution.reasons.join(' ')).toContain('correlation matrix');
+  });
+
+  it('judges freshness on the age of the DATA, not on when the maths ran', async () => {
+    // The defect this pins: the engine stamps `computed_at` at
+    // `datetime.now()` on every request, so measuring against it always gave
+    // ~0ms and `fresh`. The stale and hidden tiers were unreachable for any
+    // real risk number, and a crash-time answer computed from ten-minute-old
+    // positions was served as confidently current with the execution gate
+    // open. Every case below has a computed_at of *now*.
+    const engine = new FakeEngine();
+    const at = T0.getTime() + 3_600_000;
+
+    for (const [bookAgeS, expected] of [
+      [5, 'fresh'],
+      [90, 'stale'],
+      [400, 'hidden'],
+    ] as const) {
+      engine.computedAt = new Date(at); // the maths just ran
+      engine.bookCapturedAt = new Date(at - bookAgeS * 1000);
+      engine.pricesAsOf = new Date(at); // prices current, isolate the book
+      const body = await ask(engine, at);
+      expect(body.freshness, `book ${bookAgeS}s old`).toBe(expected);
+      expect(Object.hasOwn(body, 'value')).toBe(expected !== 'hidden');
+      if (expected !== 'fresh') expect(body.execution.allowed).toBe(false);
+      await app?.close();
+      app = undefined;
+    }
+  });
+
+  it('withholds the value on a cold matrix, instead of only blocking execution', async () => {
+    // Matrix age used to feed ONLY the execution gate, so an engine that was
+    // up with a matrix stuck for twenty minutes rendered its numbers labelled
+    // `fresh` while /api/health said ok:false and the banner claimed no
+    // numbers were being shown. Both halves wrong, and the shown numbers were
+    // the stale ones.
+    const engine = new FakeEngine();
+    const at = T0.getTime() + 3_600_000;
+    engine.computedAt = new Date(at);
+    engine.bookCapturedAt = new Date(at);
+    engine.pricesAsOf = new Date(at - 1_200_000); // 20 minutes cold
+
+    const body = await ask(engine, at);
+    expect(body.freshness).toBe('hidden');
+    expect(body.value).toBeUndefined();
+    expect(body.reason).toContain('mark prices');
+    expect(body.execution.allowed).toBe(false);
+  });
+
+  it('does not mark a routinely-rebuilt matrix stale (D4)', async () => {
+    // The counterweight: §2.1 rebuilds every five minutes by design, so the
+    // marks must NOT be judged on the 60s book clock or the product would be
+    // permanently stale.
+    const engine = new FakeEngine();
+    const at = T0.getTime() + 3_600_000;
+    engine.computedAt = new Date(at);
+    engine.bookCapturedAt = new Date(at);
+    engine.pricesAsOf = new Date(at - 290_000); // just under one rebuild cycle
+
+    const body = await ask(engine, at);
+    expect(body.freshness).toBe('fresh');
+    expect(body.execution.allowed).toBe(true);
+  });
+
+  it('reports the age of whichever input is actually out of date', async () => {
+    const engine = new FakeEngine();
+    const at = T0.getTime() + 3_600_000;
+    engine.computedAt = new Date(at);
+    engine.bookCapturedAt = new Date(at - 120_000); // stale on its 60s clock
+    engine.pricesAsOf = new Date(at - 300_000); // older, but fine on its own
+    const body = await ask(engine, at);
+    expect(body.freshness).toBe('stale');
+    expect(body.ageMs).toBe(120_000);
   });
 
   it('never returns a value field together with a non-displayable freshness', async () => {

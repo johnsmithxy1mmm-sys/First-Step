@@ -67,6 +67,29 @@ def _estimate(e: RiskEstimate) -> dict[str, Any]:
     }
 
 
+def _input_ages(self_state, book: Book) -> dict[str, Any]:
+    """The observation times of the market data a risk number was built from.
+
+    §6 is about the age of the DATA, and the wire used to carry only
+    `computed_at` -- which the engine stamps at `datetime.now()` on every
+    request, so it was always ~0 and the contract's stale and hidden tiers
+    were unreachable for the risk value. These two fields are what the
+    backend actually thresholds:
+
+      - `book_captured_at`: when the positions were observed. The 60s clock.
+      - `prices_as_of`: when the marks were observed. They are written only by
+        `EngineState.refresh()`, so they ride the five-minute matrix cadence
+        and get the matrix's own longer allowance (OPEN-QUESTIONS D4). This is
+        an honest report of what the engine has, not a claim that the marks
+        are sub-second -- no such feed is wired.
+    """
+    built = self_state.built_at()
+    return {
+        "book_captured_at": book.captured_at.isoformat(),
+        "prices_as_of": built.isoformat() if built else None,
+    }
+
+
 def _parse_book(payload: dict) -> Book:
     positions = []
     for p in payload.get("positions", []):
@@ -140,7 +163,15 @@ class RiskHandler(BaseHTTPRequestHandler):
         scheme, _, presented = header.partition(" ")
         if scheme.lower() != "bearer":
             return False
-        return hmac.compare_digest(presented.strip(), self.token)
+        # Compared as BYTES. `compare_digest` raises TypeError on str operands
+        # containing non-ASCII, and `_authorised` runs before the handler's
+        # try/except, so `Authorization: Bearer héllo` took the connection
+        # down instead of returning 401. Encoding both sides keeps the
+        # constant-time property and makes every input answerable.
+        return hmac.compare_digest(
+            presented.strip().encode("utf-8", "surrogatepass"),
+            self.token.encode("utf-8", "surrogatepass"),
+        )
 
     def _reject_unauthorised(self) -> None:
         # No echo of what was presented, and nothing about why it failed:
@@ -237,6 +268,7 @@ class RiskHandler(BaseHTTPRequestHandler):
                 "p95": out.result_24h.funding_cost.quantile(0.95),
             },
             "matrix_age_s": self.state.matrix_age_s(),
+            **_input_ages(self.state, book),
         }
 
     def _pre_trade_delta(self, payload: dict) -> dict:
@@ -290,6 +322,7 @@ class RiskHandler(BaseHTTPRequestHandler):
             "latency_ms": out.latency_ms,
             "within_budget": out.within_budget,
             "matrix_age_s": self.state.matrix_age_s(),
+            **_input_ages(self.state, book),
         }
 
 

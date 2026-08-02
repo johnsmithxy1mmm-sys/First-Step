@@ -10,7 +10,14 @@
  */
 
 import type { Guarded } from '../staleness/contract.js';
-import { guard, unavailable } from '../staleness/contract.js';
+import {
+  HIDE_AFTER_MS,
+  MATRIX_HIDE_AFTER_MS,
+  MATRIX_STALE_AFTER_MS,
+  STALE_AFTER_MS,
+  guardInputs,
+  unavailable,
+} from '../staleness/contract.js';
 
 export interface Estimate {
   point: number;
@@ -56,6 +63,13 @@ export interface PortfolioRisk {
    */
   funding_cost_24h: { median: number; p05: number; p95: number };
   matrix_age_s: number | null;
+  /**
+   * Observation times of the market data behind this number (§6). The
+   * freshness contract is judged on these, not on `computed_at` — which the
+   * engine stamps when the simulation runs, so it is always ~0s old.
+   */
+  book_captured_at?: string | null;
+  prices_as_of?: string | null;
 }
 
 export interface DeltaBlock {
@@ -81,6 +95,13 @@ export interface PreTradeDelta {
   latency_ms: Record<string, number>;
   within_budget: boolean;
   matrix_age_s: number | null;
+  /**
+   * Observation times of the market data behind this number (§6). The
+   * freshness contract is judged on these, not on `computed_at` — which the
+   * engine stamps when the simulation runs, so it is always ~0s old.
+   */
+  book_captured_at?: string | null;
+  prices_as_of?: string | null;
 }
 
 export interface Health {
@@ -176,16 +197,20 @@ export class RiskClient {
 /**
  * Run a risk call and wrap whatever comes back in the §6 contract.
  *
- * The engine's own `computed_at` is what the age is measured from, so a slow
- * hop cannot launder a stale number into a fresh one. An unpublishable
- * result (§2.5) is withheld exactly like an unavailable one — the engine has
- * said it does not stand behind the number, and passing it on with a caveat
- * would be worse than saying nothing.
+ * The age is measured from when the market DATA was observed, so neither a
+ * slow hop nor a fast recomputation can launder a stale number into a fresh
+ * one. An unpublishable result (§2.5) is withheld exactly like an unavailable
+ * one — the engine has said it does not stand behind the number, and passing
+ * it on with a caveat would be worse than saying nothing.
  */
-export async function guarded<T extends { computed_at: string; publishable: boolean }>(
-  call: () => Promise<T>,
-  now: () => number = Date.now,
-): Promise<Guarded<T>> {
+export async function guarded<
+  T extends {
+    computed_at: string;
+    publishable: boolean;
+    book_captured_at?: string | null;
+    prices_as_of?: string | null;
+  },
+>(call: () => Promise<T>, now: () => number = Date.now): Promise<Guarded<T>> {
   let result: T;
   try {
     result = await call();
@@ -198,9 +223,47 @@ export async function guarded<T extends { computed_at: string; publishable: bool
       'the engine could not resolve this estimate to its required confidence interval (§2.5)',
     );
   }
-  const computedAt = new Date(result.computed_at);
-  if (Number.isNaN(computedAt.getTime())) {
+  const computedAt = parseStamp(result.computed_at);
+  if (computedAt === null) {
     return unavailable('the risk service returned an unreadable timestamp');
   }
-  return guard(result, computedAt, { now: now() });
+
+  // The book and the marks are dated separately and judged on their own
+  // clocks. Measuring against `computed_at` — which the engine stamps when
+  // the arithmetic runs, never earlier — meant the age was always ~0 and no
+  // real risk number could ever be labelled stale or hidden.
+  //
+  // An engine that predates these fields still works: it falls back to
+  // `computed_at`, which is the old behaviour rather than a silent claim of
+  // freshness it cannot support.
+  const bookAt =
+    result.book_captured_at === undefined ? computedAt : parseStamp(result.book_captured_at);
+  const pricesAt =
+    result.prices_as_of === undefined ? computedAt : parseStamp(result.prices_as_of);
+
+  return guardInputs(
+    result,
+    [
+      {
+        label: 'the position snapshot',
+        at: bookAt,
+        staleAfterMs: STALE_AFTER_MS,
+        hideAfterMs: HIDE_AFTER_MS,
+      },
+      {
+        label: 'the mark prices',
+        at: pricesAt,
+        staleAfterMs: MATRIX_STALE_AFTER_MS,
+        hideAfterMs: MATRIX_HIDE_AFTER_MS,
+      },
+    ],
+    { now: now() },
+  );
+}
+
+/** `null` for absent or unparseable, so a bad stamp cannot read as epoch 0. */
+function parseStamp(raw: string | null | undefined): Date | null {
+  if (!raw) return null;
+  const at = new Date(raw);
+  return Number.isNaN(at.getTime()) ? null : at;
 }

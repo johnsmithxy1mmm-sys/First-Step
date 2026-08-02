@@ -317,6 +317,18 @@ class EngineState:
                 return None
             return (datetime.now(timezone.utc) - self._built_at).total_seconds()
 
+    def built_at(self) -> datetime | None:
+        """When the warm bundle -- and therefore its prices -- was last built.
+
+        §6's freshness contract has to be driven by the age of the DATA a
+        number was computed from, not by when the arithmetic ran. The mark
+        prices in `_spot` are written only by `refresh()`, so this is their
+        observation time; the backend thresholds it on the matrix's own clock
+        (OPEN-QUESTIONS D4) rather than the 60-second book clock.
+        """
+        with self._lock:
+            return self._built_at
+
     def health(self) -> dict:
         with self._lock:
             built = self._built_at
