@@ -466,11 +466,16 @@ class TestTheDiagnosticRunsOnTheShippedPath:
         refactor drops it, the harness starts refusing again and the §3.3
         window silently stops advancing — the exact failure this split fixes."""
         import inspect
+        import re
 
         import risk_engine.shadow.cli as shadow_cli
 
         src = inspect.getsource(shadow_cli._live_world)
-        assert "_build_live_bundle(serving=False)" in src
+        # A regex, not an exact call string: the pin is about the ARGUMENT
+        # being passed explicitly, and an exact-string pin broke the first
+        # time the call legitimately grew another keyword (C6's shared
+        # budget) while the property it guards was untouched.
+        assert re.search(r"_build_live_bundle\(\s*serving=False", src)
 
     def test_a_crash_together_market_stops_the_bundle_from_building(self):
         """The behaviour §2.3 and §9 actually require. If this test can be
