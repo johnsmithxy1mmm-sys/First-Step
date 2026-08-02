@@ -30,7 +30,7 @@ from datetime import datetime, timezone
 
 import numpy as np
 
-from risk_engine.domain.types import AssetSpec
+from risk_engine.domain.types import AssetSpec, Book
 from risk_engine.model.copula import (
     COPULA_DF_GRID,
     assert_lower_tail_not_understated,
@@ -50,6 +50,20 @@ log = logging.getLogger("risk_engine.service.state")
 #: nothing to estimate. Named rather than written as a bare 4.0 so it cannot be
 #: mistaken for the pre-A9 hardcoded default it replaces.
 HL_FALLBACK_COPULA_DF = 4.0
+
+#: How long a fetched book may be served from cache. Far inside §6's 60s
+#: fresh tier; see `EngineState.fetch_book`.
+BOOK_CACHE_TTL_S = 15.0
+
+
+class BookUnavailable(RuntimeError):
+    """The venue could not supply a book right now.
+
+    Its message is written to be shown to the caller: the backend maps it to
+    a non-500 status and the §6 contract renders it as `unavailable` with a
+    reason, which is the honest answer -- distinct from a malformed request
+    (400) and from a genuine engine bug (500, message withheld).
+    """
 
 
 def _estimated_assets(matrix) -> tuple[str, ...]:
@@ -278,6 +292,9 @@ class EngineState:
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _rebuild: object = field(default=None, repr=False)
     _stop: threading.Event = field(default_factory=threading.Event, repr=False)
+    #: Per-address book cache for the wallet path; (Book, monotonic stamp).
+    _book_cache: dict = field(default_factory=dict, repr=False)
+    _book_client: object = field(default=None, repr=False)
 
     # -- construction ---------------------------------------------------
 
@@ -305,6 +322,91 @@ class EngineState:
         return state
 
     # -- access ---------------------------------------------------------
+
+    @property
+    def is_fixture(self) -> bool:
+        return bool(getattr(self._rebuild, "is_fixture", False))
+
+    def fetch_book(self, address: str) -> Book:
+        """The live book behind `address`, for the wallet path (§4.1).
+
+        The frontend used to send a hardcoded demo book; a connected wallet
+        sends an address instead, and the engine fetches the book itself --
+        the parsing, the §5.1 strictness and the §5.3 weight discipline all
+        already live on this side of the wire, and `parse_clearinghouse_state`
+        stamps `captured_at` at the fetch, which is exactly the timestamp the
+        §6 book clock judges.
+
+        Cached per address for `BOOK_CACHE_TTL_S`. The UI polls every 20
+        seconds and each fetch is 20 §5.3 weight against serving's 900/minute
+        -- the cache keeps one user at ~3 fetches/minute instead of every
+        widget refresh paying full price, while staying far inside the 60s
+        freshness tier.
+
+        §5.1's named footgun applies and cannot be detected here: an AGENT
+        address returns a well-formed empty state identical to a genuinely
+        flat account's. The UI says "main account, not an agent address" at
+        the input; a flat answer for a live trader is the symptom to check.
+        """
+        from risk_engine.domain.types import normalise_address
+
+        if self.is_fixture:
+            raise ValueError(
+                "this engine runs on synthetic fixture data (see /health); it cannot "
+                "fetch a real address's book. Send the book in the payload, or run "
+                "the engine with --live."
+            )
+        address = normalise_address(address)
+        now_mono = time.monotonic()
+        with self._lock:
+            hit = self._book_cache.get(address)
+            if hit is not None and now_mono - hit[1] < BOOK_CACHE_TTL_S:
+                return hit[0]
+            client = self._book_client
+        if client is None:
+            from risk_engine.market.info import (
+                SERVING_RESERVED_FRACTION,
+                InfoClient,
+                WeightBudget,
+            )
+
+            client = InfoClient(
+                budget=WeightBudget(reserved_fraction=SERVING_RESERVED_FRACTION)
+            )
+            with self._lock:
+                # Another request may have raced the construction; either
+                # object is fine, but only one is kept.
+                if self._book_client is None:
+                    self._book_client = client
+                client = self._book_client
+
+        from risk_engine.market.info import RateLimitExceeded
+        from risk_engine.market.parse import parse_clearinghouse_state
+
+        try:
+            state = client.clearinghouse_state(address)
+        except RateLimitExceeded as exc:
+            raise BookUnavailable(
+                "the §5.3 weight window is spent; retry in a few seconds"
+            ) from exc
+        except Exception as exc:
+            # The venue being unreachable is an availability answer the §6
+            # contract wants to render, not an internal error to hide.
+            raise BookUnavailable(
+                f"could not fetch the book from the venue: {type(exc).__name__}"
+            ) from exc
+        book = parse_clearinghouse_state(state, address)
+        with self._lock:
+            self._book_cache[address] = (book, now_mono)
+            # The cache is per polling user; a stale entry costs memory, not
+            # correctness, and pruning on write keeps it bounded anyway.
+            expired = [
+                a for a, (_, t) in self._book_cache.items()
+                if now_mono - t >= BOOK_CACHE_TTL_S
+            ]
+            for a in expired:
+                del self._book_cache[a]
+        return book
 
     def require_ready(self) -> tuple[ModelBundle, dict[str, AssetSpec], dict[str, float]]:
         with self._lock:

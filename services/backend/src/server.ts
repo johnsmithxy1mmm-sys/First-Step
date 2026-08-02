@@ -26,7 +26,11 @@ export interface ServerOptions {
 }
 
 interface RiskQuery {
-  book: unknown;
+  /** An inline book (the demo path), or… */
+  book?: unknown;
+  /** …an account address for the engine to fetch the live book of (the
+   * wallet path). The engine prefers `book` when both are present. */
+  address?: string;
   n_paths?: number;
   seed?: number;
 }
@@ -82,8 +86,8 @@ export function buildServer(options: ServerOptions): FastifyInstance {
 
   app.post<{ Body: RiskQuery }>('/api/portfolio_risk', async (request, reply) => {
     const body = request.body;
-    if (!body?.book) {
-      return reply.status(400).send({ error: 'body.book is required' });
+    if (!body?.book && !body?.address) {
+      return reply.status(400).send({ error: 'body.book or body.address is required' });
     }
     const result = await guarded<PortfolioRisk>(
       () => risk.portfolioRisk(body),
@@ -94,8 +98,10 @@ export function buildServer(options: ServerOptions): FastifyInstance {
 
   app.post<{ Body: DeltaQuery }>('/api/pre_trade_delta', async (request, reply) => {
     const body = request.body;
-    if (!body?.book || !body?.order) {
-      return reply.status(400).send({ error: 'body.book and body.order are required' });
+    if ((!body?.book && !body?.address) || !body?.order) {
+      return reply
+        .status(400)
+        .send({ error: 'body.order plus body.book or body.address is required' });
     }
     const result = await guarded<PreTradeDelta>(
       () => risk.preTradeDelta(body),

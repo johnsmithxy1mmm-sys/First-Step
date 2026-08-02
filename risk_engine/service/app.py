@@ -49,7 +49,7 @@ from typing import Any
 
 from risk_engine.domain.types import Book, MarginMode, Position, RiskEstimate
 from risk_engine.observability.metrics import METRICS
-from risk_engine.service.state import EngineState
+from risk_engine.service.state import BookUnavailable, EngineState
 from risk_engine.tools.portfolio_risk import portfolio_risk
 from risk_engine.tools.pre_trade_delta import ProposedOrder, pre_trade_delta
 from risk_engine.version import MODEL_VERSION
@@ -222,6 +222,12 @@ class RiskHandler(BaseHTTPRequestHandler):
         except (KeyError, ValueError, TypeError) as exc:
             # A malformed request is the caller's error and is safe to name.
             self._send(400, {"error": f"{type(exc).__name__}: {exc}"})
+        except BookUnavailable as exc:
+            # The venue not answering (or the §5.3 window being spent) is an
+            # availability state, not an engine bug: 503, message intact, so
+            # the backend's §6 contract can render the reason instead of
+            # "internal error".
+            self._send(503, {"error": str(exc)})
         except Exception as exc:
             # Anything else is ours. The message goes to the log, not to the
             # response: §10's spirit on not leaking internals outward.
@@ -230,8 +236,25 @@ class RiskHandler(BaseHTTPRequestHandler):
 
     # -- endpoints ------------------------------------------------------
 
+    def _resolve_book(self, payload: dict) -> Book:
+        """The book to analyse: sent inline, or fetched by address.
+
+        An explicit `book` wins when both are present -- data the caller
+        already has beats an indirection the engine would have to spend §5.3
+        weight resolving, and it keeps every pre-wallet caller byte-for-byte
+        compatible. The address path is what a connected wallet uses: the
+        engine fetches the live book itself, so `captured_at` is the real
+        observation time and the §6 book clock judges something true.
+        """
+        if payload.get("book") is not None:
+            return _parse_book(payload["book"])
+        address = payload.get("address")
+        if address:
+            return self.state.fetch_book(str(address))
+        raise KeyError("the request needs either 'book' or 'address'")
+
     def _portfolio_risk(self, payload: dict) -> dict:
-        book = _parse_book(payload["book"])
+        book = self._resolve_book(payload)
         bundle, specs, spot = self.state.require_ready()
         out = portfolio_risk(
             book, spot, bundle, specs,
@@ -272,7 +295,7 @@ class RiskHandler(BaseHTTPRequestHandler):
         }
 
     def _pre_trade_delta(self, payload: dict) -> dict:
-        book = _parse_book(payload["book"])
+        book = self._resolve_book(payload)
         o = payload["order"]
         order = ProposedOrder(
             coin=o["coin"],

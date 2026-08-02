@@ -227,6 +227,125 @@ class TestErrorHandling:
         assert exc.value.code == 404
 
 
+class TestWalletPath:
+    """`address` instead of `book`: the engine fetches the live book itself."""
+
+    ADDR = "0x" + "ab" * 20
+
+    def test_neither_book_nor_address_is_a_400(self, service):
+        base, _ = service
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            call(base, "/portfolio_risk", {"n_paths": 1000})
+        assert exc.value.code == 400
+        assert "address" in json.loads(exc.value.read())["error"]
+
+    def test_a_fixture_engine_refuses_to_fetch_a_real_address(self, service):
+        """Synthetic mode cannot answer for a real account, and saying so is a
+        400 naming the mode -- not a fabricated book, not a 500."""
+        base, _ = service
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            call(base, "/portfolio_risk", {"address": self.ADDR, "n_paths": 1000})
+        assert exc.value.code == 400
+        assert "fixture" in json.loads(exc.value.read())["error"]
+
+    def test_an_explicit_book_wins_over_an_address(self, service):
+        """Data the caller already has beats an indirection. On this fixture
+        service the address path would refuse, so a 200 proves the inline
+        book was used and the address ignored."""
+        base, _ = service
+        r = call(base, "/portfolio_risk",
+                 {"book": BOOK, "address": self.ADDR, "n_paths": 2_000, "seed": 3})
+        assert r["p_liq_24h"]["point"] >= 0.0
+
+    def test_venue_unavailability_is_a_503_with_the_reason(self, service):
+        """`BookUnavailable` is an availability answer for the §6 contract to
+        render, not an internal error to hide behind a 500."""
+        from risk_engine.service.state import BookUnavailable
+
+        base, state = service
+
+        def down(address):
+            raise BookUnavailable("could not fetch the book from the venue: URLError")
+
+        original = state.fetch_book
+        state.fetch_book = down
+        try:
+            with pytest.raises(urllib.error.HTTPError) as exc:
+                call(base, "/portfolio_risk", {"address": self.ADDR})
+            assert exc.value.code == 503
+            assert "venue" in json.loads(exc.value.read())["error"]
+        finally:
+            state.fetch_book = original
+
+
+class TestFetchBook:
+    """The engine-side fetch: cache, normalisation, and §5.3 refusal."""
+
+    ADDR = "0xAB" + "cd" * 19  # mixed case on purpose
+
+    class FakeClient:
+        def __init__(self):
+            self.calls = []
+
+        def clearinghouse_state(self, address, is_agent_address=False):
+            self.calls.append(address)
+            return {
+                "marginSummary": {"accountValue": "1000.0"},
+                "crossMarginSummary": {"accountValue": "1000.0"},
+                "assetPositions": [],
+            }
+
+    def _live_ish_state(self):
+        from risk_engine.service.state import EngineState
+
+        state = EngineState()  # bare: no rebuild callable, so not a fixture
+        state._book_client = self.FakeClient()
+        return state
+
+    def test_the_address_is_normalised_before_the_wire(self):
+        state = self._live_ish_state()
+        book = state.fetch_book(self.ADDR)
+        assert state._book_client.calls == [self.ADDR.lower()]
+        assert book.address == self.ADDR.lower()
+        assert book.captured_at is not None
+
+    def test_the_cache_absorbs_polling(self):
+        """The UI polls every 20s; two requests inside the TTL cost one fetch
+        of §5.3 weight, not two."""
+        state = self._live_ish_state()
+        first = state.fetch_book(self.ADDR)
+        second = state.fetch_book(self.ADDR)
+        assert len(state._book_client.calls) == 1
+        assert first is second
+
+    def test_a_spent_weight_window_is_unavailability_not_a_crash(self):
+        from risk_engine.market.info import RateLimitExceeded
+        from risk_engine.service.state import BookUnavailable, EngineState
+
+        class Refusing:
+            def clearinghouse_state(self, address, is_agent_address=False):
+                raise RateLimitExceeded("weight 20 exceeds remaining 0")
+
+        state = EngineState()
+        state._book_client = Refusing()
+        with pytest.raises(BookUnavailable, match=r"§5\.3"):
+            state.fetch_book(self.ADDR)
+
+    def test_a_venue_error_names_the_kind_but_not_the_internals(self):
+        from risk_engine.service.state import BookUnavailable, EngineState
+
+        class Broken:
+            def clearinghouse_state(self, address, is_agent_address=False):
+                raise OSError("secret internal path /etc/hosts unreachable")
+
+        state = EngineState()
+        state._book_client = Broken()
+        with pytest.raises(BookUnavailable) as exc:
+            state.fetch_book(self.ADDR)
+        assert "OSError" in str(exc.value)
+        assert "secret" not in str(exc.value)
+
+
 class TestStateLifecycle:
     def test_a_failed_rebuild_keeps_the_previous_bundle(self):
         """A transient venue failure must not be indistinguishable from a

@@ -52,19 +52,39 @@ export default function Page() {
   const [delta, setDelta] = useState<Guarded<PreTradeDeltaValue> | null>(null);
   const [health, setHealth] = useState<{ ok: boolean; syntheticData?: boolean } | null>(null);
   const [size, setSize] = useState('800');
+  // '' = the demo book; anything else is a validated account address whose
+  // LIVE book the engine fetches itself. The engine stamps `captured_at` at
+  // its own fetch, so the §6 book clock judges a real observation time on
+  // this path — the demo path's book is fabricated per request and always
+  // fresh by construction.
+  const [address, setAddress] = useState('');
+
+  // Which book the backend should analyse. One place, so the risk poll and
+  // the pre-trade check can never disagree about whose book is on screen.
+  const bookQuery = useCallback(
+    () => (address ? { address } : { book: DEMO_BOOK }),
+    [address],
+  );
 
   const refresh = useCallback(async () => {
     setRisk(
-      await post<PortfolioRiskValue>('/api/portfolio_risk', { book: DEMO_BOOK, n_paths: 20000 }),
+      await post<PortfolioRiskValue>('/api/portfolio_risk', {
+        ...bookQuery(),
+        n_paths: 20000,
+      }),
     );
     try {
       setHealth(await (await fetch('/api/health')).json());
     } catch {
       setHealth({ ok: false });
     }
-  }, []);
+  }, [bookQuery]);
 
   useEffect(() => {
+    // Switching accounts drops straight to a spinner rather than showing the
+    // previous account's numbers under the new address for up to 20 seconds.
+    setRisk(null);
+    setDelta(null);
     void refresh();
     // Re-poll well inside the 60-second staleness window, so a healthy
     // system never *looks* stale purely because of the polling cadence.
@@ -76,18 +96,18 @@ export default function Page() {
     setDelta(null);
     setDelta(
       await post<PreTradeDeltaValue>('/api/pre_trade_delta', {
-        book: DEMO_BOOK,
+        ...bookQuery(),
         order: { coin: 'SOL', size: Number(size), leverage: 20, mode: 'cross' },
         n_paths: 20000,
       }),
     );
-  }, [size]);
+  }, [size, bookQuery]);
 
   const gate = risk?.execution ?? { allowed: false, reasons: ['no data yet'] };
 
   return (
     <main className="mx-auto max-w-5xl px-6 py-10">
-      <WalletBar health={health} />
+      <WalletBar health={health} address={address} onAddress={setAddress} />
 
       <div className="mt-6 grid gap-5 md:grid-cols-2">
         {/* 1 — portfolio risk (§4.1) */}

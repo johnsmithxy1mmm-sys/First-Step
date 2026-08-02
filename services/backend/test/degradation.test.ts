@@ -118,6 +118,33 @@ async function ask(engine: FakeEngine, nowMs: number) {
   return res.json();
 }
 
+describe('the wallet path: address instead of an inline book', () => {
+  it('accepts an address-only request and passes it through', async () => {
+    const engine = new FakeEngine();
+    app = buildServer({ risk: engine.asClient(), now: () => T0.getTime() + 5_000 });
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/portfolio_risk',
+      payload: { address: '0x' + 'ab'.repeat(20) },
+    });
+    const body = res.json();
+    expect(body.freshness).toBe('fresh');
+    expect(body.value).toBeDefined();
+  });
+
+  it('rejects a request with neither book nor address', async () => {
+    const engine = new FakeEngine();
+    app = buildServer({ risk: engine.asClient() });
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/portfolio_risk',
+      payload: { n_paths: 1000 },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toContain('address');
+  });
+});
+
 describe('§9 Phase 3: stopping the risk service', () => {
   it('serves fresh values while the engine is up and current', async () => {
     const engine = new FakeEngine();
