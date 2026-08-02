@@ -243,13 +243,24 @@ class CalibrationJournal:
         provenance about the run, not the run's product.
         """
         try:
-            self._query(
-                """
-                INSERT INTO calibration_sweeps (
-                    swept_at, observation_day, distribution_version,
-                    attempted, written, budget_exhausted, skipped_by_reason
-                ) VALUES (?,?,?,?,?,?,?)
-                """,
+            # `execute`, not `_query`: `_query` calls `rows()` = `fetchall()`,
+            # and psycopg raises on a fetch after an INSERT with no RETURNING
+            # (the result status is COMMAND_OK, not TUPLES_OK). The broad
+            # except below then swallowed it as a warning and the row never
+            # committed -- so on Postgres, which is what the shipped compose
+            # stack points every shadow job at, this table stayed empty every
+            # day while the tests (all sqlite, where fetchall after INSERT
+            # quietly returns []) passed. `record_outcome` uses `execute` for
+            # this reason.
+            self.backend.execute(
+                self._sql(
+                    """
+                    INSERT INTO calibration_sweeps (
+                        swept_at, observation_day, distribution_version,
+                        attempted, written, budget_exhausted, skipped_by_reason
+                    ) VALUES (?,?,?,?,?,?,?)
+                    """
+                ),
                 (
                     _iso(swept_at),
                     swept_at.astimezone(timezone.utc).date().isoformat(),

@@ -112,12 +112,18 @@ def _live_world(args, *, load_addresses: bool = True):
     from risk_engine.market.info import WeightBudget
     from risk_engine.service.state import _build_live_bundle
 
-    if not args.addresses:
+    # Demanded only when it is actually READ. `cmd_resolve` passes
+    # load_addresses=False and takes its addresses from the journal's own
+    # pending rows -- refusing to start it for want of a sampling frame it
+    # never opens destroys observations already paid for, which is the
+    # opposite of what this guard is for. The module docstring prints
+    # `resolve --journal shadow.db`; that command exited 1 until now.
+    if load_addresses and not args.addresses:
         raise SystemExit(
             "--addresses is required for a live run: the address list is a sampling "
             "frame and it has to be chosen deliberately (OPEN-QUESTIONS B4)"
         )
-    source = FileAddressSource(Path(args.addresses))
+    source = FileAddressSource(Path(args.addresses)) if args.addresses else None
     if load_addresses:
         # Loaded and validated HERE: before `_build_live_bundle` and before
         # the candle fetch at the bottom of this function, which are Info

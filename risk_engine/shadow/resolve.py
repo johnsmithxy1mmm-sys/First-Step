@@ -61,7 +61,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Protocol
 
 import numpy as np
@@ -100,12 +100,39 @@ class OutcomeProvider(Protocol):
 DEFAULT_STALE_AFTER_S = 2 * 3600.0
 
 #: Ceiling on one resolve run's wall clock, and how long to wait when the §5.3
-#: weight window is spent. Each resolution costs ~40 weight (book +
-#: external_flow) against 300/min, so 200 due rows need ~27 minutes of
+#: weight window is spent. Each ADDRESS costs ~40 weight (one book + one
+#: external_flow, both shared across its three variants) against 300/min, so
+#: §3.3's floor of 200 addresses -- 600 rows -- needs ~27 minutes of
 #: mostly-waiting; 50 minutes leaves headroom while staying inside the hourly
-#: cadence so runs do not overlap.
+#: cadence so runs do not overlap. Per ROW rather than per address it was 80
+#: weight and the arithmetic did not hold; see `flow_cache` in `resolve_due`.
 DEFAULT_MAX_RESOLVE_SECONDS = 50 * 60.0
 DEFAULT_BUDGET_WAIT_SECONDS = 5.0
+
+#: How stale the run's price snapshot may get before it is refetched. Matches
+#: the provider's own freshness cache, so refreshing costs at most one extra
+#: `spot()` per minute of a paced run.
+SPOT_REFRESH_SECONDS = 60.0
+
+
+def _snapshot_captured_at(pending) -> datetime:
+    """When the book behind `pending.start_equity` was actually observed.
+
+    Falls back to `predicted_at` for rows written before the snapshot carried
+    a timestamp, which is the old behaviour and no worse than it was.
+    """
+    raw = (pending.book_snapshot or {}).get("captured_at")
+    if not raw:
+        return pending.predicted_at
+    try:
+        stamp = datetime.fromisoformat(str(raw))
+    except ValueError:
+        return pending.predicted_at
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    # Never widen the window past what was asked for: a snapshot stamped
+    # before `predicted_at` would pull in flow the prediction already saw.
+    return max(stamp, pending.predicted_at)
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,8 +230,21 @@ def resolve_due(
     # resolution side exactly as it was from the snapshot side, and for the
     # same reason -- a rate limit treated as a failure instead of a pace.
     # Waiting resolves all 200 in ~27 minutes, well inside the window.
-    deadline = time.monotonic() + max_resolve_seconds
+    run_started = time.monotonic()
+    deadline = run_started + max_resolve_seconds
     budget_exhausted = False
+
+    def _observed_now() -> datetime:
+        """`now` advanced by however long this run has actually been going.
+
+        Derived from the run's own clock rather than read from
+        `datetime.now()` so an injected `now` stays authoritative — the tests
+        and any deterministic replay pass one, and reading the wall clock here
+        would make every such run look hours late. In a real paced run the
+        elapsed term is the whole point: it is the up-to-50-minute gap between
+        the run starting and this particular row's outcome being fetched.
+        """
+        return now + timedelta(seconds=time.monotonic() - run_started)
 
     def _paced(call):
         """Run an Info call, waiting through the §5.3 window rather than
@@ -223,31 +263,76 @@ def resolve_due(
 
     # One address may have several pending rows (model plus both baselines);
     # they share a realised outcome, so it is fetched once per address.
-    cache: dict[str, tuple[float, str]] = {}
+    cache: dict[str, tuple[float, str, datetime]] = {}
+    # External flow is a function of (address, window) only -- it is
+    # byte-identical across an address's three variants, and fetching it once
+    # per ROW tripled the cost of a resolution: 80 weight per address against
+    # the ~40 the capacity arithmetic below budgets with. At the deployed
+    # ~500-address list that is 2.7 ceiling-runs to clear a day's queue, so
+    # the third hourly run starts past the 2h staleness bound and ~25% of each
+    # day's observations are flagged stale and dropped from §3.3 -- the same
+    # gate-unreachable failure the pacing rework fixed on the snapshot side.
+    flow_cache: dict[tuple[str, datetime, datetime], float] = {}
+    spot_at = time.monotonic()
 
     for pending in journal.due(now):
         if budget_exhausted:
             break
         try:
+            # Prices go stale inside a paced run. The run may legitimately
+            # take up to `max_resolve_seconds`, and valuing a book fetched 50
+            # minutes in at the prices from minute zero puts that drift
+            # straight into `actual_equity` -- on a 10x book a 0.5% move is a
+            # ~5% equity error, written into an immutable row. The provider
+            # caches spot for 60s of its own, so this is at most one refresh a
+            # minute.
+            if time.monotonic() - spot_at >= SPOT_REFRESH_SECONDS:
+                fresh = _paced(provider.spot)
+                if fresh is _CEILING:
+                    break
+                spot, spot_at = fresh, time.monotonic()
+
             if pending.address not in cache:
                 book = _paced(lambda p=pending: provider.book(p.address))
                 if book is _CEILING:
                     break
-                cache[pending.address] = (book.equity(spot), position_fingerprint(book))
-            actual_equity, fingerprint = cache[pending.address]
+                # The moment the realisation was actually observed, not the
+                # moment the run started.
+                cache[pending.address] = (
+                    book.equity(spot), position_fingerprint(book), _observed_now(),
+                )
+            actual_equity, fingerprint, observed_at = cache[pending.address]
 
-            flow = _paced(lambda p=pending: provider.external_flow(
-                p.address, p.predicted_at, p.resolves_at
-            ))
-            if flow is _CEILING:
-                break
+            # The flow window has to start where `start_equity` was measured,
+            # not where the sweep began. Under pacing the sweep's book fetch
+            # can trail its own `predicted_at` by up to 90 minutes, and a
+            # deposit landing in that gap is inside `start_equity` AND inside
+            # the flow -- subtracted twice, producing a fabricated loss in a
+            # write-once table (reproduced: a $50k deposit scored as a $50k
+            # loss, VaR breached, PIT 0). `captured_at` is what the snapshot
+            # already recorded for exactly this.
+            flow_from = _snapshot_captured_at(pending)
+            flow_key = (pending.address, flow_from, pending.resolves_at)
+            if flow_key not in flow_cache:
+                got = _paced(lambda k=flow_key: provider.external_flow(k[0], k[1], k[2]))
+                if got is _CEILING:
+                    break
+                flow_cache[flow_key] = got
+            flow = flow_cache[flow_key]
             # The model predicts the change due to market moves and funding.
             # Removing the external flow is what makes the comparison fair;
             # the raw flow is stored too, so the filtered and unfiltered
             # cohorts can both be scored.
             change = actual_equity - pending.start_equity - flow
 
-            lag = (now - pending.resolves_at).total_seconds()
+            # Measured from when the outcome was OBSERVED, not from when the
+            # run started. Pacing lets those differ by up to
+            # `max_resolve_seconds`, so a realisation captured 2h40m after
+            # `resolves_at` used to record a lag of 1h50m, pass the 2h
+            # staleness test and be scored into the gate -- precisely the A-04
+            # corruption `stale_after_s` exists to prevent, and worst for the
+            # rows that sit closest to the boundary.
+            lag = (observed_at - pending.resolves_at).total_seconds()
             is_stale = lag > stale_after_s
             if is_stale:
                 stale += 1
@@ -255,7 +340,7 @@ def resolve_due(
             u = _pit_uniform(pending.id)
             journal.record_outcome(
                 prediction_id=pending.id,
-                resolved_at=now,
+                resolved_at=observed_at,
                 actual_equity=actual_equity,
                 actual_equity_change=change,
                 external_flow_usd=flow,
