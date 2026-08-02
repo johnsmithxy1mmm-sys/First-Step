@@ -22,6 +22,7 @@ Two properties matter for §6:
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -458,7 +459,7 @@ def _build_fixture_bundle():
 _build_fixture_bundle.is_fixture = True  # type: ignore[attr-defined]
 
 
-def _build_live_bundle(*, serving: bool = True):
+def _build_live_bundle(*, serving: bool = True, budget=None):
     """Fetch from the Info API and fit (§5.1).
 
     `serving` decides whether §2.3's tail-asymmetry criterion is fatal. It
@@ -467,6 +468,12 @@ def _build_live_bundle(*, serving: bool = True):
     False deliberately; see `_checked_tail_diagnostics` for why measuring is
     not serving.
 
+    `budget` lets a shadow caller charge this build to the shared §5.3 pool
+    (C6): the resolver rebuilds hourly and a bundle costs ~160 weight, which
+    used to land on a private budget no other process could see. Left None,
+    the build takes the serving allocation — correct for the engine, which is
+    the interactive side the reserve protects.
+
     NOT EXERCISED against the live API: `api.hyperliquid.xyz` is blocked at
     the proxy in the environment this was written in (OPEN-QUESTIONS E5), so
     this path is written against documented response shapes and has never
@@ -474,19 +481,55 @@ def _build_live_bundle(*, serving: bool = True):
     why the fixture path exists and is what Phase 3's degradation test runs
     against.
     """
-    from risk_engine.market.info import InfoClient
+    from risk_engine.market.info import (
+        SERVING_RESERVED_FRACTION,
+        InfoClient,
+        WeightBudget,
+    )
     from risk_engine.market.parse import (
         parse_candles_to_log_returns,
         parse_funding_history,
         parse_meta,
     )
 
-    client = InfoClient()
+    # Reserved rather than unbounded (C6): serving takes 75% of §5.3's window
+    # and the shadow jobs share the other 25%, so the two together are the
+    # venue's limit instead of 125% of it. Nothing on the request path spends
+    # this -- a request slices the warm bundle -- so the cap constrains the
+    # five-minute rebuild only, which needs about 140 weight.
+    client = InfoClient(
+        budget=budget
+        if budget is not None
+        else WeightBudget(reserved_fraction=SERVING_RESERVED_FRACTION)
+    )
     specs = parse_meta(client.meta())
     now_ms = int(time.time() * 1000)
     window_ms = 90 * 24 * 3600 * 1000
 
-    universe = [c for c in ("BTC", "ETH", "SOL") if c in specs]
+    # Config, not code (OPEN-QUESTIONS B6). The 3-asset default silently
+    # narrows the calibration cohort: an address whose positions are all
+    # off-universe is skipped as "no open positions", byte-identical to a flat
+    # account, and §3.3's 200-address count comes up short for a reason no
+    # output names. The `calibration_sweeps` census measures that drop rate;
+    # when it argues for widening, the widening is an env change here, one
+    # more candle+funding fetch per coin per rebuild (~40 weight each against
+    # serving's 900/min), and a B6 decision recorded in OPEN-QUESTIONS — not a
+    # code edit. BTC and ETH stay mandatory (§2.1's risk factors, enforced
+    # below); coins the venue does not list are dropped with the same
+    # visibility as before.
+    configured = [
+        c.strip().upper()
+        for c in os.environ.get("HL_UNIVERSE", "BTC,ETH,SOL").split(",")
+        if c.strip()
+    ]
+    universe = [c for c in configured if c in specs]
+    missing_coins = sorted(set(configured) - set(universe))
+    if missing_coins:
+        log.warning(
+            "HL_UNIVERSE names coins the venue's meta does not list: %s "
+            "(they are excluded; check the spelling against `meta.universe`)",
+            missing_coins,
+        )
     if "BTC" not in universe or "ETH" not in universe:
         raise RuntimeError("BTC and ETH must be present as risk factors (§2.1)")
 

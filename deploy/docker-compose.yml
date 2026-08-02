@@ -41,6 +41,11 @@ services:
       # that reads as "the deployment is broken" rather than "one variable is
       # unset". The serving path does not use it; the report commands do.
       SHADOW_DSN: postgresql://${POSTGRES_USER:-risk}:${POSTGRES_PASSWORD:-}@journal:5432/${POSTGRES_DB:-shadow}
+      # B6: the tracked universe, comma-separated. Widening it is a sampling
+      # decision (record it in OPEN-QUESTIONS B6) that the calibration_sweeps
+      # census informs; making it config means the decision does not need a
+      # code change. BTC and ETH are mandatory (§2.1).
+      HL_UNIVERSE: ${HL_UNIVERSE:-BTC,ETH,SOL}
     command: ["--host", "0.0.0.0", "--port", "8787", "${ENGINE_MODE:---fixture}"]
     # No `ports:`. The engine is reachable only from this network; the
     # backend is the sole consumer and owns rate limiting (§5.3). Publishing
@@ -141,6 +146,7 @@ services:
       SHADOW_DSN: postgresql://${POSTGRES_USER:-risk}:${POSTGRES_PASSWORD}@journal:5432/${POSTGRES_DB:-shadow}
       SHADOW_INTERVAL_S: ${SHADOW_INTERVAL_S:-86400}
       SHADOW_ARGS: ${SHADOW_ARGS:---fixture}
+      HL_UNIVERSE: ${HL_UNIVERSE:-BTC,ETH,SOL}
     volumes:
       - ./addresses.json:/app/addresses.json:ro
     entrypoint: ["/bin/sh", "-c"]
@@ -193,6 +199,7 @@ services:
       SHADOW_DSN: postgresql://${POSTGRES_USER:-risk}:${POSTGRES_PASSWORD}@journal:5432/${POSTGRES_DB:-shadow}
       SHADOW_INTERVAL_S: ${RESOLVE_INTERVAL_S:-3600}
       SHADOW_ARGS: ${SHADOW_ARGS:---fixture}
+      HL_UNIVERSE: ${HL_UNIVERSE:-BTC,ETH,SOL}
     volumes:
       - ./addresses.json:/app/addresses.json:ro
     entrypoint: ["/bin/sh", "-c"]

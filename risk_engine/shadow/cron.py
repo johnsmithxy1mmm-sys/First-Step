@@ -45,7 +45,10 @@ from typing import Protocol
 import numpy as np
 
 from risk_engine.domain.types import AssetSpec, Book
-from risk_engine.market.info import RateLimitExceeded
+from risk_engine.market.info import (
+    SHADOW_RESERVED_FRACTION as _SHADOW_RESERVED_FRACTION,
+    RateLimitExceeded,
+)
 from risk_engine.shadow.journal import (
     VARIANT_BASELINE_A,
     VARIANT_BASELINE_B,
@@ -58,7 +61,8 @@ from risk_engine.validation.baselines import NaiveBaseline, run_baseline_b
 from risk_engine.version import DISTRIBUTION_VERSION
 
 #: §5.3: keep three quarters of the weight budget for interactive traffic.
-SHADOW_RESERVED_FRACTION = 0.75
+#: One home in `market.info`; this was a second hand-written 0.75.
+SHADOW_RESERVED_FRACTION = _SHADOW_RESERVED_FRACTION
 
 
 class SnapshotProvider(Protocol):

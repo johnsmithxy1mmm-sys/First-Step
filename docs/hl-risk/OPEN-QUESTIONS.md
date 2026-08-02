@@ -978,6 +978,29 @@ What remains is the model-scope decision itself, and the empirical input for
 it: the true off-universe drop rate across all 515 addresses, which the first
 (pacing-truncated) run could not measure and this table now will.
 
+**The decision is now a config change (2026-08-02).** The universe is
+`HL_UNIVERSE` (comma-separated, default `BTC,ETH,SOL`), read by
+`_build_live_bundle` and passed through the compose stack, so widening it
+does not require a code edit. BTC and ETH remain mandatory (§2.1). What
+widening costs, per added coin: one 90-day candle snapshot plus one funding
+history per rebuild (~40 weight against serving's 900/min — ten coins is
+~80/min of the rebuild's budget), a row and column of correlation structure,
+one more marginal fit, and a bigger draw per path-step. What it is NOT: a
+free fix. It is a sampling-frame change AND a distribution change
+(MODEL_VERSION MINOR, §3.3 counter reset), so it must happen BEFORE the
+shadow clock starts or cost the accumulated days.
+
+The decision procedure, concretely:
+1. let the census accumulate a few days of full sweeps;
+2. measure: `SELECT skipped_by_reason FROM calibration_sweeps ORDER BY
+   swept_at DESC LIMIT 7;` — sum the `KeyError: '<COIN>'` counts by coin;
+3. if the off-universe drop rate keeps `written` comfortably above §3.3's
+   200/day floor, keep the universe and let the published score disclose the
+   cohort selection this table records;
+4. if it does not, set `HL_UNIVERSE` to cover the coins that actually appear
+   (the tally names them, most-dropped first), bump MODEL_VERSION, record
+   the new frame here, and start the clock then.
+
 ---
 
 ## C. Hyperliquid integration — facts that must be verified, not assumed
@@ -1224,15 +1247,29 @@ be sized against real traffic, not assumed.
   `URLError` subclass) was itself retried on a 1–2s backoff. Every wire
   attempt now charges, so a retry that cannot be paid for waits for the
   window instead of being sent.
-- *Open (architectural):* the reserve is per-PROCESS. The snapshot job, the
-  resolve job and the serving engine each build their own `WeightBudget`
+- *Fixed (2026-08-02, same day):* the per-PROCESS reserve. The snapshot job,
+  the resolve job and the serving engine each built their own `WeightBudget`
   behind one egress IP: two shadow processes at 300/min each plus a serving
-  default of 1200/min is a combined ceiling above the venue's 1200, and
-  during the daily snapshot/resolve overlap the actual reserve is 50%, not
-  the promised 75%. Honest fix is a shared ledger (or one process
-  multiplexing both jobs); until then the deployed mitigation is cadence —
-  the compose loops are sequential per container and the sweeps are paced —
-  which bounds but does not eliminate the overlap.
+  default of 1200/min was a combined ceiling of 1500 against the venue's
+  1200, and during the daily snapshot/resolve overlap the actual reserve was
+  50%, not the promised 75%. Now:
+    - the shadow jobs draw from ONE shared 300/min pool
+      (`shadow/weight_ledger.py`), a Postgres-backed sliding window with a
+      transaction-scoped advisory lock so two containers cannot both observe
+      the same headroom and spend it. The pool is shared, not halved: 150/min
+      each would put §3.3's floor of 200 addresses (8000 weight) at 53
+      minutes, past the resolver's 50-minute ceiling. Verified against live
+      PG16: two actors interleaving stop at 300 combined; a racing connection
+      over a full window admits nothing. The bundle build inside `_live_world`
+      charges the same pool. On a sqlite journal it falls back to the
+      in-process window (single-machine development, stated in the log);
+    - the serving engine takes the complement
+      (`SERVING_RESERVED_FRACTION = 0.25` → 900/min), so serving plus shadow
+      sums to exactly 1200. Its realised traffic is the five-minute rebuild
+      (~140 weight), nothing on the request path.
+  The §5.3 weight constants themselves (1200/min, 20/request) remain
+  documentation-derived and still need the live confirmation this entry has
+  always asked for.
 
 ### C7 `[BLOCKER — non-blocking in practice]` Is the Info API case-sensitive on `user`?
 

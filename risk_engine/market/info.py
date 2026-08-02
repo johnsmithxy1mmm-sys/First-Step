@@ -62,6 +62,23 @@ TESTNET_URL = "https://api.hyperliquid-testnet.xyz/info"
 WEIGHT_BUDGET_PER_MINUTE = 1200
 INFO_REQUEST_WEIGHT = 20
 
+#: How the 1200 is divided, as reserved fractions. These are complements on
+#: purpose: 25% background plus 75% interactive is exactly the limit, so the
+#: deployment's ceiling matches what the venue will actually serve.
+#:
+#: The serving engine used to take a budget with NO reserve, i.e. all 1200,
+#: while the shadow jobs took 300 each on top -- a combined ceiling of 1500
+#: against a limit of 1200 (OPEN-QUESTIONS C6). Its realised traffic is far
+#: below its ceiling (the five-minute rebuild, nothing on the request path),
+#: which is why this was never observed; a ceiling nobody reaches is still
+#: the wrong ceiling to publish.
+#:
+#: The two shadow jobs share ONE 300/minute pool rather than taking 300 each
+#: -- see `shadow/weight_ledger.py` for why the pool is shared and not
+#: divided.
+SHADOW_RESERVED_FRACTION = 0.75
+SERVING_RESERVED_FRACTION = 0.25
+
 
 class RateLimitExceeded(RuntimeError):
     pass

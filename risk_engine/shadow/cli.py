@@ -25,18 +25,25 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from risk_engine.market.info import (
+    SHADOW_RESERVED_FRACTION as _SHADOW_RESERVED_FRACTION,
+)
 from risk_engine.shadow.cron import ShadowCron
 from risk_engine.shadow.journal import CalibrationJournal
 from risk_engine.shadow.metrics import COHORT_BOOK_UNCHANGED, COHORTS, calibration_report
 from risk_engine.shadow.providers import FileAddressSource, LiveSnapshotProvider
 from risk_engine.shadow.resolve import DEFAULT_STALE_AFTER_S, resolve_due
+from risk_engine.shadow.weight_ledger import open_weight_budget
 from risk_engine.validation.baselines import NaiveBaseline, historical_24h_log_returns
 from risk_engine.version import DISTRIBUTION_VERSION, MODEL_VERSION
 
 log = logging.getLogger("risk_engine.shadow")
 
-#: §5.3: the sweep keeps three quarters of the weight budget for live users.
-SHADOW_RESERVED_FRACTION = 0.75
+#: §5.3: the shadow jobs keep three quarters of the weight budget for live
+#: users. Re-exported from `market.info` rather than restated -- it was
+#: written out here AND in `cron.py`, two copies of a number whose whole job
+#: is to be the same everywhere.
+SHADOW_RESERVED_FRACTION = _SHADOW_RESERVED_FRACTION
 
 
 def _fixture_world():
@@ -109,7 +116,6 @@ def _fixture_world():
 def _live_world(args, *, load_addresses: bool = True):
     import time as _time
 
-    from risk_engine.market.info import WeightBudget
     from risk_engine.service.state import _build_live_bundle
 
     # Demanded only when it is actually READ. `cmd_resolve` passes
@@ -165,8 +171,20 @@ def _live_world(args, *, load_addresses: bool = True):
     # are unknown. This window is what establishes them. The days it records
     # do NOT count toward §3.3's gate -- the remedy bumps MODEL_VERSION and
     # resets the counter -- and `_defect_note` below says so on every run.
-    bundle, specs, spot = _build_live_bundle(serving=False)
-    budget = WeightBudget(reserved_fraction=SHADOW_RESERVED_FRACTION)
+    # Shared across the snapshot and resolve containers when they share a
+    # Postgres journal (C6). Two processes each holding a private 300/min
+    # window made §5.3's reserve 50% during their overlap, and neither could
+    # see the other spending. Falls back to the in-process window on sqlite,
+    # which is the single-machine development case where they are the same
+    # thing. Built BEFORE the bundle so the bundle's own ~160 weight of meta,
+    # candle and funding fetches is charged to this pool too -- the resolver
+    # rebuilds hourly, and that spend used to land on a budget nobody shared.
+    budget = open_weight_budget(
+        getattr(args, "journal", None),
+        reserved_fraction=SHADOW_RESERVED_FRACTION,
+        actor=getattr(args, "command", "shadow"),
+    )
+    bundle, specs, spot = _build_live_bundle(serving=False, budget=budget)
     provider = LiveSnapshotProvider(source, budget=budget, universe=tuple(spot))
     # Reuse the freshly-built bundle's view of the venue rather than
     # re-fetching it per sweep. `_spot_at` has to be stamped too: it is the
