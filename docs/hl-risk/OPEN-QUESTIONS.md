@@ -1286,27 +1286,27 @@ footgun and the spec's own prose alternates between the two numbers when
 describing the positioning; the UI copy should quote the charged 0.02%, not
 the 0.03% ceiling.
 
-### C4 `[BLOCKER — non-blocking in practice]` `webData3` (§5.2)
+### C4 `[RESOLVED]` `webData3` (§5.2)
 
-`webData2` is the documented subscription. I have no confirmation that
-`webData3` exists. The shard planner is agnostic either way, so nothing
-downstream waits on this.
+`webData2` is the documented subscription. §5.2 also names `webData3`, with
+no confirmation it exists.
 
-A WebSocket question, which the Info-API harness cannot reach. Two minutes to
-settle by hand:
+**Settled 2026-08-03**, from the operator's own machine:
 
-```bash
-pip install websockets
-python -c "
-import asyncio, json, websockets
-async def main():
-    async with websockets.connect('wss://api.hyperliquid.xyz/ws') as ws:
-        await ws.send(json.dumps({'method':'subscribe','subscription':{'type':'webData3'}}))
-        print(await asyncio.wait_for(ws.recv(), 10))
-asyncio.run(main())"
+```
+{"channel":"error","data":"Error parsing JSON into valid websocket request: {\"method\": \"subscribe\", \"subscription\": {\"type\": \"webData3\"}}"}
 ```
 
-An error response means it does not exist and §5.2 should say `webData2`.
+An error response was the pre-registered criterion for "does not exist," and
+this is not a weak instance of one: the envelope is byte-identical in shape
+to `{"method":"subscribe","subscription":{"type":"trades","coin":...}}`, the
+one `collect_addresses.py` uses and which E4 already confirmed live (1 110
+frames, 0 unparseable) — only the `type` value differs. A malformed envelope
+and an unrecognised enum variant would not be distinguishable from a generic
+parser this terse, but the envelope is proven correct by a sibling
+subscription that works, which leaves the `type` value as the only thing
+that changed. §5.2 should say `webData2`; the shard planner already reads
+only that one and needs no change.
 
 ### C5 `[RESOLVED]` Isolated-position funding — confirmed on live testnet
 
