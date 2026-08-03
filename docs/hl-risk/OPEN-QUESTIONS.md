@@ -1484,7 +1484,33 @@ the date. Unlike C1, adopting a wrong value here is not dangerous in either
 direction (too high self-limits, too low gets 429s the client already
 handles), so this is an efficiency question, not a safety one.
 
-### C7 `[BLOCKER — non-blocking in practice]` Is the Info API case-sensitive on `user`?
+### C7 `[REFUTED 2026-08-03]` Is the Info API case-sensitive on `user`?
+
+**Settled, and the original claim was wrong.** The repro below was run from
+the operator's own machine against the same address the 2026-07-30 commit
+named:
+
+```
+200 0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed
+200 0x5aaeb6053f3e94c9b9a09f33669435e7ef1beaed
+```
+
+Two 200s, which this entry's own pre-registered criterion reads as
+refutation. The venue is case-insensitive on `user`; the 422 that motivated
+the original claim was something else — a malformed request in that one
+invocation, or a transient response the second attempt happened to clear —
+and is now unrepeatable evidence for anything, exactly the status this entry
+gave it before the repro ran.
+
+**Nothing built on the claim needs to change.** The section below already
+established this in advance of the result: `normalise_address` defends two
+properties of *this codebase* — the §5.1 silent-empty-state footgun and the
+journal's case-sensitive `UNIQUE` constraint — neither of which depends on
+what the venue does with case. Both stand exactly as written. The rest of
+this entry is kept rather than deleted, because it separately documents a
+real defect class (an unrepeated observation without a captured command line
+being stated as protocol fact) that is worth a future reader seeing regardless
+of which way this particular claim resolved.
 
 **Recorded 2026-07-30, after adversarial review, because it was recorded
 nowhere.** Commit 667f539 opens by asserting a live venue finding as
@@ -1517,20 +1543,12 @@ it as a protocol property. The distinction matters because a protocol property
 is something later work is entitled to build on, and this is not yet that. The
 API is 403 at this environment's proxy (E5), so it cannot be re-run from here.
 
-To settle it, from a network where the API is reachable, and record the result
-in this file rather than in a commit message:
-
-```bash
-A=0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed   # any real account, checksummed
-for u in "$A" "$(printf %s "$A" | tr 'A-F' 'a-f')"; do
-  curl -s -o /dev/null -w "%{http_code}  $u\n" -X POST https://api.hyperliquid.xyz/info \
-    -H 'Content-Type: application/json' \
-    -d "{\"type\":\"clearinghouseState\",\"user\":\"$u\"}"
-done
-```
-
-Two different status codes confirm case sensitivity; two 200s refute it and
-this entry should then say so.
+Settled from a network where the API is reachable, by
+`scripts/check_case_sensitivity.py` — a script rather than a shell one-liner
+because the bash version printed here originally could not run on the
+operator's PowerShell at all, and a repro nobody can execute settles nothing.
+Two different status codes would confirm case sensitivity; two 200s refute
+it. The result is recorded at the top of this entry.
 
 **The normalisation fix does not rest on this observation and must not be read
 as doing so.** If the venue turns out to be perfectly case-insensitive,
