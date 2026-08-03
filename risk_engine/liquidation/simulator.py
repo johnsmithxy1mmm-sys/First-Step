@@ -93,6 +93,36 @@ class SimulationOutcome:
         return self.equity_change / self.start_equity
 
 
+def _constant_mmr(position_specs: list[AssetSpec]) -> np.ndarray | None:
+    """A (1, N) row of maintenance rates when every table has ONE tier, else None.
+
+    `AssetSpec.__post_init__` validates that the first tier starts at notional
+    0, so a one-row table answers `maintenance_margin_rate` with the same
+    number at every notional: the per-path `searchsorted` in `_mmr` is a
+    lookup with exactly one possible answer, repeated for 20 000 paths on
+    every one of 24 steps.
+
+    This skips a search whose result is known in advance. It does NOT freeze a
+    tier: a multi-row table returns None here and still resolves per path per
+    step (§1.3), which is the case that matters for a book large enough to
+    cross a boundary.
+
+    Read-only on purpose. The row is cached on the simulator and handed back
+    from every `_mmr` call, where the general path returns a fresh array each
+    time; an in-place write by some future caller would otherwise corrupt the
+    rate for every remaining step AND every later run on the same simulator.
+    Downward is the direction §10 forbids, so it fails loudly instead.
+    """
+    if not position_specs or any(len(s.tiers) != 1 for s in position_specs):
+        return None
+    row = np.array(
+        [float(s.maintenance_margin_rate(0.0)) for s in position_specs],
+        dtype=np.float64,
+    )[None, :]
+    row.flags.writeable = False
+    return row
+
+
 class LiquidationSimulator:
     """Walks price and funding paths through the §1.1 conditions."""
 
@@ -128,11 +158,24 @@ class LiquidationSimulator:
         )
         self._cross_specs = [specs[p.coin] for p in cross]
         self._iso_specs = [specs[p.coin] for p in iso]
+        self._cross_const_mmr = _constant_mmr(self._cross_specs)
+        self._iso_const_mmr = _constant_mmr(self._iso_specs)
 
     # ---- helpers -------------------------------------------------------
 
-    def _mmr(self, positions_specs: list[AssetSpec], notional_abs: np.ndarray) -> np.ndarray:
-        """(P, N) maintenance margin rates, tier looked up per path per position."""
+    def _mmr(self, positions_specs: list[AssetSpec], notional_abs: np.ndarray,
+             constant: np.ndarray | None) -> np.ndarray:
+        """(P, N) maintenance margin rates, tier looked up per path per position.
+
+        `constant` short-circuits the lookup when every table has one tier --
+        see `_constant_mmr`. It is broadcast rather than materialised: the
+        callers only read it, and `_constant_mmr` marks it read-only so a
+        future in-place edit fails loudly instead of corrupting the rate for
+        every subsequent step and run (a downward corruption would understate
+        risk, which §10 forbids).
+        """
+        if constant is not None:
+            return constant
         out = np.empty_like(notional_abs)
         for j, spec in enumerate(positions_specs):
             out[:, j] = spec.maintenance_margin_rate(notional_abs[:, j])
@@ -275,7 +318,7 @@ class LiquidationSimulator:
                 upnl = self._cross_size[None, :] * (cross_px - self._cross_entry[None, :])
                 equity = cross_cash + upnl.sum(axis=1)
                 notional = np.abs(self._cross_size)[None, :] * cross_px
-                mmr = self._mmr(self._cross_specs, notional)
+                mmr = self._mmr(self._cross_specs, notional, self._cross_const_mmr)
                 gap = equity - (mmr * notional).sum(axis=1)
 
                 dead = cross_alive & (gap <= 0)
@@ -299,7 +342,7 @@ class LiquidationSimulator:
                 upnl = self._iso_size[None, :] * (iso_px - self._iso_entry[None, :])
                 equity = iso_margin + upnl
                 notional = np.abs(self._iso_size)[None, :] * iso_px
-                mmr = self._mmr(self._iso_specs, notional)
+                mmr = self._mmr(self._iso_specs, notional, self._iso_const_mmr)
                 gap = equity - mmr * notional
 
                 dead = iso_alive & (gap <= 0)
@@ -339,7 +382,7 @@ class LiquidationSimulator:
             cross_px = px0[:, self._cross_cols]
             upnl = self._cross_size[None, :] * (cross_px - self._cross_entry[None, :])
             notional = np.abs(self._cross_size)[None, :] * cross_px
-            mmr = self._mmr(self._cross_specs, notional)
+            mmr = self._mmr(self._cross_specs, notional, self._cross_const_mmr)
             cross_gap = (
                 self.book.cross_collateral + upnl.sum(axis=1) - (mmr * notional).sum(axis=1)
             )
@@ -351,7 +394,7 @@ class LiquidationSimulator:
             iso_px = px0[:, self._iso_cols]
             upnl = self._iso_size[None, :] * (iso_px - self._iso_entry[None, :])
             notional = np.abs(self._iso_size)[None, :] * iso_px
-            mmr = self._mmr(self._iso_specs, notional)
+            mmr = self._mmr(self._iso_specs, notional, self._iso_const_mmr)
             iso_gap = self._iso_margin0[None, :] + upnl - mmr * notional
         else:
             iso_gap = np.zeros((n_paths, 0))
