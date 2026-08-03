@@ -321,6 +321,56 @@ class TestShadowSweep:
         live.charge(900)
         assert live.available() == 100
 
+    def test_the_bundle_build_waits_for_the_window_instead_of_dying(self, monkeypatch):
+        """A spent window at STARTUP must pace the run, not kill it.
+
+        Observed live: a one-off snapshot started while the scheduled resolver
+        held the shared pool, and `RateLimitExceeded` came straight out of
+        `meta()` before a single prediction was written. Each process used to
+        own its budget, so a fresh process always began with a full window and
+        this could not happen; sharing the pool (C6) removed that guarantee
+        and the unpaced build turned contention into a dead run.
+
+        Same burst-and-drop failure the sweep and resolver were both fixed
+        for, one layer up: a rate limit is a PACE, not an error.
+        """
+        from risk_engine.shadow import cli
+
+        calls = {"n": 0}
+
+        def flaky(*, serving, budget):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise RateLimitExceeded("weight 20 exceeds remaining 0")
+            return ("bundle", "specs", {"BTC": 1.0})
+
+        monkeypatch.setattr(
+            "risk_engine.service.state._build_live_bundle", flaky
+        )
+        out = cli._paced_bundle(budget=None, max_wait_s=5.0, wait_s=0.0)
+        assert out == ("bundle", "specs", {"BTC": 1.0})
+        assert calls["n"] == 3, "it should have retried rather than given up"
+
+    def test_a_permanently_full_window_fails_loudly_rather_than_hanging(
+        self, monkeypatch
+    ):
+        """The ceiling exists so an oversubscribed pool is visible.
+
+        Waiting forever would leave a container asleep and the §3.3 window
+        silently not advancing, which is the failure mode the whole
+        pace-don't-drop design is trying to avoid in the other direction.
+        """
+        from risk_engine.shadow import cli
+
+        def always_full(*, serving, budget):
+            raise RateLimitExceeded("weight 20 exceeds remaining 0")
+
+        monkeypatch.setattr(
+            "risk_engine.service.state._build_live_bundle", always_full
+        )
+        with pytest.raises(SystemExit, match="weight window"):
+            cli._paced_bundle(budget=None, max_wait_s=0.0, wait_s=0.0)
+
 
 class TestTheSweepPacesRatherThanTruncating:
     """§3.3's gate was unreachable by construction.

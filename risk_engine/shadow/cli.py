@@ -28,6 +28,7 @@ from pathlib import Path
 from risk_engine.market.info import (
     SHADOW_RESERVED_FRACTION as _SHADOW_RESERVED_FRACTION,
 )
+from risk_engine.market.info import RateLimitExceeded
 from risk_engine.shadow.cron import ShadowCron
 from risk_engine.shadow.journal import CalibrationJournal
 from risk_engine.shadow.metrics import COHORT_BOOK_UNCHANGED, COHORTS, calibration_report
@@ -113,10 +114,64 @@ def _fixture_world():
     return FixtureProvider(), bundle, NaiveBaseline(factor)
 
 
+#: How long the bundle build may wait for the §5.3 window, and how long to
+#: sleep between attempts. Generous because the alternative is losing the run:
+#: a shared window refills within 60s, so anything past a few minutes means the
+#: pool is genuinely oversubscribed rather than momentarily busy.
+BUNDLE_BUDGET_WAIT_S = 5.0
+BUNDLE_MAX_WAIT_S = 10 * 60.0
+
+
+def _paced_bundle(budget, max_wait_s: float = BUNDLE_MAX_WAIT_S,
+                  wait_s: float = BUNDLE_BUDGET_WAIT_S):
+    """Build the live bundle, WAITING on the §5.3 window rather than dying on it.
+
+    The bundle costs ~160 weight (meta, plus a candle snapshot and a funding
+    history per coin) and it is spent before the sweep proper starts. While
+    each process had a private budget that was always affordable at startup,
+    because a fresh process began with a full window. Sharing the pool (C6)
+    removed that guarantee: a snapshot starting while the resolver holds the
+    window now meets a spent one, and an unpaced build turns that into a dead
+    run -- `RateLimitExceeded` propagating out of `meta()` and killing the
+    process before a single prediction is written.
+
+    That is the same burst-and-drop failure the sweep and the resolver were
+    both fixed for (a rate limit is a PACE, not an error), reintroduced one
+    layer up by the change that made the pool shared. Waiting is what §5.3
+    asks for; the ceiling only exists so a genuinely oversubscribed pool
+    surfaces as a loud failure instead of a container asleep forever.
+    """
+    import time as _t
+
+    from risk_engine.service.state import _build_live_bundle
+
+    deadline = _t.monotonic() + max_wait_s
+    waited = False
+    while True:
+        try:
+            bundle = _build_live_bundle(serving=False, budget=budget)
+            if waited:
+                log.info("§5.3 window refilled; bundle built")
+            return bundle
+        except RateLimitExceeded:
+            if _t.monotonic() >= deadline:
+                raise SystemExit(
+                    f"the shared §5.3 weight window stayed full for "
+                    f"{max_wait_s / 60:.0f} minutes, so the bundle could not be "
+                    "built. Another shadow job is holding the pool: check "
+                    "whether a snapshot and a resolve are running at once, or "
+                    "whether a one-off run is competing with the scheduled "
+                    "container (`docker compose ps`)."
+                ) from None
+            if not waited:
+                log.info("§5.3 window is spent; waiting for it to refill")
+                waited = True
+            _t.sleep(wait_s)
+
+
 def _live_world(args, *, load_addresses: bool = True):
     import time as _time
 
-    from risk_engine.service.state import _build_live_bundle
 
     # Demanded only when it is actually READ. `cmd_resolve` passes
     # load_addresses=False and takes its addresses from the journal's own
@@ -184,7 +239,7 @@ def _live_world(args, *, load_addresses: bool = True):
         reserved_fraction=SHADOW_RESERVED_FRACTION,
         actor=getattr(args, "command", "shadow"),
     )
-    bundle, specs, spot = _build_live_bundle(serving=False, budget=budget)
+    bundle, specs, spot = _paced_bundle(budget)
     provider = LiveSnapshotProvider(source, budget=budget, universe=tuple(spot))
     # Reuse the freshly-built bundle's view of the venue rather than
     # re-fetching it per sweep. `_spot_at` has to be stamped too: it is the
