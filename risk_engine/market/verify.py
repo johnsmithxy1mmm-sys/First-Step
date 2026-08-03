@@ -885,45 +885,101 @@ def check_webdata3(ws_url: str | None = None, address: str | None = None,
 
     Off by default (`--probe-ws`) because it needs the `websockets` package,
     which the engine deliberately does not depend on, and because a socket is
-    a different kind of cost from a POST. C4 is non-blocking either way: the
-    shard planner works against `webData2` regardless of the answer.
+    a different kind of cost from a POST.
+
+    **Both subscriptions are probed, and that is the point.** Asking only
+    about `webData3` produced a year of answers phrased as "it does not
+    matter, the planner uses `webData2`" — and on 2026-08-03 a probe of both
+    found that `webData2` is REFUSED by this venue, with a well-formed `user`,
+    in the exact payload shape `webData3` accepts. A one-sided question could
+    not have found that, because the assumed-good alternative was never asked
+    about. C4 is now the comparison rather than the existence check.
+
+    Non-blocking still, and for a better reason than the one given before:
+    nothing in this tree consumes either subscription. The "shard planner"
+    every previous version of this comment deferred to is a §5.2 concept with
+    no implementation here — `grep -rn shard` finds only these comments — so
+    "the planner uses `webData2`" was never a fact about running code.
     """
     if not probe:
         return Check(
-            "C4", "does the `webData3` subscription exist?", UNCHECKABLE,
+            "C4", "which of `webData2` / `webData3` does the venue accept?",
+            UNCHECKABLE,
             "not probed. Pass --probe-ws to answer it: this harness can now open "
             "the socket (the trades collector does, against the same venue), it "
             "just needs `pip install 'websockets>=12.0'`, which the engine does "
-            "not depend on. `webData2` is the documented one and the shard "
-            "planner is agnostic either way.",
+            "not depend on. Pass --address too: both subscriptions are keyed on "
+            "`user`, and without one they are refused for that reason alone, "
+            "which reads exactly like 'no such subscription'.",
             blocking=False,
         )
 
     from risk_engine.market.collect_addresses import MAINNET_WS_URL
 
     url = ws_url or MAINNET_WS_URL
-    accepted, detail = _probe_subscription(
+    three, three_detail = _probe_subscription(
         url, "webData3", address, WEBDATA_PROBE_TIMEOUT_S
     )
-    evidence = {"ws_url": url, "subscription": "webData3", "accepted": accepted}
-    if accepted is True:
+    two, two_detail = _probe_subscription(
+        url, "webData2", address, WEBDATA_PROBE_TIMEOUT_S
+    )
+    evidence = {
+        "ws_url": url,
+        "webData3_accepted": three,
+        "webData3_detail": three_detail,
+        "webData2_accepted": two,
+        "webData2_detail": two_detail,
+        "probed_with_user": bool(address),
+    }
+    question = "which of `webData2` / `webData3` does the venue accept?"
+
+    if not address:
+        # Without a `user` both are refused for the same uninformative reason,
+        # and reporting that as an answer is how the earlier reading went
+        # wrong. Say what is missing instead of resolving it.
         return Check(
-            "C4", "does the `webData3` subscription exist?", PASS,
-            f"{detail}. The shard planner may use it; it is not required to.",
+            "C4", question, INCONCLUSIVE,
+            f"probed without --address, so both were refused for a missing "
+            f"`user` rather than for anything about the subscription. "
+            f"webData3: {three_detail}; webData2: {two_detail}.",
             blocking=False, evidence=evidence,
         )
-    if accepted is False:
-        # A rejection is a real answer and NOT a failure of the model: `webData3`
-        # was only ever a maybe, and the planner is specified against `webData2`.
+    if three is None or two is None:
         return Check(
-            "C4", "does the `webData3` subscription exist?", PASS,
-            f"answered: `webData3` does not exist on this venue — {detail}. "
-            f"The shard planner uses `webData2`, so nothing depends on it.",
+            "C4", question, INCONCLUSIVE,
+            f"webData3: {three_detail}; webData2: {two_detail}",
+            blocking=False, evidence=evidence,
+        )
+    if three and not two:
+        return Check(
+            "C4", question, PASS,
+            f"`webData3` is the live one and `webData2` is NOT: {three_detail}, "
+            f"while webData2 in the same payload shape was refused — "
+            f"{two_detail}. §5.2 names `webData2`; anything built to that "
+            f"letter would subscribe to something this venue rejects.",
+            blocking=False, evidence=evidence,
+        )
+    if two and not three:
+        return Check(
+            "C4", question, PASS,
+            f"`webData2` is the live one, as §5.2 assumes, and `webData3` is "
+            f"not: {two_detail}, while webData3 was refused — {three_detail}.",
+            blocking=False, evidence=evidence,
+        )
+    if two and three:
+        return Check(
+            "C4", question, PASS,
+            f"both exist: webData3 — {three_detail}; webData2 — {two_detail}. "
+            f"Existence says nothing about which carries what; §5.2's choice "
+            f"stands unchallenged by this result.",
             blocking=False, evidence=evidence,
         )
     return Check(
-        "C4", "does the `webData3` subscription exist?", INCONCLUSIVE,
-        f"{detail}", blocking=False, evidence=evidence,
+        "C4", question, FAIL,
+        f"NEITHER subscription was accepted with a well-formed `user`. "
+        f"webData3: {three_detail}; webData2: {two_detail}. Both are documented; "
+        f"a venue refusing both means the documented shape has changed.",
+        blocking=False, evidence=evidence,
     )
 
 

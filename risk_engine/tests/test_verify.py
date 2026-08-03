@@ -431,8 +431,12 @@ class TestUncheckable:
         # It must name the flag, because "uncheckable" used to mean "this
         # harness cannot" and now means "you did not ask it to".
         assert "--probe-ws" in check.detail
-        # Non-blocking: the shard planner works either way, and this must not
-        # hold up a live path on its own.
+        # And it must name --address too. Both subscriptions are keyed on
+        # `user`; probed without one they are refused for that reason alone,
+        # which reads exactly like "no such subscription" and did.
+        assert "--address" in check.detail
+        # Non-blocking, because nothing in this tree consumes either
+        # subscription — not because of a planner that was never built.
         assert check.satisfied
 
     def test_isolated_funding_blocks_and_says_why_it_matters(self):
@@ -442,89 +446,131 @@ class TestUncheckable:
         assert "coupling term" in check.detail
 
 
-class TestWebData3Probe:
-    """C4 was UNCHECKABLE because "this harness speaks only the Info POST
-    API". That stopped being true when `collect_addresses` shipped — it has
-    since held a live socket to this exact venue for 1 110 frames. The
-    capability was in the tree and this check did not use it.
+class TestWebDataProbe:
+    """C4 became a COMPARISON on 2026-08-03, and the reason is the finding.
 
-    The probe is driven through a fake socket here: the point under test is
-    how each venue response is *interpreted*, and three of the four
-    interpretations (rejection, silence, transport failure) cannot be produced
-    on demand against a real venue.
+    While it asked only "does `webData3` exist?", every answer was phrased
+    against an assumption nobody had tested — "it does not matter, the shard
+    planner uses `webData2`". Probing both found `webData2` refused by the
+    live venue, with a well-formed `user`, in the exact payload shape
+    `webData3` accepts. A one-sided question could not have found that.
+
+    The probe is driven through a fake `_probe_subscription` here: the point
+    under test is how the PAIR of results is read, and most of the
+    combinations (one refused, both refused, silence, transport failure)
+    cannot be produced on demand against a real venue.
     """
 
-    @staticmethod
-    def _patched(monkeypatch, frames=(), raises=None):
-        """Install a fake `_websockets_transport` and a no-op `asyncio.run`."""
-        import json as _json
+    ADDR = "0x" + "b" * 40
 
-        sent: list = []
+    @staticmethod
+    def _patched(monkeypatch, results=None, raises=None):
+        """Install a fake probe answering per subscription type.
+
+        `results` maps a subscription type to `_probe_subscription`'s own
+        return shape, `(accepted, detail)`, so the fake stands in for that
+        function at its real contract rather than re-deriving it from frames.
+        """
+        asked: list = []
 
         def fake_probe(ws_url, sub_type, address, timeout_s):
+            asked.append(sub_type)
             if raises is not None:
                 return None, f"the probe itself failed: {type(raises).__name__}: {raises}"
-            sent.append((ws_url, sub_type, address))
-            for raw in frames:
-                msg = _json.loads(raw)
-                if msg.get("channel") == "error":
-                    return False, f"the venue rejected it: {msg.get('data')!r}"
-                if msg.get("channel") == "subscriptionResponse":
-                    got = ((msg.get("data") or {}).get("subscription") or {}).get("type")
-                    if got == sub_type:
-                        return True, f"the venue acknowledged the {sub_type} subscription"
-                if msg.get("channel") == sub_type:
-                    return True, f"the venue delivered a {sub_type} frame"
-            return None, "the venue neither acknowledged nor rejected it"
+            return (results or {}).get(sub_type, (None, "no stub for " + sub_type))
 
         monkeypatch.setattr(verify, "_probe_subscription", fake_probe)
-        return sent
+        return asked
 
-    def test_an_acknowledgement_answers_it(self, monkeypatch):
-        self._patched(monkeypatch, frames=[
-            '{"channel":"subscriptionResponse",'
-            '"data":{"subscription":{"type":"webData3"}}}',
-        ])
-        check = verify.check_webdata3(probe=True)
+    def test_it_asks_about_both_not_just_the_new_one(self, monkeypatch):
+        """The guard on the whole point of this rework."""
+        asked = self._patched(monkeypatch, results={
+            "webData3": (True, "acknowledged"), "webData2": (True, "acknowledged"),
+        })
+        verify.check_webdata3(address=self.ADDR, probe=True)
+        assert sorted(asked) == ["webData2", "webData3"]
+
+    def test_the_measured_result_reports_the_inversion(self, monkeypatch):
+        """What the live venue actually said on 2026-08-03.
+
+        §5.2 names `webData2`. The detail has to say plainly that building to
+        that letter subscribes to something the venue rejects, because a PASS
+        whose text merely says "webData3 exists" is how this went unnoticed.
+        """
+        self._patched(monkeypatch, results={
+            "webData3": (True, "the venue acknowledged the webData3 subscription"),
+            "webData2": (False, "the venue rejected it: 'Error parsing JSON'"),
+        })
+        check = verify.check_webdata3(address=self.ADDR, probe=True)
         assert check.status == PASS
-        assert check.evidence["accepted"] is True
+        assert check.evidence["webData3_accepted"] is True
+        assert check.evidence["webData2_accepted"] is False
+        assert "§5.2" in check.detail and "rejects" in check.detail
 
-    def test_a_rejection_is_an_answer_and_not_a_failure(self, monkeypatch):
-        """`webData3` was only ever a maybe. The planner is specified against
-        `webData2`, so "no such subscription" settles C4 rather than breaking
-        anything — reporting it as FAIL would say the live data contradicted
-        the model, which is a much stronger claim than the truth."""
-        self._patched(monkeypatch, frames=[
-            '{"channel":"error","data":"Unknown subscription type webData3"}',
-        ])
-        check = verify.check_webdata3(probe=True)
-        assert check.status == PASS
-        assert check.evidence["accepted"] is False
-        assert "does not exist" in check.detail
+    def test_without_an_address_it_refuses_to_conclude(self, monkeypatch):
+        """The mistake this rework exists to prevent.
 
-    def test_silence_is_inconclusive_not_a_rejection(self, monkeypatch):
-        self._patched(monkeypatch, frames=[])
+        Both subscriptions are keyed on `user`. Probed without one, both are
+        refused for that reason alone — and a bare rejection reads exactly
+        like "no such subscription". Reporting either way from that evidence
+        is what produced a wrong refutation of C4 in the first place.
+        """
+        self._patched(monkeypatch, results={
+            "webData3": (False, "the venue rejected it: 'Error parsing JSON'"),
+            "webData2": (False, "the venue rejected it: 'Error parsing JSON'"),
+        })
         check = verify.check_webdata3(probe=True)
         assert check.status == INCONCLUSIVE
-        assert check.evidence["accepted"] is None
+        assert "missing" in check.detail and "`user`" in check.detail
+
+    def test_both_refused_with_a_user_is_a_failure(self, monkeypatch):
+        """Distinct from the case above, and the difference is the `user`.
+        Both are documented; a venue refusing both WELL-FORMED subscribes
+        means the documented shape moved, which is what FAIL is for."""
+        self._patched(monkeypatch, results={
+            "webData3": (False, "rejected"), "webData2": (False, "rejected"),
+        })
+        check = verify.check_webdata3(address=self.ADDR, probe=True)
+        assert check.status == FAIL
+
+    def test_the_spec_being_right_is_also_an_answer(self, monkeypatch):
+        """Guard against a check that can only report the exciting result."""
+        self._patched(monkeypatch, results={
+            "webData3": (False, "rejected"),
+            "webData2": (True, "the venue acknowledged the webData2 subscription"),
+        })
+        check = verify.check_webdata3(address=self.ADDR, probe=True)
+        assert check.status == PASS
+        assert "as §5.2 assumes" in check.detail
+
+    def test_silence_is_inconclusive_not_a_rejection(self, monkeypatch):
+        self._patched(monkeypatch, results={
+            "webData3": (None, "neither acknowledged nor rejected"),
+            "webData2": (True, "acknowledged"),
+        })
+        check = verify.check_webdata3(address=self.ADDR, probe=True)
+        assert check.status == INCONCLUSIVE
 
     def test_a_transport_failure_does_not_masquerade_as_an_answer(self, monkeypatch):
         """DNS, TLS and a refused connection are all "we did not get an
         answer". Reporting any of them as "no such subscription" would record
         a fact about the venue that was never established."""
         self._patched(monkeypatch, raises=OSError("Name or service not known"))
-        check = verify.check_webdata3(probe=True)
+        check = verify.check_webdata3(address=self.ADDR, probe=True)
         assert check.status == INCONCLUSIVE
-        assert check.evidence["accepted"] is None
         assert "probe itself failed" in check.detail
 
     def test_it_stays_non_blocking_however_it_answers(self, monkeypatch):
-        """C4 must never be able to hold up a live path: the shard planner
-        works against `webData2` regardless."""
-        for frames in ([], ['{"channel":"error","data":"nope"}'],
-                       ['{"channel":"webData3","data":{}}']):
-            self._patched(monkeypatch, frames=frames)
-            assert verify.check_webdata3(probe=True).blocking is False
+        """C4 must never hold up a live path — not because "the planner uses
+        webData2", which was never a fact about code in this tree, but
+        because nothing here consumes either subscription."""
+        for res in (
+            {"webData3": (True, "ok"), "webData2": (False, "no")},
+            {"webData3": (False, "no"), "webData2": (False, "no")},
+            {"webData3": (None, "quiet"), "webData2": (None, "quiet")},
+        ):
+            self._patched(monkeypatch, results=res)
+            assert verify.check_webdata3(address=self.ADDR, probe=True).blocking is False
 
     def test_the_probe_is_off_unless_asked_for(self, monkeypatch):
         """A socket is a different kind of cost from a POST, and `websockets`
@@ -536,6 +582,7 @@ class TestWebData3Probe:
         )
         verify.check_webdata3()
         assert called == []
+
 
 class TestFrameLedgerSweep:
     """B2 across the sampling frame, because one address is not the cohort.

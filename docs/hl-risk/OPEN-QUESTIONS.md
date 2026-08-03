@@ -1334,13 +1334,56 @@ footgun and the spec's own prose alternates between the two numbers when
 describing the positioning; the UI copy should quote the charged 0.02%, not
 the 0.03% ceiling.
 
-### C4 `[BLOCKER — non-blocking in practice]` `webData3` (§5.2)
+### C4 `[RESOLVED 2026-08-03 — and it inverts §5.2]` `webData2` vs `webData3`
 
-`webData2` is the documented subscription. §5.2 also names `webData3`, with
-no confirmation it exists. The shard planner is agnostic either way, so
-nothing downstream waits on this.
+**Measured, four probes, one address, one session:**
 
-**A 2026-08-03 probe was read as a refutation and that reading was wrong.**
+| subscription | `user` | venue |
+|---|---|---|
+| `webData2` | absent | rejected — `Error parsing JSON into valid websocket request` |
+| `webData3` | absent | rejected — same message |
+| **`webData3`** | **present** | **ACCEPTED** — `{"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":{"type":"webData3","user":"0x963a…"}}}` |
+| **`webData2`** | **present** | **rejected** — same parse error, same payload shape |
+
+Two results, and the second is the one nobody was looking for.
+
+**`webData3` exists.** Settled by an explicit `subscriptionResponse` echoing
+the subscription back, which is as unambiguous as this venue gets. Both
+subscriptions are keyed on `user`, and that is why the bare probe told us
+nothing: a missing required field and an unknown type produce the identical
+parse error.
+
+**`webData2` does NOT work on this venue** — refused with a well-formed
+`user`, in the exact payload shape `webData3` accepted a moment earlier. The
+shape is therefore not in question. §5.2 names `webData2` as the documented
+subscription and this repository repeated that in nine places; anything built
+to that letter would subscribe to something the venue rejects.
+
+**Nothing is broken today, and the reason is not reassuring.** `webData2`
+appears nowhere in executable code — `grep -rn webData2` finds only comments,
+docs and this entry. The "shard planner" that every one of those comments
+deferred to (*"non-blocking: the planner uses `webData2`"*) **is not in the
+tree either**: `grep -rn shard` finds only the comments that invoke it. So
+the sentence that made C4 safe to leave open was not a fact about running
+code — it was a fact about a component nobody had written, and it happened to
+be pointing at the broken one of the two.
+
+**What changed in the checker.** `check_webdata3` now probes BOTH and reports
+the comparison, because the one-sided question is what hid this: while it
+asked only "does `webData3` exist?", every answer could be waved off with the
+assumption about `webData2` that nobody tested. It also refuses to conclude
+anything when run without `--address`, since that is precisely the evidence
+that produced a wrong refutation below.
+
+**For whoever builds the planner:** subscribe to `webData3` with a `user`,
+and re-run `verify --probe-ws --address 0x…` first, because this is one
+measurement on one day and the venue moved once already.
+
+---
+
+**The retracted reading, kept because the mistake is the instructive part.**
+A 2026-08-03 probe was read as refuting `webData3`, and that reading was
+wrong.
 Recorded because the mistake is more instructive than the result. The
 operator ran the bash snippet this entry used to print and got:
 
@@ -1364,18 +1407,21 @@ this payload carries none. A payload with a missing required field and a
 payload with an unknown type both fail to parse, and this venue's parse error
 does not say which.
 
-**The register row and the probe are consistent, and the register is the more
-likely reading.** It records `verify --probe-ws` acknowledging the
-subscription on 2026-07-31 — and `_probe_subscription` attaches
-`"user": address` when an address is supplied. `webData3` existing and
-requiring `user`, exactly as `webData2` does, explains both observations at
-once; "it does not exist" explains only one and contradicts the other.
+**The register row and the probe were consistent, and the register was the
+more likely reading — as the table above then confirmed.** It records
+`verify --probe-ws` acknowledging the subscription on 2026-07-31, and
+`_probe_subscription` attaches `"user": address` when an address is supplied.
+`webData3` existing and requiring `user` explained both observations at once;
+"it does not exist" explained one and contradicted the other. Overturning the
+better-supported reading on weaker evidence was the actual error, and the
+lesson is cheaper than the finding: the control experiment cost thirty
+seconds and was skipped because the wrong answer looked conclusive.
 
-**The control that settles it** is cheap and was skipped: send `webData2`,
-the subscription known to exist, with no `user` field. If it produces the
-same parse error, the error is about the missing field and says nothing about
-`webData3`. Then re-probe `webData3` WITH a `user`.
-`scripts/probe_webdata.py` runs all three.
+**The control that settled it** was to send `webData2` — assumed to exist —
+with no `user`. It produced the same parse error, which is what made the bare
+probe uninformative. The follow-up, `webData2` WITH a `user`, is the one
+nobody had thought to run, and it is where the real finding was.
+`scripts/probe_webdata.py` runs all four.
 
 Note that `check_webdata3` returns PASS for both answers — existence and
 non-existence — because C4 is non-blocking and a rejection is a real answer.
@@ -1968,7 +2014,7 @@ in the risk number, and is recorded in the journal's model version.
 | E1 | Builder address + its ≥100 USDC perp balance (§5.5) | Phase 4 |
 | E2 | KMS/age key material and the agent-key encryption boundary (§5.4) | Phase 4 |
 | E3 | Postgres DSN / deployment target | Shadow persistence at scale |
-| C4 | ~~Does the `webData3` subscription exist?~~ **RESOLVED 2026-07-31**: it does. `verify --probe-ws` opened `wss://api.hyperliquid.xyz/ws`, sent the subscribe, and the venue acknowledged it. Note what this does and does not establish — the subscription **exists**; nothing here says what it carries or that it is preferable to `webData2`, which the shard planner is specified against and continues to use. Existence was the question; suitability was never asked and is not answered. This check was UNCHECKABLE with the reason "this harness speaks only the Info POST API", which stopped being true when `collect_addresses` shipped and held a live socket to the same venue for 1 110 frames. | closed — planner unchanged |
+| C4 | ~~Does the `webData3` subscription exist?~~ **RESOLVED 2026-07-31**: it does. `verify --probe-ws` opened `wss://api.hyperliquid.xyz/ws`, sent the subscribe, and the venue acknowledged it. Note what this does and does not establish — the subscription **exists**; nothing here says what it carries or that it is preferable to `webData2`, which §5.2 specifies. **Superseded 2026-08-03**: probing BOTH with a `user` found `webData3` accepted and `webData2` REJECTED in the same payload shape, so the alternative this row treats as the safe default is the one that does not work. Suitability — what `webData3` carries — is still not answered. See C4. This check was UNCHECKABLE with the reason "this harness speaks only the Info POST API", which stopped being true when `collect_addresses` shipped and held a live socket to the same venue for 1 110 frames. | closed; see C4 for the 2026-08-03 inversion |
 | E4 | ~~The shadow address sampling frame~~ **RESOLVED 2026-07-31** (B4): the public trades feed, activity-selected; the leaderboard rejected because it ranks on the outcome being calibrated. Implemented by `risk_engine.market.collect_addresses`, which generates the `frame` text as well as the list. The shape is confirmed against the live venue — a 60 s `--dry-run` on 2026-07-30 (36 addresses / 30 records, field `users`), then a full 2026-07-31 collection: 515 addresses from 2 989 records over 1 110 frames, 0 unparseable, 0 anomalies, records arriving for all three subscribed coins. This row said "never been observed from here" until that date, contradicting B4's own text. No frame in this repository is a capture, which is a separate and still-true caveat. | closed |
 ### E6 `[FIXED — and it was silent on one side]` `leverage.rawUsd` is not the isolated pocket's collateral
 
