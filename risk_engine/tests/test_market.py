@@ -11,6 +11,7 @@ missing fields), which is what would otherwise rot silently.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import ClassVar
 
 import numpy as np
 import pytest
@@ -154,6 +155,100 @@ class TestParseState:
             {"crossMarginSummary": {"accountValue": "0.0"}, "assetPositions": []}, "0x"
         )
         assert book.positions == ()
+
+
+class TestLiveIsolatedMargin:
+    """E6 — verbatim mainnet responses, not fixtures.
+
+    These two are the only observations in this file. They are here because
+    the documented reading of `leverage.rawUsd` was wrong and every fixture in
+    this module agreed with it, so nothing failed: the shapes were consistent
+    with each other and with the docs, and inconsistent with the venue.
+
+    The venue's own `liquidationPx` is the oracle. Reconstructing it from what
+    the parser produced is what makes these tests observations rather than
+    another set of numbers someone typed.
+    """
+
+    # Captured from mainnet 2026-08-03.
+    LONG: ClassVar[dict] = {
+        "coin": "BTC", "szi": "0.00347",
+        "leverage": {"type": "isolated", "value": 40, "rawUsd": "-213.037712"},
+        "entryPx": "62917.0", "positionValue": "217.17342",
+        "unrealizedPnl": "-1.14857", "liquidationPx": "62171.2944953124",
+        "marginUsed": "4.135708", "maxLeverage": 40,
+    }
+    SHORT: ClassVar[dict] = {
+        "coin": "BTC", "szi": "-0.00024",
+        "leverage": {"type": "isolated", "value": 40, "rawUsd": "15.665304"},
+        "entryPx": "63709.5", "positionValue": "15.042",
+        "unrealizedPnl": "0.24828", "liquidationPx": "64466.2716049383",
+        "marginUsed": "0.623304", "maxLeverage": 40,
+    }
+
+    @staticmethod
+    def _parse(position: dict):
+        state = {
+            "marginSummary": {"accountValue": "100.0"},
+            "crossMarginSummary": {"accountValue": "100.0"},
+            "assetPositions": [{"type": "oneWay", "position": position}],
+        }
+        return parse_clearinghouse_state(state, "0x" + "cc" * 20).positions[0]
+
+    @pytest.mark.parametrize("tag", ["LONG", "SHORT"])
+    def test_the_parsed_collateral_reproduces_the_venues_liquidation_price(self, tag):
+        """The check that was missing, as a test.
+
+        If `isolated_margin` is wrong, the §1.1 condition solved at that
+        collateral lands somewhere other than where the venue says the
+        position liquidates. Nothing else in this file would have caught the
+        `rawUsd` misreading; this does, on both sides.
+        """
+        raw = getattr(self, tag)
+        pos = self._parse(raw)
+        size, entry = float(raw["szi"]), float(raw["entryPx"])
+        mmr = 0.5 / float(raw["maxLeverage"])
+        # equity(P) = margin + size*(P - entry) == mmr*|size|*P
+        ours = (pos.isolated_margin - size * entry) / (mmr * abs(size) - size)
+        theirs = float(raw["liquidationPx"])
+        assert ours == pytest.approx(theirs, rel=1e-9)
+
+    def test_a_long_pocket_is_no_longer_dropped(self):
+        """`rawUsd` is NEGATIVE for a long -- the venue buys partly on
+        borrowed dollars -- so reading it as collateral made `Position` refuse
+        the whole account. Five live accounts went that way in one sweep."""
+        assert float(self.LONG["leverage"]["rawUsd"]) < 0
+        pos = self._parse(self.LONG)
+        assert pos.isolated_margin > 0
+        assert pos.isolated_margin == pytest.approx(5.284278)
+
+    def test_a_short_pocket_is_not_silently_inflated(self):
+        """The dangerous half. For a short, `rawUsd` is
+        `marginUsed + positionValue` -- positive, so it would have PARSED,
+        at ~40x the true collateral, placing liquidation far away and
+        understating P(liq). §10 forbids that direction."""
+        raw_usd = float(self.SHORT["leverage"]["rawUsd"])
+        assert raw_usd > 0, "positive, so nothing would have refused it"
+        pos = self._parse(self.SHORT)
+        assert pos.isolated_margin == pytest.approx(0.375024)
+        assert raw_usd / pos.isolated_margin > 40, "the size of the near-miss"
+
+    def test_raw_usd_is_the_pockets_cash_on_both_sides(self):
+        """`rawUsd == marginUsed - sign(size)*positionValue`, exact on both.
+
+        The sign is the whole point and is easy to get wrong -- the long form
+        alone does not generalise. A long BORROWS dollars to hold the asset,
+        so its cash is negative; a short HOLDS dollars against an asset it
+        owes, so its cash is positive and larger than the pocket. That is what
+        identifies the field as ledger cash rather than collateral, and it is
+        why `probe_isolated_funding` is right to read it: cash reduces to
+        `collateral - size*entry`, which carries no mark-price term.
+        """
+        for raw in (self.LONG, self.SHORT):
+            size = float(raw["szi"])
+            side = 1.0 if size > 0 else -1.0
+            expected = float(raw["marginUsed"]) - side * float(raw["positionValue"])
+            assert float(raw["leverage"]["rawUsd"]) == pytest.approx(expected, abs=1e-6)
 
 
 class TestAgentAddressGuard:

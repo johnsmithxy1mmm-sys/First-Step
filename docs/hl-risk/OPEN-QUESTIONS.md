@@ -1685,12 +1685,27 @@ WAS removed — `marginUsed` carries uPnL and moves with every tick, so a delta
 over the probe's window would have been price drift attributed to funding.
 C5's verdict stands.
 
-**Still unmeasured: the SHORT case.** The four live positions were all longs.
-`marginUsed == equity` is verified for longs and inferred for shorts from the
-same balance-sheet identity; the fix does not depend on the rawUsd sign, but
-"inferred" is not "measured". A short isolated position should be dumped and
-checked against `liquidationPx` before this entry is considered closed on
-both sides.
+**The SHORT case is now measured too (same day).** A live isolated short was
+found by scanning the sampling frame (index 4 of 515):
+`szi=-0.00024, marginUsed=0.623304, uPnL=0.24828, rawUsd=15.665304`. Both
+predictions hold exactly:
+
+- cash sign: `rawUsd == marginUsed + positionValue` for a short, i.e. the
+  general form is `marginUsed - sign(size)*positionValue`. A long BORROWS
+  dollars to hold the asset (negative cash); a short HOLDS dollars against an
+  asset it owes (positive cash, larger than the pocket). The long form alone
+  does NOT generalise -- a first version of the regression test asserted it
+  for both sides and failed, which is the test doing its job;
+- the fix: collateral `0.375024`, and reconstructing §1.1 from it gives
+  `liquidationPx = 64466.271605` against the venue's `64466.2716049383` --
+  agreement to ten significant figures.
+
+That also quantifies the near-miss: `rawUsd/collateral ~= 42x`. A short would
+have parsed silently at forty-two times its true margin.
+
+Both responses are now regression tests (`TestLiveIsolatedMargin`), verbatim,
+with the venue's `liquidationPx` as the oracle rather than numbers anyone
+typed. E6 is closed on both sides.
 
 
 | E5 | ~~Live API access — every §5.1 parser written against fixtures, never exercised against the live schema~~ **RESOLVED 2026-07-29** by `python -m risk_engine.market.verify` run from a network where the API is reachable (it is still 403 at the build-environment proxy). All three parsers PASS on live mainnet: `meta` → 177 assets, 34 with multiple margin tiers; `candleSnapshot` → 720 hourly BTC returns, 0 gaps, hourly vol 0.00363; `clearinghouseState` → 10 positions, cross collateral $3,957,459.72. The documented response shapes were correct **for those three reads, and NOT for `clearinghouseState`'s isolated-margin fields** — see E6, opened 2026-08-03: `leverage.rawUsd` is not the pocket's collateral, and reading it as such dropped whole live accounts. E5's PASS was real but shallow: a parser that RETURNS a book is not a parser that returns the RIGHT book, and nothing compared the parsed numbers against the venue's own `liquidationPx`. | closed, but see E6 |
