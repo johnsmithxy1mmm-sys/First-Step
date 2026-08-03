@@ -93,7 +93,27 @@ def parse_meta(meta: dict) -> dict[str, AssetSpec]:
             # direction §10 forbids. Refuse instead; a venue shape change here
             # must be seen, not absorbed.
             tiers = tables.get(int(table_id))
-            if not tiers:
+            if not tiers and int(table_id) == int(max_lev):
+                # ...with one exception, measured against live mainnet meta on
+                # 2026-08-03 rather than assumed. For an asset with no custom
+                # tiering the venue sets `marginTableId` to the SAME NUMBER as
+                # `maxLeverage`; it is not a reference into `marginTables` at
+                # all. Over the live universe: 34 assets resolve to a real
+                # table (ids 50-56, maxLeverage 10-40), 143 are unresolved
+                # with `marginTableId == maxLeverage` (ATOM 5/5, GMX 3/3,
+                # SNX 3/3, ...), and the count of unresolved ids that differ
+                # from maxLeverage -- the genuinely anomalous case -- is ZERO.
+                # The two id spaces do not overlap, so this cannot mask a real
+                # table: every real id is >= 50 and every asset carrying one
+                # resolves.
+                #
+                # This is the documented "carries only maxLeverage" shape
+                # wearing a redundant id, so it takes that branch. The refusal
+                # below still fires for an id that resolves to nothing AND is
+                # not this encoding, which is the case that would actually
+                # mean the venue changed shape under us.
+                tiers = [MarginTier(0.0, max_lev)]
+            elif not tiers:
                 raise ValueError(
                     f"{name} declares marginTableId {table_id!r} but no usable tier "
                     f"table was parsed for it (known ids: {sorted(tables)}). Falling "

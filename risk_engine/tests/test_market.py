@@ -102,6 +102,47 @@ class TestParseMeta:
         with pytest.raises(ValueError, match="universe"):
             parse_meta({"universe": []})
 
+    def test_an_unresolved_id_equal_to_max_leverage_is_the_flat_shape(self):
+        """Measured against live mainnet meta, 2026-08-03.
+
+        For an asset with no custom tiering the venue sets `marginTableId` to
+        the same number as `maxLeverage` — it is not a reference into
+        `marginTables` at all. Live counts over 177 assets: 34 resolve to a
+        real table (ids 50-56), 143 are unresolved with id == maxLeverage
+        (ATOM 5/5, GMX 3/3, SNX 3/3, ...), and ZERO are unresolved with an id
+        that differs from maxLeverage. The id spaces do not overlap, so
+        reading this as the flat shape cannot mask a real table.
+
+        Without this the live snapshot refused the whole universe on ATOM and
+        wrote nothing, every run.
+        """
+        flat = {
+            "universe": [{"name": "ATOM", "szDecimals": 2, "maxLeverage": 5,
+                          "marginTableId": 5}],
+            "marginTables": [[56, {"marginTiers": [{"lowerBound": "0",
+                                                    "maxLeverage": "40"}]}]],
+        }
+        spec = parse_meta(flat)["ATOM"]
+        assert len(spec.tiers) == 1
+        # The flat rate applies at every notional, including a huge one.
+        assert spec.maintenance_margin_rate(1e9) == pytest.approx(0.5 / 5)
+
+    def test_an_unresolved_id_that_is_not_the_flat_encoding_still_refuses(self):
+        """The §10 guard this narrows must survive the narrowing.
+
+        An id that resolves to nothing AND does not equal maxLeverage is a
+        genuine venue-shape change. Absorbing it would hand a large book the
+        small-size maintenance rate — understating margin, and P(liq) with it.
+        """
+        anomaly = {
+            "universe": [{"name": "WEIRD", "szDecimals": 2, "maxLeverage": 10,
+                          "marginTableId": 99}],
+            "marginTables": [[56, {"marginTiers": [{"lowerBound": "0",
+                                                    "maxLeverage": "40"}]}]],
+        }
+        with pytest.raises(ValueError, match="marginTableId"):
+            parse_meta(anomaly)
+
 
 class TestParseState:
     def test_splits_cross_cash_from_unrealised_pnl(self):
