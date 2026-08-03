@@ -217,16 +217,35 @@ Changing the distribution resets the counter (§3.3, §10), so any question
 that moves it has to be settled before days start accumulating — otherwise
 they are days that get thrown away.
 
-That list has **one entry: B6's universe scope** (added 2026-08-02). The
-tracked universe is now `HL_UNIVERSE` (default `BTC,ETH,SOL`), and widening
-it adds correlation structure and marginals — a distribution change, so it
-must be settled *before* days accumulate or it throws them away. What it
-waits on is data rather than a decision in the abstract: the
-`calibration_sweeps` census records the per-coin off-universe drop rate, and
-a few days of full sweeps say whether the current universe keeps `written`
-above §3.3's 200/day floor. The measurement, the query and the decision
-procedure are in
+That list has **two entries.**
+
+**B6's universe scope** (added 2026-08-02). The tracked universe is now
+`HL_UNIVERSE` (default `BTC,ETH,SOL`), and widening it adds correlation
+structure and marginals — a distribution change, so it must be settled
+*before* days accumulate or it throws them away. What it waits on is data
+rather than a decision in the abstract: the `calibration_sweeps` census
+records the per-coin off-universe drop rate, and a few days of full sweeps
+say whether the current universe keeps `written` above §3.3's 200/day floor.
+The measurement, the query and the decision procedure are in
 [`OPEN-QUESTIONS.md`](../docs/hl-risk/OPEN-QUESTIONS.md) under B6.
+
+**D7's float32 path generation** (added here 2026-08-03; D7 has said so since
+it was written). It is worth roughly 2x on the latency budget §2.6 misses at
+the book size §0 targets, and it costs precision in a cumulative sum over 24
+steps — so it changes the distribution and, in D7's own words, "must land
+before the shadow clock starts or not at all". This section said the list had
+one entry while D7 said that; the two files disagreed about the one question
+whose cost is measured in discarded weeks.
+
+Unlike B6 this is a decision and not a measurement: no amount of shadow data
+makes it easier, because what it trades is numerical precision in a risk
+engine against a latency budget the engine currently misses by 2-3x for the
+target user. Taking it means accepting float32 accumulation error in the path
+generator; declining it means §2.6 stays missed and the over-budget counter
+(`pre_trade_budget_exceeded`) keeps being the honest report of that, per §9.
+Either answer is defensible. Deferring it is the one option that is not,
+because deferring past the first accumulated day converts a free choice into
+one that costs the window.
 
 Note the ordering trap this creates: the census that informs the decision is
 produced by sweeps, and sweeps under the *current* universe are exactly the
