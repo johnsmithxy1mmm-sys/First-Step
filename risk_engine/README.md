@@ -217,7 +217,24 @@ Changing the distribution resets the counter (§3.3, §10), so any question
 that moves it has to be settled before days start accumulating — otherwise
 they are days that get thrown away.
 
-That list is now **empty**. The last two entries on it, **A1 and A8**, were
+That list has **one entry: B6's universe scope** (added 2026-08-02). The
+tracked universe is now `HL_UNIVERSE` (default `BTC,ETH,SOL`), and widening
+it adds correlation structure and marginals — a distribution change, so it
+must be settled *before* days accumulate or it throws them away. What it
+waits on is data rather than a decision in the abstract: the
+`calibration_sweeps` census records the per-coin off-universe drop rate, and
+a few days of full sweeps say whether the current universe keeps `written`
+above §3.3's 200/day floor. The measurement, the query and the decision
+procedure are in
+[`OPEN-QUESTIONS.md`](../docs/hl-risk/OPEN-QUESTIONS.md) under B6.
+
+Note the ordering trap this creates: the census that informs the decision is
+produced by sweeps, and sweeps under the *current* universe are exactly the
+days that would be thrown away by widening it. Those days are diagnostic,
+not gate-days — the same status the A10 recording window already has — and
+that is the intended cost, not an oversight.
+
+The two entries before it, **A1 and A8**, were
 decisions rather than measurements, and both were taken on 2026-07-30: A1
 keeps zero log-return drift (`DriftConvention.ZERO_LOG_RETURN`) on the
 grounds that no convention is uniformly conservative — `-sigma^2/2` is harsher
