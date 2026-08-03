@@ -411,6 +411,39 @@ design — see A11.
 
 ### A11 `[BLOCKER]` The skewed-t remedy is not uniformly conservative
 
+**Measured on live mainnet, 2026-08-03 — and it is not always an asymmetry at
+all.** The first live shadow sweep fired A10 on all three pairs over the
+90-day window (2160 hourly observations, so n=108 exceedances at q=0.05):
+
+| pair | lower | upper | model@q | excess | sigmas | asymmetry |
+|---|---|---|---|---|---|---|
+| ETH/SOL | 0.750 | 0.685 | 0.641 | +0.109 | **+2.6** | +0.065 |
+| BTC/ETH | 0.694 | **0.731** | 0.633 | +0.061 | +1.4 | **−0.037** |
+| BTC/SOL | 0.694 | 0.667 | 0.634 | +0.060 | +1.4 | +0.027 |
+
+Two things follow, and the second is new.
+
+**The gate fires readily on noise, by design.** The SE of the empirical
+proportion at n=108 is ~0.042, so the 0.05 margin is 1.13 SE. Only ETH/SOL is
+a real signal at 2.6 sigma; the other two sit at 1.4. That is the intended
+direction — §10 makes a false alarm cheaper than a miss — but a refusal that
+does not say which pairs are signal invites someone to dismiss all three. The
+diagnostic now reports the sigma alongside each pair.
+
+**BTC/ETH is not an asymmetry: its UPPER tail is heavier than its lower**
+(0.731 against 0.694), while still failing the gate because the model sits
+under BOTH. A skewed-t buys one tail at the other's expense, so applying it
+there would fit the lower tail by making the upper worse. That pair is
+evidence about the copula df or the elliptical family, not about skew — the
+fitted df is too Gaussian to reach the observed tail dependence in either
+direction. `assert_lower_tail_not_understated` now separates the two cases
+and names the pairs where skew is the wrong remedy, because a run that read
+the old message literally would have reached for it.
+
+So the remedy is not one remedy. Before anything is built, the shadow window
+has to say which of the two shapes dominates on real books — and this first
+sweep already shows both present at once.
+
 §2.3 prescribes a skewed-t when A10 fires, and the prescription is written as
 though the fix were obviously in the safe direction. An adversarial design
 review on 2026-08-01 (three independent designs, four refutation passes, all

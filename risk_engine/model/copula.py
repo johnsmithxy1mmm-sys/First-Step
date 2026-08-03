@@ -171,13 +171,56 @@ class TailDiagnostic:
             return True
         return self.empirical_lower - self.model_at_threshold > margin
 
+    @property
+    def lower_standard_error(self) -> float:
+        """SE of the empirical lower estimate, as a binomial proportion.
+
+        Reported because the margin is not many of these. On the live mainnet
+        window (2160 hourly observations, so n=108 exceedances at q=0.05) the
+        SE is ~0.042 and the 0.05 margin is 1.13 SE, which means the gate
+        fires readily on noise. That is the intended direction -- §10 makes a
+        false alarm cheaper than a miss -- but an operator reading a refusal
+        needs to be able to tell a 2.6-sigma signal from a 1.4-sigma one.
+        """
+        n = self.n_lower_exceedances
+        p = self.empirical_lower
+        if n <= 0 or not np.isfinite(p):
+            return float("nan")
+        return float(np.sqrt(max(p * (1.0 - p), 0.0) / n))
+
+    @property
+    def lower_excess_sigmas(self) -> float:
+        """How far past the model the lower tail sits, in standard errors."""
+        se = self.lower_standard_error
+        if not np.isfinite(se) or se <= 0:
+            return float("nan")
+        return float((self.empirical_lower - self.model_at_threshold) / se)
+
+    @property
+    def upper_also_understated(self) -> bool:
+        """True when the model is under the UPPER tail too.
+
+        This is the distinction §2.3's prescribed remedy turns on. A skewed-t
+        heavies one tail at the other's expense, so it is the right fix only
+        when the lower tail is heavier than the upper. When BOTH tails run
+        above the model the family or its df is too thin all round, and adding
+        skew would fit one tail by making the other worse.
+        """
+        if not (np.isfinite(self.empirical_upper) and np.isfinite(self.empirical_lower)):
+            return False
+        return self.empirical_upper >= self.empirical_lower
+
     def __str__(self) -> str:
+        sig = self.lower_excess_sigmas
+        sigma = f" {sig:+.1f}sigma" if np.isfinite(sig) else ""
+        shape = " [UPPER TAIL ALSO UNDER-MODELLED]" if self.upper_also_understated else ""
         return (
             f"{self.pair[0]}/{self.pair[1]} @ q={self.threshold}: "
             f"lower={self.empirical_lower:.3f} upper={self.empirical_upper:.3f} "
             f"model@q={self.model_at_threshold:.3f} "
             f"model_asymptotic={self.model_asymptotic:.3f} "
-            f"asymmetry={self.asymmetry:+.3f} (n={self.n_lower_exceedances})"
+            f"asymmetry={self.asymmetry:+.3f} (n={self.n_lower_exceedances}"
+            f"{sigma}){shape}"
         )
 
 
@@ -233,9 +276,32 @@ def assert_lower_tail_not_understated(
             "than a pass -- an unmeasurable tail is not evidence of a safe one."
             if unmeasured else ""
         )
+        # §2.3 prescribes a skewed-t, and for a pair whose lower tail is
+        # genuinely heavier than its upper that is the right remedy. It is NOT
+        # the right remedy for a pair whose UPPER tail is also above the
+        # model: skew buys one tail at the other's expense, so applying it
+        # there would fit the lower tail by making the upper one worse. That
+        # case says the family or its df is too thin all round.
+        #
+        # Observed live on mainnet 2026-08-03, which is why this is separated
+        # rather than left implicit: BTC/ETH came back lower=0.694 against
+        # upper=0.731 -- asymmetry NEGATIVE -- while still failing the gate,
+        # so a run that read the message literally would have reached for the
+        # wrong fix.
+        symmetric = [d for d in bad if d.upper_also_understated]
+        shape_note = (
+            "\nNOT AN ASYMMETRY for "
+            f"{', '.join('/'.join(d.pair) for d in symmetric)}: the upper tail is "
+            "at or above the lower one, so the model is under BOTH tails there. "
+            "A skewed-t is the wrong remedy for that -- it would fit the lower "
+            "tail by worsening the upper. Those pairs point at the copula df or "
+            "the elliptical family itself (OPEN-QUESTIONS A11)."
+            if symmetric else ""
+        )
         raise ValueError(
             "the t-copula understates lower-tail dependence for:\n  "
             f"{lines}\n"
             "§2.3 classifies this as a blocking defect and prescribes a skewed-t, "
             f"which is not implemented. Report this rather than proceeding.{note}"
+            f"{shape_note}"
         )

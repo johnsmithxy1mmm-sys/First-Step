@@ -234,6 +234,27 @@ def _paired_cvar_change(
     # Resampled in batches: the vectorised tail selection is what keeps this
     # inside §2.6's budget, but a single (reps, n) index matrix would be
     # 32 MB per book, so it is built a slice at a time.
+    #
+    # A 4x faster alternative was measured and REJECTED, recorded here so the
+    # next person does not rediscover it. CVaR@95 needs only the k=1000
+    # smallest of each resample, so sorting once and drawing multinomial
+    # counts over the lowest ~1250 sorted cells replaces the (200, 20000)
+    # gather and partition entirely: 61.9 ms -> 15.8 ms per book, and a
+    # two-sample KS over 1200 draws finds no evidence the law changed
+    # (p = 0.79).
+    #
+    # It breaks the PAIRING, which is the whole point of this function. The
+    # counts have to live in each book's own sorted order, and the before and
+    # after books do not sort the same way, so the two resamples stop being
+    # the same resample. Measured on a small order: the change interval goes
+    # from 35.5 wide to 1327.3 -- 37x -- because the replicate-to-replicate
+    # correlation between the two books (0.9993 when paired) is exactly what
+    # the pairing cancels and what D6 measured as "six times tighter".
+    #
+    # Widening an interval is not a §10 violation; it is the safe direction.
+    # But §4.2 exists to tell a user whether THEIR ORDER moved the risk, and
+    # an interval 37x wider answers "cannot tell" to almost every order. The
+    # speed is real and the cost is the product.
     batch = max(1, min(reps, 4_000_000 // max(n, 1)))
     # float32 for the resampled copies: the partition is ~3x faster on half
     # the bytes, and a bootstrap *interval* does not need the seventh

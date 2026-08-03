@@ -306,6 +306,61 @@ class TestCopula:
         with pytest.raises(ValueError, match="understates lower-tail"):
             assert_lower_tail_not_understated(diags)
 
+    def test_a_symmetric_shortfall_is_not_reported_as_an_asymmetry(self):
+        """§2.3 prescribes a skewed-t, and that is the wrong fix for half of
+        what fires the gate.
+
+        Observed live on mainnet 2026-08-03: BTC/ETH came back lower=0.694
+        against upper=0.731 — the UPPER tail heavier — while still failing,
+        because the model sat under both. A skewed-t buys one tail at the
+        other's expense, so applying it there fits the lower tail by making
+        the upper worse. The refusal has to name that case, or a reader
+        following the message reaches for the wrong remedy.
+        """
+        from risk_engine.model.copula import TailDiagnostic
+
+        live_btc_eth = TailDiagnostic(
+            pair=("BTC", "ETH"), threshold=0.05,
+            empirical_lower=0.694, empirical_upper=0.731,
+            model_at_threshold=0.633, model_asymptotic=0.571,
+            n_lower_exceedances=108,
+        )
+        assert live_btc_eth.understates_lower_tail(), "it must still fail the gate"
+        assert live_btc_eth.asymmetry < 0, "the upper tail is the heavier one"
+        assert live_btc_eth.upper_also_understated
+
+        with pytest.raises(ValueError, match="NOT AN ASYMMETRY"):
+            assert_lower_tail_not_understated([live_btc_eth])
+
+        # A genuinely asymmetric pair must NOT collect that note.
+        live_eth_sol = TailDiagnostic(
+            pair=("ETH", "SOL"), threshold=0.05,
+            empirical_lower=0.750, empirical_upper=0.685,
+            model_at_threshold=0.641, model_asymptotic=0.571,
+            n_lower_exceedances=108,
+        )
+        assert not live_eth_sol.upper_also_understated
+        with pytest.raises(ValueError) as exc:
+            assert_lower_tail_not_understated([live_eth_sol])
+        assert "NOT AN ASYMMETRY" not in str(exc.value)
+
+    def test_the_refusal_reports_how_strong_the_signal_is(self):
+        """The 0.05 margin is ~1.13 standard errors at the live sample size,
+        so the gate fires readily on noise — intended (§10 makes a false alarm
+        cheaper than a miss), but a refusal that does not separate a 2.6-sigma
+        pair from a 1.4-sigma one invites dismissing all of them."""
+        from risk_engine.model.copula import TailDiagnostic
+
+        d = TailDiagnostic(
+            pair=("ETH", "SOL"), threshold=0.05,
+            empirical_lower=0.750, empirical_upper=0.685,
+            model_at_threshold=0.641, model_asymptotic=0.571,
+            n_lower_exceedances=108,
+        )
+        assert d.lower_standard_error == pytest.approx(0.0417, abs=1e-3)
+        assert d.lower_excess_sigmas == pytest.approx(2.6, abs=0.1)
+        assert "sigma" in str(d)
+
     def test_finite_threshold_dependence_exceeds_the_asymptotic_coefficient(self):
         """Why the diagnostic may not compare against the closed form: at any
         workable threshold the finite estimate sits well above the limit, so
@@ -470,12 +525,31 @@ class TestTheDiagnosticRunsOnTheShippedPath:
 
         import risk_engine.shadow.cli as shadow_cli
 
-        src = inspect.getsource(shadow_cli._live_world)
+        # Whichever function holds the call, `serving=False` must be on it.
         # A regex, not an exact call string: the pin is about the ARGUMENT
         # being passed explicitly, and an exact-string pin broke the first
         # time the call legitimately grew another keyword (C6's shared
         # budget) while the property it guards was untouched.
-        assert re.search(r"_build_live_bundle\(\s*serving=False", src)
+        builders = [shadow_cli._paced_bundle, shadow_cli._live_world]
+        sources = {f.__name__: inspect.getsource(f) for f in builders}
+        holding = [
+            name for name, src in sources.items()
+            if re.search(r"_build_live_bundle\(\s*serving=False", src)
+        ]
+        assert holding, (
+            "no shadow entry point passes serving=False to _build_live_bundle; "
+            "the harness would start refusing and the §3.3 window would stop "
+            f"advancing. Searched: {list(sources)}"
+        )
+
+        # And the live path must reach it through the PACED builder. Calling
+        # `_build_live_bundle` directly is what made a spent shared window
+        # (C6) kill the run instead of pacing it, so this pins the route as
+        # well as the argument.
+        assert "_paced_bundle(" in sources["_live_world"], (
+            "_live_world must build through _paced_bundle: an unpaced build "
+            "turns a busy §5.3 window into a dead run rather than a wait"
+        )
 
     def test_a_crash_together_market_stops_the_bundle_from_building(self):
         """The behaviour §2.3 and §9 actually require. If this test can be
