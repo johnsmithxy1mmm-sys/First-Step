@@ -372,18 +372,36 @@ def benchmark_5_leverage_monotonicity(
                     (Position("A1", size, entry, MarginMode.ISOLATED, lev, margin),), now)
         iso_probs.append(_p_liq(book, specs, spec, spot, base))
 
+    # The other half of A7, and the reason the cross grid is over EFFECTIVE
+    # leverage: §1.2 says the slider does not move a cross liquidation price
+    # at all. That is the claim that makes gridding the slider a test of the
+    # spec's wording rather than of the engine, so it is asserted rather than
+    # relied on. Measured invariant to 6 decimal places across 5x/10x/25x.
+    fixed_size = collateral * 12.0 / entry
+    slider_probs = [
+        _p_liq(
+            Book("0xbench", collateral,
+                 (Position("A1", fixed_size, entry, MarginMode.CROSS, set_lev),), now),
+            specs, spec, spot, cross_base,
+        )
+        for set_lev in (5.0, 10.0, 25.0)
+    ]
+    slider_ok = max(slider_probs) - min(slider_probs) == 0.0
+
     cross_ok = all(b > a for a, b in pairwise(cross_probs))
     iso_ok = all(b > a for a, b in pairwise(iso_probs))
     bad_cross = [i for i, (a, b) in enumerate(pairwise(cross_probs)) if b <= a]
     bad_iso = [i for i, (a, b) in enumerate(pairwise(iso_probs)) if b <= a]
     return BenchmarkResult(
         name="3.1.5 P(liq) strictly increasing in leverage",
-        passed=cross_ok and iso_ok,
+        passed=cross_ok and iso_ok and slider_ok,
         detail=(
             f"cross(effective) {cross_probs[0]:.5f}..{cross_probs[-1]:.5f} "
             f"{'ok' if cross_ok else f'violations at {bad_cross}'}; "
             f"isolated(set L) {iso_probs[0]:.5f}..{iso_probs[-1]:.5f} "
-            f"{'ok' if iso_ok else f'violations at {bad_iso}'}"
+            f"{'ok' if iso_ok else f'violations at {bad_iso}'}; "
+            f"cross slider invariant (§1.2) {slider_probs[0]:.6f} "
+            f"{'ok' if slider_ok else f'MOVED: {slider_probs}'}"
         ),
     )
 

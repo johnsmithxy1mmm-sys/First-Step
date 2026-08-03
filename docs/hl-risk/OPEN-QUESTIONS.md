@@ -170,7 +170,50 @@ leverage) is likewise only meaningful under common random numbers; evaluated
 on independent path sets, "strictly increasing" on a 20-point grid is a
 coin-flip proposition regardless of correctness.
 
-### A7 `[BLOCKER]` §3.1.5 does not say which leverage
+### A7 `[DECIDED — the reading is forced, and now pinned]` §3.1.5 does not say which leverage
+
+**Decided 2026-08-03, by measurement rather than preference.** The shipped
+reading stands, because it is the only one under which the benchmark tests
+the ENGINE instead of the specification's wording.
+
+Measured on the benchmark's own fixture (40 000 paths, 1% hourly vol,
+24 steps), holding position size fixed and moving only the leverage slider on
+a cross book:
+
+| set leverage | P(liq) |
+|---|---|
+| 5x | 0.161125 |
+| 10x | 0.161125 |
+| 25x | 0.161125 |
+
+Identical to six decimal places — exactly what §1.2 says, and exactly why
+"P(liq) strictly increases in leverage" cannot be tested against the slider
+on a cross book: the true answer is a flat line, so a strictly-increasing
+assertion would fail on CORRECT behaviour. Varying effective leverage
+(notional at fixed collateral) over the same grid moves it 0.02202 -> 0.62790.
+
+So: cross grids over effective leverage, isolated grids over set `L` (which
+genuinely does move an isolated pocket, 0.02167 -> 0.62915). Both must be
+strictly increasing.
+
+**And the invariance is now asserted end to end.** It was already checked at
+the unit level — `test_liquidation.py::test_cross_liquidation_ignores_the_leverage_slider`
+pins it on the closed-form `liquidation_price`. What was NOT checked is the
+same property through the full Monte Carlo, which is the path §3.1.5 actually
+grades: the closed form could keep the invariance while the simulator lost
+it, and the benchmark would still pass on its two monotone grids. It now
+fails if the cross slider moves simulated P(liq) at all. Measured invariant
+to six decimal places (0.161125 at 5x, 10x and 25x).
+
+What remains yours: whether the specification INTENDED effective leverage.
+The measurement settles what is testable, not what was meant — though the two
+coincide here, since the other reading is untestable.
+
+The original entry follows.
+
+---
+
+### A7 (original) `[BLOCKER]` §3.1.5 does not say which leverage
 
 For **cross** positions the spec itself establishes (§1.2) that the set
 leverage does not affect the liquidation price — only the notional-to-equity
@@ -761,7 +804,58 @@ module refuses. Each names the record that settles it:
   correct reading is "neither side is this account's perp → 0.0 flow", but
   that is to be confirmed from the record, not assumed.
 
-### B3 `[BLOCKER]` Baseline A is not a distribution
+### B3 `[DECIDED — reading confirmed, and this entry described it wrongly]` Baseline A is not a distribution
+
+**Decided 2026-08-03.** The implemented reading stands: §3.2's "historical
+unconditional frequency" is a single number, CRPS needs a distribution, and
+the only faithful way to get one is to keep the naive PREDICTOR and let it
+produce a distribution. That is what the code does.
+
+**But the description below is wrong in two ways, both found by measuring the
+code rather than reading it.**
+
+*It is not `net_exposure x r`, it is `net_exposure x (e^r - 1)`.* The draws
+are 24 h LOG returns and the code exponentiates them. On a long-only
+two-coin book at $320 000 net notional, the predicted equity change matches
+`net_notional x (exp(r) - 1)` at the 5th and 95th percentiles to within 0.05%
+(-19 869 vs -19 860, +21 136 vs +21 264). At crypto's 24 h scale the two
+differ enough to matter in the tail, which is the part that decides a
+liquidation.
+
+*The book is NOT collapsed to net notional.* One common factor is applied to
+every asset and then the REAL liquidation model runs on the REAL positions.
+Only the equity change collapses; P(liq) does not. Measured at $1 000 000 net
+notional on $60 000 collateral, identical for all three:
+
+| structure | P(liq) | sd(equity change) |
+|---|---|---|
+| one cross position | 0.3251 | 81 335 |
+| one isolated pocket | 0.3251 | 81 335 |
+| two isolated pockets | **0.3538** | 81 506 |
+
+Same net notional, same collateral, different P(liq) — because isolated
+pockets fail independently and `any_liq` is a union over them. A description
+that says "collapsed to net notional" would have someone predict 0.3251 for
+the third row.
+
+**Why it is a fair baseline, and not a straw man.** One factor means perfect
+correlation and no idiosyncratic risk, so a hedged book looks nearly
+riskless to it: measured sd of 1 590 on a book whose legs are $200 000 long
+against $160 000 short. The real model gives that book genuine
+idiosyncratic risk. So "the model beats Baseline A" is informative precisely
+on the books where correlation structure is the thing that matters — which is
+the comparison §3.2 is for. It is naive in the intended way: no correlation
+structure, no per-asset volatility, no funding, no path (one step, endpoint
+only, so no intra-horizon monitoring).
+
+What remains yours: whether §3.2 meant this predictor. Nothing measurable
+settles that.
+
+The original entry follows.
+
+---
+
+### B3 (original) `[BLOCKER]` Baseline A is not a distribution
 
 §3.2 defines Baseline A as "the historical unconditional frequency of
 liquidations at that nominal leverage" — a single probability. §0.2 and §3.3
