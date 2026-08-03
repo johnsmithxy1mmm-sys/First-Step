@@ -57,8 +57,15 @@ STATE = {
         {"type": "oneWay", "position": {
             "coin": "SOL", "szi": "-500.0", "entryPx": "210.0",
             "positionValue": "100000.0", "unrealizedPnl": "5000.0",
+            # Internally consistent with the LIVE field semantics measured on
+            # mainnet 2026-08-03: `marginUsed` is the pocket's EQUITY
+            # (collateral + uPnL), and `rawUsd` is its net ledger cash. This
+            # fixture previously carried rawUsd=22000 with the parser reading
+            # it as the collateral -- a shape the venue does not produce, which
+            # is how the misreading survived into a live sweep.
+            # Short: cash = equity + notional = 20000 + 100000.
             "marginUsed": "20000.0", "maxLeverage": 20,
-            "leverage": {"type": "isolated", "value": 5, "rawUsd": "22000.0"},
+            "leverage": {"type": "isolated", "value": 5, "rawUsd": "120000.0"},
         }},
         {"type": "oneWay", "position": {
             "coin": "ZERO", "szi": "0.0", "entryPx": "1.0",
@@ -108,7 +115,12 @@ class TestParseState:
         assert by_coin["BTC"].mode is MarginMode.CROSS
         assert by_coin["BTC"].isolated_margin is None
         assert by_coin["SOL"].mode is MarginMode.ISOLATED
-        assert by_coin["SOL"].isolated_margin == pytest.approx(22_000.0)
+        # marginUsed (20000, the pocket's equity) minus uPnL (5000).
+        # NOT rawUsd: that is the pocket's ledger cash, and reading it as
+        # collateral put a long's negative cash into a field `Position`
+        # refuses, dropping whole live accounts, while a short's positive cash
+        # would have passed silently at ~50x the true margin (§10).
+        assert by_coin["SOL"].isolated_margin == pytest.approx(15_000.0)
         assert by_coin["SOL"].size == -500.0
 
     def test_drops_zero_size_positions(self):

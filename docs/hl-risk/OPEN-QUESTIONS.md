@@ -1634,5 +1634,64 @@ in the risk number, and is recorded in the journal's model version.
 | E3 | Postgres DSN / deployment target | Shadow persistence at scale |
 | C4 | ~~Does the `webData3` subscription exist?~~ **RESOLVED 2026-07-31**: it does. `verify --probe-ws` opened `wss://api.hyperliquid.xyz/ws`, sent the subscribe, and the venue acknowledged it. Note what this does and does not establish — the subscription **exists**; nothing here says what it carries or that it is preferable to `webData2`, which the shard planner is specified against and continues to use. Existence was the question; suitability was never asked and is not answered. This check was UNCHECKABLE with the reason "this harness speaks only the Info POST API", which stopped being true when `collect_addresses` shipped and held a live socket to the same venue for 1 110 frames. | closed — planner unchanged |
 | E4 | ~~The shadow address sampling frame~~ **RESOLVED 2026-07-31** (B4): the public trades feed, activity-selected; the leaderboard rejected because it ranks on the outcome being calibrated. Implemented by `risk_engine.market.collect_addresses`, which generates the `frame` text as well as the list. The shape is confirmed against the live venue — a 60 s `--dry-run` on 2026-07-30 (36 addresses / 30 records, field `users`), then a full 2026-07-31 collection: 515 addresses from 2 989 records over 1 110 frames, 0 unparseable, 0 anomalies, records arriving for all three subscribed coins. This row said "never been observed from here" until that date, contradicting B4's own text. No frame in this repository is a capture, which is a separate and still-true caveat. | closed |
-| E5 | ~~Live API access — every §5.1 parser written against fixtures, never exercised against the live schema~~ **RESOLVED 2026-07-29** by `python -m risk_engine.market.verify` run from a network where the API is reachable (it is still 403 at the build-environment proxy). All three parsers PASS on live mainnet: `meta` → 177 assets, 34 with multiple margin tiers; `candleSnapshot` → 720 hourly BTC returns, 0 gaps, hourly vol 0.00363; `clearinghouseState` → 10 positions, cross collateral $3,957,459.72. The documented response shapes were correct. | closed |
+### E6 `[FIXED — and it was silent on one side]` `leverage.rawUsd` is not the isolated pocket's collateral
+
+Found 2026-08-03, from the first live shadow sweep. `parse_clearinghouse_state`
+read `leverage.rawUsd` as "the collateral moved into the pocket", taken from
+the documentation and never checked against a response (E5).
+
+**What it actually is.** Measured on mainnet, four isolated positions at four
+different leverages, exact to six decimals:
+
+    rawUsd == marginUsed - positionValue
+
+which for a long reduces to `collateral - size*entry`: the pocket's net USD
+LEDGER CASH, negative because the position is bought partly with borrowed
+dollars. `marginUsed` is the pocket's current EQUITY (collateral + uPnL).
+
+**How that was settled rather than guessed.** Treating `marginUsed` as equity
+and solving §1.1's isolated condition reproduces the venue's own
+`liquidationPx` with an implied maintenance rate of exactly `0.5/maxLeverage`
+on all four — 0.0125, 0.10, 0.05, 0.05. Four different leverages agreeing to
+six decimals is not a coincidence, and it independently confirms §1.3's rate
+formula against live data.
+
+**The asymmetry is the dangerous part.** For a LONG, rawUsd is negative,
+`Position` refuses it, and the whole account is dropped — loud, and visible
+in the sweep log as `isolated position needs positive isolated_margin` (5
+accounts in one sweep: BTC x2, SOL, TAO, HMSTR, PAXG). For a SHORT the same
+field is `marginUsed + positionValue`, i.e. POSITIVE and roughly fifty times
+the true collateral on a typical pocket — it would have parsed silently,
+placed liquidation far away, and understated P(liq). §10 forbids that
+direction, and the silent half is the one that would not have been noticed.
+
+**Fix.** `isolated_margin = marginUsed - unrealizedPnl`, which is
+direction-independent because it derives from `equity = collateral + uPnL`
+rather than from any cash field. `rawUsd` is no longer read here.
+
+**The check that was missing, now added.** The venue returns `liquidationPx`
+on every isolated position — the answer to "did you understand these fields?"
+handed over for free — and nothing compared against it. Parsing now
+reconstructs it and records mismatches in `ISOLATED_LIQ_PX_MISMATCHES`
+(recorded, not raised: a position in a higher margin tier legitimately breaks
+the single-rate reconstruction, and dropping those would lose exactly the
+large accounts §3.3 needs). On the live account: zero mismatches.
+
+**`probe_isolated_funding` was checked and is NOT undermined.** It reads
+`rawUsd` deliberately, and that is correct there: ledger cash is
+mark-independent (`collateral - size*entry` has no mark term), which is
+exactly the property its C5 attribution needs. Its fallback to `marginUsed`
+WAS removed — `marginUsed` carries uPnL and moves with every tick, so a delta
+over the probe's window would have been price drift attributed to funding.
+C5's verdict stands.
+
+**Still unmeasured: the SHORT case.** The four live positions were all longs.
+`marginUsed == equity` is verified for longs and inferred for shorts from the
+same balance-sheet identity; the fix does not depend on the rawUsd sign, but
+"inferred" is not "measured". A short isolated position should be dumped and
+checked against `liquidationPx` before this entry is considered closed on
+both sides.
+
+
+| E5 | ~~Live API access — every §5.1 parser written against fixtures, never exercised against the live schema~~ **RESOLVED 2026-07-29** by `python -m risk_engine.market.verify` run from a network where the API is reachable (it is still 403 at the build-environment proxy). All three parsers PASS on live mainnet: `meta` → 177 assets, 34 with multiple margin tiers; `candleSnapshot` → 720 hourly BTC returns, 0 gaps, hourly vol 0.00363; `clearinghouseState` → 10 positions, cross collateral $3,957,459.72. The documented response shapes were correct **for those three reads, and NOT for `clearinghouseState`'s isolated-margin fields** — see E6, opened 2026-08-03: `leverage.rawUsd` is not the pocket's collateral, and reading it as such dropped whole live accounts. E5's PASS was real but shallow: a parser that RETURNS a book is not a parser that returns the RIGHT book, and nothing compared the parsed numbers against the venue's own `liquidationPx`. | closed, but see E6 |
 | E6 | Historical liquidation frequencies by nominal leverage for Baseline A's `P(liq)` arm (B3) | Baseline A's probability output |

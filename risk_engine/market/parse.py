@@ -114,6 +114,68 @@ def parse_meta(meta: dict) -> dict[str, AssetSpec]:
     return specs
 
 
+#: Isolated positions whose parsed collateral does not reproduce the venue's
+#: own `liquidationPx`: (coin, ours, theirs, relative error). Recorded rather
+#: than raised, because a position sitting in a higher margin TIER legitimately
+#: breaks the single-rate reconstruction below, and refusing those would drop
+#: exactly the large accounts §3.3 most needs. `market.verify` reports it.
+#:
+#: This check is the one that was missing. The venue hands back the answer to
+#: "did you understand these fields?" on every isolated position, for free, and
+#: nothing compared against it -- which is why reading `rawUsd` as collateral
+#: survived from documentation into a live sweep.
+ISOLATED_LIQ_PX_MISMATCHES: list[tuple[str, float, float, float]] = []
+
+#: Relative tolerance on that reconstruction. Generous: mark price moves
+#: between the venue computing `liquidationPx` and us reading `positionValue`,
+#: and funding accrues in between.
+_LIQ_PX_TOLERANCE = 0.02
+
+
+def _record_isolated_consistency(
+    p: dict, lev: dict, coin: str, iso_margin: float, size: float, upnl: float
+) -> None:
+    """Reproduce the venue's `liquidationPx` from what we just parsed.
+
+    Solves the §1.1 isolated condition `equity(P) = mmr * |size| * P` with
+    `mmr = 0.5 / maxLeverage`, and compares. A mismatch means either the field
+    reading is wrong again or the position sits in a tier the single-rate
+    formula does not describe; both are worth surfacing and neither is worth
+    dropping an account over.
+    """
+    try:
+        liq_px = p.get("liquidationPx")
+        # The ASSET's maxLeverage, not the user's chosen `leverage.value`:
+        # §1.3 makes the maintenance rate a property of the asset and its
+        # notional tier, and the user's leverage only gates how much size may
+        # be opened. The two were EQUAL on all four live positions, so the
+        # live data could not distinguish them -- this ordering follows the
+        # spec rather than the coincidence.
+        max_lev = p.get("maxLeverage") or lev.get("value")
+        entry = p.get("entryPx")
+        if liq_px is None or not max_lev or entry is None:
+            return
+        theirs = float(liq_px)
+        if theirs <= 0:
+            return
+        mmr = 0.5 / float(max_lev)
+        # equity(P) = iso_margin + size*(P - entry); set equal to mmr*|size|*P.
+        side = 1.0 if size > 0 else -1.0
+        denom = size - mmr * abs(size)
+        if denom == 0:
+            return
+        ours = (size * float(entry) - iso_margin) / denom
+        del side
+        if not math.isfinite(ours) or ours <= 0:
+            return
+        rel = abs(ours - theirs) / theirs
+        if rel > _LIQ_PX_TOLERANCE:
+            ISOLATED_LIQ_PX_MISMATCHES.append((coin, ours, theirs, rel))
+    except (TypeError, ValueError):
+        # A consistency probe must never be the reason a book fails to parse.
+        return
+
+
 def parse_clearinghouse_state(
     state: dict, address: str, captured_at: datetime | None = None
 ) -> Book:
@@ -143,10 +205,44 @@ def parse_clearinghouse_state(
         upnl = _f(p.get("unrealizedPnl"), f"{coin}.unrealizedPnl")
         iso_margin = None
         if mode is MarginMode.ISOLATED:
-            # `rawUsd` is the collateral moved into the pocket; `marginUsed`
-            # is the fallback the docs also expose.
-            raw = lev.get("rawUsd", p.get("marginUsed"))
-            iso_margin = _f(raw, f"{coin}.isolated margin")
+            # `marginUsed` MINUS `unrealizedPnl`, and NOT `leverage.rawUsd`.
+            #
+            # This module read `rawUsd` as "the collateral moved into the
+            # pocket", from the documentation, and never saw a live response
+            # (E5). Measured against mainnet 2026-08-03, on four isolated
+            # positions at four different leverages, `rawUsd` is exactly
+            # `marginUsed - positionValue` -- the pocket's net USD CASH, which
+            # for a long is negative because the position is bought partly
+            # with borrowed dollars.
+            #
+            # What `marginUsed` is was settled by reproducing the venue's own
+            # `liquidationPx` from it: treating it as the pocket's CURRENT
+            # EQUITY (collateral plus unrealised PnL) recovers a maintenance
+            # rate of exactly 0.5/maxLeverage on all four -- 0.0125, 0.10,
+            # 0.05, 0.05 -- which is a four-way independent confirmation and
+            # incidentally validates §1.3's rate formula against live data.
+            #
+            # This model's `isolated_margin` is the collateral that uPnL is
+            # added TO (`isolated_margin + unrealised_pnl` is the pocket's
+            # equity, domain/types.py), so it is `marginUsed - unrealizedPnl`.
+            # The subtraction is direction-independent, which matters: the old
+            # reading failed LOUDLY on longs (negative rawUsd, refused by
+            # `Position`, the whole account dropped) but would have passed
+            # SILENTLY on shorts, where rawUsd is `marginUsed + positionValue`
+            # and therefore positive -- roughly fifty times the true
+            # collateral on a typical pocket, which places liquidation far
+            # away and understates P(liq). §10 forbids that direction, and the
+            # silent half is the dangerous one.
+            margin_used = lev.get("marginUsed", p.get("marginUsed"))
+            if margin_used is None:
+                raise ValueError(
+                    f"{coin}: isolated position exposes no marginUsed, so the "
+                    "pocket's equity cannot be read. `leverage.rawUsd` is NOT a "
+                    "substitute -- it is the pocket's net cash, negative for a "
+                    "long (measured live 2026-08-03)."
+                )
+            iso_margin = _f(margin_used, f"{coin}.marginUsed") - upnl
+            _record_isolated_consistency(p, lev, coin, iso_margin, size, upnl)
         else:
             cross_upnl += upnl
         positions.append(

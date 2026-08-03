@@ -112,14 +112,32 @@ def _snapshot(client: InfoClient, address: str) -> Snapshot:
         sizes[coin] = size
         lev = p.get("leverage") or {}
         if lev.get("type") == "isolated":
-            raw = lev.get("rawUsd", p.get("marginUsed"))
+            # `rawUsd` ONLY, with no fallback to `marginUsed`. The two are not
+            # interchangeable here and the difference decides C5's verdict.
+            #
+            # Measured live 2026-08-03: `rawUsd == marginUsed - positionValue`,
+            # which for a long reduces to `collateral - size*entry` -- ledger
+            # cash, with no mark-price term. That is exactly the property this
+            # probe needs and the docstring above claims: it moves on funding
+            # and on transfers, not on price.
+            #
+            # `marginUsed` is the pocket's current EQUITY and DOES carry
+            # unrealised PnL, so it moves with every tick of the mark. Falling
+            # back to it would make this probe measure price drift over an hour
+            # and attribute it to funding -- and the drift dwarfs a funding
+            # payment, which is precisely the confound the audit (P-2) removed
+            # from the cross side. Better to refuse than to answer a
+            # structural question about §1.1 with the wrong series.
+            raw = lev.get("rawUsd")
             if raw is None:
                 # Refuse at the BEFORE snapshot, loudly, rather than crashing
                 # on float(None) at the after snapshot -- an hour of waiting
                 # later (audit P-3).
                 raise ValueError(
-                    f"{coin}: isolated position exposes neither leverage.rawUsd "
-                    "nor marginUsed; the pocket's collateral cannot be observed"
+                    f"{coin}: isolated position exposes no leverage.rawUsd, so the "
+                    "pocket's ledger cash cannot be observed. `marginUsed` is NOT a "
+                    "substitute: it carries unrealised PnL and moves with the mark, "
+                    "so a delta over the window would be price drift, not funding."
                 )
             isolated[coin] = float(raw)
     return Snapshot(
