@@ -59,6 +59,18 @@ TESTNET_URL = "https://api.hyperliquid-testnet.xyz/info"
 #: §5.3. The published budget is 1200 weight/minute per IP; info requests
 #: cost about 20. These are the numbers the governor is built around and,
 #: like everything else here, need confirming against the live API.
+#:
+#: One flat weight for every endpoint is very likely WRONG, and wrong by 10x
+#: on the call this deployment makes most. Secondary sources (including a
+#: `ccxt` issue quoting the published table) put `clearinghouseState` --
+#: one request per address, the dominant cost of the shadow sweep -- in a
+#: weight-2 tier alongside `l2Book` and `allMids`, with 20 as the default for
+#: everything else. Not adopted: the primary page is 403 at this
+#: environment's proxy, and OPEN-QUESTIONS C1 is explicit that agreement
+#: among secondary sources is not the bar. Over-charging is the safe error --
+#: it self-limits harder than the venue asks -- so this stays until someone
+#: reads the page and records the citation. See C6 for what confirming it
+#: would change (B1's window arithmetic, B6's universe scale).
 WEIGHT_BUDGET_PER_MINUTE = 1200
 INFO_REQUEST_WEIGHT = 20
 

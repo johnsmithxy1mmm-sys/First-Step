@@ -158,7 +158,7 @@ with the effective sample size `n_eff = (sum w)^2 / sum w^2` substituted for
 textbook estimator, and is marked as such in the code and in the model
 version string.
 
-### A6 `[BLOCKER]` §3.1.2's 0.3 pp tolerance is below Monte Carlo noise
+### A6 `[RESOLVED]` §3.1.2's 0.3 pp tolerance is below Monte Carlo noise
 
 At 20 000 paths the standard error on a probability near 10% is 0.21 pp, so
 the *difference* of two independent estimates has a standard error of 0.30 pp
@@ -169,6 +169,17 @@ makes the comparison near-deterministic. Benchmark §3.1.5 (monotonicity in
 leverage) is likewise only meaningful under common random numbers; evaluated
 on independent path sets, "strictly increasing" on a 20-point grid is a
 coin-flip proposition regardless of correctness.
+
+**Not a live decision point.** Unlike D4/D6, nothing here turns on what the
+specification *meant* — CRN is the standard fix for exactly this failure
+mode (comparing two noisy estimates of a shared, correlated quantity) and
+the alternative is a flaky gate. A7's own measurement leans on this directly:
+`benchmark_5_leverage_monotonicity`'s cross-slider invariance
+(0.161125 at 5x/10x/25x, to six decimals) is only a meaningful zero *because*
+the six evaluations share paths. Left labelled `[BLOCKER]` past that point
+it would have been the same defect A7 and C1 were both opened to fix —
+a question with a settled answer that the label still asked the reader to
+re-litigate.
 
 ### A7 `[DECIDED — the reading is forced, and now pinned]` §3.1.5 does not say which leverage
 
@@ -1430,6 +1441,49 @@ be sized against real traffic, not assumed.
   documentation-derived and still need the live confirmation this entry has
   always asked for.
 
+**Secondary evidence that 20/request is wrong for the call this sweep is
+built on (2026-08-03), recorded and NOT acted on.** Several third-party
+sources — including a `ccxt` issue whose maintainers quote the published
+rate-limit page directly — state that the weight table is not flat:
+
+| info request | weight |
+|---|---|
+| `l2Book`, `allMids`, **`clearinghouseState`**, `orderStatus`, `spotClearinghouseState`, `exchangeStatus` | **2** |
+| `userRole` | 60 |
+| all other documented info requests | 20 |
+
+`clearinghouseState` is one call per address and is the dominant cost of the
+entire shadow sweep. If it is weight 2, this build over-charges it **10x**.
+
+**The direction is safe, which is why nothing changed.** Over-charging
+self-limits harder than the venue requires: we use less of the budget than we
+are entitled to, and §5.3's promise to interactive users is over-kept rather
+than under-kept. There is no §10 exposure and therefore no reason to hurry.
+
+**What it would change if confirmed**, stated now so the arithmetic is not
+re-derived from the wrong number later:
+
+- B1's reachable-window table. §3.3's floor of 200 addresses is quoted there
+  at 8000 weight / 27 minutes; at weight 2 it is 400 weight and under two
+  minutes.
+- This entry's own case for sharing the pool rather than halving it. That
+  argument is "150/min would put 200 addresses at 53 minutes, past the
+  resolver's 50-minute ceiling" — which stops being true by an order of
+  magnitude. The shared ledger would still be the right design (two processes
+  that cannot see each other's spending is a correctness problem at any
+  weight), but its stated justification would need rewriting rather than
+  reusing.
+- B6's universe scale, which is budget-constrained.
+
+**Why it is recorded rather than adopted.** This is precisely the trap C1
+names: agreement among secondary sources is how a value nobody verified
+becomes a value everybody trusts. `hyperliquid.gitbook.io` is 403 at this
+environment's proxy, so the primary page could not be read from here. The bar
+is the same as C1's — read the published rate-limit page, record the URL and
+the date. Unlike C1, adopting a wrong value here is not dangerous in either
+direction (too high self-limits, too low gets 429s the client already
+handles), so this is an efficiency question, not a safety one.
+
 ### C7 `[BLOCKER — non-blocking in practice]` Is the Info API case-sensitive on `user`?
 
 **Recorded 2026-07-30, after adversarial review, because it was recorded
@@ -1657,28 +1711,52 @@ have deliberately not done it yet", and collapsing that into `[RESOLVED]`
 is what produced a documented safety property with no implementation behind
 it.
 
-### D3 `[BLOCKER]` "Effective leverage" is unsigned (§4.1)
+### D3 `[RESOLVED]` "Effective leverage" is unsigned (§4.1)
 
-§4.1 defines it as `sigma(equity 24h) / sigma(BTC 24h)` and the UI string is
-"your book moves like BTC with leverage X". Those do not match: the ratio of
+§4.1 defines it as `sigma(equity 24h) / sigma(BTC 24h)` and the UI string was
+"your book moves like BTC with leverage X". Those did not match: the ratio of
 volatilities is unsigned and direction-free, so a market-neutral book with
-large idiosyncratic variance reads as "BTC with leverage 3" while having no
-BTC exposure at all — and a short book reads identically to a long one. The
-engine returns the specified ratio *and* the regression beta to BTC; the UI
-copy should not claim directionality that the ratio does not carry.
+large idiosyncratic variance read as "BTC with leverage 3" while having no
+BTC exposure at all — and a short book read identically to a long one.
 
-### D4 `[BLOCKER]` §6's 60-second staleness rule vs §2.1's 5-minute rebuild
+**Shipped 2026-08-02** (`apps/web/app/page.tsx`, panel 2). The unsigned ratio
+now carries its own caveat verbatim in the UI — "This ratio has no direction:
+a market-neutral book with large idiosyncratic variance scores the same as an
+outright long" — displayed beside a *separately labelled* signed figure,
+"Beta to {factor_coin} — the number that carries direction", with an explicit
+long/short readout gated on `direction_detectable`. Nothing in the original
+entry was left open to confirm: it named the fix (return the ratio and the
+beta; do not let the ratio's copy claim direction) and the shipped copy is
+that fix, not a paraphrase of it.
+
+### D4 `[RESOLVED — confirmed 2026-08-03]` §6's 60-second staleness rule vs §2.1's 5-minute rebuild
 
 The global correlation matrix is rebuilt every 5 minutes by design. If the
 60-second staleness rule applied to it, every result would be permanently
 stale and the execution button permanently disabled. The two clocks are
 therefore separated: the 60 s / 5 min contract governs the *book and mark
 price* inputs (WebSocket-driven, sub-second in normal operation), and matrix
-age carries its own longer threshold, exposed separately on the health
-endpoint as §6 requires. Confirmation wanted, since this is the one rule
-§6 says not to soften for conversion.
+age carries its own longer threshold (`MATRIX_HIDE_AFTER_MS = 960_000`),
+exposed separately on the health endpoint as §6 requires.
 
-### D6 `[BLOCKER]` §4.2's overlap rule is the wrong significance test
+**Confirmed by the specification owner on 2026-08-03**, asked because this is
+the one rule §6 says not to soften for conversion — so a split adopted on
+engineering grounds alone would have been exactly the softening it forbids.
+What the confirmation covers is the *partition*, not a relaxation: neither
+clock was widened, and each input is still judged against its own. The
+degradation contract takes the worst verdict across all inputs
+(`guardInputs()`), so a stale book still blocks execution however fresh the
+matrix is.
+
+Worth restating why the split is not a loophole. A 16-minute matrix threshold
+sounds permissive next to 60 seconds until you note it is barely three
+rebuild cycles: it fires when the rebuild loop has *failed*, which is the
+condition it exists to detect, and it cannot fire in normal operation because
+normal operation refreshes it every 5 minutes. The 60-second rule is doing
+the opposite job — catching a feed that stopped ticking seconds ago — and one
+threshold cannot do both without either blocking permanently or never firing.
+
+### D6 `[RESOLVED — confirmed 2026-08-03]` §4.2's overlap rule is the wrong significance test
 
 §4.2 says that when the "before" and "after" intervals overlap, the UI must
 report statistical indistinguishability. Applied to the paired estimates this
@@ -1703,8 +1781,14 @@ exactly what §4.2 asks for; `change` is the paired interval and
 `distinguishable` is read off it. `distinguishable` is what the UI should
 act on, and `overlap_rule_would_mislead` fires (and is counted in
 observability) whenever the two disagree, so the discrepancy is visible
-rather than silently resolved. Confirmation wanted that the paired test is
-the intended one.
+rather than silently resolved.
+
+**Confirmed by the specification owner on 2026-08-03**: the paired test is
+the one the UI acts on. Note what the confirmation does *not* do — it does
+not delete §4.2's rule from the output. `marginal_intervals_overlap` is still
+computed and returned, because the disagreement counter is only meaningful
+while both readings exist, and a departure from the specification that erases
+the thing it departed from cannot be audited afterwards.
 
 ### D7 `[BLOCKER]` §2.6's 300 ms budget is not met at the book size §0 targets
 
