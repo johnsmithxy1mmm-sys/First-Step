@@ -56,23 +56,90 @@ from risk_engine.domain.types import normalise_address
 MAINNET_URL = "https://api.hyperliquid.xyz/info"
 TESTNET_URL = "https://api.hyperliquid-testnet.xyz/info"
 
-#: §5.3. The published budget is 1200 weight/minute per IP; info requests
-#: cost about 20. These are the numbers the governor is built around and,
-#: like everything else here, need confirming against the live API.
+#: §5.3, from the published rate-limit page, read 2026-08-03:
+#: https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/rate-limits-and-user-limits
 #:
-#: One flat weight for every endpoint is very likely WRONG, and wrong by 10x
-#: on the call this deployment makes most. Secondary sources (including a
-#: `ccxt` issue quoting the published table) put `clearinghouseState` --
-#: one request per address, the dominant cost of the shadow sweep -- in a
-#: weight-2 tier alongside `l2Book` and `allMids`, with 20 as the default for
-#: everything else. Not adopted: the primary page is 403 at this
-#: environment's proxy, and OPEN-QUESTIONS C1 is explicit that agreement
-#: among secondary sources is not the bar. Over-charging is the safe error --
-#: it self-limits harder than the venue asks -- so this stays until someone
-#: reads the page and records the citation. See C6 for what confirming it
-#: would change (B1's window arithmetic, B6's universe scale).
+#:     REST requests share an aggregated weight limit of 1200 per minute.
 WEIGHT_BUDGET_PER_MINUTE = 1200
+
+#: The default for documented info requests, per the same page.
 INFO_REQUEST_WEIGHT = 20
+
+#: The endpoints that are NOT the default. Until 2026-08-03 this file charged
+#: a flat 20 for everything and called the error safe, on the grounds that
+#: over-charging self-limits harder than the venue asks. Reading the actual
+#: table showed the flat rate is wrong in BOTH directions, and only one of
+#: them is the safe one:
+#:
+#:   - `clearinghouseState` is weight 2, not 20. It is one request per
+#:     address and the dominant cost of the shadow sweep, so the sweep was
+#:     paying 10x its real cost -- safe, but it is why §3.3's 200-address
+#:     floor looked like 27 minutes of budget when it is nearer two.
+#:   - `candleSnapshot` and `fundingHistory` bill an EXTRA weight unit per
+#:     block of items returned, on top of their base 20. A 90-day hourly
+#:     candle fetch is 2160 items and therefore ~56 weight, not 20. That
+#:     direction is the dangerous one: the bundle build spends more than it
+#:     records, so the reserve §5.3 promises interactive users was being
+#:     eaten by an amount nothing could observe.
+INFO_REQUEST_WEIGHTS = {
+    "l2Book": 2,
+    "allMids": 2,
+    "clearinghouseState": 2,
+    "orderStatus": 2,
+    "spotClearinghouseState": 2,
+    "exchangeStatus": 2,
+    "userRole": 60,
+}
+
+#: Endpoints charging one extra weight unit per N items in the RESPONSE, and
+#: N. The page words it as "an additional rate limit weight per 20 items
+#: returned", which could be read as +1 per 20 items or +20 per 20 items.
+#:
+#: It is +1, and the deployment itself is the evidence. Under the other
+#: reading a single 90-day hourly `candleSnapshot` -- 2160 items -- would
+#: cost 2160 weight against a 1200/minute limit, so it could never succeed
+#: even from an otherwise idle process. This build has made that exact call
+#: on every bundle rebuild for weeks without a 429.
+#:
+#: Note `userNonFundingLedgerUpdates` is deliberately absent. The page lists
+#: `nonUserFundingUpdates`, which is a different endpoint with a confusingly
+#: similar name, and reading one for the other would invent a surcharge on
+#: the call B2's resolver makes per address.
+INFO_ITEMS_PER_EXTRA_WEIGHT = {
+    "recentTrades": 20,
+    "historicalOrders": 20,
+    "userFills": 20,
+    "userFillsByTime": 20,
+    "fundingHistory": 20,
+    "userFunding": 20,
+    "nonUserFundingUpdates": 20,
+    "twapHistory": 20,
+    "userTwapSliceFills": 20,
+    "userTwapSliceFillsByTime": 20,
+    "delegatorHistory": 20,
+    "delegatorRewards": 20,
+    "validatorStats": 20,
+    "candleSnapshot": 60,
+}
+
+
+def info_request_weight(request_type: str) -> int:
+    """The weight charged BEFORE a request, from its type alone."""
+    return INFO_REQUEST_WEIGHTS.get(request_type, INFO_REQUEST_WEIGHT)
+
+
+def info_response_surcharge(request_type: str, response: object) -> int:
+    """The extra weight a response's own length incurred.
+
+    Charged after the fact because it cannot be known before: it is a
+    function of how many items came back. Returns 0 for every endpoint that
+    does not bill this way, which is most of them.
+    """
+    per = INFO_ITEMS_PER_EXTRA_WEIGHT.get(request_type)
+    if per is None or not isinstance(response, list):
+        return 0
+    return len(response) // per
+
 
 #: How the 1200 is divided, as reserved fractions. These are complements on
 #: purpose: 25% background plus 75% interactive is exactly the limit, so the
@@ -132,6 +199,22 @@ class WeightBudget:
             )
         self._events.append((now, weight))
 
+    def charge_incurred(self, weight: int, now: float | None = None) -> None:
+        """Record weight the venue has already counted. Never refuses.
+
+        Some endpoints bill per item RETURNED, so their true cost is not
+        knowable until the response is in hand. Refusing at that point would
+        throw away a response already paid for, and pretending it was free
+        would understate the window — which on this side of the accounting
+        means eating the reserve §5.3 sets aside for interactive users.
+
+        So it is recorded and allowed to overshoot. The window then reads
+        fuller than `usable`, `available()` floors at zero, and the NEXT
+        charge waits — which is the correct consequence, one request late.
+        """
+        now = now if now is not None else time.monotonic()
+        self._events.append((now, weight))
+
 
 #: How a paced charge waits out a spent window: poll interval, and the
 #: ceiling past which a full window stops being a pace and starts being a
@@ -176,6 +259,10 @@ class PacedBudget:
     def available(self, now: float | None = None) -> int:
         return self.inner.available(now)
 
+    def charge_incurred(self, weight: int, now: float | None = None) -> None:
+        # Never refuses, so there is nothing to pace.
+        self.inner.charge_incurred(weight, now)
+
     def charge(self, weight: int, now: float | None = None) -> None:
         # An explicit `now` is a frozen clock -- a test or a deterministic
         # replay -- and a window measured against it never refills. Waiting
@@ -208,7 +295,13 @@ class InfoClient:
         self.timeout = timeout
         self.max_retries = max_retries
 
-    def post(self, payload: dict, weight: int = INFO_REQUEST_WEIGHT) -> dict | list:
+    def post(self, payload: dict, weight: int | None = None) -> dict | list:
+        """POST one Info request, charging §5.3's published weight for it.
+
+        `weight` defaults to the type's own published weight rather than to a
+        flat 20 -- see `INFO_REQUEST_WEIGHTS`. An explicit value still wins,
+        for a caller that knows better than the table.
+        """
         # Backstop, and deliberately *before* `charge`: a malformed address
         # must cost no weight, or the shadow sweep pays §5.3 budget for a
         # request it was never going to be able to make (cron.py charges per
@@ -222,6 +315,9 @@ class InfoClient:
         # -- the caller's dict is theirs.
         if "user" in payload:
             payload = {**payload, "user": normalise_address(payload["user"])}
+        request_type = str(payload.get("type", ""))
+        if weight is None:
+            weight = info_request_weight(request_type)
         self.budget.charge(weight)
         body = json.dumps(payload).encode()
         # S310: the scheme is fixed by MAINNET_URL / TESTNET_URL, which are
@@ -246,7 +342,14 @@ class InfoClient:
                 self.budget.charge(weight)
             try:
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:  # noqa: S310
-                    return json.load(resp)
+                    payload_out = json.load(resp)
+                # Some endpoints bill per item returned, which is knowable
+                # only now. Recorded rather than refused: the request is
+                # already on the wire and the venue has already counted it.
+                extra = info_response_surcharge(request_type, payload_out)
+                if extra:
+                    self.budget.charge_incurred(extra)
+                return payload_out
             except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
                 last = exc
                 if attempt < self.max_retries - 1:

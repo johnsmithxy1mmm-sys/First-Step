@@ -303,6 +303,69 @@ class TestAgentAddressGuard:
         assert client.budget.spent() == 0  # nothing was charged
 
 
+class TestPublishedWeightTable:
+    """§5.3's weights, as the venue publishes them (OPEN-QUESTIONS C6).
+
+    This client charged a flat 20 for every request until 2026-08-03 and the
+    entry recording that called it a safe error, because over-charging
+    self-limits harder than the venue asks. Reading the published table
+    showed the flat rate is wrong in BOTH directions, and the entry's whole
+    justification only covered one of them.
+    """
+
+    def test_clearinghouse_state_is_the_cheap_tier(self):
+        """One request per address, the dominant cost of the shadow sweep,
+        billed at 2 and charged at 20 — a 10x self-limit that made §3.3's
+        200-address floor look like 27 minutes of budget instead of two."""
+        from risk_engine.market.info import info_request_weight
+
+        assert info_request_weight("clearinghouseState") == 2
+        assert info_request_weight("l2Book") == 2
+        assert info_request_weight("userRole") == 60
+        assert info_request_weight("meta") == 20, "the default still applies"
+
+    def test_a_long_response_costs_more_than_its_base_weight(self):
+        """The direction the old flat rate got DANGEROUSLY wrong.
+
+        `candleSnapshot` and `fundingHistory` bill per item returned on top
+        of their base. A 90-day hourly candle fetch is 2160 items, so the
+        bundle build was spending far more than it recorded — and unrecorded
+        spend is exactly what eats the reserve §5.3 promises live users.
+        """
+        from risk_engine.market.info import info_response_surcharge
+
+        assert info_response_surcharge("candleSnapshot", [{}] * 2160) == 36
+        assert info_response_surcharge("fundingHistory", [{}] * 720) == 36
+        assert info_response_surcharge("meta", [{}] * 2160) == 0
+        assert info_response_surcharge("candleSnapshot", {"not": "a list"}) == 0
+
+    def test_the_confusingly_named_ledger_call_is_not_surcharged(self):
+        """The published list contains `nonUserFundingUpdates`. The call B2's
+        resolver makes per address is `userNonFundingLedgerUpdates` — a
+        different endpoint whose name differs by a transposition. Reading one
+        for the other would invent a surcharge on the hottest B2 path."""
+        from risk_engine.market.info import info_response_surcharge
+
+        assert info_response_surcharge("userNonFundingLedgerUpdates", [{}] * 500) == 0
+        assert info_response_surcharge("nonUserFundingUpdates", [{}] * 500) == 25
+
+    def test_the_surcharge_is_recorded_even_when_it_overshoots(self):
+        """It cannot refuse: the request is already on the wire and the venue
+        has already counted it. Refusing would discard a paid-for response;
+        pretending it was free would understate the window. So it overshoots
+        and the NEXT charge waits — one request late, which is the best
+        available answer for a cost that is not knowable in advance."""
+        from risk_engine.market.info import RateLimitExceeded, WeightBudget
+
+        budget = WeightBudget(limit_per_minute=100, reserved_fraction=0.0)
+        budget.charge(90)
+        budget.charge_incurred(50)  # must not raise
+        assert budget.spent() == 140
+        assert budget.available() == 0, "floors at zero rather than going negative"
+        with pytest.raises(RateLimitExceeded):
+            budget.charge(1)
+
+
 class TestCandlesAndFunding:
     def test_log_returns_from_candles(self):
         candles = [{"t": 3_600_000 * i, "c": str(100.0 * 1.01**i)} for i in range(5)]

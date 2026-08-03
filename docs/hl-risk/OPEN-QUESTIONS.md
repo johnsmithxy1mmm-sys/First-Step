@@ -1488,7 +1488,7 @@ absorbed it — §1.1 is false and the simulator needs a term it does not have.
 Testnet works too (`--testnet`) if a suitable mainnet address is hard to
 find; opening a minimal isolated position there costs nothing.
 
-### C6 `[BLOCKER]` Shadow cron vs. rate limit (§3.3 vs §5.3)
+### C6 `[RESOLVED 2026-08-03]` Shadow cron vs. rate limit (§3.3 vs §5.3)
 
 500 addresses x ~20 weight per `clearinghouseState` is 10 000 weight, against
 a 1200/minute budget: a full sweep costs 8.3 minutes of the *entire* budget,
@@ -1558,52 +1558,83 @@ be sized against real traffic, not assumed.
       a private 300/min window and prints which pool it actually joined.
       Believing you share a pool while holding a private one is the C6 defect
       itself; it must not be recoverable by staying quiet.
-  The §5.3 weight constants themselves (1200/min, 20/request) remain
-  documentation-derived and still need the live confirmation this entry has
-  always asked for.
+  The §5.3 weight constants were the last thing outstanding here, and the
+  table below closes them against the published page. What this entry cannot
+  close by reading is whether the venue enforces what it publishes; the
+  client handles a 429 either way, and over-charging is no longer the
+  blanket description of our error.
 
-**Secondary evidence that 20/request is wrong for the call this sweep is
-built on (2026-08-03), recorded and NOT acted on.** Several third-party
-sources — including a `ccxt` issue whose maintainers quote the published
-rate-limit page directly — state that the weight table is not flat:
+**The weight table, read from the primary source 2026-08-03** — and the
+secondary-source note this replaces had it half right, in the reassuring
+half. That note said `clearinghouseState` was probably weight 2 rather than
+20, judged the error safe because over-charging self-limits harder than the
+venue asks, and left the flat rate alone. The published page
+(`.../for-developers/api/rate-limits-and-user-limits`) confirms the 2 — and
+shows the flat rate is wrong in the OTHER direction too:
 
-| info request | weight |
-|---|---|
-| `l2Book`, `allMids`, **`clearinghouseState`**, `orderStatus`, `spotClearinghouseState`, `exchangeStatus` | **2** |
-| `userRole` | 60 |
-| all other documented info requests | 20 |
+| request | published | this build charged | direction |
+|---|---|---|---|
+| `clearinghouseState` | **2** | 20 | over — safe, and 10x the sweep's real cost |
+| `l2Book`, `allMids`, `orderStatus`, `spotClearinghouseState`, `exchangeStatus` | 2 | 20 | over |
+| `userRole` | 60 | 20 | **under** (not called here) |
+| `candleSnapshot` | 20 **+1 per 60 items** | 20 | **under** |
+| `fundingHistory`, `userFunding`, `userFills`, … | 20 **+1 per 20 items** | 20 | **under** |
+| everything else documented | 20 | 20 | correct |
 
-`clearinghouseState` is one call per address and is the dominant cost of the
-entire shadow sweep. If it is weight 2, this build over-charges it **10x**.
+**The under-charges are the finding.** A 90-day hourly candle snapshot is
+2160 items — 20 + 36 = ~56 weight, charged as 20. A 30-day funding history is
+720 items — also ~56, charged as 20. The bundle build fetches one of each per
+coin, so on a 3-coin universe it spent ~356 weight while recording 140.
+Against a 300/minute shadow reserve that is not a rounding error: the build
+alone overshot the pool and ate into the share §5.3 sets aside for
+interactive users, and **nothing could observe it**, because the budget only
+ever knew what it charged itself. The serving engine did the same on every
+five-minute rebuild.
 
-**The direction is safe, which is why nothing changed.** Over-charging
-self-limits harder than the venue requires: we use less of the budget than we
-are entitled to, and §5.3's promise to interactive users is over-kept rather
-than under-kept. There is no §10 exposure and therefore no reason to hurry.
+Same shape as the per-process reserve this entry already fixed, one level
+down: an accounting error invisible from inside the accounting.
 
-**What it would change if confirmed**, stated now so the arithmetic is not
-re-derived from the wrong number later:
+**Taken.** `INFO_REQUEST_WEIGHTS` gives each type its published weight, and
+`info_response_surcharge` bills the per-item extra once the response is in
+hand — it cannot be known before, being a function of how many items came
+back. That charge is *recorded, never refused* (`charge_incurred`): the
+request is already on the wire and the venue has already counted it, so
+refusing would discard a paid-for response while pretending it was free would
+understate the window. It overshoots and the next charge waits — one request
+late, which is the best available answer for a cost nobody can know in
+advance.
 
-- B1's reachable-window table. §3.3's floor of 200 addresses is quoted there
-  at 8000 weight / 27 minutes; at weight 2 it is 400 weight and under two
-  minutes.
-- This entry's own case for sharing the pool rather than halving it. That
-  argument is "150/min would put 200 addresses at 53 minutes, past the
-  resolver's 50-minute ceiling" — which stops being true by an order of
-  magnitude. The shared ledger would still be the right design (two processes
-  that cannot see each other's spending is a correctness problem at any
-  weight), but its stated justification would need rewriting rather than
-  reusing.
-- B6's universe scale, which is budget-constrained.
+**One reading had to be chosen, and the deployment settled it.** "An
+additional rate limit weight per 20 items returned" admits +1 per 20 items or
++20 per 20 items. It is +1: under the alternative a single 90-day
+`candleSnapshot` would cost 2160 weight against a 1200/minute limit and could
+never succeed from any process, and this build has made exactly that call on
+every rebuild for weeks without a 429.
 
-**Why it is recorded rather than adopted.** This is precisely the trap C1
-names: agreement among secondary sources is how a value nobody verified
-becomes a value everybody trusts. `hyperliquid.gitbook.io` is 403 at this
-environment's proxy, so the primary page could not be read from here. The bar
-is the same as C1's — read the published rate-limit page, record the URL and
-the date. Unlike C1, adopting a wrong value here is not dangerous in either
-direction (too high self-limits, too low gets 429s the client already
-handles), so this is an efficiency question, not a safety one.
+**What it changes, now that it is confirmed rather than rumoured:**
+
+- B1's reachable-window table. §3.3's floor of 200 addresses was quoted at
+  8000 weight / 27 minutes; at weight 2 it is 400 weight and **under two
+  minutes**. The sweep was never the constraint it was sized against.
+- This entry's own case for sharing the pool rather than halving it, which
+  argued "150/min would put 200 addresses at 53 minutes, past the resolver's
+  50-minute ceiling". False now by an order of magnitude. The shared ledger
+  is still right — two processes that cannot see each other's spending is a
+  correctness problem at any weight, and the per-item surcharge is a second
+  reason — but this justification for it is retired rather than reused.
+- B6's universe scale, which is budget-constrained. Each added coin costs one
+  candle snapshot plus one funding history per rebuild: ~112 weight, not the
+  ~40 previously quoted. Widening is far cheaper than the old sweep
+  arithmetic implied and dearer than the old per-coin figure did.
+
+**One websocket limit worth carrying to whoever builds the shard planner**,
+from the same page: *maximum of 10 unique users across user-specific
+websocket subscriptions*. `webData3` is user-keyed (C4), so a planner
+following C4's finding cannot watch more than 10 addresses per IP by
+subscription — against §3.3's 200 a day. A design constraint on a component
+that does not exist yet, recorded so it is met at design time rather than
+discovered at address 11.
+
 
 ### C7 `[REFUTED 2026-08-03]` Is the Info API case-sensitive on `user`?
 

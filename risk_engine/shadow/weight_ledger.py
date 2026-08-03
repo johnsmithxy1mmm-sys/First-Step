@@ -174,6 +174,30 @@ class SharedWeightBudget:
             self._conn.rollback()
             raise
 
+    def charge_incurred(self, weight: int, now: float | None = None) -> None:
+        """Record weight already spent on the wire. Never refuses.
+
+        Same contract as `WeightBudget.charge_incurred`, and the shared case
+        is where it matters more: an endpoint billing per item returned
+        overshoots a pool the OTHER container is also drawing from, so
+        leaving it unrecorded would understate the window for both.
+
+        No advisory lock, because there is no read-decide-write to
+        serialise — this is an unconditional insert.
+        """
+        del now
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO venue_weight_ledger (charged_at, weight, actor) "
+                    "VALUES (now(), %s, %s)",
+                    (int(weight), self.actor),
+                )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
     def close(self) -> None:
         self._conn.close()
 
