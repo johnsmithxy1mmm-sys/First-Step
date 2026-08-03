@@ -1394,6 +1394,38 @@ be sized against real traffic, not assumed.
       (`SERVING_RESERVED_FRACTION = 0.25` → 900/min), so serving plus shadow
       sums to exactly 1200. Its realised traffic is the five-minute rebuild
       (~140 weight), nothing on the request path.
+- *Fixed (2026-08-03), the residual the fix above left behind:* the
+  verification harness. The two-process arithmetic was corrected for the two
+  processes that are *scheduled*, and `market/verify.py` — run by hand, so
+  never counted — kept `InfoClient()`'s default budget, which is the
+  interactive one: all 1200/min, no reserve. A verification run launched
+  while the stack was up therefore published 900 serving plus 300 shadow plus
+  1200 here on one egress IP, a worse combined ceiling (2400) than the one
+  this entry had just fixed (1500). It was found by reading, not by an
+  incident, which is the point: a ceiling nobody reaches is invisible from
+  inside, and the operational answer at the time — "stop the shadow
+  containers before verifying" — was a precondition nothing enforced.
+  Now the harness takes the background reserve and, when `$SHADOW_DSN` (or
+  `--journal`) reaches the calibration database, charges the SAME ledger the
+  sweep and the resolver share, as `actor='verify'`. Two consequences worth
+  stating:
+    - *it is paced.* Its 300/min share is less than one run costs — a
+      50-address frame sweep alone is 1000 weight — so an unpaced charge
+      would have turned the reserve into UNCHECKABLE results about requests
+      that never left the process, which is precisely the defect
+      `_is_self_inflicted` documents having already happened once. `charge`
+      now waits out a spent window (`PacedBudget` in `market/info.py`),
+      bounded at 10 minutes so a pool somebody is genuinely holding still
+      surfaces. A full run costs about four minutes instead of one. This is
+      the *fourth* place "a rate limit is a pace, not an error" had to be
+      fixed (sweep, resolver, bundle build, harness); wrapping the budget
+      rather than the caller is what stops there being a fifth.
+    - *the fallback is loud.* An unreachable DSN, a sqlite journal or a
+      missing psycopg all mean this run cannot see the other jobs' spending,
+      and none of them is a reason to refuse to verify — so it falls back to
+      a private 300/min window and prints which pool it actually joined.
+      Believing you share a pool while holding a private one is the C6 defect
+      itself; it must not be recoverable by staying quiet.
   The §5.3 weight constants themselves (1200/min, 20/request) remain
   documentation-derived and still need the live confirmation this entry has
   always asked for.

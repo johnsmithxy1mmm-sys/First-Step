@@ -121,6 +121,68 @@ class WeightBudget:
         self._events.append((now, weight))
 
 
+#: How a paced charge waits out a spent window: poll interval, and the
+#: ceiling past which a full window stops being a pace and starts being a
+#: fault worth reporting.
+PACED_BUDGET_WAIT_S = 5.0
+PACED_BUDGET_MAX_WAIT_S = 10 * 60.0
+
+
+class PacedBudget:
+    """Any weight budget, waiting out a spent window rather than raising.
+
+    "A rate limit is a pace, not an error" is settled for the background
+    jobs -- the sweep, the resolver and the bundle build all wait -- but it
+    was settled three separate times, once per caller, each time after the
+    unpaced version had already killed a run. Wrapping the budget puts the
+    wait where the charge is, so the next caller inherits it instead of
+    rediscovering it.
+
+    The ceiling stays. A window that has not refilled in ten minutes is not
+    congestion, it is a pool somebody else is holding, and the callers have
+    honest ways to say so; an unbounded wait would turn that into a process
+    asleep forever.
+
+    Deliberately duck-typed rather than a `WeightBudget` subclass, for the
+    same reason `SharedWeightBudget` is: it must be able to wrap either, and
+    inheriting a `_events` list that stays empty would look authoritative.
+    """
+
+    def __init__(
+        self,
+        inner: "WeightBudget | PacedBudget",
+        max_wait_s: float = PACED_BUDGET_MAX_WAIT_S,
+        wait_s: float = PACED_BUDGET_WAIT_S,
+    ) -> None:
+        self.inner = inner
+        self.max_wait_s = max_wait_s
+        self.wait_s = wait_s
+
+    def spent(self, now: float | None = None) -> int:
+        return self.inner.spent(now)
+
+    def available(self, now: float | None = None) -> int:
+        return self.inner.available(now)
+
+    def charge(self, weight: int, now: float | None = None) -> None:
+        # An explicit `now` is a frozen clock -- a test or a deterministic
+        # replay -- and a window measured against it never refills. Waiting
+        # would spend the whole ceiling to arrive at the same refusal, so
+        # such a caller gets the unpaced answer it asked for.
+        if now is not None:
+            self.inner.charge(weight, now)
+            return
+        deadline = time.monotonic() + self.max_wait_s
+        while True:
+            try:
+                self.inner.charge(weight)
+                return
+            except RateLimitExceeded:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(self.wait_s)
+
+
 class InfoClient:
     def __init__(
         self,

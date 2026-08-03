@@ -118,3 +118,53 @@ def test_a_literal_percent_in_a_help_string_is_what_broke_it():
     ok = argparse.ArgumentParser(prog="t", add_help=False)
     ok.add_argument("--x", help="a 95%% lower bound")
     assert "95%" in ok.format_help()
+
+
+def _documented_compose_runs() -> list[tuple[str, str]]:
+    """Every `docker compose run` line the repo prints at an operator.
+
+    Backslash continuations are folded first: the commands are wrapped for
+    width, and a line-at-a-time scan would see the flags and the service name
+    as separate commands.
+    """
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[2]
+    found: list[tuple[str, str]] = []
+    for rel in ("deploy/README.md", "deploy/docker-compose.yml"):
+        text = (root / rel).read_text(encoding="utf-8")
+        # Continuations inside a YAML comment carry a `#` on the next line.
+        joined = re.sub(r"\\\s*\n\s*#?\s*", " ", text)
+        for line in joined.splitlines():
+            if "docker compose run" in line:
+                found.append((rel, line.strip().lstrip("# ")))
+    return found
+
+
+def test_the_documented_one_off_commands_can_actually_start():
+    """The engine image's ENTRYPOINT is `python3 -m risk_engine.service`, so
+    `docker compose run engine -m risk_engine.shadow progress` APPENDS to it
+    and dies on an argparse usage message before reaching the module named.
+
+    Both files shipped exactly that line. One of them carried a comment
+    explaining how a *different* defect in the same command had been fixed --
+    a missing `SHADOW_DSN` -- which is how a command can be corrected and stay
+    unrunnable. Checked here rather than by eye because the failure is
+    invisible in review and lands entirely on the operator.
+    """
+    runs = _documented_compose_runs()
+    assert runs, "the parser found no commands; it stopped testing anything"
+    for where, cmd in runs:
+        if "-m risk_engine." in cmd:
+            assert "--entrypoint" in cmd, f"{where}: {cmd}"
+
+
+def test_the_entrypoint_this_guards_is_still_the_one_in_the_image():
+    """The guard above is only meaningful while the image really does bake a
+    module into its ENTRYPOINT. If that changes, this fails and the guard gets
+    re-derived rather than silently protecting against nothing."""
+    import pathlib
+
+    dockerfile = (pathlib.Path(__file__).resolve().parents[2]
+                  / "deploy/Dockerfile.engine").read_text(encoding="utf-8")
+    assert 'ENTRYPOINT ["python3", "-m", "risk_engine.service"]' in dockerfile

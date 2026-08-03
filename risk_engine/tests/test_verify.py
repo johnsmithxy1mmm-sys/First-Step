@@ -19,6 +19,7 @@ import datetime as _dt
 import numpy as np
 import pytest
 
+from risk_engine.market import info as verify_info
 from risk_engine.market import verify
 from risk_engine.market.verify import FAIL, INCONCLUSIVE, PASS, UNCHECKABLE
 from risk_engine.model.funding import FundingBounds
@@ -650,8 +651,13 @@ class TestSelfInflictedLimitsNeverReadAsFail:
             assert check.status == UNCHECKABLE, f"{check.id}: {check.status}"
             assert not check.failed, check.id
             # The remedy is named, because "uncheckable" without a next move
-            # is a dead end for the operator reading it.
-            assert "budget" in check.detail, check.id
+            # is a dead end for the operator reading it. Asserted on the move
+            # itself rather than on the word "budget": the message used to
+            # say "re-run this check alone", which stopped being the remedy
+            # once the pool became shared with the shadow jobs, and a
+            # keyword-shaped assertion would not have noticed.
+            assert "--frame-sample" in check.detail, check.id
+            assert "docker compose ps" in check.detail, check.id
 
     def test_a_real_venue_error_still_fails(self):
         """The guard must not soften genuine failures: a 500 from the venue is
@@ -915,6 +921,111 @@ class TestExitCodes:
     def test_a_non_blocking_unchecked_item_does_not_hold_up_the_run(self, monkeypatch):
         checks = [verify.Check("E5.1", "q", PASS, "held"), verify.check_webdata3()]
         assert self._run(monkeypatch, checks) == 0
+
+
+class TestThisHarnessIsBackgroundTraffic:
+    """§5.3 across the whole deployment, not per process (OPEN-QUESTIONS C6).
+
+    C6 fixed the two shadow jobs and left this tool holding an interactive
+    budget -- 1200/min, no reserve -- so a verification run during a sweep
+    published a combined ceiling of 2400 against a venue limit of 1200. The
+    ceiling was never reached, which is exactly why it survived: an
+    accounting error nobody trips over is still an accounting error.
+    """
+
+    def test_it_takes_the_background_reserve_not_the_interactive_one(self, monkeypatch):
+        from risk_engine.market.info import SHADOW_RESERVED_FRACTION
+
+        monkeypatch.delenv("SHADOW_DSN", raising=False)
+        budget = verify._verify_budget(None)
+        assert budget.inner.reserved_fraction == SHADOW_RESERVED_FRACTION
+        assert budget.available() == 300
+
+    def test_a_postgres_journal_puts_it_in_the_shared_ledger(self, monkeypatch):
+        """The point of the fix: same pool as the sweep and the resolver,
+        rather than a third private window beside them."""
+        seen = {}
+
+        def _fake(target, reserved_fraction=0.0, actor="shadow"):
+            seen.update(target=target, reserved_fraction=reserved_fraction, actor=actor)
+            return verify_info.WeightBudget(reserved_fraction=reserved_fraction)
+
+        import risk_engine.shadow.weight_ledger as ledger
+
+        monkeypatch.setattr(ledger, "open_weight_budget", _fake)
+        monkeypatch.setenv("SHADOW_DSN", "postgresql://u@db/shadow")
+        verify._verify_budget(None)
+        assert seen["target"] == "postgresql://u@db/shadow"
+        assert seen["actor"] == "verify", (
+            "the ledger records who spent what; 'shadow' would make a "
+            "verification run indistinguishable from the cron in the table it "
+            "shares with it"
+        )
+
+    def test_an_unreachable_ledger_verifies_anyway_and_says_so(self, monkeypatch, capsys):
+        """A silent fallback would BE the C6 defect: believing you share a
+        pool while holding a private one cannot be observed from inside."""
+        import risk_engine.shadow.weight_ledger as ledger
+
+        def _boom(*a, **k):
+            raise OSError("could not translate host name 'db'")
+
+        monkeypatch.setattr(ledger, "open_weight_budget", _boom)
+        monkeypatch.setenv("SHADOW_DSN", "postgresql://u@db/shadow")
+        budget = verify._verify_budget(None)
+        out = capsys.readouterr().out
+        assert budget.available() == 300, "still bounded, still background"
+        assert "PRIVATE" in out and "db" in out
+
+    def test_a_spent_window_is_waited_out_rather_than_reported(self):
+        """One full run costs more than one minute's share -- a 50-address
+        frame sweep alone is 1000 weight against 300/min -- so without
+        pacing the reserve would turn most of a run into UNCHECKABLE results
+        about requests that never left the process."""
+        inner = verify_info.WeightBudget(reserved_fraction=0.75)
+        inner.charge(300)
+        paced = verify_info.PacedBudget(inner, max_wait_s=5.0, wait_s=0.0)
+        # The window refills as the events age out; wait_s=0.0 spins instead
+        # of sleeping, so this is fast without a fake clock.
+        inner._events = [(t - 61.0, w) for t, w in inner._events]
+        paced.charge(20)
+        assert inner.spent() == 20
+
+    def test_the_wait_has_a_ceiling(self):
+        """A pool nobody releases is a real condition with an honest report
+        (`_self_limited` → UNCHECKABLE), so the wait must end."""
+        inner = verify_info.WeightBudget(reserved_fraction=0.75)
+        inner.charge(300)
+        paced = verify_info.PacedBudget(inner, max_wait_s=0.0, wait_s=0.0)
+        with pytest.raises(verify_info.RateLimitExceeded):
+            paced.charge(20)
+
+    def test_a_frozen_clock_is_not_paced(self):
+        """Deterministic replays and unit tests pass `now`; a window measured
+        against a clock that does not move never refills, so waiting would
+        spend the whole ceiling to reach the same refusal."""
+        inner = verify_info.WeightBudget(reserved_fraction=0.75)
+        paced = verify_info.PacedBudget(inner, max_wait_s=600.0, wait_s=600.0)
+        paced.charge(300, now=1000.0)
+        with pytest.raises(verify_info.RateLimitExceeded):
+            paced.charge(20, now=1000.0)  # returns at once, or this test hangs
+
+    def test_the_run_actually_uses_it(self, monkeypatch):
+        """The budget only counts if it reaches the client that spends."""
+        captured = {}
+
+        class _Stub:
+            def __init__(self, url=None, budget=None, **kw):
+                captured["budget"] = budget
+
+            def post(self, *a, **k):
+                raise RuntimeError("stop here; the client is all this test wants")
+
+        monkeypatch.delenv("SHADOW_DSN", raising=False)
+        monkeypatch.setattr(verify, "InfoClient", _Stub)
+        verify.run_all(None, ["BTC"], 1, 1, 0.0, False)
+        assert isinstance(captured["budget"], verify_info.PacedBudget)
+        assert captured["budget"].available() == 300
 
 
 def test_the_harness_reaches_the_live_host_or_says_it_cannot():

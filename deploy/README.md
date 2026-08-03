@@ -65,6 +65,22 @@ naming each separately:
 python -m risk_engine.market.verify --address 0x<an-account-you-can-read> --report verify.json
 ```
 
+It is safe to run while the shadow containers are up. The harness takes the
+same background reserve they do and, when `$SHADOW_DSN` is in scope, charges
+the same shared §5.3 pool (C6), waiting out a spent window rather than
+reporting an UNCHECKABLE result about a request that never left the process.
+Inside the stack that variable is already set:
+
+```bash
+docker compose run --rm --entrypoint python3 engine \
+  -m risk_engine.market.verify --address 0x...
+```
+
+The first line of output states which pool it joined. `private to this
+process` means it could not reach the ledger — verification still runs, but
+two private windows on one egress IP is the arrangement C6 exists to prevent,
+so stop the shadow containers for the duration or fix the DSN.
+
 Pass `--address`: without it the B2 check (ledger delta types) cannot run at
 all, and B2 is the one that has already caught a real defect — the venue
 returned a `send` type this build could not classify, which would have

@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import statistics
 import sys
 import time
@@ -80,6 +81,12 @@ def _is_self_inflicted(exc: BaseException) -> bool:
     "contradicts a recorded PASS". Nothing about the basis had changed. The
     module docstring already draws this line for a malformed `--address`;
     a self-imposed rate limit is the same category and was not covered.
+
+    Since `_verify_budget` paces, this is no longer reachable by simply
+    spending the minute's allowance -- that now waits. What remains reachable
+    is the ceiling on the wait, which means a pool held by something else for
+    ten minutes. Still self-inflicted in the sense that matters here: the
+    venue never answered, so no verdict about the venue is available.
     """
     from risk_engine.market.info import RateLimitExceeded
 
@@ -103,11 +110,13 @@ def _self_limited(check_id: str, question: str, exc: BaseException) -> "Check | 
         return None
     return Check(
         check_id, question, UNCHECKABLE,
-        f"this run spent its own §5.3 weight budget before the request could "
-        f"be made ({exc}). That is this harness rate-limiting itself, not the "
-        f"venue answering — re-run this check alone, or lower --frame-sample. "
-        f"FAIL here would claim live data contradicted the model on the "
-        f"strength of a self-imposed limit.",
+        f"the §5.3 weight budget stayed spent for the whole wait ceiling, so "
+        f"this request was never made ({exc}). That is a rate limit on our "
+        f"side, not the venue answering — this run shares its budget with the "
+        f"shadow jobs, so check whether one of them is holding the pool "
+        f"(`docker compose ps`), or lower --frame-sample. FAIL here would "
+        f"claim live data contradicted the model on the strength of a "
+        f"self-imposed limit.",
     )
 
 
@@ -355,12 +364,14 @@ def check_basis(client: InfoClient, coins: list[str], samples: int,
             if _is_self_inflicted(exc):
                 return Check(
                     "C2", "is mark ≈ mid, per §1.4's threshold?", UNCHECKABLE,
-                    f"this run spent its own §5.3 weight budget before C2 could "
-                    f"sample ({exc}). That is this harness rate-limiting itself, "
-                    f"not the venue answering — re-run C2 alone, or lower "
-                    f"--frame-sample. Reporting it as FAIL would claim live data "
-                    f"contradicted the model on the strength of a self-imposed "
-                    f"limit.",
+                    f"the §5.3 weight budget stayed spent for the whole wait "
+                    f"ceiling, so C2 could not sample ({exc}). That is a rate "
+                    f"limit on our side, not the venue answering — this run "
+                    f"shares its budget with the shadow jobs, so check whether "
+                    f"one of them is holding the pool (`docker compose ps`), or "
+                    f"lower --frame-sample. Reporting it as FAIL would claim live "
+                    f"data contradicted the model on the strength of a "
+                    f"self-imposed limit.",
                     evidence={"samples_taken": i},
                 )
             return Check("C2", "is mark ≈ mid, per §1.4's threshold?", FAIL,
@@ -996,13 +1007,77 @@ def apply_recorded(check: Check, finding, now=None) -> Check:
 # -- driver ---------------------------------------------------------------
 
 
+def _verify_budget(journal: str | None):
+    """This harness's §5.3 share: background class, shared pool, paced.
+
+    C6 fixed the shadow jobs double-counting the reserve and left this tool
+    out, because it is run by hand rather than scheduled. That is not a
+    difference the venue observes. `InfoClient()`'s default budget is the
+    interactive one -- all 1200/minute, no reserve -- so a verification run
+    launched while the stack is up put a third ceiling on one egress IP:
+    900 serving plus 300 shadow plus 1200 here, against a limit of 1200.
+
+    It is background traffic by every test that matters (an operator waiting
+    on a diagnostic is not a user waiting on a price), so it takes the
+    background reserve and, when the calibration database is reachable,
+    charges the SAME ledger the sweep and the resolver share. Then running a
+    verification during a sweep is slow instead of unsound, which is the
+    outcome worth having: the previous answer was "stop the shadow jobs
+    first", and an operational precondition nothing enforces is one somebody
+    eventually forgets.
+
+    Paced for a reason this tool already learned the hard way. Its 300/minute
+    share is less than one full run costs -- a 50-address frame sweep alone
+    is 1000 weight -- and an unpaced charge turns that arithmetic into
+    UNCHECKABLE results about requests that never left the process, which is
+    exactly what `_is_self_inflicted` was written for. Waiting converts the
+    same arithmetic into a run that takes about four minutes.
+
+    A fallback that stayed quiet would be the C6 defect itself: believing you
+    share a pool while holding a private one is invisible from inside. So the
+    pool actually joined is stated on every run.
+    """
+    from risk_engine.market.info import (
+        SHADOW_RESERVED_FRACTION,
+        WEIGHT_BUDGET_PER_MINUTE,
+        PacedBudget,
+        WeightBudget,
+    )
+
+    target = journal or os.environ.get("SHADOW_DSN") or None
+    rate = int(WEIGHT_BUDGET_PER_MINUTE * (1.0 - SHADOW_RESERVED_FRACTION))
+    inner: Any
+    try:
+        from risk_engine.shadow.weight_ledger import open_weight_budget
+
+        inner = open_weight_budget(
+            target, reserved_fraction=SHADOW_RESERVED_FRACTION, actor="verify"
+        )
+    except Exception as exc:
+        # Unreachable database, no psycopg, a DSN that resolves only inside
+        # the compose network: all of them mean this run cannot see the other
+        # jobs' spending, and none of them is a reason to refuse to verify.
+        print(f"note: shared §5.3 ledger unavailable ({type(exc).__name__}: {exc}); "
+              f"this run holds a PRIVATE {rate}/min window. Do not run it "
+              f"alongside the shadow containers.\n")
+        inner = WeightBudget(reserved_fraction=SHADOW_RESERVED_FRACTION)
+    else:
+        shared = type(inner).__name__ == "SharedWeightBudget"
+        print(f"§5.3: {rate}/min, "
+              + (f"shared with the shadow jobs via {target.split('@')[-1]}"
+                 if shared else "private to this process")
+              + ". A spent window is waited out, not reported as a result.\n")
+    return PacedBudget(inner)
+
+
 def run_all(address: str | None, coins: list[str], days: int, samples: int,
             interval_s: float, testnet: bool, probe_ws: bool = False,
             findings: dict | None = None, frame_addresses: list[str] | None = None,
-            frame_sample: int = 50) -> list[Check]:
+            frame_sample: int = 50, journal: str | None = None) -> list[Check]:
     from risk_engine.market.info import MAINNET_URL, TESTNET_URL
 
-    client = InfoClient(url=TESTNET_URL if testnet else MAINNET_URL)
+    client = InfoClient(url=TESTNET_URL if testnet else MAINNET_URL,
+                        budget=_verify_budget(journal))
     checks: list[Check] = []
 
     meta_check, specs = check_meta(client)
@@ -1072,6 +1147,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--frame-sample", dest="frame_sample", type=int, default=50,
                         help="how many addresses from that list to scan "
                              "(default 50; costs 20 weight each)")
+    parser.add_argument(
+        "--journal", default=None,
+        help="calibration journal (Postgres DSN), so this run charges the same "
+             "§5.3 pool as the shadow jobs instead of a second private one. "
+             "Defaults to $SHADOW_DSN, which the compose stack already sets; a "
+             "SQLite path or an unreachable DSN falls back to a private window "
+             "and says so.",
+    )
     parser.add_argument("--report", help="write the full result as JSON")
     parser.add_argument("--findings", default=None,
                         help="JSON of verifications made outside this harness "
@@ -1127,11 +1210,11 @@ def main(argv: list[str] | None = None) -> int:
         except (OSError, ValueError) as exc:
             parser.error(f"--addresses {args.addresses}: {exc}")
 
+    print(f"live-API verification against {'testnet' if args.testnet else 'mainnet'}\n")
     checks = run_all(address, coins, args.days, args.samples,
                      args.interval_s, args.testnet, args.probe_ws, findings,
-                     frame_addresses, args.frame_sample)
+                     frame_addresses, args.frame_sample, args.journal)
 
-    print(f"live-API verification against {'testnet' if args.testnet else 'mainnet'}\n")
     for check in checks:
         print(check.render())
         print()
