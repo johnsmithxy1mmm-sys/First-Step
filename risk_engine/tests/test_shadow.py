@@ -310,6 +310,57 @@ class TestShadowSweep:
         assert not report.budget_exhausted
         journal.close()
 
+    def test_the_sweep_says_it_is_alive_while_it_works(
+        self, bundle, specs, spot, books, naive, now, caplog
+    ):
+        """A sweep that logs nothing is indistinguishable from a hung one.
+
+        `run_once` had no logging at all, so a real list -- tens of minutes,
+        up to a 90-minute ceiling -- produced not one line between the bundle
+        build and the final report. That is worse here than it would be
+        elsewhere, because this sweep is DESIGNED to spend most of its wall
+        clock asleep waiting on §5.3's window: its healthy state and a
+        deadlock look identical from outside. It cost two rounds of
+        "is it working?" on the same deployment before anyone read the code.
+        """
+        import logging as _logging
+
+        provider = _BudgetedProvider(books, spot, specs, allow=len(books) + 8)
+        journal = CalibrationJournal()
+        with caplog.at_level(_logging.INFO, logger="risk_engine.shadow.cron"):
+            ShadowCron(provider, bundle, journal, naive, n_paths=500).run_once(now)
+        journal.close()
+
+        lines = [r.getMessage() for r in caplog.records]
+        assert any(f"sweeping {len(books)} addresses" in m for m in lines), lines
+        # The closing line is forced rather than rate-limited: a sweep short
+        # enough to finish inside one PROGRESS_LOG_SECONDS window would
+        # otherwise report its start and never its result.
+        assert any("addresses:" in m and "written" in m for m in lines), lines
+
+    def test_the_progress_line_separates_waiting_from_elapsed(
+        self, bundle, specs, spot, books, naive, now, caplog
+    ):
+        """Those two numbers are the diagnosis. Mostly-waiting is §5.3
+        working as designed; elapsed climbing while neither addresses nor
+        waiting move is a stall worth acting on. One combined number would
+        not tell them apart, which is the question the operator actually has.
+        """
+        import logging as _logging
+
+        provider = _BudgetedProvider(books, spot, specs, allow=0, release_after=1)
+        journal = CalibrationJournal()
+        with caplog.at_level(_logging.INFO, logger="risk_engine.shadow.cron"):
+            ShadowCron(
+                provider, bundle, journal, naive, n_paths=500,
+                max_sweep_seconds=60.0, budget_wait_seconds=0.0,
+            ).run_once(now)
+        journal.close()
+
+        final = [r.getMessage() for r in caplog.records if "elapsed" in r.getMessage()]
+        assert final, [r.getMessage() for r in caplog.records]
+        assert "waiting for the §5.3 window" in final[-1]
+
     def test_budget_refuses_to_dip_into_the_reserve(self):
         budget = WeightBudget(limit_per_minute=1000, reserved_fraction=0.75)
         budget.charge(250)

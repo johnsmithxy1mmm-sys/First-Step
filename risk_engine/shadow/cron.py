@@ -37,6 +37,7 @@ Two failure channels, and the difference between them is load-bearing:
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -127,6 +128,24 @@ MAX_SWEEP_SECONDS = 90.0 * 60.0
 #: burns CPU re-asking.
 BUDGET_WAIT_SECONDS = 5.0
 
+#: How often the sweep says where it is.
+#:
+#: `run_once` used to log NOTHING. Between the bundle build and the final
+#: report -- tens of minutes on a real list, up to `MAX_SWEEP_SECONDS` -- the
+#: container emitted not one line, so an operator watching a daily job could
+#: not tell a working sweep from a hung one. That is not a hypothetical: it
+#: happened twice on the same deployment, and the second time the sweep was
+#: healthy and the silence was the whole problem.
+#:
+#: The design makes it worse than an ordinary missing log line. This sweep is
+#: SUPPOSED to spend most of its wall clock asleep -- pacing against §5.3's
+#: window is the yield the reserve asks for -- so its normal working state and
+#: a deadlock are outwardly identical, and the one the operator fears is the
+#: one they will assume.
+PROGRESS_LOG_SECONDS = 30.0
+
+log = logging.getLogger("risk_engine.shadow.cron")
+
 
 class ShadowCron:
     def __init__(
@@ -204,6 +223,35 @@ class ShadowCron:
         written = 0
         skipped: list[tuple[str, str]] = []
         exhausted = False
+        attempted = 0
+        waited_s = 0.0
+        started_monotonic = time.monotonic()
+        last_progress = started_monotonic
+
+        def _say_progress(force: bool = False) -> None:
+            """One line saying the sweep is alive and where it is.
+
+            Reports the waiting time separately from the elapsed time, because
+            those two numbers are what distinguish the failure modes: mostly
+            waiting is §5.3 working as designed, while elapsed climbing with
+            neither addresses nor waiting moving is a stall worth acting on.
+            """
+            nonlocal last_progress
+            at = time.monotonic()
+            if not force and at - last_progress < PROGRESS_LOG_SECONDS:
+                return
+            last_progress = at
+            log.info(
+                "sweep %d/%d addresses: %d written, %d skipped, %.0fs elapsed "
+                "(%.0fs of it waiting for the §5.3 window)",
+                attempted, len(addresses), written, len(skipped),
+                at - started_monotonic, waited_s,
+            )
+
+        log.info(
+            "sweeping %d addresses; ceiling %.0f min, %d paths per prediction",
+            len(addresses), self.max_sweep_seconds / 60.0, self.n_paths,
+        )
 
         # The deadline is set BEFORE the first weight-spending call, and
         # `specs()`/`spot()` are paced too. They charge ~80 weight (meta plus
@@ -216,7 +264,7 @@ class ShadowCron:
         deadline = time.monotonic() + self.max_sweep_seconds
 
         def _paced(call):
-            nonlocal exhausted
+            nonlocal exhausted, waited_s
             while True:
                 # Checked BEFORE the call, not only in the rate-limit handler.
                 # The ceiling used to bound waiting rather than the run: a slow
@@ -234,6 +282,8 @@ class ShadowCron:
                     if time.monotonic() >= deadline:
                         exhausted = True
                         return None
+                    _say_progress()
+                    waited_s += self.budget_wait_seconds
                     time.sleep(self.budget_wait_seconds)
 
         specs = _paced(self.provider.specs)
@@ -268,11 +318,18 @@ class ShadowCron:
             #     client charges the budget BEFORE the request, so a refused
             #     call spends nothing and is safe to retry -- which `_paced`
             #     does, the same wrapper `specs()`/`spot()` above use.
+            attempted += 1
+            _say_progress()
             try:
                 book = _paced(lambda a=address: self.provider.book(a))
                 if exhausted:
                     # Ceiling reached mid-wait: a pathological list cannot pin
                     # the container in a sleep loop until the next daily run.
+                    log.warning(
+                        "sweep hit its %.0f-minute ceiling at address %d/%d; "
+                        "reporting truncation (§5.3)",
+                        self.max_sweep_seconds / 60.0, attempted, len(addresses),
+                    )
                     break
                 if not book.positions:
                     skipped.append((address, "no open positions"))
@@ -285,6 +342,7 @@ class ShadowCron:
             except Exception as exc:  # one bad address must not stop the sweep
                 skipped.append((address, f"{type(exc).__name__}: {exc}"))
 
+        _say_progress(force=True)
         return SweepReport(
             started_at=now,
             attempted=len(addresses),
