@@ -1425,7 +1425,52 @@ The same slack is why `mc_non_convergence` is structurally pinned at zero
 half-width is 0.0069, so `converged=False` is unreachable and the counter
 cannot fire. It is a real invariant, not a working metric.
 
-### D2 `[DECIDED, NOT IMPLEMENTED]` `max_safe_size` may have no answer
+### D2 `[IMPLEMENTED — and the design needed one more thing]` `max_safe_size` may have no answer
+
+**Built 2026-08-02** in `risk_engine/tools/max_safe_size.py`, with tests. It
+is NOT wired to any serving path: §3.3 gates a recommendation exactly as it
+gates execution, and a test asserts that `service/app.py` and
+`service/state.py` do not reference it, so the gate does not depend on anyone
+remembering.
+
+**The design below was incomplete, and the missing half points the forbidden
+way.** This entry named Monte Carlo noise as the reason bisection needs common
+random numbers. That is true and is done — one draw per query, reused for
+every candidate. But non-monotonicity here is not only a noise problem, it is
+a STRUCTURAL one, and CRN does nothing about that: on a hedged book an order
+opposite to the net exposure first REDUCES P(liq), passes through a minimum
+near flat, and only then raises it. Measured on the fixture, a book short 6
+BTC on $60k equity, scanning long orders: **3.82% → 0.00% → 10.00%**. The safe
+set is an interval only when the order ADDS to the existing exposure.
+
+Bisection assumes "safe below, unsafe above". Run across that minimum it can
+return a size that is not safe — an understatement of risk, silently, which
+§10 forbids. So the implementation scans a grid first (the shape is measured,
+not assumed) and bisects ONLY inside a bracket already known to contain a
+crossing, where bisection is valid. It also never offers a size past the first
+breach even when a larger one measures safe again, because a recommendation
+that needs the user to understand a U-shape is not a recommendation.
+
+Two further things the build settled:
+- **Three outcomes, not two.** `safe` / `none` / `unresolved`. The third is
+  when the interval straddles the threshold everywhere the scan looked; it is
+  "this many paths cannot tell you", not "there is no safe size", and
+  collapsing either into 0 would say "trade nothing".
+- **The scan ceiling has to cover flattening an opposing position.** Sizing it
+  as `equity × leverage / price` truncated the answer on exactly the hedged
+  books this tool is for, because an offsetting order releases margin rather
+  than consuming it: measured 6 against a true 12 on the book above. Fixed,
+  and when nothing on the scanned range breaches the result says so
+  (`scan_bounded`) rather than presenting a scan artefact as a risk limit.
+
+Cost note: every candidate is a full book walk, but they all ride ONE set of
+price paths (`run_blocks` takes a sequence of books), so a query costs one
+path generation rather than one per candidate. It is still far more work than
+§4.2 and is deliberately not on §2.6's 300 ms clock.
+
+The original entry follows.
+
+---
 
 §4.3 defines the answer as the largest size whose *upper CI bound* on
 `P(liq)` stays under the threshold. If the smallest tradable increment

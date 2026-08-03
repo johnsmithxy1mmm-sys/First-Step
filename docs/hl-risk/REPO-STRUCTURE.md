@@ -8,8 +8,10 @@ code with it. The two are independent top-level trees; nothing in
 > `services/backend/` and `apps/web/` as "not built yet" (both are built),
 > named five backend directories of which one exists, omitted
 > `risk_engine/service/`, `deploy/` and `qa/` entirely, and listed
-> `max_safe_size` as a shipped tool — it does not exist (Phase 4, gate
-> closed; OPEN-QUESTIONS D2). What follows is the tree as it stands. Where
+> `max_safe_size` as a shipped tool when it did not exist. It exists now
+> (`risk_engine/tools/max_safe_size.py`, built 2026-08-02) but is gate-closed:
+> computed and tested, wired to no serving path until shadow validation
+> clears (OPEN-QUESTIONS D2, §3.3). What follows is the tree as it stands. Where
 > something is still a plan it is marked **PLANNED**, and keeping that
 > distinction visible is the point of the file: a structure document that
 > quietly describes the intended end state reads, to anyone new, as a
@@ -61,7 +63,9 @@ docs/hl-risk/                 # specification deltas, open questions, methodolog
 
 **PLANNED, not present.** `src/exchange/` (§5.4 agent wallet, nonce, the
 single signing path) and `src/db/` (Postgres access) are Phase 4 and do not
-exist. `tools/max_safe_size.py` is Phase 4 (D2). `lib/wallet/` — wagmi/viem,
+exist. `tools/max_safe_size.py` is BUILT but gate-closed — the computation
+and its tests are present, and a test asserts no serving module references it
+until §3.3 clears (D2). `lib/wallet/` — wagmi/viem,
 `approveBuilderFee`, agent-key revoke — is Phase 4, which is why
 `AgentKeyDisclaimer.tsx` is copy rather than a flow and `apps/web` carries no
 wallet dependency at all. Phase 4 does not begin until shadow validation
@@ -104,8 +108,8 @@ shared `node_modules`.
 
 ## Build order
 
-Phases 1-3 and 5 are built. Phase 4 — `max_safe_size`, the builder fee, agent
-keys, the signing path — is gated on shadow validation, and its directories
-are deliberately absent rather than scaffolded: empty structure that compiles
+Phases 1-3 and 5 are built. Phase 4 — the builder fee, agent keys, the
+signing path — is gated on shadow validation, and its directories are
+deliberately absent rather than scaffolded: empty structure that compiles
 but does nothing is a liability, and it is also exactly what let this file
 drift, since a listed directory reads as an existing one whether or not it is.

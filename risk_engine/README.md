@@ -17,7 +17,7 @@ implemented as literally written — are in
 | 1 | Liquidation model, risk engine, §3.1 benchmarks, calibration journal, shadow cron | **complete, gate passing** |
 | 2 | `pre_trade_delta` | **complete** |
 | 3 | Read-only frontend, backend, degradation contract | **complete, acceptance verified** |
-| 4 | `max_safe_size`, builder fee — gated on 21 days x 200 addresses of shadow validation | not started, gate closed |
+| 4 | `max_safe_size` **built, gate-closed**; builder fee, agent keys, signing path not started — all gated on 21 days x 200 addresses of shadow validation | gate closed |
 | 5 | `funding_drag`, observability, champion/challenger | **complete** |
 
 Phases 2 and 3 added an internal REST service (`risk_engine/service/`), a
