@@ -74,7 +74,17 @@ Inside the stack that variable is already set:
 ```bash
 docker compose run --rm --entrypoint python3 engine \
   -m risk_engine.market.verify --address 0x...
+
+# With --addresses, run it on a shadow service instead: that is where
+# addresses.json is mounted, and the harness reads the container's path.
+docker compose --profile shadow run --rm --entrypoint python3 shadow-snapshot \
+  -m risk_engine.market.verify --address 0x... \
+  --addresses /app/addresses.json --frame-sample 50
 ```
+
+`--entrypoint python3` is not optional on either: the image bakes
+`python3 -m risk_engine.service` into its ENTRYPOINT, so without the override
+the module name is appended to the serving command and argparse exits 2.
 
 The first line of output states which pool it joined. `private to this
 process` means it could not reach the ledger — verification still runs, but
