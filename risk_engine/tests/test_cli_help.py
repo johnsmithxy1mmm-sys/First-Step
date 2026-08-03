@@ -168,3 +168,81 @@ def test_the_entrypoint_this_guards_is_still_the_one_in_the_image():
     dockerfile = (pathlib.Path(__file__).resolve().parents[2]
                   / "deploy/Dockerfile.engine").read_text(encoding="utf-8")
     assert 'ENTRYPOINT ["python3", "-m", "risk_engine.service"]' in dockerfile
+
+
+def _compose_defaults() -> dict[str, dict[str, int]]:
+    """Per-service `NAME: ${VAR:-default}` integers, by regex.
+
+    Deliberately not pyyaml. CI installs `risk_engine/requirements.txt` and
+    nothing else, so a test that needed a YAML parser would SKIP there —
+    and a guard that skips in the only place it runs unattended is not a
+    guard. The extraction is checked below rather than trusted.
+    """
+    import pathlib as _p
+
+    root = _p.Path(__file__).resolve().parents[2]
+    text = (root / "deploy/docker-compose.yml").read_text(encoding="utf-8")
+    out: dict[str, dict[str, int]] = {}
+    service = None
+    for line in text.splitlines():
+        svc = re.match(r"^  ([a-z][a-z0-9-]*):\s*$", line)
+        if svc:
+            service = svc.group(1)
+            out[service] = {}
+            continue
+        env = re.match(r"^\s+([A-Z_]+):\s*\$\{[A-Z_]+:-(\d+)\}\s*$", line)
+        if env and service:
+            out[service][env.group(1)] = int(env.group(2))
+    return out
+
+
+def test_the_two_shadow_jobs_cannot_start_in_the_same_second_every_day():
+    """The daily period is an exact multiple of the hourly one.
+
+    Both containers start together and both sleep the REMAINDER of their
+    interval, so they hold phase forever: with no offset, the daily snapshot
+    begins in the same second as an hourly resolve every single day for the
+    life of the deployment. On 2026-08-03 that happened for real — both
+    wanted a bundle at once from one 300/min pool, the snapshot waited out
+    its ceiling and exited, and the day was lost.
+
+    A lost snapshot is not symmetric with a lost resolve. The resolver picks
+    the row up next hour; the snapshot's day cannot be made up, because the
+    prediction had to be made against that day's book. So the offset must be
+    on the RESOLVER, and it must be non-zero.
+    """
+    conf = _compose_defaults()
+    snap = conf.get("shadow-snapshot", {})
+    res = conf.get("shadow-resolve", {})
+    # Guard on the guard: a regex that matched nothing would pass every
+    # assertion below by vacuity.
+    assert snap.get("SHADOW_INTERVAL_S"), f"parsed no snapshot interval: {conf}"
+    assert res.get("SHADOW_INTERVAL_S"), f"parsed no resolve interval: {conf}"
+
+    assert snap["SHADOW_INTERVAL_S"] % res["SHADOW_INTERVAL_S"] == 0, (
+        "if this ever stops being an exact multiple the phase-lock argument "
+        "changes and this guard should be re-derived, not deleted"
+    )
+    delay = res.get("RESOLVE_START_DELAY_S")
+    assert delay, "the resolver has no start offset; see the docstring"
+    # Not a whole number of resolve periods, which would put them back in phase.
+    assert delay % res["SHADOW_INTERVAL_S"] != 0
+    # The offset belongs to the resolver alone: one on the snapshot would
+    # delay the job whose misses are the unrecoverable ones.
+    assert "RESOLVE_START_DELAY_S" not in snap
+
+
+def test_the_bundle_may_wait_longer_than_it_takes_to_lose_the_day():
+    """The ceiling on STARTING must not be tighter than the one on working.
+
+    It was 10 minutes against the sweep's own 90, and the asymmetry bit: a
+    snapshot that cannot start loses one of §3.3's 21 days, while waiting
+    longer costs wall clock on a job that sleeps most of the day anyway.
+    """
+    from risk_engine.shadow.cli import BUNDLE_MAX_WAIT_S
+    from risk_engine.shadow.cron import MAX_SWEEP_SECONDS
+
+    assert BUNDLE_MAX_WAIT_S >= 30 * 60.0
+    assert BUNDLE_MAX_WAIT_S <= MAX_SWEEP_SECONDS, (
+        "still bounded: a pool nobody releases must surface, not hang"
+    )

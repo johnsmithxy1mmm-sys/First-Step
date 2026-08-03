@@ -119,7 +119,24 @@ def _fixture_world():
 #: a shared window refills within 60s, so anything past a few minutes means the
 #: pool is genuinely oversubscribed rather than momentarily busy.
 BUNDLE_BUDGET_WAIT_S = 5.0
-BUNDLE_MAX_WAIT_S = 10 * 60.0
+
+#: Raised from 10 minutes on 2026-08-03, after the ceiling was reached for
+#: real on the first restart under the shared pool: the resolver was building
+#: its own bundle and working through pending rows, the snapshot waited out
+#: its ten minutes and exited, and that day's predictions were never written.
+#:
+#: Ten was inconsistent with the sweep's own 90-minute ceiling -- the run was
+#: allowed an hour and a half of WORK but ten minutes to START -- and the
+#: costs are wildly asymmetric. Waiting longer costs wall clock on a job that
+#: runs once a day and is already expected to spend most of its time asleep.
+#: Giving up costs one of §3.3's 21 days, and it cannot be made up later: the
+#: prediction had to be made against that day's book.
+#:
+#: This is defence in depth, not the fix. Scheduling was the fix -- see
+#: `RESOLVE_START_DELAY_S` in deploy/docker-compose.yml, which stops the two
+#: jobs starting in the same second every day. The ceiling covers whatever
+#: else takes the pool.
+BUNDLE_MAX_WAIT_S = 30 * 60.0
 
 
 def _paced_bundle(budget, max_wait_s: float = BUNDLE_MAX_WAIT_S,

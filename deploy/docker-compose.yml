@@ -207,6 +207,7 @@ services:
     environment:
       SHADOW_DSN: postgresql://${POSTGRES_USER:-risk}:${POSTGRES_PASSWORD}@journal:5432/${POSTGRES_DB:-shadow}
       SHADOW_INTERVAL_S: ${RESOLVE_INTERVAL_S:-3600}
+      RESOLVE_START_DELAY_S: ${RESOLVE_START_DELAY_S:-1800}
       SHADOW_ARGS: ${SHADOW_ARGS:---fixture}
       HL_UNIVERSE: ${HL_UNIVERSE:-BTC,ETH,SOL}
     volumes:
@@ -218,6 +219,26 @@ services:
     # a late resolution stale and drops it from the gate (audit A-04). The
     # window is the scarce thing here, not the API calls.
     #
+    # RESOLVE_START_DELAY_S exists because 86400 is an exact multiple of 3600.
+    # Both containers start together and both sleep the REMAINDER of their
+    # interval, so they hold phase forever: without an offset the daily
+    # snapshot begins in the same second as one of these hourly runs, every
+    # single day, for the life of the deployment.
+    #
+    # Observed 2026-08-03, first restart after the shared pool landed. Both
+    # jobs wanted a bundle at once (~356 weight each under the corrected §5.3
+    # accounting) from one 300/min pool; the snapshot waited out its ceiling
+    # and exited, logging "another shadow job is holding the pool". That is
+    # §3.3's gate unreachable BY CONSTRUCTION -- the third time this project
+    # has produced that failure and the first time from scheduling rather
+    # than from rate-limit handling.
+    #
+    # Half an hour, and the direction of the offset is the load-bearing part:
+    # the RESOLVER yields, not the snapshot. A missed resolve is retried the
+    # next hour and the row is still pending; a missed snapshot is a day of
+    # the 21 that cannot be recovered, because the prediction it would have
+    # written had to be made against that day's book.
+    #
     # Same drift correction and failure escalation as the snapshot job, with a
     # higher threshold: this runs 24x more often, so three consecutive misses
     # is three hours rather than three days, and a rate-limited hour is not a
@@ -227,6 +248,8 @@ services:
     command:
       - |
         fails=0
+        echo "deferring the first resolve by $${RESOLVE_START_DELAY_S}s so the hourly cadence stays out of phase with the daily snapshot" >&2
+        sleep "$$RESOLVE_START_DELAY_S"
         while true; do
           started=$$(date +%s)
           if python3 -m risk_engine.shadow resolve \
