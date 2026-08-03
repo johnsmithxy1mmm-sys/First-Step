@@ -268,7 +268,7 @@ def check_clearinghouse(client: InfoClient, address: str | None) -> Check:
 
 
 def check_funding_clamp(client: InfoClient, coins: list[str], days: int) -> Check:
-    bounds = FundingBounds.documented_default()
+    bounds = FundingBounds.hyperliquid_confirmed()
     now_ms = int(time.time() * 1000)
     worst = 0.0
     worst_coin = ""

@@ -1143,7 +1143,55 @@ The decision procedure, concretely:
 
 ## C. Hyperliquid integration — facts that must be verified, not assumed
 
-### C1 `[BLOCKER — downgraded]` The funding-rate protocol clamp (§1.5)
+### C1 `[RESOLVED 2026-08-03]` The funding-rate protocol clamp (§1.5)
+
+**Closed by reading the primary source.** The operator opened
+`https://hyperliquid.gitbook.io/hyperliquid-docs/trading/funding` on
+2026-08-03, and it states, in its own words:
+
+> Funding on Hyperliquid is capped at 4%/hour. Note that this is much less
+> aggressive capping than CEX counterparts. The funding cap and funding
+> interval do not depend on the asset.
+
+That is `HL_DOCUMENTED_HOURLY_CAP = 0.04`, confirmed on the basis this code
+clips: **per hour**, and asset-independent, which the single constant already
+assumed. The shipped bound is now
+`FundingBounds.hyperliquid_confirmed()` — the citation, the quoted sentence
+and the read date live in `model/funding.py` — and `check_funding_clamp` has
+a reachable PASS for the first time.
+
+**The trap this entry named in advance was real, and the page contains both
+numbers.** The published formula is
+
+    F = P + clamp(interest_rate - P, -0.0005, 0.0005)
+
+so ±0.0005 bounds the interest-rate term *inside* the formula, while 4%/hour
+bounds the realised rate. Recording ±0.0005 as `cap_per_hour` would have
+clipped simulated funding at 1/80th of the true bound — understating cost of
+carry, the §10-forbidden direction. Both constants are now named in the code
+with that distinction attached, so the next reader does not have to
+rediscover which is which.
+
+**One residual ambiguity, and it fails safe.** The page also says the formula
+computes an 8-hour rate paid hourly at one eighth. If the 4% cap were meant
+against that 8-hour rate, the true hourly bound would be 0.5% and this value
+would be 8× too permissive — which lets the model simulate funding *more*
+extreme than the protocol allows and therefore OVERSTATES cost of carry, a
+direction §10 permits. The plain reading is the direct one (the cap is
+written "%/hour", the same basis `fundingHistory` reports and this bound
+clips), and the alternative reading is the harmless one, so nothing turns on
+resolving it further.
+
+Note what closing this does NOT change: the measurement below still stands,
+and it is what makes the bound unimportant in practice. A confirmed bound
+1760× above anything the market did in a month is a guard rail, not a
+distribution parameter. Confirmation was always about provenance.
+
+The original entry follows.
+
+---
+
+### C1 (original) `[BLOCKER — downgraded]` The funding-rate protocol clamp (§1.5)
 
 §1.5 correctly forbids inventing the bound, and the AR(1) is unusable without
 it. The engine takes the clamp from a configuration record carrying a
@@ -1286,27 +1334,54 @@ footgun and the spec's own prose alternates between the two numbers when
 describing the positioning; the UI copy should quote the charged 0.02%, not
 the 0.03% ceiling.
 
-### C4 `[RESOLVED]` `webData3` (§5.2)
+### C4 `[BLOCKER — non-blocking in practice]` `webData3` (§5.2)
 
 `webData2` is the documented subscription. §5.2 also names `webData3`, with
-no confirmation it exists.
+no confirmation it exists. The shard planner is agnostic either way, so
+nothing downstream waits on this.
 
-**Settled 2026-08-03**, from the operator's own machine:
+**A 2026-08-03 probe was read as a refutation and that reading was wrong.**
+Recorded because the mistake is more instructive than the result. The
+operator ran the bash snippet this entry used to print and got:
 
 ```
 {"channel":"error","data":"Error parsing JSON into valid websocket request: {\"method\": \"subscribe\", \"subscription\": {\"type\": \"webData3\"}}"}
 ```
 
-An error response was the pre-registered criterion for "does not exist," and
-this is not a weak instance of one: the envelope is byte-identical in shape
-to `{"method":"subscribe","subscription":{"type":"trades","coin":...}}`, the
-one `collect_addresses.py` uses and which E4 already confirmed live (1 110
-frames, 0 unparseable) — only the `type` value differs. A malformed envelope
-and an unrecognised enum variant would not be distinguishable from a generic
-parser this terse, but the envelope is proven correct by a sibling
-subscription that works, which leaves the `type` value as the only thing
-that changed. §5.2 should say `webData2`; the shard planner already reads
-only that one and needs no change.
+This entry's stated criterion was "an error response means it does not
+exist", and that criterion is too coarse. `Error parsing JSON into valid
+websocket request` is a complaint about the REQUEST, and it has two
+explanations that the message does not distinguish:
+
+  - the subscription type is unknown, or
+  - a required field is missing. `webData2` is keyed on `user`, and the probe
+    above sends no `user` at all.
+
+The refutation was argued from "the envelope is the same shape as the
+`trades` subscription E4 confirmed live, so only the `type` value differs".
+That is false on inspection: `trades` carries a second field (`coin`), and
+this payload carries none. A payload with a missing required field and a
+payload with an unknown type both fail to parse, and this venue's parse error
+does not say which.
+
+**The register row and the probe are consistent, and the register is the more
+likely reading.** It records `verify --probe-ws` acknowledging the
+subscription on 2026-07-31 — and `_probe_subscription` attaches
+`"user": address` when an address is supplied. `webData3` existing and
+requiring `user`, exactly as `webData2` does, explains both observations at
+once; "it does not exist" explains only one and contradicts the other.
+
+**The control that settles it** is cheap and was skipped: send `webData2`,
+the subscription known to exist, with no `user` field. If it produces the
+same parse error, the error is about the missing field and says nothing about
+`webData3`. Then re-probe `webData3` WITH a `user`.
+`scripts/probe_webdata.py` runs all three.
+
+Note that `check_webdata3` returns PASS for both answers — existence and
+non-existence — because C4 is non-blocking and a rejection is a real answer.
+That is right, and it is also how a reader who scans statuses rather than
+detail text can come away believing the opposite of what was measured. This
+entry's contradiction lasted one commit; that property is permanent.
 
 ### C5 `[RESOLVED]` Isolated-position funding — confirmed on live testnet
 

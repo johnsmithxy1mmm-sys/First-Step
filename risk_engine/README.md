@@ -414,13 +414,14 @@ that produced it:
 | B2 | ledger delta types classify | **PASS** 2026-07-31 | `market.verify --address`, after `send` was added; it FAILED first and that is what found `send` |
 | C2 | mark ≈ mid within §1.4's threshold | **PASS** 2026-07-30 | 12-hour series: median \|basis\| 2.61e-05 against a 9.07e-04 threshold, 35× margin |
 | C5 | isolated funding debits the isolated pocket | **PASS** 2026-07-31 | `probe_isolated_funding` across a funding tick: pocket absorbed 100%, cross moved $0.00 |
-| C1 | the funding clamp is the documented constant | **INCONCLUSIVE** | no breach in 1 500 observations over 30 d, worst 0.1% of the cap — but a clamp is a protocol constant and no sample of realised rates can establish one. Needs the source, not more data. |
-| C4 | the `webData3` subscription exists | **UNCHECKABLE** here | a WebSocket question; `market.verify` speaks only the Info POST API. The shard planner is agnostic either way. |
+| C1 | the funding clamp is the documented constant | **PASS** 2026-08-03 | the primary source, read and cited: "Funding on Hyperliquid is capped at 4%/hour". PASS needs both halves — the citation, plus the 1 500 observations over 30 d that fail to contradict it (worst 0.1% of the cap). Neither alone closes it. |
+| C4 | the `webData3` subscription exists | **UNSETTLED** | a 2026-07-31 `--probe-ws` run acknowledged it; a 2026-08-03 hand probe got a parse error. The two are consistent — the second sent no `user` field, and `webData2` is keyed on one — so the error may be about the payload rather than the type. `scripts/probe_webdata.py` runs the control. Non-blocking: the shard planner uses `webData2`. |
 
 So: the §5.1 parsers are no longer unverified, and treating them as such
 would now be its own kind of wrong — it invites re-doing settled work and
-discounts a real result. What remains genuinely unestablished is C1, whose
-status will not improve with more observations, and C4.
+discounts a real result. Every row in this table has now been reached, C1
+last: it was the one that could not improve with more observations, because
+what it needed was a citation rather than data.
 
 `market.verify` is the command that produces this table; run it rather than
 trusting the table, because a table is a claim about a past run and the venue

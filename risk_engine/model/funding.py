@@ -30,10 +30,25 @@ from dataclasses import dataclass
 
 import numpy as np
 
-#: Hyperliquid's documented per-hour funding rate cap. MUST be re-verified
-#: against the live API before Phase 4 (OPEN-QUESTIONS C1) -- this constant
-#: exists so the value has one home, not so it can be trusted unchecked.
+#: Hyperliquid's documented per-hour funding rate cap.
 HL_DOCUMENTED_HOURLY_CAP = 0.04
+
+#: Where that number was read, and when. C1 asked for a citation someone can
+#: re-check rather than a value carried on trust; this is it.
+HL_FUNDING_DOC_URL = "https://hyperliquid.gitbook.io/hyperliquid-docs/trading/funding"
+HL_FUNDING_DOC_QUOTE = "Funding on Hyperliquid is capped at 4%/hour"
+HL_FUNDING_DOC_READ_ON = "2026-08-03"
+
+#: The trap C1 named in advance, recorded here because the page contains both
+#: numbers and taking the wrong one is a 100x error toward understating cost
+#: of carry (§10-forbidden). The published formula is
+#:
+#:     F = P + clamp(interest_rate - P, -0.0005, 0.0005)
+#:
+#: so ±0.0005 bounds the interest-rate TERM INSIDE the formula. It is not the
+#: cap on the realised rate, which the same page states separately as 4%/hour.
+#: `cap_per_hour` clips simulated funding paths and is therefore the latter.
+HL_INTEREST_TERM_CLAMP = 0.0005
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,9 +82,48 @@ class FundingBounds:
 
     @classmethod
     def documented_default(cls) -> FundingBounds:
+        """The value carried on trust. Kept, and no longer what ships.
+
+        `hyperliquid_confirmed()` below replaced it at every shipped call site
+        on 2026-08-03. This stays because it is the honest constructor for a
+        number nobody has read, and the next bound added here will start life
+        that way — deleting it would leave `from_protocol_source` as the only
+        route and quietly invite a citation to be invented for it.
+        """
         return cls(
             cap_per_hour=HL_DOCUMENTED_HOURLY_CAP,
             source="Hyperliquid docs (unverified against live API; OPEN-QUESTIONS C1)",
+        )
+
+    @classmethod
+    def hyperliquid_confirmed(cls) -> FundingBounds:
+        """The shipped bound, with the citation C1 spent its life asking for.
+
+        Read from the primary source on 2026-08-03. Two things about the page
+        are worth carrying here rather than only in OPEN-QUESTIONS, because
+        both are ways to get this wrong later:
+
+        **The page states two clamps and only one of them is this.** See
+        `HL_INTEREST_TERM_CLAMP` — ±0.0005 bounds a term inside the formula,
+        4%/hour bounds the realised rate. Recording the former here would clip
+        simulated funding at 1/80th of the true bound, understating cost of
+        carry, which §10 forbids.
+
+        **The 8-hour/1-hour split does not put an 8x in this number.** The
+        formula computes an 8-hour rate paid hourly at one eighth, and the cap
+        is stated separately and explicitly per hour ("capped at 4%/hour"),
+        which is the same basis `fundingHistory` reports and the same basis
+        this bound clips. Had the reading been wrong in the other direction —
+        the cap applying to the 8-hour rate, making the true hourly bound
+        0.5% — this value would be 8x too permissive, which lets the model
+        simulate funding more extreme than the protocol allows and OVERSTATES
+        cost of carry. §10 permits that direction, so even the residual
+        ambiguity fails safe.
+        """
+        return cls.from_protocol_source(
+            HL_DOCUMENTED_HOURLY_CAP,
+            f"{HL_FUNDING_DOC_URL} — {HL_FUNDING_DOC_QUOTE!r} "
+            f"(read {HL_FUNDING_DOC_READ_ON})",
         )
 
     @classmethod

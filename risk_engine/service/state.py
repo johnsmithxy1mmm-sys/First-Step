@@ -540,7 +540,7 @@ def _build_fixture_bundle():
         c: fit_marginal(c, r, float(matrix.step_vol[matrix.assets.index(c)]))
         for c, r in returns.items()
     }
-    bounds = FundingBounds.documented_default()
+    bounds = FundingBounds.hyperliquid_confirmed()
     funding = {
         c: fit_ar1(c, 1e-5 + 2e-5 * rng.standard_normal(30 * 24), bounds)
         for c in returns
@@ -655,7 +655,7 @@ def _build_live_bundle(*, serving: bool = True, budget=None):
         c: fit_marginal(c, r, float(matrix.step_vol[matrix.assets.index(c)]))
         for c, r in returns.items()
     }
-    bounds = FundingBounds.documented_default()
+    bounds = FundingBounds.hyperliquid_confirmed()
     funding = {c: fit_ar1(c, r, bounds) for c, r in funding_hist.items()}
     # This is the call §2.3 is actually about, and the one that may refuse to
     # start the service. Ninety days of real hourly crypto returns is exactly

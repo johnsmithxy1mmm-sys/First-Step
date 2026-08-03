@@ -98,7 +98,23 @@ class StubClient:
 
 
 class TestFundingClamp:
-    def test_a_quiet_history_is_inconclusive_not_a_pass(self):
+    @pytest.fixture
+    def unconfirmed(self, monkeypatch):
+        """The bound as it shipped before C1 closed.
+
+        These tests are about what a QUIET HISTORY does or does not establish,
+        and that question only has teeth while the citation is absent — with
+        one, PASS is carried by the citation and the data merely fails to
+        contradict it. Injecting the unconfirmed bound keeps them testing the
+        §10-relevant half instead of quietly becoming duplicates of
+        `test_the_shipped_bound_now_closes_it`.
+        """
+        monkeypatch.setattr(
+            FundingBounds, "hyperliquid_confirmed",
+            classmethod(lambda cls: FundingBounds.documented_default()),
+        )
+
+    def test_a_quiet_history_is_inconclusive_not_a_pass(self, unconfirmed):
         """The whole point. Nothing exceeded the clamp; that is not evidence
         the clamp is right, and reporting PASS would turn the absence of a
         counter-example into a confirmation."""
@@ -117,10 +133,15 @@ class TestFundingClamp:
         # It must name the fix, and the fix is not "clamp reality away".
         assert "fix the bound" in check.detail
 
-    def test_an_inconclusive_clamp_still_blocks(self):
-        """C1 is a blocker, so "we could not tell" has to hold up the live
+    def test_an_inconclusive_clamp_still_blocks(self, unconfirmed):
+        """C1 was a blocker, so "we could not tell" has to hold up the live
         path exactly as a failure would. A non-blocking maybe is how a
-        blocker quietly stops blocking."""
+        blocker quietly stops blocking.
+
+        Still asserted after C1 closed, because the property belongs to the
+        INCONCLUSIVE verdict rather than to C1's status: the next bound added
+        here starts unconfirmed, and it must block on the way in too.
+        """
         check = verify.check_funding_clamp(StubClient(), ["BTC"], days=30)
         assert check.blocking
         assert not check.satisfied
@@ -685,20 +706,48 @@ class TestFundingClampCanActuallyClose:
         # 2.27e-05/h, about 0.06% of the 0.04/h cap.
         return StubClient(rates=[rate, -rate, rate / 2])
 
-    def test_an_unconfirmed_source_is_inconclusive_however_quiet_the_data(self):
+    def test_an_unconfirmed_source_is_inconclusive_however_quiet_the_data(
+        self, monkeypatch
+    ):
         """Absence of a breach is not evidence for a protocol constant, and no
-        volume of it becomes evidence."""
+        volume of it becomes evidence.
+
+        The bound shipped unconfirmed until 2026-08-03, so this used to hold
+        with no setup. It now needs the unconfirmed bound injected — the
+        principle is unchanged and still reachable, but a test that silently
+        became a test of the *confirmed* path would have stopped guarding the
+        thing it was written for.
+        """
+        from risk_engine.model.funding import FundingBounds
+
+        monkeypatch.setattr(
+            FundingBounds, "hyperliquid_confirmed",
+            classmethod(lambda cls: FundingBounds.documented_default()),
+        )
         check = verify.check_funding_clamp(self._client(), ["BTC"], 30)
         assert check.status == INCONCLUSIVE
         assert check.evidence["source_confirmed"] is False
         # It must name the call that closes it, not just ask for a "source".
         assert "from_protocol_source" in check.detail
 
+    def test_the_shipped_bound_now_closes_it(self):
+        """C1's success path, exercised on what actually ships.
+
+        The two tests above drive injected bounds; this one drives none, so it
+        fails if the shipped constructor ever loses its citation. That is the
+        whole content of closing C1 — not that a confirmed bound *can* pass,
+        which was already true, but that the one in the tree *is* one.
+        """
+        check = verify.check_funding_clamp(self._client(), ["BTC"], 30)
+        assert check.status == PASS
+        assert check.evidence["source_confirmed"] is True
+        assert "hyperliquid.gitbook.io" in check.evidence["source"]
+
     def test_a_confirmed_source_plus_consistent_data_passes(self, monkeypatch):
         from risk_engine.model.funding import FundingBounds
 
         monkeypatch.setattr(
-            FundingBounds, "documented_default",
+            FundingBounds, "hyperliquid_confirmed",
             classmethod(lambda cls: FundingBounds.from_protocol_source(
                 0.04, "https://example.invalid/docs/funding#cap (read 2026-07-31)")),
         )
@@ -713,7 +762,7 @@ class TestFundingClampCanActuallyClose:
         from risk_engine.model.funding import FundingBounds
 
         monkeypatch.setattr(
-            FundingBounds, "documented_default",
+            FundingBounds, "hyperliquid_confirmed",
             classmethod(lambda cls: FundingBounds.from_protocol_source(
                 0.04, "https://example.invalid/docs/funding#cap (read 2026-07-31)")),
         )
