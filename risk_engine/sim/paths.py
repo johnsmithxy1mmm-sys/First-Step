@@ -102,31 +102,52 @@ def generate_log_returns(spec: PathSpec, base: BaseRandomness) -> np.ndarray:
         raise ValueError(f"randomness has {base.z.shape[2]} assets, spec has {spec.n_assets}")
 
     chol = np.linalg.cholesky(spec.corr)
+    # `y` is freshly allocated by the matmul and is not visible to the caller,
+    # so every step from here on works in place on it. `base.z` is never
+    # touched -- it is shared across configurations by design.
     y = base.z @ chol.T
     if spec.copula_df is not None:
         # Elliptical t: a Gaussian vector divided by an independent
         # sqrt(chi2/nu). One mixing draw per (path, step) is what couples the
         # assets in the tail -- a shared shock, not per-asset noise.
-        y = y / np.sqrt(base.chi)
+        y /= np.sqrt(base.chi)
 
-    out = np.empty_like(y)
+    # One scratch column shared by every asset: `apply` is memory-bound and
+    # allocating its working buffer per asset measured as real time at
+    # (20 000 x 24) elements. Column `a` is only written after `apply` has
+    # finished reading it, and the columns are disjoint, so mapping in place
+    # is safe and saves a second (P, S, A) array.
+    scratch = np.empty(y.shape[:2], dtype=np.float64)
     for a, df in enumerate(spec.marginal_df):
-        out[:, :, a] = MAP_CACHE.get(spec.copula_df, df).apply(y[:, :, a])
-    out *= spec.step_vol[None, None, :]
-    out += np.asarray(log_drift_per_step(spec.drift, spec.step_vol))[None, None, :]
-    return out
+        col = MAP_CACHE.get(spec.copula_df, df).apply(y[:, :, a], out=scratch)
+        # Vol-scale the column while it is still hot, instead of sweeping the
+        # whole (P, S, A) block afterwards. Same bits: the map's last act is a
+        # `copysign`, and multiplying a signed magnitude by a positive vol
+        # gives what scaling the block later would have given.
+        col *= spec.step_vol[a]
+        y[:, :, a] = col
+    drift = np.asarray(log_drift_per_step(spec.drift, spec.step_vol))
+    # ZERO_LOG_RETURN -- the default -- has drift exactly zero, and adding a
+    # zero vector to (P, S, A) is a full pass over the array for nothing.
+    if drift.any():
+        y += drift[None, None, :]
+    return y
 
 
 def generate_price_paths(
     spec: PathSpec, spot: np.ndarray, base: BaseRandomness
 ) -> np.ndarray:
     """(P, S+1, A) price paths; column 0 is `spot`."""
+    # `r` is this function's private array (generate_log_returns builds it
+    # fresh every call), so the cumulative sum and the exponential both run in
+    # place, and the scaling by spot writes straight into the output block
+    # instead of through a full-size temporary.
     r = generate_log_returns(spec, base)
-    log_paths = np.cumsum(r, axis=1)
+    np.cumsum(r, axis=1, out=r)
+    np.exp(r, out=r)
     prices = np.empty((r.shape[0], r.shape[1] + 1, r.shape[2]), dtype=np.float64)
     prices[:, 0, :] = spot[None, :]
-    np.exp(log_paths, out=log_paths)
-    prices[:, 1:, :] = spot[None, None, :] * log_paths
+    np.multiply(r, spot[None, None, :], out=prices[:, 1:, :])
     return prices
 
 

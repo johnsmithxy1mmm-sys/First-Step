@@ -131,9 +131,11 @@ class QuantileMap:
             tail_slope_u=float((log_y[-1] - log_y[-2]) / (u[-1] - u[-2])),
         )
 
-    def apply(self, x: np.ndarray) -> np.ndarray:
+    def apply(self, x: np.ndarray, out: np.ndarray | None = None) -> np.ndarray:
         if self.linear_slope is not None:
-            return x * self.linear_slope
+            if out is None:
+                return x * self.linear_slope
+            return np.multiply(x, self.linear_slope, out=out)
         ax = np.abs(x)
         x_min = np.exp(self.grid_u0)
         # Branch-free over the whole array. Splitting out the near-zero and
@@ -147,7 +149,10 @@ class QuantileMap:
         frac = t - i
         lo = self.grid_log_y[i]
         ly = lo + frac * (self.grid_log_y[i + 1] - lo)
-        out = np.exp(ly)
+        if out is None:
+            out = np.exp(ly)
+        else:
+            np.exp(ly, out=out)
         # Near zero the map is linear, with the slope of its first segment.
         np.copyto(out, ax * self.small_slope, where=ax < x_min)
         # Past the last node, continue in log-survival space, where the
@@ -160,7 +165,7 @@ class QuantileMap:
             out[over] = np.exp(
                 self.grid_log_y[-1] + self.tail_slope_u * (u - self.last_u)
             )
-        return np.copysign(out, x)
+        return np.copysign(out, x, out=out)
 
 
 class QuantileMapCache:
