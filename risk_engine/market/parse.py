@@ -180,12 +180,10 @@ def _record_isolated_consistency(
             return
         mmr = 0.5 / float(max_lev)
         # equity(P) = iso_margin + size*(P - entry); set equal to mmr*|size|*P.
-        side = 1.0 if size > 0 else -1.0
         denom = size - mmr * abs(size)
         if denom == 0:
             return
         ours = (size * float(entry) - iso_margin) / denom
-        del side
         if not math.isfinite(ours) or ours <= 0:
             return
         rel = abs(ours - theirs) / theirs

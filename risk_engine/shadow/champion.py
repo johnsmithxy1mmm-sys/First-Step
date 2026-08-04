@@ -146,22 +146,22 @@ def compare(
 
 
 def _cohort_rows(journal: CalibrationJournal, version: str, cohort: str) -> list[dict]:
-    from risk_engine.shadow.metrics import (
-        COHORT_ALL,
-        COHORT_BOOK_UNCHANGED,
-        COHORT_NO_FLOW,
-    )
+    """The champion/challenger population, defined by `metrics.in_cohort`.
 
-    rows = journal.scored(version, VARIANT_MODEL)
-    keep = []
-    for r in rows:
-        if r["stale_resolution"]:
-            continue
-        if cohort == COHORT_NO_FLOW and r["external_flow_usd"] != 0.0:
-            continue
-        if cohort == COHORT_BOOK_UNCHANGED and r["book_changed"]:
-            continue
-        if cohort not in (COHORT_ALL, COHORT_NO_FLOW, COHORT_BOOK_UNCHANGED):
-            raise ValueError(f"unknown cohort {cohort!r}")
-        keep.append(r)
-    return keep
+    Shared rather than restated. §0.2's migration decision is made here and
+    §3.1's gate is computed in `metrics.py`; a cohort that means two things
+    would let the two be measured on different rows while both look ordinary.
+
+    The validation used to sit inside this loop, which meant an empty journal
+    never reached it and an unrecognised cohort came back as an empty list
+    instead of an error -- indistinguishable from a cohort that legitimately
+    has no resolved rows yet, which on day one is the expected state.
+    """
+    from risk_engine.shadow.metrics import COHORTS, in_cohort
+
+    if cohort not in COHORTS:
+        raise ValueError(f"unknown cohort {cohort!r}; expected one of {list(COHORTS)}")
+    return [
+        r for r in journal.scored(version, VARIANT_MODEL)
+        if not r["stale_resolution"] and in_cohort(r, cohort)
+    ]

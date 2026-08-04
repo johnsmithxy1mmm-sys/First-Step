@@ -71,6 +71,7 @@ hands (`EXIT_*` constants below):
     2  the feed did not look the way this module assumes -- code, not weather
     3  never got a usable connection: --ws-url, DNS, TLS, refusal, missing dep
     4  bad invocation, caught before anything connects
+    5  collected and could not write it; the file is on stdout, redirect it
 
 **No example output anywhere in this repository was captured from the live
 feed.** The API is 403 at this environment's proxy (OPEN-QUESTIONS E5), so
@@ -634,8 +635,30 @@ async def _collect(
                 f"the collector is running."
             ) from exc
 
-        for coin in coins:
-            await ws.send(_subscribe_payload(coin))
+        # The send is wrapped for the same reason the connect above is, and it
+        # was missed when the connect was fixed. A venue that accepts the TCP
+        # and TLS handshake on a path it does not serve, a proxy that closes
+        # after the upgrade, a half-open socket -- all of these report
+        # themselves on the first WRITE, not on connect. Left bare, the
+        # library's ConnectionClosed (not an OSError, so nothing below catches
+        # it either) escapes `harvest`, escapes `main`, tracebacks, and exits
+        # 1: EXIT_REFUSED, "collected a list and refused to publish it", whose
+        # documented next move is a longer --minutes on a collector that never
+        # sent a subscription. It is the same fact about the world as a refused
+        # connection -- no usable socket, nothing observed -- so it gets the
+        # same diagnosis and the same exit code.
+        try:
+            for coin in coins:
+                await ws.send(_subscribe_payload(coin))
+        except Exception as exc:
+            raise FeedUnreachable(
+                f"opened a WebSocket to {ws_url} but could not send the subscription: "
+                f"{type(exc).__name__}: {exc}. Nothing was collected and nothing will be "
+                f"written. A handshake that succeeds and a first write that fails is what "
+                f"a host serving something else at this path looks like, so check "
+                f"--ws-url before assuming the network. The envelope sent was "
+                f"{_subscribe_payload(coins[0])}."
+            ) from exc
         emit(
             f"subscribed to '{TRADES_CHANNEL}' for {', '.join(coins)} on {ws_url}; "
             f"collecting for up to {budget_s / 60:.0f} min or {target} addresses"
@@ -1506,7 +1529,9 @@ def main(argv: Iterable[str] | None = None) -> int:
             "(short of the gate, or --out exists) -- the addresses are kept in a "
             "'.refused-<window>' file beside --out; 2 the feed did not match this "
             "collector's assumed message shape; 3 no usable connection (--ws-url, DNS, "
-            "TLS, refusal, or the missing 'websockets' package); 4 bad invocation."
+            "TLS, refusal, or the missing 'websockets' package); 4 bad invocation; "
+            "5 collected but the write failed -- the exact file is on stdout, redirect "
+            "it somewhere writable rather than collecting again."
         ),
     )
     parser.add_argument("--out", help="where to write the address list "

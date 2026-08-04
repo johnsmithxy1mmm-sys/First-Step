@@ -23,6 +23,7 @@ from risk_engine.shadow.journal import (
 from risk_engine.shadow.metrics import (
     COHORT_ALL,
     COHORT_BOOK_UNCHANGED,
+    Cohort,
     calibration_report,
     load_cohort,
     tail_calibration,
@@ -1061,7 +1062,14 @@ class TestCalibrationMetrics:
     outcomes whose truth is known rather than against the engine's own output."""
 
     @staticmethod
-    def _fill(journal, n_days=30, per_day=15, seed=0):
+    def _fill(journal, n_days=30, per_day=15, seed=0, tie_baselines=False):
+        """`tie_baselines` gives all three variants the SAME distribution.
+
+        Every observation then scores identically under all three, so the CRPS
+        means coincide exactly and the "beats baseline" comparison sits on its
+        boundary -- which is where `<` and `<=` differ and where nothing had
+        ever put it.
+        """
         rng = np.random.default_rng(seed)
         # Separate stream for the randomized-PIT uniforms: drawing them from
         # `rng` would shift the data stream and silently change what this
@@ -1075,10 +1083,11 @@ class TestCalibrationMetrics:
             shock = rng.normal(0, 1000)  # one market move shared by the day
             for i in range(per_day):
                 actual = 0.7 * shock + 0.7141 * rng.normal(0, 1000)
+                other = truth if tie_baselines else wrong
                 for variant, dist in (
                     (VARIANT_MODEL, truth),
-                    (VARIANT_BASELINE_A, wrong),
-                    (VARIANT_BASELINE_B, wrong),
+                    (VARIANT_BASELINE_A, other),
+                    (VARIANT_BASELINE_B, other),
                 ):
                     pid = journal.record_prediction(
                         address=addr(i), variant=variant, predicted_at=when,
@@ -1108,6 +1117,194 @@ class TestCalibrationMetrics:
         assert report.crps_beats_baseline_b
         assert report.ks_pvalue > 0.01
         journal.close()
+
+    def test_each_cohort_keeps_the_rows_its_name_claims(self):
+        """The three cohort filters, none of which had a test.
+
+        `no_external_flow` was never selected by any test in this suite, so
+        inverting its predicate -- keeping exactly the rows with flow -- left
+        the whole suite green. That cohort is offered on the CLI
+        (`shadow icc --cohort`) and is one of the three §3.1 reports, and a
+        silently inverted filter publishes a calibration score computed on the
+        accounts the cohort exists to exclude, under the cohort's own name.
+
+        Asserted as counts over a journal built with known contamination, so
+        the test says which rows each cohort keeps rather than that it keeps
+        some.
+        """
+        from risk_engine.shadow.metrics import COHORT_NO_FLOW, in_cohort
+
+        rows = [
+            {"external_flow_usd": 0.0, "book_changed": False},    # clean
+            {"external_flow_usd": 250.0, "book_changed": False},  # deposited
+            {"external_flow_usd": 0.0, "book_changed": True},     # traded
+            {"external_flow_usd": -80.0, "book_changed": True},   # both
+        ]
+        kept = {c: [i for i, r in enumerate(rows) if in_cohort(r, c)]
+                for c in (COHORT_ALL, COHORT_NO_FLOW, COHORT_BOOK_UNCHANGED)}
+
+        assert kept[COHORT_ALL] == [0, 1, 2, 3]
+        assert kept[COHORT_NO_FLOW] == [0, 2], (
+            "no_external_flow keeps the rows with NO flow; a withdrawal is "
+            "flow just as much as a deposit is"
+        )
+        assert kept[COHORT_BOOK_UNCHANGED] == [0, 1]
+
+    def test_a_mistyped_cohort_is_refused_rather_than_silently_meaning_all(self):
+        """It used to mean `all`, labelled with the typo.
+
+        `load_cohort` filtered on equality against the two known names and had
+        no else, so any other string fell through every filter and returned
+        every row -- a §3.1 report over the whole population, named after a
+        cohort that was never applied. `champion.py` raised on the same input,
+        so the two halves of the §0.2 decision disagreed about what a cohort
+        name even is. Both now refuse, and both refuse BEFORE reading a row, so
+        an empty journal (day one, the expected state) fails the same way a
+        full one does rather than returning an empty list.
+        """
+        from risk_engine.shadow.champion import _cohort_rows
+        from risk_engine.shadow.metrics import COHORTS
+
+        journal = CalibrationJournal()
+        try:
+            for cohort in ("book_unchagned", "", "ALL"):
+                assert cohort not in COHORTS
+                with pytest.raises(ValueError, match="unknown cohort"):
+                    load_cohort(journal, "test", VARIANT_MODEL, cohort)
+                with pytest.raises(ValueError, match="unknown cohort"):
+                    _cohort_rows(journal, "test", cohort)
+        finally:
+            journal.close()
+
+    def test_a_tie_on_crps_does_not_count_as_beating_the_baseline(self):
+        """§0.2 asks for an improvement, and equal is not better.
+
+        Every other assertion in this class sits far from the boundary -- the
+        model is the true distribution and wins comfortably, or is deliberately
+        wrong and loses -- so `<` could be `<=` and nothing would notice. A tie
+        is not hypothetical: a challenger that changes nothing observable for
+        these books scores exactly what the baseline scores, and `<=` would
+        report it as having beaten a baseline it merely matched, on the check
+        §0.2 reads to decide a migration.
+        """
+        from risk_engine.shadow.journal import VARIANT_BASELINE_A, VARIANT_BASELINE_B
+
+        journal = CalibrationJournal()
+        try:
+            self._fill(journal, n_days=6, per_day=4, tie_baselines=True)
+            report = calibration_report(journal, "test", COHORT_ALL)
+
+            assert report.mean_crps[VARIANT_MODEL] == pytest.approx(
+                report.mean_crps[VARIANT_BASELINE_A], rel=1e-12
+            ), "the fixture did not actually tie, so this is not on the boundary"
+            assert report.mean_crps[VARIANT_MODEL] == pytest.approx(
+                report.mean_crps[VARIANT_BASELINE_B], rel=1e-12
+            )
+
+            assert not report.crps_beats_baseline_a
+            assert not report.crps_beats_baseline_b
+            assert "FAIL  CRPS beats baseline A" in report.gate_summary
+            assert "FAIL  CRPS beats baseline B" in report.gate_summary
+        finally:
+            journal.close()
+
+    def test_the_gates_own_pass_flags_are_read_off_the_clustered_interval(self):
+        """The four §3.1 checks, at the boundaries that decide them.
+
+        `passes_clustered` is what `gate_summary` prints for the VaR@95 row --
+        `passes_naive` is computed and read by nothing -- and neither had an
+        assertion anywhere: swapping the lower bound of the clustered interval
+        for its upper one, so the check becomes `target == upper`, left the
+        suite green. Same for the KS row's `p > 0.05`. These are the flags a
+        reader of the published score uses to decide whether Phase 4 opens, so
+        they are pinned here on both sides of each boundary rather than
+        inferred from a well-behaved fixture that passes everything.
+        """
+        from risk_engine.shadow.metrics import TailCalibration
+
+        inside = TailCalibration(breach_rate=0.05, naive_ci=(0.01, 0.09),
+                                 clustered_ci=(0.02, 0.08), target=0.05, n=100, n_days=5)
+        assert inside.passes_clustered is True
+        assert inside.passes_naive is True
+
+        # Target below the clustered interval, and above it. Both must fail,
+        # which is what pins the interval as an interval rather than a bound.
+        below = TailCalibration(breach_rate=0.20, naive_ci=(0.15, 0.25),
+                                clustered_ci=(0.12, 0.30), target=0.05, n=100, n_days=5)
+        above = TailCalibration(breach_rate=0.001, naive_ci=(0.0, 0.01),
+                                clustered_ci=(0.0, 0.02), target=0.05, n=100, n_days=5)
+        assert below.passes_clustered is False
+        assert above.passes_clustered is False
+
+        # The bounds are inclusive: an interval that just touches the target
+        # contains it.
+        touching = TailCalibration(breach_rate=0.05, naive_ci=(0.05, 0.09),
+                                   clustered_ci=(0.05, 0.08), target=0.05, n=100, n_days=5)
+        assert touching.passes_clustered is True
+
+        # No clustered interval at all is None, not False -- "not computed" and
+        # "computed and failed" are different facts about the gate.
+        assert TailCalibration(breach_rate=0.05, naive_ci=(0.0, 0.1),
+                               clustered_ci=None, target=0.05, n=3,
+                               n_days=1).passes_clustered is None
+
+    def test_the_KS_row_flips_on_the_five_per_cent_it_names(self):
+        """`PIT uniform (KS p>0.05)` says 0.05 in its own label, so 0.05 itself
+        must fail. Nothing asserted where it flips."""
+        from risk_engine.shadow.journal import VARIANT_BASELINE_A, VARIANT_BASELINE_B
+        from risk_engine.shadow.metrics import CalibrationReport, TailCalibration
+
+        tail = TailCalibration(breach_rate=0.05, naive_ci=(0.0, 0.1),
+                               clustered_ci=(0.0, 0.2), target=0.05, n=10, n_days=3)
+
+        def summary_for(p):
+            return CalibrationReport(
+                distribution_version="test", cohort=COHORT_ALL, n=10, n_days=3,
+                ks_statistic=0.1, ks_pvalue=p,
+                mean_crps={VARIANT_MODEL: 1.0, VARIANT_BASELINE_A: 2.0,
+                           VARIANT_BASELINE_B: 2.0},
+                crps_beats_baseline_a=True, crps_beats_baseline_b=True,
+                tail=tail, n_paired=10,
+            ).gate_summary
+
+        assert "PASS  PIT uniform" in summary_for(0.0500001)
+        assert "FAIL  PIT uniform" in summary_for(0.05)
+        assert "FAIL  PIT uniform" in summary_for(0.0499999)
+
+    def test_one_day_of_observations_gets_no_clustered_interval(self):
+        """The day-clustered bootstrap needs at least two clusters.
+
+        `n_days >= 2` had no test at its boundary, and the two sides mean
+        opposite things for the gate: below it `passes_clustered` is None and
+        the VaR row cannot pass at all, at or above it the interval exists and
+        the row is decided. Getting the threshold wrong by one silently
+        withholds the gate's only cluster-robust check on the first day it
+        could have been computed.
+        """
+        keys = np.array(["k0", "k1", "k2", "k3"], dtype=object)
+        one_day = Cohort(
+            name=COHORT_ALL,
+            pit=np.full(4, 0.5), crps=np.ones(4),
+            breached=np.array([True, False, False, False]),
+            days=np.array(["2026-08-01"] * 4), keys=keys,
+        )
+        two_days = Cohort(
+            name=COHORT_ALL,
+            pit=np.full(4, 0.5), crps=np.ones(4),
+            breached=np.array([True, False, False, False]),
+            days=np.array(["2026-08-01", "2026-08-01", "2026-08-02", "2026-08-02"]),
+            keys=keys,
+        )
+
+        assert one_day.n_days == 1
+        assert tail_calibration(one_day).clustered_ci is None
+        assert tail_calibration(one_day).passes_clustered is None
+
+        assert two_days.n_days == 2
+        assert tail_calibration(two_days).clustered_ci is not None, (
+            "two distinct days is enough clusters to bootstrap over; withholding "
+            "the interval there delays the gate's only cluster-robust check"
+        )
 
     def test_day_clustering_widens_the_interval_the_spec_assumes_is_tight(self):
         """OPEN-QUESTIONS B1: observations on one day share one market, so the

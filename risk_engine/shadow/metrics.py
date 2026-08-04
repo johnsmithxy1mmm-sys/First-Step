@@ -39,6 +39,39 @@ COHORT_BOOK_UNCHANGED = "book_unchanged"
 COHORTS = (COHORT_ALL, COHORT_NO_FLOW, COHORT_BOOK_UNCHANGED)
 
 
+def in_cohort(row: dict, cohort: str) -> bool:
+    """Does one scored row belong to `cohort`? The single definition of that.
+
+    It was written out twice -- here in `load_cohort` and again in
+    `champion.py::_cohort_rows` -- and the two must agree exactly, because
+    §3.1's gate is computed from the first and §0.2's migration decision from
+    the second. Two populations under one cohort name would let a challenger
+    be judged against a champion measured on different rows, with both numbers
+    looking entirely ordinary.
+
+    They had already drifted. An unrecognised cohort string raised in
+    `champion.py` and was silently treated as `all` here, so
+    `calibration_report(cohort="book_unchagned")` returned a report over every
+    row, labelled with the typo, and nothing in the output said the filter had
+    not been applied. That is the §3.3 gate's own population. Validation now
+    happens once, here, before any row is read -- and therefore also on an
+    empty journal, which is the case `champion.py` missed by validating inside
+    its loop.
+
+    Stale resolutions are NOT filtered here: `load_cohort` takes them out
+    separately under `include_stale`, which exists so the excluded rows can be
+    inspected rather than scored (audit A-04). Folding that in would remove
+    the only way to look at them.
+    """
+    if cohort not in COHORTS:
+        raise ValueError(f"unknown cohort {cohort!r}; expected one of {list(COHORTS)}")
+    if cohort == COHORT_NO_FLOW:
+        return row["external_flow_usd"] == 0.0
+    if cohort == COHORT_BOOK_UNCHANGED:
+        return not row["book_changed"]
+    return True
+
+
 @dataclass(frozen=True, slots=True)
 class Cohort:
     name: str
@@ -163,16 +196,14 @@ def load_cohort(
     punctuality, not the model (audit A-04). `include_stale` exists so the
     excluded rows can be inspected, not so they can be scored.
     """
+    # Before reading a row, so a mistyped cohort fails on an empty journal too.
+    if cohort not in COHORTS:
+        raise ValueError(f"unknown cohort {cohort!r}; expected one of {list(COHORTS)}")
     rows = journal.scored(version, variant)
-    keep = []
-    for r in rows:
-        if not include_stale and r["stale_resolution"]:
-            continue
-        if cohort == COHORT_NO_FLOW and r["external_flow_usd"] != 0.0:
-            continue
-        if cohort == COHORT_BOOK_UNCHANGED and r["book_changed"]:
-            continue
-        keep.append(r)
+    keep = [
+        r for r in rows
+        if (include_stale or not r["stale_resolution"]) and in_cohort(r, cohort)
+    ]
     return Cohort(
         name=cohort,
         pit=np.array([r["pit"] for r in keep], dtype=np.float64),

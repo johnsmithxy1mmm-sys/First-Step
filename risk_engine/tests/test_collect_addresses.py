@@ -89,6 +89,21 @@ class StubSocket:
         await asyncio.sleep(3600)
 
 
+#: Where the fake clock starts, and it is deliberately not zero.
+#:
+#: The collector's default clock is `time.monotonic`, which on Linux counts
+#: from boot -- so every real reading is somewhere in the 1e5..1e7 range and
+#: never near zero. A fake clock starting at 0.0 makes an absolute reading
+#: indistinguishable from an elapsed one, and every elapsed-time expression in
+#: `_collect` is then unpinned: `elapsed = now - started` can be written
+#: `now + started` and this whole file still passes, while a real run reads
+#: elapsed as twice the uptime, trips the 30-second first-frame grace on its
+#: first iteration, and aborts every collection window before a frame arrives.
+#: Found by mutation, not by reading. An offset in the range a real machine
+#: actually reports kills that mutant and every other one of its shape.
+CLOCK_ORIGIN_S = 1_234_567.0
+
+
 class FakeClock:
     """A monotonic clock that advances a fixed step per reading.
 
@@ -96,11 +111,15 @@ class FakeClock:
     time-budget test finishes instantly and deterministically. The suite
     already carries one wall-clock assertion that fails intermittently on a
     loaded box; a 30-minute test, or a sleeping one, would be more of the same.
+
+    It starts at `CLOCK_ORIGIN_S` rather than at zero for the reason given
+    there: a zero origin quietly excuses arithmetic that a real monotonic
+    clock would break on.
     """
 
-    def __init__(self, step: float = 5.0) -> None:
+    def __init__(self, step: float = 5.0, origin: float = CLOCK_ORIGIN_S) -> None:
         self.step = step
-        self.now = 0.0
+        self.now = origin
 
     def __call__(self) -> float:
         self.now += self.step
@@ -289,6 +308,34 @@ class TestCollecting:
         progress = [line for line in lines if "addresses" in line and "trades" in line]
         assert len(progress) >= 2
         assert "/40 addresses" in progress[-1]
+
+    def test_the_progress_interval_is_an_interval_and_not_every_frame(self):
+        """`>= 2` above passes just as well when EVERY iteration prints.
+
+        The interval is `now - last_progress >= progress_every_s`, and with the
+        absolute clock in place of the difference it is a number in the
+        millions on any real machine, so the condition holds on every loop and
+        a 30-minute run emits thousands of lines instead of a hundred. This
+        module argues in two places that an unreadable progress stream is the
+        same as no progress stream (the once-per-kind anomaly warnings exist
+        for exactly that reason), so the count is asserted rather than its
+        non-emptiness.
+
+        The clock steps 5s per reading and is read once per iteration, so at a
+        30s interval a line is due every sixth iteration at most.
+        """
+        frames = [_frame([_trade([_addr(i), _addr(i + 1)])]) for i in range(1, 60, 2)]
+        _, _, lines = _run(frames, target=200, minutes=5.0, clock_step=5.0,
+                           progress_every_s=30.0)
+        progress = [line for line in lines if "addresses" in line and "trades" in line]
+
+        # 5 minutes of budget, one clock reading per iteration at 5s a step:
+        # about 60 iterations, so at most ~10 progress lines and certainly not
+        # one per iteration.
+        assert 2 <= len(progress) <= 12, (
+            f"{len(progress)} progress lines for a 5-minute window at a "
+            f"30-second interval; the interval is not being applied"
+        )
 
     def test_acknowledgements_and_heartbeats_are_ignored_not_fatal(self):
         frames = [_ack(), json.dumps({"channel": "pong"}),
@@ -1050,6 +1097,34 @@ class TestTheGateFloorAndTheRescueCopy:
         assert "THIN HEADROOM" not in payload["frame"]
         assert payload["_provenance"]["gate_required_addresses"] == 200
 
+    def test_exactly_the_gate_publishes_and_one_short_of_it_does_not(self, tmp_path):
+        """The boundary the whole module turns on, asserted from both sides.
+
+        `n < required` decides whether a 30-minute window becomes a file, and
+        every other test here sits far from it -- 2 addresses, or 240. So the
+        comparison could be `n <= required` and nothing would notice, which
+        means a harvest of exactly §3.3's 200 would be refused as short, the
+        rescue copy written, and the operator sent back for another window
+        against a bar they had already met. Found by mutation.
+        """
+        gate = collect.gate_required_addresses()
+        frames = [_frame([_trade([_addr(2 * i), _addr(2 * i + 1)])])
+                  for i in range(gate // 2)]
+        result, _, _ = _run(frames, target=gate, progress_every_s=600.0)
+        assert len(result.addresses) == gate
+
+        out = tmp_path / "exactly-the-gate.json"
+        payload = collect.write_address_list(result, out)
+        assert out.exists(), "a harvest that meets §3.3 exactly must publish"
+        assert "SHORT:" not in payload["frame"]
+        assert FileAddressSource(out).addresses() == list(result.addresses)
+
+        # And one below it is refused, so the assertion above is about the
+        # boundary rather than about the refusal being broken altogether.
+        one_short = replace(result, addresses=result.addresses[:-1])
+        with pytest.raises(ValueError, match=f"found {gate - 1} distinct addresses"):
+            collect.write_address_list(one_short, tmp_path / "one-short.json")
+
     def test_required_may_still_be_raised_above_the_gate(self, tmp_path):
         """The floor only ever tightens. A caller who wants more headroom than
         §3.3 demands is asking for something reasonable."""
@@ -1328,6 +1403,79 @@ class TestExitCodesDoNotCollide:
 
         assert exc.value.code == collect.EXIT_USAGE
         assert "not an existing directory" in capsys.readouterr().err
+
+    def test_a_subscription_that_cannot_be_sent_is_a_connection_fault(self):
+        """The connect is wrapped in FeedUnreachable; the send beside it was not.
+
+        A host that accepts the TCP and TLS handshake on a path it does not
+        serve reports itself on the first WRITE, not on connect -- and the
+        library's `ConnectionClosed` is not an `OSError`, so the closed-error
+        clause further down does not catch it either. It escaped `harvest`,
+        escaped `main`, and exited 1: EXIT_REFUSED, whose documented next move
+        is a longer --minutes on a collector that never sent a subscription.
+        """
+        class _DiesOnSend:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc_info):
+                return False
+
+            async def send(self, _payload):
+                raise StubClosed("sent 1011 (internal error); no close frame received")
+
+            async def recv(self):
+                raise AssertionError("recv must not be reached; nothing was subscribed")
+
+        transport = collect.Transport(connect=_DiesOnSend, closed_errors=(StubClosed,))
+        with pytest.raises(collect.FeedUnreachable) as exc:
+            harvest(coins=("BTC",), minutes=1.0, transport=transport,
+                    clock=FakeClock(), utcnow=FakeUtcNow(), emit=lambda line: None,
+                    ws_url="wss://api.hyperliquid.invalid/ws")
+
+        message = str(exc.value)
+        assert "could not send the subscription" in message
+        assert "wss://api.hyperliquid.invalid/ws" in message
+        assert "--ws-url" in message
+        assert "nothing will be written" in message
+
+    def test_a_failed_subscription_exits_three_not_one(self, tmp_path, monkeypatch, capsys):
+        """The same defect where an operator meets it: the shell's exit code."""
+        def _dies(**kwargs):
+            raise collect.FeedUnreachable("could not send the subscription: ConnectionClosed")
+
+        monkeypatch.setattr(collect, "harvest", _dies)
+        code = collect.main(["--out", str(tmp_path / "a.json")])
+
+        assert code == collect.EXIT_UNREACHABLE
+        assert code != collect.EXIT_REFUSED
+        assert "COULD NOT CONNECT" in capsys.readouterr().out
+
+    def test_every_returnable_exit_code_is_in_both_operator_facing_lists(self, capsys):
+        """A code IS the diagnosis here, so a code with no dictionary entry is
+        a diagnosis an operator cannot look up.
+
+        EXIT_WRITE_FAILED was returnable from `main` and named in neither the
+        `--help` epilog nor the module docstring's table, both of which stopped
+        at 4. This asserts over the EXIT_* constants rather than over a list
+        written out here, so adding a sixth code without documenting it fails.
+        """
+        with pytest.raises(SystemExit):
+            collect.main(["--help"])
+        help_text = capsys.readouterr().out
+        module_doc = collect.__doc__ or ""
+
+        codes = {name: value for name, value in vars(collect).items()
+                 if name.startswith("EXIT_")}
+        assert len(codes) >= 6, "the EXIT_* constants moved; this test is reading nothing"
+        for name, value in sorted(codes.items(), key=lambda kv: kv[1]):
+            assert f"    {value}  " in module_doc, (
+                f"{name}={value} is returnable but the module docstring's exit-code "
+                f"table does not list it"
+            )
+            assert f"{value} " in help_text, (
+                f"{name}={value} is returnable but --help's epilog does not list it"
+            )
 
     def test_the_summary_line_names_the_anomalies_the_run_counted(
         self, tmp_path, monkeypatch, capsys

@@ -50,7 +50,11 @@ from risk_engine.domain.types import (
     RiskEstimate,
     SimulationProvenance,
 )
-from risk_engine.liquidation.simulator import BridgeContext, LiquidationSimulator
+from risk_engine.liquidation.simulator import (
+    BridgeContext,
+    LiquidationSimulator,
+    any_liquidated,
+)
 from risk_engine.model.correlation import GlobalCorrelationMatrix
 from risk_engine.model.drift import DriftConvention
 from risk_engine.model.funding import Ar1Funding, FundingBounds, simulate_funding
@@ -636,9 +640,14 @@ class MonteCarloEngine:
 
 
 def _any_liq(raw: _RawOutcome) -> np.ndarray:
-    if raw.iso_liq.size:
-        return raw.cross_liq | raw.iso_liq.any(axis=1)
-    return raw.cross_liq
+    """The model's `p_liq_any` event, delegated rather than restated.
+
+    `_RawOutcome` is a different type from `SimulationOutcome`, so this cannot
+    be the property -- but it can be the same code. It used to be a third
+    hand-written copy of the same two lines, sitting on the other side of the
+    §3.1 comparison from `validation/baselines.py`'s copy.
+    """
+    return any_liquidated(raw.cross_liq, raw.iso_liq)
 
 
 def _concat(parts: list[_RawOutcome]) -> _RawOutcome:

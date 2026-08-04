@@ -89,6 +89,19 @@ class TestParseMeta:
         assert len(specs["SOL"].tiers) == 1
         assert specs["SOL"].maintenance_margin_rate(1e6) == pytest.approx(0.5 / 20)
 
+    def test_a_missing_size_decimal_count_defaults_to_zero(self):
+        """`szDecimals` sets the size increment, and the increment is what
+        `max_safe_size` rounds an answer DOWN to. A default of anything but 0
+        would let a rounding step invent precision the venue does not accept —
+        so the default has to be the one that cannot over-state, and it has to
+        be pinned, because no live payload in this file omits the field."""
+        specs = parse_meta({
+            "universe": [{"name": "XYZ", "maxLeverage": 10}],
+            "marginTables": [],
+        })
+        assert specs["XYZ"].sz_decimals == 0
+        assert specs["XYZ"].size_increment == 1.0
+
     def test_no_maintenance_rate_is_hardcoded_anywhere(self):
         """§1.3. Change the venue's table and every rate must follow."""
         halved = {
@@ -254,6 +267,87 @@ class TestLiveIsolatedMargin:
         theirs = float(raw["liquidationPx"])
         assert ours == pytest.approx(theirs, rel=1e-9)
 
+    def test_the_shipped_probe_stays_silent_on_a_book_it_understands(self):
+        """The test above re-implements the reconstruction in its own body, so
+        it pins the parsed COLLATERAL and never runs the shipped probe.
+
+        A mutation sweep found the consequence: every arithmetic site inside
+        `_record_isolated_consistency` survived — the maintenance rate, the
+        denominator's sign, the tolerance. The probe exists to catch a future
+        misreading of these fields on live data, and a probe whose own
+        arithmetic is unpinned reports "no mismatches" whether or not there
+        are any, which is the failure mode it was written to prevent.
+        """
+        from risk_engine.market.parse import ISOLATED_LIQ_PX_MISMATCHES
+
+        ISOLATED_LIQ_PX_MISMATCHES.clear()
+        self._parse(self.LONG)
+        self._parse(self.SHORT)
+        assert ISOLATED_LIQ_PX_MISMATCHES == []
+
+    def test_the_shipped_probe_can_actually_fire(self):
+        """The half that matters more. A check that cannot report a problem is
+        indistinguishable from one that finds none, and this repository has
+        met that shape before (a counter pinned at zero, a diagnostic nothing
+        called). Here the venue's own answer is moved 10% and the probe must
+        say so.
+        """
+        from risk_engine.market.parse import ISOLATED_LIQ_PX_MISMATCHES
+
+        ISOLATED_LIQ_PX_MISMATCHES.clear()
+        wrong = dict(self.LONG)
+        wrong["liquidationPx"] = str(float(self.LONG["liquidationPx"]) * 1.10)
+        self._parse(wrong)
+        assert len(ISOLATED_LIQ_PX_MISMATCHES) == 1
+        coin, ours, _theirs, rel = ISOLATED_LIQ_PX_MISMATCHES[0]
+        assert coin == "BTC"
+        assert rel == pytest.approx(0.10 / 1.10, rel=1e-6)
+        assert ours == pytest.approx(float(self.LONG["liquidationPx"]), rel=1e-6), (
+            "the reconstruction itself must still land on the venue's real "
+            "answer; only the number it was compared against moved"
+        )
+
+    def test_the_tolerance_is_the_thing_that_decides(self):
+        """Pins `_LIQ_PX_TOLERANCE` as a threshold rather than a decoration.
+        Generous on purpose — the mark moves and funding accrues between the
+        venue computing `liquidationPx` and us reading `positionValue` — but a
+        tolerance nothing tests is a number anyone may widen.
+        """
+        from risk_engine.market.parse import (
+            ISOLATED_LIQ_PX_MISMATCHES,
+            _LIQ_PX_TOLERANCE,
+        )
+
+        # Pinned to the LITERAL, not just used as a parameter: parameterising
+        # by the constant makes the test move with it, so widening the
+        # tolerance would go unnoticed by the very test that names it.
+        assert _LIQ_PX_TOLERANCE == 0.02
+
+        real = float(self.LONG["liquidationPx"])
+        for factor, expect_flagged in (
+            (1.0 + _LIQ_PX_TOLERANCE * 0.5, False),
+            (1.0 + _LIQ_PX_TOLERANCE * 2.0, True),
+        ):
+            ISOLATED_LIQ_PX_MISMATCHES.clear()
+            skewed = dict(self.LONG)
+            skewed["liquidationPx"] = str(real * factor)
+            self._parse(skewed)
+            assert bool(ISOLATED_LIQ_PX_MISMATCHES) is expect_flagged, factor
+
+    def test_a_venue_price_of_zero_is_not_a_mismatch(self):
+        """`liquidationPx` of 0 means the venue is not naming a liquidation
+        price, not that ours is wrong by infinity. Without the guard the
+        relative error is `x / 0.0` — inf for floats, no exception — and every
+        such position is reported as a mismatch, burying the real ones.
+        """
+        from risk_engine.market.parse import ISOLATED_LIQ_PX_MISMATCHES
+
+        ISOLATED_LIQ_PX_MISMATCHES.clear()
+        quiet = dict(self.LONG)
+        quiet["liquidationPx"] = "0"
+        self._parse(quiet)
+        assert ISOLATED_LIQ_PX_MISMATCHES == []
+
     def test_a_long_pocket_is_no_longer_dropped(self):
         """`rawUsd` is NEGATIVE for a long -- the venue buys partly on
         borrowed dollars -- so reading it as collateral made `Position` refuse
@@ -381,6 +475,25 @@ class TestCandlesAndFunding:
     def test_rejects_a_non_positive_close(self):
         with pytest.raises(ValueError, match="non-positive"):
             parse_candles_to_log_returns([{"t": 1, "c": "0"}, {"t": 2, "c": "1"}])
+
+    def test_a_sub_dollar_coin_is_not_a_non_positive_close(self):
+        """The guard's boundary is zero, and only zero.
+
+        Every close in every other test here is above 1.0, so the guard could
+        be tightened to `closes <= 1` -- or to any threshold below the cheapest
+        fixture price -- without a single assertion noticing. Hyperliquid lists
+        plenty of perps that trade under a dollar (DOGE, kPEPE, kBONK), and for
+        those the tightened guard is not a stricter check but a total refusal:
+        `build_return_matrix` would raise on the whole universe fetch rather
+        than on one bad candle, and §2.1 would have no matrix at all.
+        """
+        candles = [{"t": 3_600_000 * i, "c": str(0.15 * 1.01**i)} for i in range(4)]
+        times, rets = parse_candles_to_log_returns(candles)
+        assert times.size == rets.size == 3
+        assert np.allclose(rets, np.log(1.01)), (
+            "a coin priced in cents must parse exactly like a coin priced in "
+            "thousands; only a close at or below zero is refused"
+        )
 
     def test_funding_history_parses_in_time_order(self):
         history = [

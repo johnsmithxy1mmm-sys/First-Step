@@ -83,10 +83,12 @@ class NaiveBaseline:
             prices[:, 1, i] = spot[c] * mult[:, 0]
 
         out = LiquidationSimulator(book, specs, columns).run(prices)
-        liq = out.cross_liquidated
-        if out.isolated_liquidated.size:
-            liq = liq | out.isolated_liquidated.any(axis=1)
-        k = int(liq.sum())
+        # The property, not a second copy of its body. Baseline A's p_liq is
+        # compared against the model's, and the model's comes from
+        # `engine.py::_any_liq`; two hand-written definitions of "liquidated"
+        # on opposite sides of that comparison can drift into scoring different
+        # events while both still look like probabilities.
+        k = int(out.any_liquidated.sum())
         return BaselinePrediction(
             name=self.name,
             equity_change=PredictiveDistribution.from_samples(out.equity_change),

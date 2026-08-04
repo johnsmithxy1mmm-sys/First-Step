@@ -66,6 +66,36 @@ class BridgeContext:
     corr: np.ndarray  # (A, A)
 
 
+def any_liquidated(cross_liquidated: np.ndarray, isolated_liquidated: np.ndarray) -> np.ndarray:
+    """Per path: did ANYTHING liquidate -- the cross pool or any isolated pocket.
+
+    A free function taking the two arrays rather than a method, because this
+    predicate is needed from three places holding three different types, and
+    it had been written out three times: here as
+    `SimulationOutcome.any_liquidated`, again inline in
+    `validation/baselines.py`, and again as `sim/engine.py::_any_liq` over
+    `_RawOutcome`. The named one was called by nobody, so the two live copies
+    were the ones that mattered and neither pointed at it.
+
+    That duplication is worse than it looks. `p_liq_any` is the headline number
+    the product shows AND the event §3.1 scores the model on, and the two live
+    copies sit on opposite sides of that comparison -- `engine.py` computes the
+    model's, `baselines.py` computes baseline A's. If either drifts, both still
+    return perfectly valid probabilities of *different events*, the CRPS and
+    Brier comparisons that decide §0.2 migration compare them anyway, and
+    nothing in the output says so. One definition, three callers.
+
+    The empty-isolated branch is not an optimisation: `np.any` over a (P, 0)
+    array returns all-False of the right shape, so the OR would be correct
+    without it, but only when `isolated_liquidated` was built with the right
+    first dimension. Returning `cross_liquidated` untouched makes a book with
+    no isolated pockets independent of that array's shape entirely.
+    """
+    if isolated_liquidated.size:
+        return cross_liquidated | isolated_liquidated.any(axis=1)
+    return cross_liquidated
+
+
 @dataclass(frozen=True, slots=True)
 class SimulationOutcome:
     cross_liquidated: np.ndarray  # (P,) bool
@@ -78,19 +108,11 @@ class SimulationOutcome:
 
     @property
     def any_liquidated(self) -> np.ndarray:
-        if self.isolated_liquidated.size:
-            return self.cross_liquidated | self.isolated_liquidated.any(axis=1)
-        return self.cross_liquidated
+        return any_liquidated(self.cross_liquidated, self.isolated_liquidated)
 
     @property
     def equity_change(self) -> np.ndarray:
         return self.terminal_equity - self.start_equity
-
-    @property
-    def equity_return(self) -> np.ndarray:
-        if self.start_equity <= 0:
-            raise ValueError("start equity is non-positive; the account is already gone")
-        return self.equity_change / self.start_equity
 
 
 def _constant_mmr(position_specs: list[AssetSpec]) -> np.ndarray | None:
