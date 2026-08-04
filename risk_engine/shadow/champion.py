@@ -27,7 +27,7 @@ import numpy as np
 
 from risk_engine.shadow.journal import VARIANT_MODEL, CalibrationJournal
 from risk_engine.shadow.metrics import COHORT_BOOK_UNCHANGED
-from risk_engine.sim.stats import clustered_bootstrap_ci
+from risk_engine.sim.stats import clustered_mean_ci
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,8 +128,8 @@ def compare(
 
     clustered = None
     if np.unique(days).size >= 2:
-        clustered = clustered_bootstrap_ci(
-            diff, days, lambda v: float(v.mean()), np.random.default_rng(seed)
+        clustered = clustered_mean_ci(
+            diff, days, np.random.default_rng(seed)
         )
     return ChallengerVerdict(
         champion_version=champion_version,

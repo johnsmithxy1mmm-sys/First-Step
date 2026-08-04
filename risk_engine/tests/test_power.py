@@ -14,7 +14,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from risk_engine.sim.stats import clustered_bootstrap_ci
+from risk_engine.sim.stats import clustered_mean_ci
 from risk_engine.validation.power import (
     NOMINAL_BREACH_RATE,
     clustered_rate_ci,
@@ -68,7 +68,7 @@ class TestGenerator:
 class TestIntervalAgreement:
     def test_the_fast_interval_equals_the_general_clustered_one(self):
         """`clustered_rate_ci` is a specialisation for a ratio of sums. If it
-        drifts from `clustered_bootstrap_ci` the whole table is measuring
+        drifts from `clustered_mean_ci` the whole table is measuring
         something other than the interval the gate is actually read from."""
         rng = np.random.default_rng(4)
         sums, counts = simulate_days(30, 200, NOMINAL_BREACH_RATE, 0.15, rng)
@@ -84,9 +84,8 @@ class TestIntervalAgreement:
         ids = np.concatenate([
             np.full(c, d) for d, c in enumerate(counts)
         ])
-        general = clustered_bootstrap_ci(
-            values, ids, lambda v: float(v.mean()), np.random.default_rng(9),
-            n_boot=4_000,
+        general = clustered_mean_ci(
+            values, ids, np.random.default_rng(9), n_boot=4_000,
         )
         assert fast[0] == pytest.approx(general[0], abs=0.002)
         assert fast[1] == pytest.approx(general[1], abs=0.002)
@@ -187,3 +186,82 @@ class TestCalibration:
                         n_trials=150, n_boot=400, seed=15)
         # Under independence 2.5x the sample would cut the half-width by ~37%.
         assert many.clustered_half_width_pp > 0.85 * few.clustered_half_width_pp
+
+
+class TestTheClusteredIntervalActuallyCovers:
+    """Nobody had measured the one property an interval exists to have.
+
+    The shipped interval was a PERCENTILE bootstrap over days. Resampling
+    days is necessary — B1's whole argument — and it is not sufficient: a
+    percentile bootstrap undercovers badly when the clusters are few, and 21
+    days is few. Measured at 200 addresses/day against a nominal 95%:
+
+    | ICC  | percentile (was) | studentised (now) |
+    |------|------------------|-------------------|
+    | 0.00 |  94.8%           |  95.2%            |
+    | 0.10 |  89.0%           |  94.0%            |
+    | 0.20 |  82.8%           |  94.5%            |
+    | 0.40 |  79.2%           |  91.2%            |
+
+    Two costs, and the second is worse. A gate criterion read off an interval
+    covering 83% rejects a correct model ~17% of the time instead of 5%. And
+    `clustered_half_width_pp` — the column B1 sizes the window from — was
+    taken from that interval: 3.58pp at ICC 0.20 where the honest figure is
+    7.31pp, so a window sized off it looks informative and is not.
+
+    B1 records this exact lesson, learned on the ICC estimator in
+    `clustering.py` ("the day-clustered percentile bootstrap covers 43% ...
+    Both were discarded"). It never reached this interval.
+    """
+
+    TRIALS = 200
+
+    def _coverage(self, icc, days=21, per_day=200, seed=0):
+        rng = np.random.default_rng(seed)
+        hits = 0
+        for t in range(self.TRIALS):
+            sums, counts = simulate_days(days, per_day, NOMINAL_BREACH_RATE, icc, rng)
+            lo, hi = clustered_rate_ci(sums, counts,
+                                       np.random.default_rng(7717 + t), n_boot=200)
+            hits += lo <= NOMINAL_BREACH_RATE <= hi
+        return hits / self.TRIALS
+
+    @pytest.mark.parametrize("icc", [0.0, 0.10, 0.20])
+    def test_it_covers_at_about_its_nominal_level(self, icc):
+        """0.90 rather than 0.95 as the bar: 200 trials carry a standard
+        error near 1.5pp, so a tighter threshold would be flaky. It is still
+        far above the 82.8% the percentile version scored at ICC 0.20, which
+        is the regression this guards."""
+        assert self._coverage(icc) >= 0.90, icc
+
+    def test_the_naive_interval_does_not_cover_at_all(self):
+        """The contrast that justifies the machinery. §0.3's binomial interval
+        assumes independence; at ICC 0.20 it contains the true rate about a
+        quarter of the time, which is B1's recorded 77.7% false rejection
+        seen from the other side."""
+        from risk_engine.sim.stats import wilson_interval
+
+        rng = np.random.default_rng(1)
+        hits = 0
+        for _ in range(self.TRIALS):
+            sums, counts = simulate_days(21, 200, NOMINAL_BREACH_RATE, 0.20, rng)
+            lo, hi = wilson_interval(int(sums.sum()), int(counts.sum()))
+            hits += lo <= NOMINAL_BREACH_RATE <= hi
+        assert hits / self.TRIALS < 0.5
+
+    def test_a_degenerate_sample_gets_a_point_not_a_fabricated_width(self):
+        """Every day identical means there is no between-day variation to
+        studentise against. A width invented from nothing would be worse than
+        admitting the interval is a point."""
+        sums = np.zeros(21, dtype=np.int64)
+        counts = np.full(21, 200, dtype=np.int64)
+        lo, hi = clustered_rate_ci(sums, counts, np.random.default_rng(0), n_boot=50)
+        assert lo == hi == 0.0
+
+    def test_it_refuses_a_single_day(self):
+        """One cluster cannot bound between-cluster variation, and a silent
+        answer there would be the undercoverage this class exists to stop,
+        taken to its limit."""
+        with pytest.raises(ValueError, match="two days"):
+            clustered_rate_ci(np.array([10]), np.array([200]),
+                              np.random.default_rng(0))

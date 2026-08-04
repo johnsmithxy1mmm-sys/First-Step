@@ -83,23 +83,48 @@ def clustered_rate_ci(
     n_boot: int = 2_000,
     alpha: float = 0.05,
 ) -> tuple[float, float]:
-    """Day-clustered percentile interval on the pooled breach rate.
+    """Day-clustered STUDENTISED interval on the pooled breach rate.
 
-    Resamples whole days, which is what `clustered_bootstrap_ci` does for the
+    Resamples whole days, which is what `clustered_mean_ci` does for the
     general case. Specialised here because the statistic is a ratio of sums:
     a resampled rate is `sum(picked sums) / sum(picked counts)`, so a whole
-    sweep costs two gathers instead of rebuilding the observation vector
-    thousands of times. It is the same interval, and
-    `test_power.py` checks that against the general implementation rather
-    than taking it on trust.
+    sweep costs a few gathers instead of rebuilding the observation vector
+    thousands of times. It is the same interval, and `test_power.py` checks
+    that against the general implementation rather than taking it on trust.
+
+    Studentised since 2026-08-04, with the general one, for the reason
+    recorded there: a PERCENTILE bootstrap over days undercovers badly when
+    the clusters are few, and 21 days is few. It covered 82.8% at ICC 0.20
+    against a nominal 95%.
+
+    That matters here specifically, and more than it does at the gate. The
+    `clustered_half_width_pp` column of the table this module produces is
+    what B1 sizes the shadow window from, and a half-width taken from an
+    interval covering 83% is too narrow: at ICC 0.20 the honest figure is
+    ~7.3pp rather than ~3.6pp. A window sized off the old number looks
+    informative and is not, which is §10's direction reached by arithmetic.
+    Any table printed before this date is under-stated and should be re-run.
     """
     d = day_sums.size
+    if d < 2:
+        raise ValueError("need at least two days to resample over them")
+    total = float(day_counts.sum())
+    theta = float(day_sums.sum()) / total
+    resid = day_sums - day_counts * theta
+    se = float(np.sqrt((d / (d - 1.0)) * float((resid**2).sum()) / total**2))
+    if se <= 0.0:
+        return theta, theta
+
     pick = rng.integers(0, d, size=(n_boot, d))
-    rates = day_sums[pick].sum(axis=1) / day_counts[pick].sum(axis=1)
-    return (
-        float(np.quantile(rates, alpha / 2)),
-        float(np.quantile(rates, 1 - alpha / 2)),
-    )
+    s, c = day_sums[pick], day_counts[pick]
+    tot_b = c.sum(axis=1)
+    theta_b = s.sum(axis=1) / tot_b
+    resid_b = s - c * theta_b[:, None]
+    se_b = np.sqrt((d / (d - 1.0)) * (resid_b**2).sum(axis=1) / tot_b**2)
+    ts = np.divide(theta_b - theta, se_b, out=np.zeros_like(theta_b),
+                   where=se_b > 0)
+    hi_t, lo_t = np.quantile(ts, [1.0 - alpha / 2, alpha / 2])
+    return float(theta - hi_t * se), float(theta - lo_t * se)
 
 
 @dataclass(frozen=True)

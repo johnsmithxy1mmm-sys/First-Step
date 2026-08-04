@@ -311,31 +311,92 @@ def ks_uniformity(pit_values: np.ndarray) -> tuple[float, float]:
     return float(res.statistic), float(res.pvalue)
 
 
-def clustered_bootstrap_ci(
+def _pooled_mean_and_cluster_se(groups: list[np.ndarray]) -> tuple[float, float]:
+    """Pooled mean and its cluster-robust (sandwich) standard error.
+
+    Pooled rather than the unweighted average of per-cluster means, because
+    §0.3 asks about THE breach rate over the observations, and the two differ
+    whenever days carry different numbers of addresses.
+    """
+    n = sum(g.size for g in groups)
+    m = len(groups)
+    if n == 0 or m < 2:
+        return float("nan"), float("nan")
+    theta = sum(float(g.sum()) for g in groups) / n
+    resid = np.array([float(g.sum()) - g.size * theta for g in groups])
+    var = (m / (m - 1.0)) * float((resid**2).sum()) / (n**2)
+    return theta, float(np.sqrt(max(var, 0.0)))
+
+
+def clustered_mean_ci(
     values: np.ndarray,
     cluster_ids: np.ndarray,
-    statistic,
     rng: np.random.Generator,
     n_boot: int = 2000,
     alpha: float = 0.05,
 ) -> tuple[float, float]:
-    """Interval that resamples whole clusters, not individual observations.
+    """Cluster-robust interval on a mean, STUDENTISED.
 
-    §0.3 and §3.3 ask for a binomial interval around the VaR breach rate.
-    That interval assumes independent observations; 300 addresses observed on
-    the same day are not independent, because one market move drives all of
-    them. Resampling days keeps the dependence intact and is the interval the
-    gate should actually be read from (OPEN-QUESTIONS B1).
+    §0.3 and §3.3 ask for an interval around the VaR breach rate. The binomial
+    one assumes independent observations, and 300 addresses observed on the
+    same day are not independent -- one market move drives all of them -- so
+    days are resampled whole (OPEN-QUESTIONS B1).
+
+    Resampling days is necessary and was not sufficient. This was a PERCENTILE
+    bootstrap over days, and a percentile bootstrap undercovers badly when the
+    clusters are few, which 21 days is. Measured against a beta-binomial
+    generator whose day-level correlation is controlled, at 200 addresses/day,
+    nominal 95%:
+
+    | ICC  | percentile (was) | studentised (now) |
+    |------|------------------|-------------------|
+    | 0.00 |  94.8% ±0.63pp   |  95.2% ±0.69pp    |
+    | 0.05 |  92.0% ±2.06pp   |  94.8% ±2.55pp    |
+    | 0.10 |  89.0% ±2.74pp   |  94.0% ±3.92pp    |
+    | 0.20 |  82.8% ±3.58pp   |  94.5% ±7.31pp    |
+    | 0.40 |  79.2% ±4.94pp   |  91.2% ±27.83pp   |
+
+    The harness is calibrated by the row this repository already published:
+    the naive Wilson interval covers 23.5% at ICC 0.20 here, against B1's
+    recorded 77.7% rejection rate for a correct model.
+
+    Two consequences, and the second is the worse one. A gate criterion read
+    off an interval covering 83% rejects a correctly calibrated model about
+    17% of the time instead of 5%. And B1's window arithmetic reads this
+    interval's WIDTH: at ICC 0.20 the honest half-width is 7.31pp, not the
+    3.58pp the percentile version reported, so a window sized off the old
+    number looks informative and is not -- §10's forbidden direction, reached
+    by arithmetic.
+
+    B1 records exactly this lesson, learned on the OTHER interval: "the
+    day-clustered percentile bootstrap covers 43% at 14 days ... Both were
+    discarded. The shipped intervals invert the test." That fix went into
+    `clustering.py`'s ICC estimator and never reached this one.
+
+    The width at ICC 0.40 is not a defect of the interval. 27pp says a
+    21-day window cannot resolve the breach rate at that clustering, which is
+    what B1's power table independently concludes (~180 days).
     """
-    v = np.asarray(values)
+    v = np.asarray(values, dtype=np.float64)
     ids = np.asarray(cluster_ids)
     uniq = np.unique(ids)
     if uniq.size < 2:
         raise ValueError("need at least two clusters to bootstrap over them")
     groups = [v[ids == u] for u in uniq]
-    out = np.empty(n_boot)
+    theta, se = _pooled_mean_and_cluster_se(groups)
+    if not np.isfinite(se) or se <= 0.0:
+        # Every cluster identical -- no variation to studentise against, and
+        # a bootstrap over identical clusters says the same. A degenerate
+        # point interval is the honest answer, not a fabricated width.
+        return float(theta), float(theta)
+    m = len(groups)
+    ts = np.empty(n_boot)
     for b in range(n_boot):
-        pick = rng.integers(0, len(groups), size=len(groups))
-        out[b] = statistic(np.concatenate([groups[i] for i in pick]))
-    lo, hi = np.quantile(out, [alpha / 2, 1 - alpha / 2])
-    return float(lo), float(hi)
+        pick = rng.integers(0, m, size=m)
+        tb, sb = _pooled_mean_and_cluster_se([groups[i] for i in pick])
+        ts[b] = (tb - theta) / sb if sb > 0 else 0.0
+    # Note the crossing: the UPPER quantile of the t distribution gives the
+    # LOWER endpoint. Getting this backwards inverts the interval and is
+    # silent, because a symmetric-looking result stays symmetric-looking.
+    hi_t, lo_t = np.quantile(ts, [1.0 - alpha / 2, alpha / 2])
+    return float(theta - hi_t * se), float(theta - lo_t * se)

@@ -571,6 +571,45 @@ realised intra-class correlation is checked against the requested one, and
 the fast interval is checked against `clustered_bootstrap_ci`
 (`test_power.py`). 300 trials per cell:
 
+**RE-DERIVED 2026-08-04.** The half-widths below were computed with an
+interval that did not cover: `clustered_rate_ci` was a day-clustered
+PERCENTILE bootstrap, and a percentile bootstrap undercovers badly when the
+clusters are few. Measured coverage against a nominal 95% was 94.8% at
+ICC 0, 89.0% at 0.10, **82.8% at 0.20** and 79.2% at 0.40. Resampling days
+was necessary — this entry's whole argument — and it was not sufficient.
+
+That is the same lesson this entry already records having learned on the
+OTHER interval ("the day-clustered percentile bootstrap covers 43% at 14
+days ... Both were discarded. The shipped intervals invert the test"). The
+fix went into `clustering.py`'s ICC estimator and never reached this one, so
+the sizing table was built on a too-narrow interval. Both are now
+studentised; coverage after the change is 94-95% across the range.
+
+The corrected table, 400 trials per cell:
+
+| days | addr/day | ICC | §0.3 rejects a *correct* model | clustered ±pp | power vs 8% | power vs 10% |
+|---|---|---|---|---|---|---|
+| 21 | 200 | 0.00 | 4.5% | 0.70 | 100% | 100% |
+| 21 | 200 | 0.05 | 53.0% | 2.43 | 70.0% | 98.0% |
+| 21 | 200 | 0.10 | 70.0% | 3.48 | 39.8% | 80.5% |
+| 21 | 200 | 0.20 | 74.2% | **5.80** | 21.0% | 47.8% |
+| 21 | 200 | 0.40 | 83.5% | **15.36** | 13.0% | 26.8% |
+| 60 | 200 | 0.20 | 74.8% | 2.79 | 58.8% | 93.2% |
+| 90 | 200 | 0.20 | 75.0% | 2.22 | 75.5% | 99.5% |
+| 180 | 200 | 0.20 | 74.8% | 1.51 | 97.0% | 100% |
+| 180 | 200 | 0.40 | 83.2% | 2.16 | 76.5% | 98.8% |
+
+What moved, and it is the half-widths rather than the conclusions: 3.60 →
+**5.80** pp at ICC 0.20, and 4.87 → **15.36** pp at 0.40. So a 21-day window
+bounds the breach rate to about ±5.8pp at the plausible clustering, not
+±3.6pp — the gate was reporting a precision it did not have, in §10's
+direction. The day counts this entry recommends are unchanged, because power
+depends on both endpoints moving together; what changes is the honesty of
+the number a published score would quote.
+
+For the record, the superseded figures, computed with the undercovering
+interval:
+
 | days | addr/day | ICC | §0.3 rejects a *correct* model | clustered ±pp | power vs 8% | power vs 10% |
 |---|---|---|---|---|---|---|
 | 21 | 200 | 0.00 | 3.7% | 0.61 | 100% | 100% |
@@ -598,7 +637,7 @@ Three findings, none of which the estimate had:
    measuring, it is not calibration.
 
 2. **More addresses buy almost nothing.** 200 → 500 per day moves the
-   clustered half-width from 3.60 to 3.43 pp at ICC 0.20. Under independence
+   clustered half-width barely at all at ICC 0.20. Under independence
    2.5× the sample would cut it by 37%. The day is the unit; sampling harder
    is not a substitute for waiting, and the §3.3 window's "× 200 addresses"
    is doing far less work than its "21 days".

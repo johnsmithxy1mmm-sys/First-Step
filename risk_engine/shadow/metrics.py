@@ -31,7 +31,7 @@ from risk_engine.shadow.journal import (
     VARIANT_MODEL,
     CalibrationJournal,
 )
-from risk_engine.sim.stats import clustered_bootstrap_ci, ks_uniformity
+from risk_engine.sim.stats import clustered_mean_ci, ks_uniformity
 
 COHORT_ALL = "all"
 COHORT_NO_FLOW = "no_external_flow"
@@ -193,10 +193,9 @@ def tail_calibration(cohort: Cohort, target: float = 0.05, seed: int = 0) -> Tai
     naive = wilson_interval(k, n)
     clustered = None
     if cohort.n_days >= 2:
-        clustered = clustered_bootstrap_ci(
+        clustered = clustered_mean_ci(
             cohort.breached.astype(float),
             cohort.days,
-            lambda v: float(v.mean()),
             np.random.default_rng(seed),
         )
     return TailCalibration(
