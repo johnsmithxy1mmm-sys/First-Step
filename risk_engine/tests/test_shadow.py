@@ -1474,3 +1474,186 @@ def test_the_shadow_jobs_do_not_inherit_a_healthcheck_they_cannot_pass():
     for svc in ("shadow-snapshot", "shadow-resolve"):
         block = text.split(f"  {svc}:", 1)[1].split("\n  shadow-", 1)[0]
         assert "disable: true" in block, svc
+
+
+class _WindowedProvider(FakeProvider):
+    """A provider whose `external_flow` HONOURS the window it is asked for.
+
+    `FakeProvider` returns the same figure for any window, which is exactly
+    why the defect below could not surface in this suite: every mutation of
+    the flow window's bounds survived every test. Any future test about
+    WHICH flows are corrected has to use this one.
+    """
+
+    def __init__(self, books, spot, specs, later_books, flow_at, amount):
+        super().__init__(books, spot, specs, later_books=later_books)
+        self._flow_at, self._amount = flow_at, amount
+        self.windows: list[tuple[datetime, datetime]] = []
+
+    def external_flow(self, address, since, until):
+        self.windows.append((since, until))
+        return self._amount if since <= self._flow_at <= until else 0.0
+
+
+class TestTheFlowWindowCoversWhatTheEquityIncludes:
+    """`change = actual_equity - start_equity - flow`, and the two ends of
+    that subtraction have to describe the same interval.
+
+    `actual_equity` is the book read at `observed_at`. Under pacing that
+    trails `resolves_at` by minutes to tens of minutes — legitimately, and by
+    up to `stale_after_s` (2h) before it is even flagged. A flow window
+    ending at `resolves_at` therefore leaves everything in that gap inside
+    the equity and outside the correction, where it is scored as model error.
+
+    Reproduced before the fix: a $50 000 deposit landing 10 minutes after
+    `resolves_at`, book read 30 minutes after, recorded as a $50 000
+    model-attributable change with `external_flow_usd` 0.00 and PIT 1.0000,
+    NOT flagged stale. It corrupts all three scored quantities — `pit`,
+    `crps` and `var_95_breached` are every one of them a function of
+    `actual_equity_change`.
+
+    The mirror of this at the START of the window was already fixed (see
+    `_snapshot_captured_at`); this is the same mistake at the other end.
+    """
+
+    DEPOSIT = 50_000.0
+
+    def _seed(self, journal, bundle, specs, spot, books, naive, now, later_books,
+              flow_at):
+        provider = _WindowedProvider(books, spot, specs, later_books, flow_at,
+                                     self.DEPOSIT)
+        ShadowCron(provider, bundle, journal, naive, n_paths=1_000).run_once(now)
+        provider.phase = "after"
+        return provider
+
+    def test_a_deposit_after_the_horizon_is_corrected_not_scored(
+        self, bundle, specs, spot, books, naive, now
+    ):
+        resolves_at = now + timedelta(hours=24)
+        flow_at = resolves_at + timedelta(minutes=10)
+        observed = resolves_at + timedelta(minutes=30)
+        richer = {
+            a: Book(b.address, b.cross_collateral + self.DEPOSIT, b.positions,
+                    b.captured_at)
+            for a, b in books.items()
+        }
+        journal = CalibrationJournal()
+        provider = self._seed(journal, bundle, specs, spot, books, naive, now,
+                              richer, flow_at)
+        resolve_due(journal, provider, observed)
+
+        rows = journal._query(
+            "SELECT o.actual_equity_change, o.external_flow_usd, o.stale_resolution "
+            "FROM calibration_outcomes o JOIN calibration_predictions p "
+            "ON p.id = o.prediction_id WHERE p.variant = ?", (VARIANT_MODEL,)
+        )
+        journal.close()
+        assert rows, "nothing resolved; the fixture is not exercising the path"
+        row = rows[0]
+        assert not row["stale_resolution"], (
+            "a 30-minute lag is well inside the 2h bound, so staleness does not "
+            "cover this — which is what makes it dangerous"
+        )
+        assert row["external_flow_usd"] == pytest.approx(self.DEPOSIT), (
+            "the deposit landed inside the interval the measured equity covers, "
+            "so it must be subtracted"
+        )
+        assert abs(row["actual_equity_change"]) < self.DEPOSIT / 100.0, (
+            "with the flow corrected, a book whose positions and prices did not "
+            "move must record ~no model-attributable change"
+        )
+
+    def test_the_window_ends_where_the_book_was_read(
+        self, bundle, specs, spot, books, naive, now
+    ):
+        """Stated directly, because the assertion above would also pass if the
+        window were widened by luck rather than by construction."""
+        resolves_at = now + timedelta(hours=24)
+        observed = resolves_at + timedelta(minutes=30)
+        journal = CalibrationJournal()
+        provider = self._seed(journal, bundle, specs, spot, books, naive, now,
+                              {}, resolves_at)
+        resolve_due(journal, provider, observed)
+        journal.close()
+
+        assert provider.windows, "no flow window was requested at all"
+        for _since, until in provider.windows:
+            assert until > resolves_at, (
+                f"window ends at {until}, at or before the horizon end "
+                f"{resolves_at} — the gap to the book read is unaccounted"
+            )
+
+    def test_one_flow_fetch_per_address_not_per_variant(
+        self, bundle, specs, spot, books, naive, now
+    ):
+        """The fix must not cost what the cache saves. `observed_at` comes off
+        the per-address cache, so the three variants of one address still
+        share a key — if it were read per row, each address would cost three
+        fetches and the resolver's capacity arithmetic (~40 weight/address)
+        would be wrong by 3x."""
+        resolves_at = now + timedelta(hours=24)
+        observed = resolves_at + timedelta(minutes=5)
+        journal = CalibrationJournal()
+        provider = self._seed(journal, bundle, specs, spot, books, naive, now,
+                              {}, resolves_at)
+        resolve_due(journal, provider, observed)
+        journal.close()
+
+        assert len(provider.windows) == len(books), (
+            f"{len(provider.windows)} flow fetches for {len(books)} addresses; "
+            f"the per-address cache is not being hit"
+        )
+
+
+class TestTheFingerprintSeesWhatMovesThePrediction:
+    """`book_changed` decides the cohort B2 says the gate is read off, so a
+    material change it misses admits a row whose realisation came from a
+    different book than the one predicted.
+
+    The fingerprint covered coin, size and mode. Both of the things that make
+    an ISOLATED pocket riskier or safer were invisible.
+    """
+
+    NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    def _iso(self, margin: float, lev: float) -> Book:
+        return Book(ADDR_A, 0.0, (Position("BTC", 1.0, 100_000.0,
+                                           MarginMode.ISOLATED, lev,
+                                           isolated_margin=margin),), self.NOW)
+
+    def test_adding_margin_to_a_pocket_is_a_change(self):
+        """Total equity does not move — the collateral shifts from cross into
+        the pocket — so the SCORED quantity hides it entirely. What moves is
+        the pocket's distance to liquidation, which is what was predicted."""
+        assert position_fingerprint(self._iso(10_000.0, 10.0)) != \
+            position_fingerprint(self._iso(50_000.0, 10.0))
+
+    def test_isolated_leverage_is_a_change(self):
+        """A7 measured this one: set leverage moves an isolated pocket's
+        P(liq) from 0.02167 to 0.62915 over its own grid."""
+        assert position_fingerprint(self._iso(10_000.0, 5.0)) != \
+            position_fingerprint(self._iso(10_000.0, 25.0))
+
+    def test_cross_leverage_is_deliberately_not_a_change(self):
+        """The other half, and it is not an oversight. §1.2 makes the cross
+        slider immaterial and A7 pinned the invariance through the full Monte
+        Carlo — 0.161125 at 5x, 10x and 25x. Flagging it would shrink the
+        cohort for a book that did not materially change."""
+        def cross(lev):
+            return Book(ADDR_A, 100_000.0,
+                        (Position("BTC", 1.0, 100_000.0, MarginMode.CROSS, lev),),
+                        self.NOW)
+
+        assert position_fingerprint(cross(5.0)) == position_fingerprint(cross(25.0))
+
+    def test_size_mode_and_coin_still_count(self):
+        """Guard on the rework: the original three must not have been lost."""
+        base = self._iso(10_000.0, 10.0)
+        bigger = Book(ADDR_A, 0.0, (Position("BTC", 2.0, 100_000.0,
+                                             MarginMode.ISOLATED, 10.0,
+                                             isolated_margin=10_000.0),), self.NOW)
+        other = Book(ADDR_A, 0.0, (Position("ETH", 1.0, 100_000.0,
+                                            MarginMode.ISOLATED, 10.0,
+                                            isolated_margin=10_000.0),), self.NOW)
+        assert position_fingerprint(base) != position_fingerprint(bigger)
+        assert position_fingerprint(base) != position_fingerprint(other)

@@ -369,8 +369,30 @@ def resolve_due(
             # write-once table (reproduced: a $50k deposit scored as a $50k
             # loss, VaR breached, PIT 0). `captured_at` is what the snapshot
             # already recorded for exactly this.
+            #
+            # And it has to END where `actual_equity` was measured, for the
+            # mirror-image reason. `actual_equity` is the book read at
+            # `observed_at`, which under pacing trails `resolves_at` by
+            # minutes to tens of minutes -- legitimately, and up to
+            # `stale_after_s` (2h) before it is even flagged. A window ending
+            # at `resolves_at` leaves every flow in that gap inside the equity
+            # and outside the correction, so it is scored as model error.
+            #
+            # Reproduced: a $50 000 deposit landing 10 minutes after
+            # `resolves_at`, with the book read 30 minutes after, was recorded
+            # as a $50 000 model-attributable change with `external_flow_usd`
+            # of 0.00 and PIT 1.0000 -- and NOT flagged stale, because 1800s
+            # is well inside the 2h bound. It corrupts all three scored
+            # quantities (`pit`, `crps`, `var_95_breached`), which is more
+            # than the start-of-window version of this bug did.
+            #
+            # `observed_at` is per ADDRESS (it comes off `cache`), so the
+            # three variants of one address still share a key and the flow is
+            # still fetched once. Two predictions for the same address from
+            # different days differ in `flow_from` and are fetched separately,
+            # which is correct.
             flow_from = _snapshot_captured_at(pending)
-            flow_key = (pending.address, flow_from, pending.resolves_at)
+            flow_key = (pending.address, flow_from, observed_at)
             if flow_key not in flow_cache:
                 got = _paced(lambda k=flow_key: provider.external_flow(k[0], k[1], k[2]))
                 if got is _CEILING:

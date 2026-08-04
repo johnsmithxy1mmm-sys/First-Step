@@ -45,7 +45,7 @@ from typing import Protocol
 
 import numpy as np
 
-from risk_engine.domain.types import AssetSpec, Book
+from risk_engine.domain.types import AssetSpec, Book, MarginMode
 from risk_engine.market.info import (
     SHADOW_RESERVED_FRACTION as _SHADOW_RESERVED_FRACTION,
     RateLimitExceeded,
@@ -457,8 +457,42 @@ def _book_snapshot(book: Book, spot: dict[str, float]) -> dict:
 
 
 def position_fingerprint(book: Book) -> str:
-    """Stable identity of a book's positions, ignoring price movement."""
-    parts = sorted(f"{p.coin}:{p.size:.10g}:{p.mode.value}" for p in book.positions)
+    """Stable identity of a book's positions, ignoring price movement.
+
+    Identity, not merely shape. This decides `book_changed`, and B2 says the
+    gate is read off the book-UNCHANGED cohort — so anything material that
+    this misses puts a row into that cohort whose realisation came from a
+    different book than the one predicted.
+
+    It used to cover coin, size and mode alone, which left two material
+    changes invisible:
+
+    - **isolated margin.** Adding or removing collateral from a pocket leaves
+      total equity untouched (it moves between cross and the pocket), so the
+      SCORED quantity does not move — but the pocket's liquidation distance
+      does, which is most of what the prediction was about.
+    - **isolated leverage.** A7 measured set leverage moving an isolated
+      pocket's P(liq) from 0.02167 to 0.62915 over its own grid. A 29x change
+      in the predicted quantity, recorded as "book unchanged".
+
+    Cross leverage is deliberately NOT included, on the same measurement:
+    §1.2 makes it immaterial for a cross position, and A7 pinned the
+    invariance end to end through the Monte Carlo (0.161125 at 5x, 10x and
+    25x, to six decimals). Including it would flag books that did not
+    materially change, which costs cohort size for nothing.
+
+    Format note: the string changed on 2026-08-04. A row written under the
+    old format resolves as `book_changed=True` against the new one, which is
+    the conservative direction — such rows drop OUT of the strict cohort
+    rather than into it — and the blast radius today is nil because the §3.3
+    counter has not started.
+    """
+    parts = sorted(
+        f"{p.coin}:{p.size:.10g}:{p.mode.value}"
+        + (f":m{p.isolated_margin:.10g}:l{p.leverage:.10g}"
+           if p.mode is MarginMode.ISOLATED else "")
+        for p in book.positions
+    )
     return "|".join(parts)
 
 
