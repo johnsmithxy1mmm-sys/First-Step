@@ -1205,3 +1205,52 @@ class TestItSaysWhatItIsDoing:
         with pytest.raises(verify_info.RateLimitExceeded):
             paced.charge(1)
         assert paced.waited_s > 0.0
+
+
+class TestTheRecordedFindingsReachTheContainer:
+    """The mechanism was built, tested, and inert where it is used.
+
+    `market/verify.py` reads `docs/hl-risk/VERIFIED.json`, resolved relative
+    to the package's own parent. The engine image copied `risk_engine/` and
+    nothing else, so inside a container the file did not exist —
+    `load_findings` returns {} for a missing file (correct: a fresh checkout
+    has none) and every containerised run reported C2 and C5 as unconfirmed
+    while the measurements that closed them sat in the repository.
+
+    Observed 2026-08-04 in a live run whose C2 line read plain INCONCLUSIVE
+    with no `(recorded)` suffix.
+    """
+
+    def test_the_image_copies_the_file_verify_reads(self):
+        import pathlib as _p
+
+        root = _p.Path(__file__).resolve().parents[2]
+        dockerfile = (root / "deploy/Dockerfile.engine").read_text(encoding="utf-8")
+        assert "COPY docs/hl-risk/VERIFIED.json" in dockerfile
+
+    def test_the_copied_path_is_the_one_the_code_resolves(self):
+        """Guard on the guard: copying the file to the wrong place inside the
+        image would satisfy the test above and change nothing. `WORKDIR /app`
+        plus `risk_engine/` at /app/risk_engine puts the default at
+        /app/docs/hl-risk/VERIFIED.json, so the COPY destination must be the
+        same repo-relative path."""
+        import pathlib as _p
+
+        from risk_engine.market.findings import DEFAULT_FINDINGS_PATH
+
+        root = _p.Path(__file__).resolve().parents[2]
+        assert DEFAULT_FINDINGS_PATH == root / "docs/hl-risk/VERIFIED.json"
+        dockerfile = (root / "deploy/Dockerfile.engine").read_text(encoding="utf-8")
+        assert "COPY docs/hl-risk/VERIFIED.json docs/hl-risk/VERIFIED.json" in dockerfile
+        assert "WORKDIR /app" in dockerfile
+
+    def test_an_empty_load_is_reported_rather_than_assumed(self, capsys, tmp_path):
+        """A missing file must stay legal and stop being silent. Silence is
+        what let this run for months: an empty result reads identically to
+        'nothing was ever recorded'."""
+        missing = tmp_path / "nope.json"
+        rc = verify.main(["--coins", "BTC", "--findings", str(missing)])
+        out = capsys.readouterr().out
+        assert "no recorded findings" in out
+        assert str(missing) in out
+        assert rc in (0, 1, 2)  # the venue is unreachable here; the print is the point

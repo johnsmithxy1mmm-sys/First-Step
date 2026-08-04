@@ -20,6 +20,19 @@ RUN pip install --no-cache-dir -r risk_engine/requirements.txt
 
 COPY risk_engine/ risk_engine/
 
+# The recorded out-of-band findings (C2's 12-hour basis series, C5's testnet
+# funding tick). Not documentation despite where it lives: `market/verify.py`
+# READS this file, and `DEFAULT_FINDINGS_PATH` resolves it relative to the
+# package's own parent — i.e. /app/docs/hl-risk/VERIFIED.json.
+#
+# Missing until 2026-08-04, and the failure was silent by design: a missing
+# findings file is the normal case for a fresh checkout, so `load_findings`
+# returns an empty dict rather than raising. Every containerised verification
+# run therefore reported C2 and C5 as unconfirmed while the measurements that
+# closed them sat in the repository, unreadable from inside. The mechanism was
+# built, tested, and inert on the one path an operator actually uses.
+COPY docs/hl-risk/VERIFIED.json docs/hl-risk/VERIFIED.json
+
 # Non-root. The engine writes nothing except logs; the journal lives in
 # Postgres or on a mounted volume owned by the same uid.
 RUN useradd --create-home --uid 10001 risk && chown -R risk:risk /app

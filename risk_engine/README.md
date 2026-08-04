@@ -411,7 +411,7 @@ that produced it:
 |---|-----------|--------|----------|
 | E5 | `meta`, `candleSnapshot`, `clearinghouseState` parse | **PASS** 2026-07-29 | `market.verify`: 177 assets / 34 multi-tier; 720 hourly BTC returns, 0 gaps; 10 positions, cross collateral $4.5M |
 | E4 | trades-feed message shape | **PASS** 2026-07-31 | `collect_addresses`: 515 addresses from 2 989 records, 0 unparseable, 0 anomalies |
-| B2 | ledger delta types classify | **PASS** 2026-07-31 | `market.verify --address`, after `send` was added; it FAILED first and that is what found `send` |
+| B2 | ledger delta types classify | **PASS** 2026-08-04 | 200-address frame sweep: 23 599 records, 200/200 addresses, **16 distinct types, all readable** — including the three flagged as unproven (`internalTransfer`, `subAccountTransfer`, `accountClassTransfer`). One residual: nine unrecognised dex names, read as builder-deployed venues; an alias for the primary dex would hide a flow (see B2) |
 | C2 | mark ≈ mid within §1.4's threshold | **PASS** 2026-07-30 | 12-hour series: median \|basis\| 2.61e-05 against a 9.07e-04 threshold, 35× margin |
 | C5 | isolated funding debits the isolated pocket | **PASS** 2026-07-31 | `probe_isolated_funding` across a funding tick: pocket absorbed 100%, cross moved $0.00 |
 | C1 | the funding clamp is the documented constant | **PASS** 2026-08-03 | the primary source, read and cited: "Funding on Hyperliquid is capped at 4%/hour". PASS needs both halves — the citation, plus the 1 500 observations over 30 d that fail to contradict it (worst 0.1% of the cap). Neither alone closes it. |

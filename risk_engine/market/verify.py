@@ -48,7 +48,11 @@ from typing import Any
 import numpy as np
 
 from risk_engine.domain.types import normalise_address
-from risk_engine.market.findings import STALE_AFTER_DAYS, load_findings
+from risk_engine.market.findings import (
+    DEFAULT_FINDINGS_PATH,
+    STALE_AFTER_DAYS,
+    load_findings,
+)
 from risk_engine.market.info import InfoClient
 from risk_engine.market.parse import (
     parse_candles_to_log_returns,
@@ -1310,6 +1314,20 @@ def main(argv: list[str] | None = None) -> int:
     if not args.no_findings:
         try:
             findings = load_findings(args.findings)
+            # Said out loud, because an empty result is indistinguishable from
+            # "nothing was ever recorded" and was wrong for months: the engine
+            # image did not COPY the findings file, so every containerised run
+            # silently reported C2 and C5 as unconfirmed while the
+            # measurements that closed them sat unreadable in the repository.
+            # A missing file is a legitimate state (fresh checkout) and must
+            # not raise — but it must not be invisible either.
+            if findings:
+                print(f"recorded findings: {', '.join(sorted(findings))} "
+                      f"(from {args.findings or DEFAULT_FINDINGS_PATH})\n")
+            else:
+                print(f"no recorded findings at "
+                      f"{args.findings or DEFAULT_FINDINGS_PATH}; every "
+                      f"out-of-band result will read as unconfirmed\n")
         except ValueError as exc:
             # A malformed findings file is the operator's own input, so it is
             # a usage error and not evidence about the venue -- the same

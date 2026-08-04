@@ -700,7 +700,50 @@ take them:
   re-run until it passes, which is §10's overfitting prohibition arrived at
   by procedure instead of by intent.
 
-### B2 `[BLOCKER]` Equity changes for reasons the model does not predict
+### B2 `[RESOLVED for readability 2026-08-04 — one residual, named]` Equity changes for reasons the model does not predict
+
+**The 200-address frame sweep ran, and it closes what B2 was actually afraid
+of.** 23 599 ledger records across **200 of 200** sampled addresses, **16
+distinct delta types, every one readable**:
+
+    accountClassTransfer, borrowLend, cStakingTransfer, deposit,
+    gossipPriorityGasAuction, internalTransfer, liquidation, rewardsClaim,
+    send, spotGenesis, spotTransfer, subAccountTransfer, vaultDeposit,
+    vaultDistribution, vaultWithdraw, withdraw
+
+That includes all three types this entry flagged as known-unproven and
+near-certain to appear — `internalTransfer`, `subAccountTransfer`,
+`accountClassTransfer`. The failure mode they threatened was specific and
+silent: an unclassifiable type raises inside `resolve_due`, is filed
+TRANSIENT by name, and is retried forever, so it withholds an address's
+observations while the counter fails to advance. Encountered on day 6 it
+costs the window. It cost one command instead.
+
+**The residual, and its direction.** Nine dex names appeared that are neither
+the primary perp account nor the known spot value:
+
+    abcd, cash, flx, hyna, km, mkts, para, vntl, xyz
+
+They read as builder-deployed venues (HIP-3), each its own margin space with
+its own `clearinghouseState`, so a transfer to one has left the account this
+model predicts and is correctly counted as an outflow. That reading is safe
+for every case but one: if any name is an ALIAS for the primary dex, a
+transfer to it never left the book, and subtracting it as an outflow
+overstates the model-attributable equity change — a corruption of the very
+correction B2 exists to make.
+
+`UNRECOGNISED_DEX_NAMES` surfaces them rather than merely handling them,
+which is why they are in this entry at all. Settling it means confirming
+against the venue that each is a deployed builder dex; anything found to be
+an alias goes in `PERP_DEX_VALUES`. Not settled by plausibility here — the
+names look exactly like builder identifiers, and C4 is the standing reminder
+of what that kind of confidence is worth.
+
+The original entry follows.
+
+---
+
+### B2 (original) `[BLOCKER]` Equity changes for reasons the model does not predict
 
 The PIT test compares predicted 24 h equity change against realised equity
 change. But equity also moves when the user deposits, withdraws, opens,
