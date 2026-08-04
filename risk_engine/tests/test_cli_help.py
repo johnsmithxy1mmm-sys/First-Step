@@ -28,8 +28,11 @@ from __future__ import annotations
 import io
 import re
 from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
 
 import pytest
+
+from risk_engine.shadow.journal import CalibrationJournal
 
 # Import the entry points, not module paths: a renamed module then fails here
 # as a collection error rather than as a silently skipped test.
@@ -157,6 +160,69 @@ def test_the_documented_one_off_commands_can_actually_start():
     for where, cmd in runs:
         if "-m risk_engine." in cmd:
             assert "--entrypoint" in cmd, f"{where}: {cmd}"
+
+
+def test_no_documented_command_writes_the_DSN_on_the_host_command_line():
+    """`--journal "$SHADOW_DSN"` cannot work from an operator's shell, and the
+    way it fails depends on the shell -- which is why it survived a fix.
+
+    The variable is set on the CONTAINER. The operator's shell expands the
+    command line first, so bash substitutes `$$` for its PID and passes
+    `<pid>SHADOW_DSN`, while PowerShell substitutes `$env:SHADOW_DSN` for the
+    empty string. PowerShell is the lucky half: argparse refuses a flag with
+    no value. bash is not -- `open_backend` takes any string that is not a
+    `postgres://` URL as a SQLite PATH and creates it, so the command prints
+    `0 days, 0 addresses, 0 observations` from a database that did not exist a
+    moment earlier. That is the same reading a real journal gives on day one.
+
+    `cli.py::_journal_arg` already defaults `--journal` to `$SHADOW_DSN` read
+    inside the container, so the documented form is to pass nothing. The
+    compose file kept printing the broken one in a comment whose subject was
+    how it had been fixed.
+    """
+    offenders = [
+        f"{where}: {cmd}"
+        for where, cmd in _documented_compose_runs()
+        if "-m risk_engine.shadow" in cmd and "--journal" in cmd
+    ]
+    assert not offenders, (
+        "a documented one-off command passes --journal on the host command "
+        "line; inside the stack it must pass nothing and let $SHADOW_DSN "
+        "default it in the container:\n  " + "\n  ".join(offenders)
+    )
+
+
+def test_a_report_command_will_not_invent_the_journal_it_reports_on(tmp_path):
+    """`progress` and `icc` read; they must not create.
+
+    `open_backend` creates a SQLite file for any non-DSN string, which is
+    right for `snapshot` and wrong here: a report over a journal you just
+    conjured is necessarily zeros, and zeros are not an error message. They
+    are exactly what a genuine journal prints before anything resolves, so the
+    operator reads "the §3.3 gate has not advanced" from an answer that means
+    "that path is not a journal". Reachable from an ordinary typo as well as
+    from the documented command.
+    """
+    from risk_engine.shadow.cli import _open_for_reading
+
+    missing = tmp_path / "12345SHADOW_DSN"      # what bash actually passes
+    with pytest.raises(SystemExit) as exc:
+        _open_for_reading(str(missing))
+
+    message = str(exc.value)
+    assert "no calibration journal" in message
+    assert "will not create one" in message
+    assert "$SHADOW_DSN" in message
+    assert not missing.exists(), "the refusal still created the file it refused"
+
+    # A journal that exists opens normally, so this is a guard and not a ban.
+    real = tmp_path / "shadow.db"
+    CalibrationJournal(str(real)).close()
+    _open_for_reading(str(real)).close()
+
+    # And a DSN is never path-checked: Postgres owns whether that database
+    # exists, and this must not try to answer that from the filesystem.
+    assert not Path("postgresql://risk@journal:5432/shadow").exists()
 
 
 def test_the_entrypoint_this_guards_is_still_the_one_in_the_image():

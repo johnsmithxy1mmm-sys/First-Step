@@ -31,7 +31,22 @@ services:
       # Present so the documented one-off commands actually run:
       #
       #   docker compose run --rm --entrypoint python3 engine \
-      #     -m risk_engine.shadow progress --journal "$$SHADOW_DSN"
+      #     -m risk_engine.shadow progress
+      #
+      # NO `--journal`, and that is the whole point of this variable. It is
+      # read by `cli.py::_journal_arg` INSIDE the container, where it is in
+      # scope. Writing it on the command line cannot work and does not fail
+      # honestly: the operator's shell expands it first, so bash turns
+      # `"$$SHADOW_DSN"` into `<pid>SHADOW_DSN` and PowerShell turns
+      # `"$env:SHADOW_DSN"` into an empty string. PowerShell is the lucky
+      # case -- argparse refuses a flag with no value. bash is not: any
+      # string that does not start with `postgres://` is taken as a SQLite
+      # PATH (backends.py:184), so the command silently creates an empty
+      # database and prints `0 days, 0 addresses, 0 observations` -- a
+      # well-formed, confident, entirely wrong answer that reads as "the §3.3
+      # gate has not advanced" when it means "you queried a file that did not
+      # exist a moment ago". This comment printed that form until now, while
+      # deploy/README.md beside it already documented the fix.
       #
       # `--entrypoint python3` is not optional. This image's ENTRYPOINT is
       # `python3 -m risk_engine.service`, so trailing arguments are APPENDED

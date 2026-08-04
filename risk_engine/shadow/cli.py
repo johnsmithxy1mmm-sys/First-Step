@@ -418,8 +418,42 @@ def cmd_resolve(args) -> int:
     return 0
 
 
+def _open_for_reading(target: str) -> CalibrationJournal:
+    """Open a journal that must already exist, for the commands that only read.
+
+    `open_backend` treats anything not starting with `postgres://` as a SQLite
+    path and CREATES it (backends.py:184). That is right for `snapshot`, which
+    is allowed to start a journal, and wrong for `progress` and `icc`, which
+    exist to report on one. Reporting on a database you just conjured cannot
+    be anything but zeros, and zeros here are not an error message -- they are
+    `0 days, 0 addresses, 0 observations`, which is exactly what a real
+    journal on day one prints. The operator reads "the §3.3 gate has not
+    advanced" from an answer that means "that journal does not exist".
+
+    Reachable from an ordinary typo and from the documented command itself:
+    `--journal "$SHADOW_DSN"` is expanded by the OPERATOR's shell, not the
+    container's, so bash passes `<pid>SHADOW_DSN` -- a perfectly good SQLite
+    filename. Reproduced. The `--journal` default exists so nobody has to
+    write that, and this is the backstop for when they do anyway.
+    """
+    text = str(target)
+    if not text.startswith(("postgres://", "postgresql://")) and text != ":memory:":
+        if not Path(text).exists():
+            raise SystemExit(
+                f"no calibration journal at {text!r}, and a report command will not "
+                f"create one -- it would print zeros from a database that did not "
+                f"exist a moment ago, which is indistinguishable from a real journal "
+                f"that has not resolved anything yet.\n"
+                f"Inside the compose stack, pass no --journal at all: it defaults to "
+                f"$SHADOW_DSN, which is set on the container. Writing "
+                f'--journal "$SHADOW_DSN" on the host cannot work -- your shell '
+                f"expands it, not the container's."
+            )
+    return CalibrationJournal(text)
+
+
 def cmd_progress(args) -> int:
-    with CalibrationJournal(args.journal) as journal:
+    with _open_for_reading(args.journal) as journal:
         progress = journal.progress(DISTRIBUTION_VERSION)
         print(f"model {MODEL_VERSION}")
         print(progress)
@@ -469,7 +503,7 @@ def cmd_icc(args) -> int:
     from risk_engine.shadow.metrics import load_cohort
 
     version = args.version or DISTRIBUTION_VERSION
-    with CalibrationJournal(args.journal) as journal:
+    with _open_for_reading(args.journal) as journal:
         cohort = load_cohort(journal, version, VARIANT_MODEL, args.cohort)
         if cohort.n == 0:
             print(f"no resolved observations in cohort {args.cohort}")
