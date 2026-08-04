@@ -23,7 +23,6 @@
     "and it disagrees with a recording, the live verdict wins and the",
     "disagreement is reported."
   ],
-
   "C2": {
     "status": "PASS",
     "observed_utc": "2026-07-30T00:00:00+00:00",
@@ -32,13 +31,12 @@
     "detail": "mark tracks mid within §1.4's threshold over a 12-hour series: median |basis| 2.61e-05 against a 9.07e-04 threshold, a 35x margin. The margin is what makes this a PASS rather than a close call -- §1.4's simplification is that mark and mid are interchangeable for liquidation purposes, and being wrong by 1/35th of the tolerance does not move a liquidation price by a tick.",
     "evidence": {
       "median_abs_basis": 2.61e-05,
-      "threshold": 9.07e-04,
+      "threshold": 0.000907,
       "margin_ratio": 35,
       "window_hours": 12,
       "why_not_in_a_run": "the in-run check samples for about a minute, which is not the window §1.4 intends; a minute of quiet says nothing about the basis under stress."
     }
   },
-
   "C5": {
     "status": "PASS",
     "observed_utc": "2026-07-31T00:00:00+00:00",
@@ -51,6 +49,21 @@
       "ticks_observed": 1,
       "why_not_in_a_run": "no read-only endpoint distinguishes the two accounts; it needs a funded position observed across a funding tick, which is out-of-band by construction.",
       "caveat": "testnet; one tick; one position."
+    }
+  },
+  "C4": {
+    "status": "PASS",
+    "observed_utc": "2026-08-03T00:00:00+00:00",
+    "network": "mainnet",
+    "command": "python scripts/probe_webdata.py 0x<any-real-account>",
+    "detail": "`webData3` EXISTS and `webData2` does NOT, which inverts §5.2. Four probes in one session: with a well-formed `user`, webData3 was accepted with an explicit subscriptionResponse echoing the subscription back, while webData2 was REJECTED in the identical payload shape a moment later -- so the shape is not in question. Without a `user` both are rejected with the same parse error, which is why a bare probe settles nothing and why an earlier reading of one wrongly refuted webData3. Nothing in this tree consumes either subscription: the \"shard planner\" those comments deferred to has no implementation here. The finding is for whoever builds it -- §5.2 names the one the venue refuses.",
+    "evidence": {
+      "webData3_with_user": "accepted (subscriptionResponse)",
+      "webData2_with_user": "rejected (Error parsing JSON into valid websocket request)",
+      "webData3_no_user": "rejected (same parse error)",
+      "webData2_no_user": "rejected (same parse error)",
+      "why_not_in_a_run": "a WebSocket probe needs `websockets`, which the engine deliberately does not depend on; `verify --probe-ws` runs the same comparison when it is installed.",
+      "caveat": "one session, one address, mainnet. The venue moved once already -- this subscription pair is exactly the thing that changed."
     }
   }
 }

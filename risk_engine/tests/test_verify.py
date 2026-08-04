@@ -977,7 +977,7 @@ class TestRecordedFindings:
         from risk_engine.market.findings import load_findings
 
         findings = load_findings()
-        assert set(findings) >= {"C2", "C5"}
+        assert set(findings) >= {"C2", "C4", "C5"}
         for f in findings.values():
             assert not f.is_stale(), f"{f.id} recorded {f.observed_utc} is stale"
             assert f.command.strip() and f.network.strip()
@@ -991,6 +991,23 @@ class TestRecordedFindings:
         c5 = load_findings()["C5"]
         assert c5.network == "testnet"
         assert "TESTNET" in c5.detail.upper()
+
+    def test_the_shipped_c4_finding_records_both_halves(self):
+        """C4's measurement is a COMPARISON, and the half nobody expected is
+        the one that matters: `webData2` — the subscription §5.2 names — was
+        rejected. A finding that recorded only "webData3 exists" would leave
+        the next reader building against the broken one, which is exactly how
+        this went unnoticed for as long as it did.
+        """
+        from risk_engine.market.findings import load_findings
+
+        c4 = load_findings()["C4"]
+        assert c4.network == "mainnet"
+        assert "webData3" in c4.detail and "webData2" in c4.detail
+        assert "§5.2" in c4.detail
+        # Both directions in the evidence, not just the positive one.
+        assert "accepted" in c4.evidence["webData3_with_user"]
+        assert "rejected" in c4.evidence["webData2_with_user"]
 
 
 class TestExitCodes:
