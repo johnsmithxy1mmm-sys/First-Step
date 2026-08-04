@@ -334,6 +334,31 @@ class ShadowCron:
                 if not book.positions:
                     skipped.append((address, "no open positions"))
                     continue
+                # Named BEFORE `equity()` touches `spot`, and naming ALL the
+                # missing coins rather than whichever one a dict lookup hit
+                # first (OPEN-QUESTIONS B6).
+                #
+                # This used to surface as a bare `KeyError: 'ATOM'` from
+                # inside `equity()`, caught by the handler below. That is a
+                # skip reason expressed as an implementation detail, and the
+                # census stores reasons verbatim — so B6's own decision
+                # procedure ("sum the KeyError counts by coin") was unsound.
+                # An address holding ATOM and HYPE was filed under whichever
+                # came first, so per-coin totals answer "how many addresses
+                # mention this coin first", never "how many addresses would a
+                # universe containing it recover". Adding the top coin by that
+                # tally can recover nothing at all, if every address holding
+                # it also holds a second off-universe coin.
+                #
+                # Listing every missing coin makes the census answer the
+                # question actually being asked: an address is recovered by
+                # universe U exactly when this whole list is inside U.
+                off_universe = sorted({p.coin for p in book.positions} - set(spot))
+                if off_universe:
+                    skipped.append(
+                        (address, f"off-universe: {', '.join(off_universe)}")
+                    )
+                    continue
                 if book.equity(spot) <= 0:
                     skipped.append((address, "non-positive equity"))
                     continue

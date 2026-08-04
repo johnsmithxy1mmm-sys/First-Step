@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import inspect
 import re
-from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -1330,3 +1330,68 @@ class TestBaselineAComesOffTheBundle:
         assert "NaiveBaseline(" in src
         i, j = src.index("hourly = bundle.factor_returns"), src.index("NaiveBaseline(")
         assert i < j, "the series must be read before the baseline is built from it"
+
+
+class TestOffUniverseSkipsNameEveryCoin:
+    """B6's census has to answer the question B6 actually asks.
+
+    An off-universe holding used to surface as a bare `KeyError: 'ATOM'`
+    raised inside `equity()` and caught by the sweep's per-address handler.
+    The census stores skip reasons verbatim, so B6's decision procedure —
+    "sum the `KeyError: '<COIN>'` counts by coin, most-dropped first" — was
+    computing something else: how often a coin is the FIRST one missing, not
+    how many addresses a universe containing it would recover.
+
+    The two differ in the direction that matters. An address holding ATOM and
+    HYPE is filed under one of them; adding that one coin recovers the
+    address only if the other is also added. Widening to the top of that
+    tally can therefore recover nothing.
+    """
+
+    def test_all_missing_coins_are_named_not_just_the_first(self, bundle, specs,
+                                                            spot, naive, now):
+        book = Book("0x" + "e" * 40, 100_000.0, (
+            Position("BTC", 1.0, 100_000.0, MarginMode.CROSS, 10.0),
+            Position("ATOM", 500.0, 8.0, MarginMode.CROSS, 10.0),
+            Position("HYPE", 200.0, 30.0, MarginMode.CROSS, 10.0),
+        ), now)
+        provider = FakeProvider({book.address: book}, spot, specs)
+        journal = CalibrationJournal()
+        report = ShadowCron(provider, bundle, journal, naive,
+                            n_paths=500).run_once(now)
+        journal.close()
+
+        assert report.written == 0
+        (_, reason), = report.skipped
+        assert "ATOM" in reason and "HYPE" in reason, reason
+        # Sorted, so the census groups identical holdings under one string
+        # instead of two orderings of the same set.
+        assert reason == "off-universe: ATOM, HYPE"
+
+    def test_a_flat_account_is_still_a_different_reason(self, bundle, specs,
+                                                        spot, naive, now):
+        """The two must stay distinguishable. B6 says an all-off-universe book
+        reads as "no open positions", byte-identical to a flat account — that
+        is not what the code does, and the distinction is what makes the
+        census informative: flat accounts are not recoverable by widening the
+        universe and off-universe ones are."""
+        flat = Book("0x" + "f" * 40, 100_000.0, (), now)
+        provider = FakeProvider({flat.address: flat}, spot, specs)
+        journal = CalibrationJournal()
+        report = ShadowCron(provider, bundle, journal, naive,
+                            n_paths=500).run_once(now)
+        journal.close()
+        (_, reason), = report.skipped
+        assert reason == "no open positions"
+
+    def test_an_in_universe_book_is_untouched(self, bundle, specs, spot, books,
+                                              naive, now):
+        """Guard on the guard: a check that skipped everything would satisfy
+        the assertions above."""
+        provider = FakeProvider(books, spot, specs)
+        journal = CalibrationJournal()
+        report = ShadowCron(provider, bundle, journal, naive,
+                            n_paths=500).run_once(now)
+        journal.close()
+        assert report.written == len(books)
+        assert not report.skipped

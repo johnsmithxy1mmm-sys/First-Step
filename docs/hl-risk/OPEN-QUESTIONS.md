@@ -1128,16 +1128,67 @@ free fix. It is a sampling-frame change AND a distribution change
 (MODEL_VERSION MINOR, §3.3 counter reset), so it must happen BEFORE the
 shadow clock starts or cost the accumulated days.
 
+**Measured 2026-08-04, first complete live sweep** (515 addresses, mainnet,
+`HL_UNIVERSE=BTC,ETH,SOL`). 299 skip lines were captured:
+
+| reason | n | share |
+|---|---|---|
+| off-universe holding | 196 | 66% |
+| no open positions | 103 | 34% |
+
+Two thirds of the loss is the universe, so widening is aimed at the right
+thing — but the tail is long. **42 distinct coins** appeared, and the top of
+the distribution is not concentrated enough to fix cheaply:
+
+| coin | n | cumulative |
+|---|---|---|
+| HYPE | 47 | 24% |
+| ATOM | 22 | 35% |
+| AVAX | 18 | 44% |
+| DOGE | 13 | 51% |
+| XRP | 11 | 57% |
+| BNB | 8 | 61% |
+| DYDX | 7 | 64% |
+| … 35 more | 70 | 100% |
+
+Reaching 87% of off-universe skips takes about 20 added coins. At ~112
+weight per coin per rebuild (C6's corrected table), 20 coins is ~2 240
+weight per rebuild against a 300/min shadow pool — roughly eight minutes of
+budget for every bundle build, hourly on the resolver.
+
+**And the counts above overstate what any given widening buys**, which is a
+measurement defect this entry itself introduced. The procedure below used to
+say "sum the `KeyError: '<COIN>'` counts by coin, most-dropped first". That
+tally answers *how often a coin is the FIRST one missing*, never *how many
+addresses a universe containing it would recover*: an address holding ATOM
+and HYPE is filed under whichever a dict lookup reached first, so adding the
+top coin alone can recover **nothing**, if every address holding it also
+holds a second off-universe coin. Fixed 2026-08-04 — the sweep now names
+every missing coin (`off-universe: ATOM, HYPE`), so an address is recovered
+by universe U exactly when its whole list is inside U, and that is
+computable from the census. The table above is the OLD encoding and its
+per-coin counts should be read as upper bounds.
+
+**One thing this entry got wrong about the code**, corrected here rather
+than left to mislead the next reading: it says an address whose positions
+are all off-universe "is skipped as `no open positions`, byte-identical to a
+flat account". That is not what happens. `LiveSnapshotProvider.book` does
+not filter to the universe (`universe` is used only by `spot()`), so such a
+book has positions and fails later. The two reasons were already distinct in
+the log, which is why the table above can separate them at all — and that
+separation is the whole value of the census, since flat accounts are not
+recoverable by widening and off-universe ones are.
+
 The decision procedure, concretely:
-1. let the census accumulate a few days of full sweeps;
-2. measure: `SELECT skipped_by_reason FROM calibration_sweeps ORDER BY
-   swept_at DESC LIMIT 7;` — sum the `KeyError: '<COIN>'` counts by coin;
+1. let the census accumulate a few days of full sweeps **under the new
+   reason format** — the old rows cannot answer step 2;
+2. for each candidate universe U, count the addresses whose entire
+   `off-universe:` list is inside U. Not a per-coin sum;
 3. if the off-universe drop rate keeps `written` comfortably above §3.3's
    200/day floor, keep the universe and let the published score disclose the
    cohort selection this table records;
-4. if it does not, set `HL_UNIVERSE` to cover the coins that actually appear
-   (the tally names them, most-dropped first), bump MODEL_VERSION, record
-   the new frame here, and start the clock then.
+4. if it does not, set `HL_UNIVERSE` to the smallest U that clears the floor,
+   bump MODEL_VERSION, record the new frame here, and start the clock then.
 
 ---
 
