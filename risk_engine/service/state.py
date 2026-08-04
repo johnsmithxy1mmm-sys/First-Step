@@ -554,6 +554,7 @@ def _build_fixture_bundle():
         matrix=matrix, marginals=marginals, funding=funding,
         funding_bounds=bounds, copula_df=copula_df,
         tail_diagnostics=_checked_tail_diagnostics(returns, matrix, copula_df),
+        factor_returns=returns,
     )
     return bundle, specs, spot
 
@@ -677,5 +678,6 @@ def _build_live_bundle(*, serving: bool = True, budget=None):
         funding_bounds=bounds, copula_df=copula_df,
         tail_diagnostics=_checked_tail_diagnostics(
             returns, matrix, copula_df, fatal=serving, timestamps=candle_times),
+        factor_returns=returns,
     )
     return bundle, {c: specs[c] for c in universe}, spot

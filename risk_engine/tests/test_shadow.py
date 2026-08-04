@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import inspect
 import re
+from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -817,9 +819,12 @@ class TestTheLiveCliSpendsNoWeightItNeedNot:
             calls.append(coin)
             return [{"t": 1, "c": "100000.0"}]
 
+        # The bundle now carries the fitted return series, so `_live_world`
+        # reads Baseline A's factor off it instead of fetching.
+        stub_bundle = SimpleNamespace(factor_returns={"BTC": np.full(500, 0.001)})
         monkeypatch.setattr(
             state_mod, "_build_live_bundle",
-            lambda *a, **k: (object(), {"BTC": object()}, {"BTC": 100_000.0}),
+            lambda *a, **k: (stub_bundle, {"BTC": object()}, {"BTC": 100_000.0}),
         )
         monkeypatch.setattr(
             "risk_engine.market.info.InfoClient.candle_snapshot", _candles
@@ -833,12 +838,15 @@ class TestTheLiveCliSpendsNoWeightItNeedNot:
         )
 
         provider, _, _ = cli_mod._live_world(self._args(self._write(tmp_path, [ADDR_A])))
-        # One call, and it is the 90-day history the naive baseline is fitted
-        # from -- not a price refresh.
-        assert calls == ["BTC"]
+        # ZERO calls now. This used to assert exactly one -- the 90-day BTC
+        # history Baseline A is fitted from -- which was the redundant fetch
+        # itself: the build had already pulled that series to fit the matrix,
+        # and re-requesting it cost ~56 weight, unpaced, on a window the
+        # build had just drained.
+        assert calls == [], "_live_world fetched candles the bundle already carries"
 
         assert provider.spot() == {"BTC": 100_000.0}
-        assert calls == ["BTC"], "spot() re-fetched prices it had just been given"
+        assert calls == [], "spot() re-fetched prices it had just been given"
 
 
 class TestResolverPacesRatherThanDroppingToStale:
@@ -1279,3 +1287,46 @@ class TestVersionGating:
             "predicted distribution; pooling 0.1.x shadow days would be "
             "exactly the overfitting §3.3 forbids"
         )
+
+
+class TestBaselineAComesOffTheBundle:
+    """The factor series for §3.2's Baseline A must not cost a second fetch.
+
+    `_live_world` re-requested 90 days of BTC candles right after the paced
+    build had fetched exactly that series to fit the matrix — ~56 weight
+    under the published table (20 base plus the per-item surcharge on 2160
+    candles) for data already in memory. Worse, the call sat outside the
+    pacing, so it ran against a window the build had just drained: a live
+    run died with `weight 20 exceeds remaining 0 (323/300 spent)` one line
+    after successfully waiting its turn.
+    """
+
+    def test_both_builders_carry_the_series(self):
+        """Live and fixture alike, so the shadow path behaves the same under
+        `--fixture` as it does against the venue."""
+        from risk_engine.service.state import _build_fixture_bundle
+
+        bundle, _, _ = _build_fixture_bundle()
+        assert "BTC" in bundle.factor_returns
+        assert bundle.factor_returns["BTC"].size > 100
+
+    def test_a_bundle_without_btc_is_refused_rather_than_silently_wrong(self):
+        """BTC is mandatory as a risk factor (§2.1) and `_build_live_bundle`
+        refuses without it, so an absent series means the bundle came from
+        somewhere unexpected. Better to say so than to build Baseline A from
+        whatever happens to be first."""
+        from risk_engine.shadow import cli
+
+        src = inspect.getsource(cli._live_world)
+        assert 'factor_returns.get("BTC")' in src
+        assert "raise SystemExit" in src
+
+    def test_the_naive_baseline_is_built_from_it(self):
+        """Guard on the guard: the series being present proves nothing if
+        the baseline is fitted from something else."""
+        from risk_engine.shadow import cli
+
+        src = inspect.getsource(cli._live_world)
+        assert "NaiveBaseline(" in src
+        i, j = src.index("hourly = bundle.factor_returns"), src.index("NaiveBaseline(")
+        assert i < j, "the series must be read before the baseline is built from it"

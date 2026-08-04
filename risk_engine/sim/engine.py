@@ -160,6 +160,19 @@ class ModelBundle:
     #: adequate, and that claim expires when the market does. `assert_...`
     #: below is what refuses; this is what lets an operator see the margin.
     tail_diagnostics: tuple = ()
+    #: The per-coin hourly log returns this bundle was fitted from.
+    #:
+    #: Carried for the same reason as `tail_diagnostics` and for one concrete
+    #: caller: `NaiveBaseline` (§3.2's Baseline A) needs BTC's hourly series,
+    #: and the shadow entry point used to re-fetch 90 days of BTC candles
+    #: immediately after the build had already fetched exactly that. Two
+    #: costs, and the second was the one that bit: ~56 weight of §5.3 budget
+    #: for data already in memory, spent by an UNPACED call sitting right
+    #: after the paced build had drained the window — so a run that had just
+    #: waited its turn died on the next line. Empty when the bundle was
+    #: assembled by hand (tests, benchmarks); callers must not assume a coin
+    #: is present.
+    factor_returns: dict[str, np.ndarray] = field(default_factory=dict)
 
     def path_spec(self, coins: tuple[str, ...], independent: bool = False) -> PathSpec:
         with Timer("slice_submatrix"):

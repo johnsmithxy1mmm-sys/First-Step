@@ -272,14 +272,29 @@ def _live_world(args, *, load_addresses: bool = True):
 
     import numpy as np
 
-    from risk_engine.market.parse import parse_candles_to_log_returns
-
-    now_ms = int(_time.time() * 1000)
-    candles = provider.client.candle_snapshot(
-        "BTC", "1h", now_ms - 90 * 24 * 3600 * 1000, now_ms
+    # Baseline A's factor series comes off the bundle, NOT from a fresh
+    # fetch. This used to re-request 90 days of BTC candles here — the same
+    # 90 days `_build_live_bundle` had just fetched to fit the matrix — and
+    # it did so UNPACED, on the line after `_paced_bundle` had waited out and
+    # then drained the §5.3 window. Measured cost: ~56 weight (20 base plus
+    # the per-item surcharge on 2160 candles) for data already in memory,
+    # and a live run that died with `weight 20 exceeds remaining 0
+    # (323/300 spent)` immediately after successfully waiting its turn.
+    #
+    # That was the fifth appearance of "a rate limit is an error, not a
+    # pace" in this codebase. Pacing it would have fixed the crash and kept
+    # the waste; not making the call fixes both, and leaves nothing to pace.
+    hourly = bundle.factor_returns.get("BTC")
+    if hourly is None:
+        raise SystemExit(
+            "the bundle carries no BTC return series, so Baseline A (§3.2) "
+            "cannot be built. BTC is mandatory as a risk factor (§2.1) and "
+            "`_build_live_bundle` refuses without it, so reaching this means "
+            "the bundle came from somewhere else."
+        )
+    return provider, bundle, NaiveBaseline(
+        historical_24h_log_returns(np.asarray(hourly))
     )
-    _, hourly = parse_candles_to_log_returns(candles)
-    return provider, bundle, NaiveBaseline(historical_24h_log_returns(np.asarray(hourly)))
 
 
 def _print_defect_note(bundle) -> None:

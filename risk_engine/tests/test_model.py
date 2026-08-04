@@ -551,6 +551,23 @@ class TestTheDiagnosticRunsOnTheShippedPath:
             "turns a busy §5.3 window into a dead run rather than a wait"
         )
 
+        # And it must make NO venue call of its own afterwards. Pinning the
+        # paced route was not enough: the next line down re-fetched 90 days
+        # of BTC candles for Baseline A -- the same 90 days the build had
+        # just fetched -- unpaced, on a window the build had drained. A live
+        # run died there with "weight 20 exceeds remaining 0 (323/300
+        # spent)" immediately after successfully waiting its turn.
+        #
+        # Asserted as "no fetch at all" rather than "the fetch is paced",
+        # because the data is already in `bundle.factor_returns`: pacing it
+        # would have fixed the crash and kept the redundant round trip.
+        for call in ("candle_snapshot(", "funding_history(", "clearinghouse_state("):
+            assert call not in sources["_live_world"], (
+                f"_live_world calls {call} directly. Everything it needs is on "
+                "the bundle the paced build returned; a venue call here runs "
+                "outside the pacing and duplicates weight already spent."
+            )
+
     def test_a_crash_together_market_stops_the_bundle_from_building(self):
         """The behaviour §2.3 and §9 actually require. If this test can be
         made to pass by any change that lets the service start on a market
