@@ -67,6 +67,8 @@ from typing import Protocol
 import numpy as np
 
 from risk_engine.domain.types import Book, normalise_address
+import logging
+
 from risk_engine.market.info import RateLimitExceeded
 from risk_engine.observability.metrics import METRICS, Metrics
 from risk_engine.shadow.cron import position_fingerprint
@@ -113,6 +115,23 @@ DEFAULT_BUDGET_WAIT_SECONDS = 5.0
 #: the provider's own freshness cache, so refreshing costs at most one extra
 #: `spot()` per minute of a paced run.
 SPOT_REFRESH_SECONDS = 60.0
+
+#: How often the resolve run says where it is.
+#:
+#: `resolve_due` logged NOTHING, exactly as `ShadowCron.run_once` did before
+#: it was given progress output -- and the fix was applied to the sweep alone,
+#: which is how this half survived a day longer than the other. Same shape:
+#: a 265-address run is roughly twenty minutes of which most is spent asleep
+#: on the §5.3 window by design, so working and wedged are outwardly
+#: identical, and the operator assumes the worse one.
+#:
+#: It matters more here than on the snapshot side. A silent sweep costs a
+#: day's predictions; a silent resolver costs them *after* they were paid
+#: for, because an outcome collected past `stale_after_s` is flagged and
+#: dropped from the gate rather than scored.
+PROGRESS_LOG_SECONDS = 30.0
+
+log = logging.getLogger("risk_engine.shadow.resolve")
 
 
 def _snapshot_captured_at(pending) -> datetime:
@@ -232,6 +251,22 @@ def resolve_due(
     run_started = time.monotonic()
     deadline = run_started + max_resolve_seconds
     budget_exhausted = False
+    seen = 0
+    waited_s = 0.0
+    last_progress = run_started
+
+    def _say_progress(force: bool = False) -> None:
+        nonlocal last_progress
+        at = time.monotonic()
+        if not force and at - last_progress < PROGRESS_LOG_SECONDS:
+            return
+        last_progress = at
+        log.info(
+            "resolve %d rows: %d resolved, %d stale, %d failed, %.0fs elapsed "
+            "(%.0fs of it waiting for the §5.3 window)",
+            seen, resolved, stale, len(failed) + len(permanent),
+            at - run_started, waited_s,
+        )
 
     def _observed_now() -> datetime:
         """`now` advanced by however long this run has actually been going.
@@ -250,7 +285,7 @@ def resolve_due(
         letting a rate limit surface as a per-row failure. Charges happen
         before the request, so a refused call spends nothing and retries
         cleanly. Returns a sentinel when the whole-run ceiling is reached."""
-        nonlocal budget_exhausted
+        nonlocal budget_exhausted, waited_s
         while True:
             # Before the call, not only in the handler: a slow or failing
             # venue never trips the weight limit, so a deadline consulted only
@@ -265,7 +300,9 @@ def resolve_due(
                 if time.monotonic() >= deadline:
                     budget_exhausted = True
                     return _CEILING
+                _say_progress()
                 time.sleep(budget_wait_seconds)
+                waited_s += budget_wait_seconds
 
     # One address may have several pending rows (model plus both baselines);
     # they share a realised outcome, so it is fetched once per address.
@@ -288,9 +325,17 @@ def resolve_due(
         return ResolveReport(resolved=0, failed=[], budget_exhausted=True)
     spot_at = time.monotonic()
 
-    for pending in journal.due(now):
+    due = list(journal.due(now))
+    log.info(
+        "resolving %d pending rows; ceiling %.0f min, anything collected more "
+        "than %.0f min late is flagged stale and dropped from the gate",
+        len(due), max_resolve_seconds / 60.0, stale_after_s / 60.0,
+    )
+    for pending in due:
         if budget_exhausted:
             break
+        seen += 1
+        _say_progress()
         try:
             # Prices go stale inside a paced run. The run may legitimately
             # take up to `max_resolve_seconds`, and valuing a book fetched 50
@@ -380,6 +425,7 @@ def resolve_due(
             if reason is not None:
                 permanent.append((pending.id, reason))
 
+    _say_progress(force=True)
     return ResolveReport(
         resolved=resolved, failed=failed, stale=stale, permanent=permanent,
         budget_exhausted=budget_exhausted,

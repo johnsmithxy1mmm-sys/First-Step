@@ -148,6 +148,25 @@ services:
     <<: *engine-image
     profiles: ["shadow"]
     restart: unless-stopped
+    # The image's HEALTHCHECK polls http://<self>:8787/health, which is the
+    # SERVICE's endpoint. These jobs are cron loops that serve no HTTP, so the
+    # inherited check can never pass: both containers report `unhealthy` from
+    # the moment they start and for as long as they run correctly.
+    #
+    # Worse than cosmetic. `docker compose ps` is where an operator looks
+    # first, and a column that says `unhealthy` for a healthy container
+    # teaches them to ignore the column — so the one time it means something,
+    # it reads the same. Observed 2026-08-04: both shadow jobs `unhealthy`
+    # while the snapshot had just written 1481 predictions.
+    #
+    # Disabled rather than replaced. A cron loop that sleeps 23 of every 24
+    # hours has no cheap liveness signal worth the name, and inventing one
+    # that passes while asleep would be the same lie in the other direction.
+    # Absence of a signal is honest; a permanently false one is not. The
+    # failure escalation these jobs DO have is the consecutive-failure counter
+    # in `command:` above, which exits non-zero and shows up as a restart.
+    healthcheck:
+      disable: true
     depends_on:
       journal:
         condition: service_healthy
@@ -201,6 +220,25 @@ services:
     <<: *engine-image
     profiles: ["shadow"]
     restart: unless-stopped
+    # The image's HEALTHCHECK polls http://<self>:8787/health, which is the
+    # SERVICE's endpoint. These jobs are cron loops that serve no HTTP, so the
+    # inherited check can never pass: both containers report `unhealthy` from
+    # the moment they start and for as long as they run correctly.
+    #
+    # Worse than cosmetic. `docker compose ps` is where an operator looks
+    # first, and a column that says `unhealthy` for a healthy container
+    # teaches them to ignore the column — so the one time it means something,
+    # it reads the same. Observed 2026-08-04: both shadow jobs `unhealthy`
+    # while the snapshot had just written 1481 predictions.
+    #
+    # Disabled rather than replaced. A cron loop that sleeps 23 of every 24
+    # hours has no cheap liveness signal worth the name, and inventing one
+    # that passes while asleep would be the same lie in the other direction.
+    # Absence of a signal is honest; a permanently false one is not. The
+    # failure escalation these jobs DO have is the consecutive-failure counter
+    # in `command:` above, which exits non-zero and shows up as a restart.
+    healthcheck:
+      disable: true
     depends_on:
       journal:
         condition: service_healthy

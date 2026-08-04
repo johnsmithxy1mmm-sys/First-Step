@@ -1395,3 +1395,82 @@ class TestOffUniverseSkipsNameEveryCoin:
         journal.close()
         assert report.written == len(books)
         assert not report.skipped
+
+
+class TestTheResolverSaysItIsAlive:
+    """The sweep's silence, one job over — and it cost more here.
+
+    `resolve_due` logged nothing at all. A 265-address run is roughly twenty
+    minutes, most of it asleep on the §5.3 window by design, so a working
+    resolver and a wedged one are outwardly identical. Observed 2026-08-04:
+    the container built its bundle, printed one line, and went quiet, while
+    1481 predictions sat pending — some already two days past due.
+
+    Silence costs more on this side than on the snapshot side. A silent sweep
+    loses a day's predictions; a silent resolver loses them AFTER they were
+    paid for, because an outcome collected past `stale_after_s` is flagged
+    and dropped from the gate rather than scored.
+    """
+
+    def test_it_announces_the_queue_and_the_stale_bound(
+        self, bundle, specs, spot, books, naive, now, caplog
+    ):
+        import logging as _logging
+
+        journal = CalibrationJournal()
+        ShadowCron(FakeProvider(books, spot, specs), bundle, journal, naive,
+                   n_paths=500).run_once(now)
+        later = now + timedelta(hours=24)
+        with caplog.at_level(_logging.INFO, logger="risk_engine.shadow.resolve"):
+            resolve_due(journal, FakeProvider(books, spot, specs), later)
+        journal.close()
+
+        lines = [r.getMessage() for r in caplog.records]
+        assert any("resolving" in m and "pending rows" in m for m in lines), lines
+        # The stale bound is named up front, because it is the thing that
+        # turns a slow run into lost observations rather than late ones.
+        assert any("stale" in m for m in lines), lines
+
+    def test_the_closing_line_is_forced(
+        self, bundle, specs, spot, books, naive, now, caplog
+    ):
+        """A run short enough to finish inside one progress window would
+        otherwise announce its queue and never report what it did with it."""
+        import logging as _logging
+
+        journal = CalibrationJournal()
+        ShadowCron(FakeProvider(books, spot, specs), bundle, journal, naive,
+                   n_paths=500).run_once(now)
+        later = now + timedelta(hours=24)
+        with caplog.at_level(_logging.INFO, logger="risk_engine.shadow.resolve"):
+            resolve_due(journal, FakeProvider(books, spot, specs), later)
+        journal.close()
+
+        lines = [r.getMessage() for r in caplog.records]
+        final = [m for m in lines if "elapsed" in m]
+        assert final, lines
+        assert "waiting for the §5.3 window" in final[-1]
+
+
+def test_the_shadow_jobs_do_not_inherit_a_healthcheck_they_cannot_pass():
+    """The engine image's HEALTHCHECK polls its own :8787/health. The shadow
+    jobs are cron loops that serve no HTTP, so the inherited check can never
+    pass and both containers read `unhealthy` while running correctly.
+
+    That is not cosmetic: `docker compose ps` is where an operator looks
+    first, and a column that lies in the safe-looking direction on every
+    healthy container teaches them to ignore it — so the one time it means
+    something, it reads the same. Observed 2026-08-04, both jobs `unhealthy`
+    with 1481 predictions freshly written.
+    """
+    import pathlib as _p
+
+    text = (_p.Path(__file__).resolve().parents[2]
+            / "deploy/docker-compose.yml").read_text(encoding="utf-8")
+    # Both shadow services, and only them, disable it.
+    assert text.count("disable: true") == 2, (
+        "expected exactly the two shadow jobs to disable the inherited check"
+    )
+    for svc in ("shadow-snapshot", "shadow-resolve"):
+        block = text.split(f"  {svc}:", 1)[1].split("\n  shadow-", 1)[0]
+        assert "disable: true" in block, svc
