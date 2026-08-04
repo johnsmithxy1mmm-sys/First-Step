@@ -63,6 +63,27 @@ export interface DatedInput {
   readonly hideAfterMs: number;
 }
 
+/**
+ * How far a `computedAt` may sit in the FUTURE before the age stops being
+ * believable.
+ *
+ * An age is `now - computedAt`, and under this contract's own model
+ * `computedAt` is always in the past — so a negative age is not a very fresh
+ * number, it is evidence that the two clocks disagree. Treated as fresh, and
+ * it was: a stamp an hour ahead gave `ageMs = -3600000`, `freshness: 'fresh'`
+ * and an execution gate that opened with no reasons, whatever the data's real
+ * age. The guard defends against a slow hop laundering a stale number and did
+ * not defend against a skewed clock deleting the mechanism outright, which is
+ * the §6 rule §10 forbids softening.
+ *
+ * A second of tolerance, because sub-second disagreement between two
+ * containers is ordinary and tripping on it would make the contract fire on
+ * healthy deployments. Beyond that the age is unknowable, and this contract
+ * already has a verdict for unknowable: withheld, the same as a `null`
+ * timestamp.
+ */
+export const MAX_CLOCK_SKEW_MS = 1_000;
+
 export type Freshness = 'fresh' | 'stale' | 'hidden' | 'unavailable';
 
 /** A value the UI may display, together with how old it is. */
@@ -117,6 +138,15 @@ export function guard<T>(
   const ageMs = now - computedAt.getTime();
   const iso = computedAt.toISOString();
 
+  if (ageMs < -MAX_CLOCK_SKEW_MS) {
+    return {
+      freshness: 'unavailable',
+      reason: `risk data is stamped ${Math.round(-ageMs / 1000)}s in the FUTURE, so its age cannot be established; the engine and backend clocks disagree`,
+      computedAt: iso,
+      ageMs,
+      degraded: true,
+    };
+  }
   if (ageMs >= hideAfter) {
     return {
       freshness: 'hidden',
@@ -171,6 +201,20 @@ export function guardInputs<T>(
     const ageMs = now - (i.at as Date).getTime();
     return { input: i, ageMs, hidden: ageMs >= i.hideAfterMs, stale: ageMs >= i.staleAfterMs };
   });
+
+  // Checked before the ranking, not inside it: a future-stamped input scores
+  // as the FRESHEST of the set, so severity ranking would hand the verdict to
+  // some other input and let this one through unremarked.
+  const skewed = scored.find((s) => s.ageMs < -MAX_CLOCK_SKEW_MS);
+  if (skewed) {
+    return {
+      freshness: 'unavailable',
+      reason: `${skewed.input.label} is stamped ${Math.round(-skewed.ageMs / 1000)}s in the FUTURE, so its age cannot be established; the clocks disagree`,
+      computedAt: (skewed.input.at as Date).toISOString(),
+      ageMs: skewed.ageMs,
+      degraded: true,
+    };
+  }
 
   // Rank by severity, then by how far past its own threshold the input is --
   // comparing raw ages across inputs with different clocks would let a
@@ -257,6 +301,12 @@ export function executionGate(input: ExecutionGateInput): ExecutionGate {
   }
   if (input.matrixAgeMs === null) {
     reasons.push('the correlation matrix has never been built');
+  } else if (input.matrixAgeMs < -MAX_CLOCK_SKEW_MS) {
+    reasons.push(
+      `the correlation matrix is stamped ${Math.round(
+        -input.matrixAgeMs / 1000,
+      )}s in the future; its age cannot be established`,
+    );
   } else if (input.matrixAgeMs >= matrixLimit) {
     reasons.push(
       `the correlation matrix is ${Math.round(input.matrixAgeMs / 1000)}s old, past its ${Math.round(
