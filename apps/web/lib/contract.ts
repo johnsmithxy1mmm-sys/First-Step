@@ -117,3 +117,52 @@ export const pct = (x: number) => `${(x * 100).toFixed(2)}%`;
 export const pp = (x: number) => `${x >= 0 ? '+' : '−'}${Math.abs(x * 100).toFixed(2)} pp`;
 export const usd = (x: number) =>
   x.toLocaleString('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
+
+
+/**
+ * How long a payload the client could not refresh may stay on screen.
+ *
+ * Matches the backend's `HIDE_AFTER_MS`, and it exists because the backend's
+ * copy cannot help here. The backend judges freshness when it is ASKED; if
+ * the browser cannot reach it — offline, DNS gone, a connection black-holed
+ * so `fetch` neither resolves nor rejects — nothing re-evaluates anything and
+ * the last payload stays on screen with the age badge it arrived with.
+ *
+ * §9's Phase 3 criterion is that values DISAPPEAR within five minutes of the
+ * risk service stopping. That was tested by stopping the risk service, which
+ * the backend survives and reports; it was never tested by cutting the
+ * browser off from the backend, where the same five minutes was unbounded.
+ */
+export const CLIENT_HIDE_AFTER_MS = 300_000;
+
+/**
+ * A payload downgraded by how long the CLIENT has been unable to refresh it.
+ *
+ * Belt and braces with the fetch error path, not a duplicate of it: a fetch
+ * that REJECTS can be caught and turned into `unavailable`, and a fetch that
+ * HANGS cannot — it never settles, so no catch runs and no state updates.
+ * Only a clock the client owns can expire that.
+ */
+export function expireLocally<T>(
+  payload: Guarded<T> | null,
+  receivedAt: number | null,
+  now: number = Date.now(),
+  hideAfterMs: number = CLIENT_HIDE_AFTER_MS,
+): Guarded<T> | null {
+  if (payload === null || receivedAt === null) return payload;
+  const sinceRefresh = now - receivedAt;
+  if (sinceRefresh < hideAfterMs) return payload;
+  return {
+    freshness: 'unavailable',
+    reason: `this value could not be refreshed for ${Math.round(
+      sinceRefresh / 1000,
+    )}s, so it is withheld rather than shown at whatever age it last reported`,
+    computedAt: payload.computedAt ?? null,
+    ageMs: null,
+    degraded: true,
+    execution: {
+      allowed: false,
+      reasons: ['the browser has not been able to reach the backend'],
+    },
+  } as Guarded<T>;
+}

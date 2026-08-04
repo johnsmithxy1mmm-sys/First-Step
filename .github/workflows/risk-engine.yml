@@ -189,6 +189,12 @@ jobs:
         run: npm ci
       - working-directory: apps/web
         run: npx tsc --noEmit
+      # This package carried §6's display side with no test runner at all
+      # until 2026-08-04. `expireLocally` is the rule that makes a value
+      # disappear when the browser cannot reach the backend, which is the
+      # half of §9's Phase 3 criterion its acceptance never exercised.
+      - working-directory: apps/web
+        run: npm test
       - working-directory: apps/web
         env:
           BACKEND_URL: http://backend:8080

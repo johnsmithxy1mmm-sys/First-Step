@@ -17,7 +17,7 @@ import { GuardedPanel, EstimateValue } from '@/components/Guarded';
 import { AgentKeyDisclaimer } from '@/components/AgentKeyDisclaimer';
 import { WalletBar } from '@/components/WalletBar';
 import type { Guarded, PortfolioRiskValue, PreTradeDeltaValue } from '@/lib/contract';
-import { hasValue, pct, pp, usd } from '@/lib/contract';
+import { expireLocally, hasValue, pct, pp, usd } from '@/lib/contract';
 
 const DEMO_BOOK = {
   address: '0xdemo',
@@ -28,23 +28,45 @@ const DEMO_BOOK = {
   ],
 };
 
+function withheld<T>(reason: string): Guarded<T> {
+  return {
+    freshness: 'unavailable',
+    reason,
+    computedAt: null,
+    ageMs: null,
+    degraded: true,
+    execution: { allowed: false, reasons: [reason] },
+  };
+}
+
 async function post<T>(path: string, body: unknown): Promise<Guarded<T>> {
-  const res = await fetch(path, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    return {
-      freshness: 'unavailable',
-      reason: `backend returned ${res.status}`,
-      computedAt: null,
-      ageMs: null,
-      degraded: true,
-      execution: { allowed: false, reasons: [`backend returned ${res.status}`] },
-    };
+  // `fetch` REJECTS on a network failure — offline, DNS gone, connection
+  // refused — it does not resolve with `res.ok === false`. Only the second
+  // was handled, so a dropped network threw out of `refresh`, `setRisk` was
+  // never called, and the last numbers stayed on screen with the age badge
+  // they arrived with. The `/api/health` call two lines below already had
+  // this guard; the one carrying the risk numbers did not, so the health dot
+  // would go red while the numbers beside it still read "fresh".
+  let res: Response;
+  try {
+    res = await fetch(path, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  } catch (err) {
+    return withheld(
+      `the backend could not be reached (${err instanceof Error ? err.message : 'network error'})`,
+    );
   }
-  return (await res.json()) as Guarded<T>;
+  if (!res.ok) {
+    return withheld(`backend returned ${res.status}`);
+  }
+  try {
+    return (await res.json()) as Guarded<T>;
+  } catch {
+    return withheld('the backend returned a response this page could not read');
+  }
 }
 
 export default function Page() {
@@ -58,6 +80,14 @@ export default function Page() {
   // this path — the demo path's book is fabricated per request and always
   // fresh by construction.
   const [address, setAddress] = useState('');
+  // When the last successful poll landed, by the CLIENT's clock. `ageMs` on
+  // the payload is the backend's answer at the moment it answered; it says
+  // nothing about how long ago that moment was, and a page that stops being
+  // able to poll would otherwise keep showing it forever.
+  const [receivedAt, setReceivedAt] = useState<number | null>(null);
+  // Forces a re-render so `expireLocally` is re-evaluated on a clock the
+  // page owns, rather than only when a fetch happens to come back.
+  const [, setTick] = useState(0);
 
   // Which book the backend should analyse. One place, so the risk poll and
   // the pre-trade check can never disagree about whose book is on screen.
@@ -73,6 +103,7 @@ export default function Page() {
         n_paths: 20000,
       }),
     );
+    setReceivedAt(Date.now());
     try {
       setHealth(await (await fetch('/api/health')).json());
     } catch {
@@ -85,11 +116,19 @@ export default function Page() {
     // previous account's numbers under the new address for up to 20 seconds.
     setRisk(null);
     setDelta(null);
+    setReceivedAt(null);
     void refresh();
     // Re-poll well inside the 60-second staleness window, so a healthy
     // system never *looks* stale purely because of the polling cadence.
     const id = setInterval(() => void refresh(), 20_000);
-    return () => clearInterval(id);
+    // A separate, cheap ticker. The poll above cannot serve this purpose: a
+    // fetch that HANGS never settles, so `setRisk` is never called and no
+    // re-render happens however many times the poll fires.
+    const tick = setInterval(() => setTick((n) => n + 1), 5_000);
+    return () => {
+      clearInterval(id);
+      clearInterval(tick);
+    };
   }, [refresh]);
 
   const runDelta = useCallback(async () => {
@@ -103,7 +142,11 @@ export default function Page() {
     );
   }, [size, bookQuery]);
 
-  const gate = risk?.execution ?? { allowed: false, reasons: ['no data yet'] };
+  // Every read of the payload goes through the local expiry, including the
+  // execution gate: a gate computed from a payload the client has not been
+  // able to refresh is a gate answering about data nobody can vouch for.
+  const shown = expireLocally(risk, receivedAt);
+  const gate = shown?.execution ?? { allowed: false, reasons: ['no data yet'] };
 
   return (
     <main className="mx-auto max-w-5xl px-6 py-10">
@@ -114,7 +157,7 @@ export default function Page() {
         <GuardedPanel
           title="Portfolio risk"
           subtitle="Probability of liquidation, 24h and 7d"
-          payload={risk}
+          payload={shown}
         >
           {(v) => (
             <div className="space-y-4">
@@ -148,7 +191,7 @@ export default function Page() {
         <GuardedPanel
           title="Effective leverage"
           subtitle="Book volatility relative to BTC"
-          payload={risk}
+          payload={shown}
         >
           {(v) => (
             <div className="space-y-4">
@@ -250,7 +293,7 @@ export default function Page() {
         <GuardedPanel
           title="Funding cost"
           subtitle="Distribution over the next 24h, not a point"
-          payload={risk}
+          payload={shown}
         >
           {(v) => (
             <div className="space-y-2">
@@ -359,9 +402,9 @@ export default function Page() {
           advice. The model does not forecast prices: it assumes zero drift and estimates the
           distribution of outcomes around that.
         </p>
-        {risk && hasValue(risk) ? (
+        {shown && hasValue(shown) ? (
           <p className="mt-2 tabular-nums">
-            Model {risk.value.model_version} · computed {risk.computedAt}
+            Model {shown.value.model_version} · computed {shown.computedAt}
           </p>
         ) : null}
       </footer>
