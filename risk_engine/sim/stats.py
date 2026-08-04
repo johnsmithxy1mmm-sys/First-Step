@@ -225,14 +225,68 @@ class PredictiveDistribution:
     def crps(self, actual: float) -> float:
         """Continuous ranked probability score, lower is better.
 
-        Computed from the quantile function via the pinball identity
-        `CRPS = 2 * integral_0^1 QL_tau dtau`, which is exact for this
-        representation rather than a sample approximation of it.
+        The pinball identity `CRPS = 2 * integral_0^1 QL_tau dtau`, integrated
+        EXACTLY for this representation — which the previous trapezoid was
+        not, though its docstring said so.
+
+        The integrand is `(1{x < q(tau)} - tau) * (q(tau) - x)`. On a segment
+        where `q` is linear that is a product of two affine functions of
+        `tau`, i.e. a QUADRATIC, and the trapezoid rule is exact only for
+        linear integrands. Measured on a forecast whose quantile function is
+        exactly representable (uniform, `q(tau) = tau`, so no representation
+        error at all): the error against the closed form was 3.33e-3 at 11
+        levels, 3.33e-5 at 101, 3.33e-7 at the shipped 1001 and 3.33e-9 at
+        10001 — exactly 100x per 10x refinement, the signature of a
+        second-order method, and the residual is the integrator's alone.
+        4e-6 relative at the shipped grid.
+
+        Small, and not obviously harmless: `crps_beats_baseline_a/b` is a bare
+        `<` between two means with no tolerance, the value is written once to
+        an immutable journal row, and the bias does not cancel between model
+        and baseline because it depends on the shape of each distribution.
+        Exactness costs a few lines on a cold path (once per resolution, not
+        per path), so there is no reason to carry an approximation here.
+
+        Simpson is exact for quadratics, so each segment integrates exactly
+        provided the indicator does not flip inside it. Where `q` crosses
+        `actual` the segment is split at the crossing and each half done
+        separately, which is the only place the integrand is not smooth.
         """
-        q = self.values
-        tau = self.levels
-        pinball = np.where(actual < q, 1.0 - tau, -tau) * (q - actual)
-        return float(2.0 * np.trapezoid(pinball, tau))
+        tau, q = self.levels, self.values
+        if tau.size < 2:
+            return 0.0
+        a, b, qa, qb = tau[:-1], tau[1:], q[:-1], q[1:]
+
+        def _simpson(lo, hi, q_lo, q_hi):
+            """Exact for the quadratic pinball integrand on one sub-interval.
+
+            The indicator is read at the MIDPOINT, which is constant across
+            any sub-interval the caller has already split at the crossing —
+            and avoids the boundary case where `q == actual` exactly, where
+            `<` would have to pick a side.
+            """
+            mid_q = 0.5 * (q_lo + q_hi)
+            mid_t = 0.5 * (lo + hi)
+            c = np.where(actual < mid_q, 1.0, 0.0)
+            g_lo = (c - lo) * (q_lo - actual)
+            g_mid = (c - mid_t) * (mid_q - actual)
+            g_hi = (c - hi) * (q_hi - actual)
+            return (hi - lo) / 6.0 * (g_lo + 4.0 * g_mid + g_hi)
+
+        total = _simpson(a, b, qa, qb)
+
+        # Segments where `q` passes through `actual`: the indicator flips
+        # inside them, so one Simpson over the whole segment integrates the
+        # wrong function on one side of the crossing.
+        span = qb - qa
+        crossing = np.nonzero((qa - actual) * (qb - actual) < 0.0)[0]
+        for i in crossing:
+            t_star = a[i] + (actual - qa[i]) * (b[i] - a[i]) / span[i]
+            total[i] = (
+                _simpson(a[i], t_star, qa[i], actual)
+                + _simpson(t_star, b[i], actual, qb[i])
+            )
+        return float(2.0 * total.sum())
 
     def var(self, level: float = 0.95) -> float:
         return float(-self.quantile(1.0 - level))

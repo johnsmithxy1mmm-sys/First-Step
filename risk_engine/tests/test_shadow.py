@@ -1757,3 +1757,117 @@ class TestABookThatLeavesTheUniverseStillResolves:
         resolve_due(journal, provider, now + timedelta(hours=24))
         journal.close()
         assert provider.mids_calls == 0
+
+
+class TestTheCrpsComparisonIsPaired:
+    """§0.2 asks whether the model beats both baselines. The three variants'
+    cohorts were loaded independently and their MEANS compared, which treats
+    them as describing the same observations — and they need not.
+
+    A row can fail on its own, and the resolver's ceiling lands BETWEEN rows
+    rather than between addresses: `due()` orders by `resolves_at`, which the
+    three variants of one address share, so a truncated run routinely leaves
+    an address with one or two of its three rows resolved.
+
+    That is not a rounding-level concern, because CRPS carries the units of
+    the equity change and its mean is dominated by the largest accounts.
+    """
+
+    VERSION = DISTRIBUTION_VERSION
+
+    def _write(self, journal, address, variant, day, crps, resolve=True):
+        import json as _json
+
+        predicted_at = datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(days=day)
+        resolves_at = predicted_at + timedelta(hours=24)
+        rows = journal._query(
+            """
+            INSERT INTO calibration_predictions (
+                address, variant, predicted_at, horizon_hours, resolves_at,
+                model_version, distribution_version, seed, n_paths, converged,
+                start_equity, p_liq, p_liq_ci_low, p_liq_ci_high, var_95,
+                cvar_95, quantile_values, n_quantile_levels, book_snapshot
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            RETURNING id
+            """,
+            (address, variant, predicted_at.isoformat(), 24,
+             resolves_at.isoformat(), "0.4.0", self.VERSION, 1, 10, True,
+             1_000.0, 0.0, 0.0, 0.0, 100.0, 100.0,
+             _json.dumps(list(np.linspace(-1e3, 1e3, 11))), 11, _json.dumps({})),
+        )
+        journal.backend.commit()
+        if not resolve:
+            return
+        journal.record_outcome(
+            prediction_id=int(rows[0]["id"]), resolved_at=resolves_at,
+            actual_equity=1_000.0, actual_equity_change=0.0,
+            external_flow_usd=0.0, book_changed=False, liquidated=False,
+            pit=0.5, pit_u=0.5, crps=crps, var_95_breached=False,
+            observation_day=predicted_at.date(), resolution_lag_s=0.0,
+            stale_resolution=False,
+        )
+
+    def _journal_with_a_whale(self, drop_from):
+        """Twenty small accounts where the model is genuinely better, plus one
+        whale all three score IDENTICALLY — so no verdict may turn on it."""
+        journal = CalibrationJournal()
+        for i in range(20):
+            a = addr(i)
+            self._write(journal, a, VARIANT_MODEL, i, 10.0)
+            self._write(journal, a, VARIANT_BASELINE_A, i, 12.0)
+            self._write(journal, a, VARIANT_BASELINE_B, i, 12.0)
+        whale = "0x" + "f" * 40
+        for variant in (VARIANT_MODEL, VARIANT_BASELINE_A, VARIANT_BASELINE_B):
+            self._write(journal, whale, variant, 20, 5_000.0,
+                        resolve=variant != drop_from)
+        return journal
+
+    def test_one_missing_baseline_row_does_not_flip_the_verdict(self):
+        """Reproduced before the fix: the model 'lost' to A (247.6 against
+        12.0) and 'beat' B (247.6 against 249.5) on identical data, purely
+        because one baseline-A row had not resolved."""
+        journal = self._journal_with_a_whale(drop_from=VARIANT_BASELINE_A)
+        report = calibration_report(journal, self.VERSION, cohort=COHORT_ALL)
+        journal.close()
+        assert report.crps_beats_baseline_a, report.mean_crps
+        assert report.crps_beats_baseline_b, report.mean_crps
+
+    def test_a_missing_MODEL_row_does_not_flatter_it_either(self):
+        """The other direction, and the one §10 forbids: dropping the whale
+        from the MODEL's own cohort would lower its mean and let a model that
+        is not better appear to win."""
+        journal = CalibrationJournal()
+        for i in range(20):
+            a = addr(i)
+            self._write(journal, a, VARIANT_MODEL, i, 12.0)     # model is WORSE
+            self._write(journal, a, VARIANT_BASELINE_A, i, 10.0)
+            self._write(journal, a, VARIANT_BASELINE_B, i, 10.0)
+        whale = "0x" + "f" * 40
+        self._write(journal, whale, VARIANT_MODEL, 20, 5_000.0, resolve=False)
+        self._write(journal, whale, VARIANT_BASELINE_A, 20, 5_000.0)
+        self._write(journal, whale, VARIANT_BASELINE_B, 20, 5_000.0)
+        report = calibration_report(journal, self.VERSION, cohort=COHORT_ALL)
+        journal.close()
+        assert not report.crps_beats_baseline_a, report.mean_crps
+        assert not report.crps_beats_baseline_b, report.mean_crps
+
+    def test_the_report_says_when_rows_could_not_be_paired(self):
+        """Said whenever it happens, not only when it changes a verdict: an
+        unpaired comparison that happens to agree is still one nobody could
+        audit from the output."""
+        journal = self._journal_with_a_whale(drop_from=VARIANT_BASELINE_A)
+        report = calibration_report(journal, self.VERSION, cohort=COHORT_ALL)
+        journal.close()
+        assert report.n_paired == 20
+        assert report.n == 21, "the model's own n is unchanged"
+        assert sum(report.unpaired_dropped.values()) == 2
+        assert "paired" in report.gate_summary
+
+    def test_the_model_keeps_every_row_for_its_own_calibration(self):
+        """PIT, KS and the tail describe the MODEL alone rather than a
+        comparison, so pairing must not shrink them — that would discard data
+        for no reason."""
+        journal = self._journal_with_a_whale(drop_from=VARIANT_BASELINE_A)
+        report = calibration_report(journal, self.VERSION, cohort=COHORT_ALL)
+        journal.close()
+        assert report.tail.n == 21

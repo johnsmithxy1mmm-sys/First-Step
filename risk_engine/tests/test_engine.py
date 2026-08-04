@@ -267,6 +267,50 @@ class TestStatistics:
         actual = rng.normal(0, 1, 2_000)
         assert np.mean([good.crps(a) for a in actual]) < np.mean([bad.crps(a) for a in actual])
 
+    def test_crps_is_exact_for_the_representation_it_claims_to_be(self):
+        """The docstring said "exact for this representation" while using the
+        trapezoid rule, which is exact only for LINEAR integrands.
+
+        The pinball integrand is `(1{x<q} - tau)(q - x)`: on a segment where
+        `q` is linear it is a product of two affine functions of `tau`, i.e.
+        quadratic. A uniform forecast pins the difference, because its
+        quantile function `q(tau) = tau` is stored losslessly — so any error
+        is the integrator's and nothing else's.
+
+        Measured with the old trapezoid: 3.33e-3 at 11 levels, 3.33e-5 at
+        101, 3.33e-7 at the shipped 1001, 3.33e-9 at 10001. Exactly 100x per
+        10x refinement, which is what a second-order method does and what an
+        exact one does not do at all.
+        """
+        def closed_form(x):           # CRPS of U(0,1) at x in [0,1]
+            return x ** 3 / 3.0 + (1.0 - x) ** 3 / 3.0
+
+        for n_levels in (11, 101, 1001):
+            levels = np.linspace(0.0, 1.0, n_levels)
+            d = PredictiveDistribution(levels=levels, values=levels.copy())
+            for x in (0.1, 0.25, 0.5, 0.75, 0.9):
+                assert d.crps(x) == pytest.approx(closed_form(x), abs=1e-12), (
+                    f"n_levels={n_levels} x={x}"
+                )
+
+    def test_crps_is_exact_outside_the_support_too(self):
+        """No crossing at all, so the split branch never fires — the case a
+        crossing-only implementation would silently get wrong. Hand integral:
+        for U(0,1) at x=-2, ∫(F-1)² over [-2,0] is 2, plus ∫F² over [0,1] =
+        1/3."""
+        levels = np.linspace(0.0, 1.0, 1001)
+        d = PredictiveDistribution(levels=levels, values=levels.copy())
+        assert d.crps(-2.0) == pytest.approx(2.0 + 1.0 / 3.0, abs=1e-12)
+        assert d.crps(3.0) == pytest.approx(2.0 + 1.0 / 3.0, abs=1e-12)
+
+    def test_crps_of_a_point_mass_at_the_outcome_is_zero(self):
+        """A forecast that is certain and right scores perfectly, or the
+        scale has an offset in it."""
+        d = PredictiveDistribution(levels=np.linspace(0.0, 1.0, 101),
+                                   values=np.full(101, 4.0))
+        assert d.crps(4.0) == 0.0
+        assert d.crps(5.0) == pytest.approx(1.0, abs=1e-12)
+
     def test_pit_of_a_correct_forecast_is_uniform(self):
         rng = np.random.default_rng(1)
         dist = PredictiveDistribution.from_samples(rng.normal(0, 1, 100_000))
