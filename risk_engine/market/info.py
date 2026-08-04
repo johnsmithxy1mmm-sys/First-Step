@@ -383,6 +383,16 @@ class InfoClient:
         address = normalise_address(address)
         return self.post({"type": "clearinghouseState", "user": address})  # type: ignore[return-value]
 
+    def all_mids(self) -> dict:
+        """Mid price for every listed asset, in one weight-2 request.
+
+        The cheapest complete price source this venue offers, and the only
+        one that can value a book holding an asset outside the tracked
+        universe (OPEN-QUESTIONS B6). `candleSnapshot` costs 20 plus a
+        per-item surcharge and answers for one coin.
+        """
+        return self.post({"type": "allMids"})  # type: ignore[return-value]
+
     def open_orders(self, address: str) -> list:
         address = normalise_address(address)
         return self.post({"type": "openOrders", "user": address})  # type: ignore[return-value]

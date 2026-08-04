@@ -247,6 +247,42 @@ class LiveSnapshotProvider:
         self._spot, self._spot_at = out, time.monotonic()
         return dict(out)
 
+    def mids(self) -> dict[str, float]:
+        """Mid price for EVERY listed asset, at weight 2 for the whole set.
+
+        `spot()` answers for the tracked universe only, which is right for
+        the sweep: those are the coins the model has marginals for. The
+        resolver needs more, and B6 is why -- an account that held only
+        BTC/ETH/SOL when its prediction was written may hold ZEC a day
+        later, and `Book.equity` cannot value a position it has no price
+        for. Without this the resolution raises `KeyError`, is filed
+        transient, and is retried hourly forever.
+
+        Not merged into `spot()`. That would change the price source the
+        SWEEP values `start_equity` at -- from an hourly close to a live mid
+        -- on every address, which is a change to recorded data made for the
+        convenience of a different caller.
+        """
+        raw = self.client.all_mids()
+        if not isinstance(raw, dict):
+            raise RuntimeError(
+                f"allMids did not return the documented object; got "
+                f"{type(raw).__name__}"
+            )
+        out: dict[str, float] = {}
+        for coin, px in raw.items():
+            try:
+                value = float(px)
+            except (TypeError, ValueError):
+                # One unparseable entry must not deny every other coin a
+                # price: this exists to value books the universe does not
+                # cover, and refusing wholesale would put us back where we
+                # started.
+                continue
+            if value > 0.0:
+                out[coin] = value
+        return out
+
     def book(self, address: str) -> Book:
         # Normalised once here so the request and the Book carry the same
         # string. `parse_clearinghouse_state` echoes the address it is handed

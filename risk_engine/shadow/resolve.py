@@ -84,6 +84,16 @@ class OutcomeProvider(Protocol):
     def book(self, address: str) -> Book: ...
     def spot(self) -> dict[str, float]: ...
 
+    def mids(self) -> dict[str, float]:
+        """Prices for assets OUTSIDE the tracked universe, for valuation only.
+
+        Optional: a provider without it simply cannot resolve a book that
+        drifted out of the universe, and `resolve_due` says so per row rather
+        than pretending. The live provider answers it in one weight-2
+        request.
+        """
+        ...
+
     def external_flow(self, address: str, since: datetime, until: datetime) -> float:
         """Net deposits minus withdrawals over the window, in USD.
 
@@ -324,6 +334,9 @@ def resolve_due(
     if spot is _CEILING:
         return ResolveReport(resolved=0, failed=[], budget_exhausted=True)
     spot_at = time.monotonic()
+    # Fetched lazily and at most once per run: most books never need it, and
+    # `allMids` is weight 2 for the whole venue.
+    extra_mids: dict[str, float] | None = None
 
     due = list(journal.due(now))
     log.info(
@@ -354,10 +367,40 @@ def resolve_due(
                 book = _paced(lambda p=pending: provider.book(p.address))
                 if book is _CEILING:
                     break
-                # The moment the realisation was actually observed, not the
-                # moment the run started.
+                # A book may hold a coin the tracked universe does not cover
+                # (B6): the account held only BTC/ETH/SOL when the prediction
+                # was written and opened ZEC the next day. `spot` answers for
+                # the universe, so valuing that book raises KeyError -- which
+                # was caught per row, filed as a transient failure, and
+                # retried hourly FOREVER, because `_permanent_reason` only
+                # knows about unusable addresses.
+                #
+                # Observed 2026-08-04 on the live journal: 30 due rows, 30
+                # failed, 0 resolved, every one a KeyError on ZEC, HYPE, BCH,
+                # kPEPE or TAO. Dead rows accumulate daily, are retried every
+                # hour, and eat the run's 50-minute ceiling ahead of rows that
+                # COULD resolve -- pushing those past the 2h staleness bound.
+                # §3.3 unreachable by construction, from the resolution side.
+                #
+                # Valuing it is the right answer rather than dropping it. The
+                # realised equity is a fact about the account; the new
+                # position changes the fingerprint, so `book_changed` is True
+                # and B2's cohort filter excludes it from the strict gate
+                # while the all-observations cohort keeps it. Dropping it
+                # instead would bias the cohort toward inactive accounts
+                # silently, which is the thing B6 exists to disclose.
+                missing = [p.coin for p in book.positions if p.coin not in spot]
+                if missing:
+                    if extra_mids is None:
+                        got = _paced(provider.mids)
+                        if got is _CEILING:
+                            break
+                        extra_mids = got
+                    priced = {**extra_mids, **spot}
+                else:
+                    priced = spot
                 cache[pending.address] = (
-                    book.equity(spot), position_fingerprint(book), _observed_now(),
+                    book.equity(priced), position_fingerprint(book), _observed_now(),
                 )
             actual_equity, fingerprint, observed_at = cache[pending.address]
 

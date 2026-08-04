@@ -1657,3 +1657,103 @@ class TestTheFingerprintSeesWhatMovesThePrediction:
                                             isolated_margin=10_000.0),), self.NOW)
         assert position_fingerprint(base) != position_fingerprint(bigger)
         assert position_fingerprint(base) != position_fingerprint(other)
+
+
+class TestABookThatLeavesTheUniverseStillResolves:
+    """The fourth gate-unreachable failure, from the resolution side.
+
+    The sweep SKIPS an address holding an off-universe coin, so a prediction
+    is only ever written for an in-universe book. But B6's world is one where
+    accounts drift: an account holding only BTC/ETH/SOL when its prediction
+    was written may hold ZEC a day later. `spot` answers for the tracked
+    universe, so `Book.equity` raises KeyError on the new position — caught
+    per row, filed transient, and retried hourly FOREVER, because
+    `_permanent_reason` only knows about unusable addresses.
+
+    Observed on the live journal 2026-08-04: 30 due rows, 30 failed, 0
+    resolved, every one a KeyError on ZEC, HYPE, BCH, kPEPE or TAO. Dead rows
+    accumulate daily and eat the run's 50-minute ceiling ahead of rows that
+    COULD resolve, pushing those past the 2h staleness bound.
+    """
+
+    class _DriftingProvider(FakeProvider):
+        """Holds an off-universe position at resolution time, and can price
+        it — like the live provider, which answers `mids()` from `allMids`."""
+
+        def __init__(self, books, spot, specs, later_books, mids):
+            super().__init__(books, spot, specs, later_books=later_books)
+            self._mids = mids
+            self.mids_calls = 0
+
+        def mids(self):
+            self.mids_calls += 1
+            return dict(self._mids)
+
+    def _drifted(self, books, now):
+        """The same book plus one position in a coin the universe lacks."""
+        out = {}
+        for a, b in books.items():
+            out[a] = Book(b.address, b.cross_collateral,
+                          (*b.positions,
+                           Position("ZEC", 3.0, 250.0, MarginMode.CROSS, 5.0)),
+                          b.captured_at)
+        return out
+
+    def test_it_resolves_instead_of_failing_forever(
+        self, bundle, specs, spot, books, naive, now
+    ):
+        journal = CalibrationJournal()
+        provider = self._DriftingProvider(
+            books, spot, specs, self._drifted(books, now), {"ZEC": 250.0})
+        ShadowCron(provider, bundle, journal, naive, n_paths=1_000).run_once(now)
+        provider.phase = "after"
+        report = resolve_due(journal, provider, now + timedelta(hours=24))
+        journal.close()
+
+        assert report.resolved > 0, (
+            f"nothing resolved; failures were {report.failed[:3]}"
+        )
+        assert not report.failed, report.failed[:3]
+
+    def test_the_drifted_book_is_marked_changed(
+        self, bundle, specs, spot, books, naive, now
+    ):
+        """Resolving it must not smuggle it into the strict cohort. The new
+        position changes the fingerprint, so B2's filter excludes it from
+        book-unchanged while the all-observations cohort keeps it — which is
+        the point of valuing it rather than dropping it."""
+        journal = CalibrationJournal()
+        provider = self._DriftingProvider(
+            books, spot, specs, self._drifted(books, now), {"ZEC": 250.0})
+        ShadowCron(provider, bundle, journal, naive, n_paths=1_000).run_once(now)
+        provider.phase = "after"
+        resolve_due(journal, provider, now + timedelta(hours=24))
+        rows = journal._query("SELECT book_changed FROM calibration_outcomes")
+        journal.close()
+        assert rows and all(r["book_changed"] for r in rows)
+
+    def test_the_extra_prices_are_fetched_at_most_once_per_run(
+        self, bundle, specs, spot, books, naive, now
+    ):
+        """`allMids` is weight 2 for the whole venue, but per-address it would
+        still be a per-address cost the capacity arithmetic does not budget."""
+        journal = CalibrationJournal()
+        provider = self._DriftingProvider(
+            books, spot, specs, self._drifted(books, now), {"ZEC": 250.0})
+        ShadowCron(provider, bundle, journal, naive, n_paths=1_000).run_once(now)
+        provider.phase = "after"
+        resolve_due(journal, provider, now + timedelta(hours=24))
+        journal.close()
+        assert provider.mids_calls == 1, provider.mids_calls
+
+    def test_an_in_universe_book_never_asks_for_them(
+        self, bundle, specs, spot, books, naive, now
+    ):
+        """The common case must not pay for the rare one."""
+        journal = CalibrationJournal()
+        provider = self._DriftingProvider(books, spot, specs, {}, {"ZEC": 250.0})
+        ShadowCron(provider, bundle, journal, naive, n_paths=1_000).run_once(now)
+        provider.phase = "after"
+        resolve_due(journal, provider, now + timedelta(hours=24))
+        journal.close()
+        assert provider.mids_calls == 0
