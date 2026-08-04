@@ -65,6 +65,11 @@ UNCHECKABLE = "UNCHECKABLE"
 
 HOUR_MS = 3_600_000
 
+#: How often the frame sweep says where it is. Matches the shadow sweep's
+#: cadence, and for the same reason: both spend most of their time asleep on
+#: the §5.3 window, so both are outwardly indistinguishable from a hang.
+PROGRESS_EVERY_S = 30.0
+
 
 def _is_self_inflicted(exc: BaseException) -> bool:
     """Whether a failure is this harness's own doing rather than the venue's.
@@ -518,7 +523,23 @@ def check_frame_ledger_types(client: InfoClient, addresses: list[str],
     n_read = 0
 
     budget_stopped = False
-    for addr in chosen:
+    started = time.monotonic()
+    last_progress = started
+    for i, addr in enumerate(chosen, 1):
+        # This loop is where a verification run spends nearly all its wall
+        # clock, and nearly all of THAT is asleep: 200 addresses is 4000
+        # weight against a 300/min shared pool, so roughly twelve of the
+        # thirteen minutes are waiting for the window. Silence here reads as
+        # a hang. Elapsed and waiting are reported separately for the same
+        # reason the shadow sweep separates them -- mostly-waiting is §5.3
+        # working as designed, elapsed climbing while waiting does not is a
+        # stall worth acting on.
+        if time.monotonic() - last_progress >= PROGRESS_EVERY_S:
+            last_progress = time.monotonic()
+            waited = _waited_s(client)
+            _step(f"B2.frame {i}/{len(chosen)} addresses, {n_records} records, "
+                  f"{len(kinds)} delta types, {time.monotonic() - started:.0f}s "
+                  f"elapsed ({waited:.0f}s waiting)")
         try:
             rows = list(client.non_funding_ledger_updates(
                 addr, now_ms - window_days * 24 * HOUR_MS, now_ms) or [])
@@ -1126,6 +1147,32 @@ def _verify_budget(journal: str | None):
     return PacedBudget(inner)
 
 
+def _step(label: str) -> None:
+    """Say which check is running, before it runs.
+
+    This harness shares one 300/min pool with the shadow jobs and waits out
+    a spent window rather than failing on it (C6), so a run legitimately
+    spends most of its wall clock asleep — a 200-address frame sweep is 4000
+    weight, about thirteen minutes of which twelve are waiting. Without a
+    line per step that is indistinguishable from a hang, which is exactly the
+    confusion the shadow sweep's silence caused before it was given progress
+    output.
+
+    stderr, so `--report` and piped stdout stay clean.
+    """
+    print(f"  … {label}", file=sys.stderr, flush=True)
+
+
+def _waited_s(client) -> float:
+    """Seconds this run has spent asleep on the §5.3 window, or 0.
+
+    Tolerant of a client without a budget, because the client is injectable
+    and every test drives a stub. A progress line is not worth an
+    AttributeError in the middle of a verification run.
+    """
+    return float(getattr(getattr(client, "budget", None), "waited_s", 0.0) or 0.0)
+
+
 def run_all(address: str | None, coins: list[str], days: int, samples: int,
             interval_s: float, testnet: bool, probe_ws: bool = False,
             findings: dict | None = None, frame_addresses: list[str] | None = None,
@@ -1136,6 +1183,7 @@ def run_all(address: str | None, coins: list[str], days: int, samples: int,
                         budget=_verify_budget(journal))
     checks: list[Check] = []
 
+    _step("E5.1 meta -> margin tiers")
     meta_check, specs = check_meta(client)
     checks.append(meta_check)
     if specs:
@@ -1148,21 +1196,37 @@ def run_all(address: str | None, coins: list[str], days: int, samples: int,
             ))
         coins = known or coins
 
+    _step(f"E5.2 candleSnapshot for {coins[0]}")
     candle_check, returns = check_candles(client, coins[0])
     checks.append(candle_check)
     hourly_vol = float(np.std(returns)) if returns is not None else None
 
+    _step("E5.3 clearinghouseState")
     checks.append(check_clearinghouse(client, address))
+    _step("B2 ledger delta types, one account")
     checks.append(check_external_flow(client, address))
     if frame_addresses is not None:
+        n = min(frame_sample, len(frame_addresses))
+        _step(f"B2.frame ledger types across {n} addresses "
+              f"(~{n * 20 // 300 + 1} min, mostly waiting on the §5.3 window)")
         checks.append(check_frame_ledger_types(client, frame_addresses, frame_sample))
+    _step(f"C1 funding clamp over {days}d x {len(coins)} "
+          f"coin{'s' if len(coins) != 1 else ''}")
     checks.append(check_funding_clamp(client, coins, days))
+    _step(f"C2 basis, {samples} samples every {interval_s:.0f}s "
+          f"(~{samples * interval_s / 60:.0f} min by construction)")
     checks.append(check_basis(client, coins, samples, interval_s, hourly_vol))
     # Testnet has its own socket. Inferring the URL was called out as a
     # guess in `collect_addresses`, so it is not inferred here either --
     # probing testnet needs the URL passed explicitly.
+    if probe_ws and not testnet:
+        _step("C4 webData2 / webData3 subscribe probe")
     checks.append(check_webdata3(address=address, probe=probe_ws and not testnet))
     checks.append(check_isolated_funding())
+
+    waited = _waited_s(client)
+    if waited:
+        _step(f"done; {waited:.0f}s of that was waiting for the §5.3 window")
 
     # Folded in last, over the finished list, so every check is written and
     # tested as a pure live check that knows nothing about recorded history.

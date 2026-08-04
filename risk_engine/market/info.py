@@ -252,6 +252,13 @@ class PacedBudget:
         self.inner = inner
         self.max_wait_s = max_wait_s
         self.wait_s = wait_s
+        #: Cumulative seconds spent waiting for the window, across all
+        #: charges. Exposed because the wait is invisible from outside
+        #: otherwise: a caller sees only that a request took a long time, and
+        #: "mostly waiting" and "mostly stuck" are the two readings it has to
+        #: tell apart. The shadow sweep reports the same split for the same
+        #: reason.
+        self.waited_s = 0.0
 
     def spent(self, now: float | None = None) -> int:
         return self.inner.spent(now)
@@ -280,6 +287,7 @@ class PacedBudget:
                 if time.monotonic() >= deadline:
                     raise
                 time.sleep(self.wait_s)
+                self.waited_s += self.wait_s
 
 
 class InfoClient:

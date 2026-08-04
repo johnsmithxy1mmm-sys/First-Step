@@ -1143,3 +1143,65 @@ def test_the_harness_reaches_the_live_host_or_says_it_cannot():
     if check.status != PASS:
         pytest.skip(f"live meta did not parse: {check.detail}")
     assert specs and len(specs) > 10
+
+
+class TestItSaysWhatItIsDoing:
+    """A run that shares one 300/min pool and waits out a spent window (C6)
+    spends most of its wall clock asleep — a 200-address frame sweep is 4000
+    weight, roughly twelve of its thirteen minutes waiting. Silent, that is
+    indistinguishable from a hang, which is the confusion the shadow sweep
+    had to be given progress output to fix. Same failure, same remedy.
+    """
+
+    def test_progress_goes_to_stderr_so_a_report_pipe_stays_clean(self, capsys):
+        verify._step("E5.1 meta")
+        out = capsys.readouterr()
+        assert "E5.1 meta" in out.err
+        assert out.out == ""
+
+    def test_each_check_announces_itself_before_it_runs(self, monkeypatch, capsys):
+        """Before, not after: the point is to name the step you are waiting
+        on, and a line printed on completion arrives once the waiting is
+        already over."""
+        monkeypatch.delenv("SHADOW_DSN", raising=False)
+        order: list[str] = []
+
+        def _spy(label):
+            order.append(label)
+
+        monkeypatch.setattr(verify, "_step", _spy)
+        monkeypatch.setattr(verify, "InfoClient", lambda **kw: StubClient())
+        monkeypatch.setattr(verify, "check_meta", lambda c: (
+            verify.Check("E5.1", "q", PASS, "ok"), {"BTC": object()}))
+        monkeypatch.setattr(verify, "check_candles", lambda c, coin: (
+            verify.Check("E5.2", "q", PASS, "ok"), np.zeros(10)))
+        for name in ("check_clearinghouse", "check_external_flow",
+                     "check_funding_clamp"):
+            monkeypatch.setattr(verify, name,
+                                lambda *a, **k: verify.Check("X", "q", PASS, "ok"))
+        monkeypatch.setattr(verify, "check_basis",
+                            lambda *a, **k: verify.Check("C2", "q", PASS, "ok"))
+
+        verify.run_all(None, ["BTC"], 30, 12, 5.0, False)
+        joined = " | ".join(order)
+        for expected in ("E5.1", "E5.2", "E5.3", "C1", "C2"):
+            assert expected in joined, joined
+
+    def test_the_frame_sweep_reports_waiting_apart_from_elapsed(self):
+        """Those two numbers are the diagnosis, and one combined number
+        cannot give it: mostly-waiting is §5.3 working as designed, elapsed
+        climbing while waiting does not is a stall."""
+        import inspect
+
+        src = inspect.getsource(verify.check_frame_ledger_types)
+        assert "waited_s" in src
+        assert "elapsed" in src and "waiting" in src
+
+    def test_the_paced_budget_counts_what_it_slept(self):
+        """The number the line above reports has to be real."""
+        inner = verify_info.WeightBudget(limit_per_minute=100, reserved_fraction=0.0)
+        inner.charge(100)
+        paced = verify_info.PacedBudget(inner, max_wait_s=0.05, wait_s=0.01)
+        with pytest.raises(verify_info.RateLimitExceeded):
+            paced.charge(1)
+        assert paced.waited_s > 0.0
