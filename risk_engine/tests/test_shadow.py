@@ -1381,6 +1381,22 @@ class TestCalibrationMetrics:
             # A dict on both backends: Postgres hands back JSONB, SQLite text.
             assert row["skipped_by_reason"]["off-universe: ATOM, HYPE"] == 10
             assert journal.sweeps("some-other-version") == []
+
+            # The DEFAULT read pools every version, each row labelled. The
+            # first reader filtered on the CURRENT version, and the day after
+            # it landed the version bumped twice without the universe moving
+            # -- `shadow census` then reported "no sweeps recorded" over a
+            # table holding exactly the full sweeps B6 step 1 asks for. The
+            # drop pattern is a fact about the address list and HL_UNIVERSE,
+            # not about the copula.
+            journal.record_sweep(
+                swept_at=when, distribution_version="test-2",
+                attempted=515, written=222, budget_exhausted=False,
+                skipped_by_reason={"off-universe: HYPE": 5},
+            )
+            pooled = journal.sweeps()
+            assert {r["distribution_version"] for r in pooled} == {"test", "test-2"}
+            assert len(pooled) == 2
         finally:
             journal.close()
 

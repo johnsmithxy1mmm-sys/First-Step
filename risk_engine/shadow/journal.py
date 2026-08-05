@@ -433,7 +433,7 @@ class CalibrationJournal:
             row["observation_day"] = as_date(row["observation_day"]).isoformat()
         return rows
 
-    def sweeps(self, distribution_version: str) -> list[dict]:
+    def sweeps(self, distribution_version: str | None = None) -> list[dict]:
         """The per-sweep census rows (OPEN-QUESTIONS B6), normalised.
 
         `record_sweep` has written this table since 2026-08-01 and until now
@@ -444,19 +444,33 @@ class CalibrationJournal:
         that could not be asked of it. That is the same shape as a metric
         computed and never read: the write is not the point, the answer is.
 
+        `distribution_version=None` -- the default, and the B6 reading --
+        returns EVERY version's rows, each row carrying its version. The first
+        shipped version of this reader filtered on the current version, which
+        hid the whole census the day after it landed: the model version bumped
+        twice in two days (0.4 -> 0.5 -> 0.6, none of them touching the
+        universe), and `shadow census` reported "no sweeps recorded for 0.6"
+        over a table holding exactly the full sweeps B6 step 1 asks for. The
+        drop pattern depends on the address list and HL_UNIVERSE, not on the
+        copula's df; a universe change does bump the version, but a version
+        bump does not imply a universe change, so the version is the wrong
+        key for this question. Pass a version to inspect one run's provenance.
+
         `skipped_by_reason` is written with `json.dumps`, which Postgres
         stores as JSONB and hands back as a dict while SQLite hands back the
         text; `as_json` settles that here rather than in every caller.
         """
+        where = "" if distribution_version is None else "WHERE distribution_version = ?"
+        params = () if distribution_version is None else (distribution_version,)
         rows = self._query(
-            """
-            SELECT swept_at, observation_day, attempted, written,
-                   budget_exhausted, skipped_by_reason
+            f"""
+            SELECT swept_at, observation_day, distribution_version,
+                   attempted, written, budget_exhausted, skipped_by_reason
             FROM calibration_sweeps
-            WHERE distribution_version = ?
+            {where}
             ORDER BY swept_at
-            """,
-            (distribution_version,),
+            """,  # noqa: S608 - `where` is one of two literals above
+            params,
         )
         for row in rows:
             row["budget_exhausted"] = as_bool(row["budget_exhausted"])

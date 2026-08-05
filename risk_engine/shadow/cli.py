@@ -530,25 +530,33 @@ def cmd_census(args) -> int:
     ).required_addresses
 
     with _open_for_reading(args.journal) as journal:
-        sweeps = journal.sweeps(DISTRIBUTION_VERSION)
+        # ALL versions, deliberately: the drop pattern depends on the address
+        # list and HL_UNIVERSE, not on the model version, and the version
+        # bumped twice in two days without the universe moving. The first
+        # version of this command filtered on the current version and reported
+        # "no sweeps" over a table holding exactly the data B6 asked for.
+        sweeps = journal.sweeps()
 
     if not sweeps:
-        print(f"no sweeps recorded for {DISTRIBUTION_VERSION}. The census is "
-              f"written by `snapshot`, one row per run; B6 needs a few days of "
-              f"FULL sweeps before its question can be answered.")
+        print("no sweeps recorded at all. The census is written by `snapshot`, "
+              "one row per run; B6 needs a few days of FULL sweeps before its "
+              "question can be answered.")
         return 0
 
-    print(f"model {MODEL_VERSION}, distribution {DISTRIBUTION_VERSION}")
+    versions = sorted({s["distribution_version"] for s in sweeps})
+    print(f"current model {MODEL_VERSION}; census pooled across "
+          f"distribution version(s) {', '.join(versions)} -- valid while "
+          f"HL_UNIVERSE is unchanged, which no bump so far has touched")
     print(f"{len(sweeps)} sweep(s), {sweeps[0]['observation_day']} to "
           f"{sweeps[-1]['observation_day']}\n")
 
     truncated = [s for s in sweeps if s["budget_exhausted"]]
-    print(f"{'day':<12}{'attempted':>10}{'written':>9}{'floor':>8}")
+    print(f"{'day':<12}{'dist':>6}{'attempted':>10}{'written':>9}{'floor':>8}")
     for s in sweeps:
         mark = "  <- budget exhausted" if s["budget_exhausted"] else ""
         meets = "yes" if s["written"] >= floor else "NO"
-        print(f"{s['observation_day']:<12}{s['attempted']:>10}"
-              f"{s['written']:>9}{meets:>8}{mark}")
+        print(f"{s['observation_day']:<12}{s['distribution_version']:>6}"
+              f"{s['attempted']:>10}{s['written']:>9}{meets:>8}{mark}")
     if truncated:
         # A truncated sweep did not attempt every address, so its drop rates
         # are not a sample of the list -- they are a sample of its prefix.
