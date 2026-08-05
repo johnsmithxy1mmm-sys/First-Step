@@ -641,6 +641,70 @@ conclusion, not a design: the choice of df target and family is a
 model-scope decision (MODEL_VERSION MINOR, §3.3 reset) that belongs to the
 product owner, informed by the window.
 
+**PROPOSAL (2026-08-05): a conditional tail floor on the copula df.** The
+remedy space above, turned into numbers an owner can decide on. Measured
+against the live 2026-08-05 sweep banner (ETH/SOL lower 0.759 at +2.7σ,
+BTC/ETH 0.704/0.741 at +1.3σ; n=108/tail, SE ≈ 0.042), with each pair's ρ
+backed out of its own model@q reading at the fitted df 6.5: ρ ≈ 0.884–0.887
+on all three pairs.
+
+*The df lever is weak, and its reach is now known.* Walking df down at the
+fitted ρ:
+
+| df | 6.5 | 5.0 | 4.0 | 3.0 | 2.0 | 1.5 | 1.05 |
+|---|---|---|---|---|---|---|---|
+| ETH/SOL model@q | 0.651 | 0.661 | 0.673 | 0.691 | 0.716 | 0.735 | 0.762 |
+
+Covering the POINT estimate (0.759) needs df ≈ 1.05 — a near-Cauchy copula,
+foreclosed: it would wreck the body fit and every other pair to chase one
+number that carries a 0.042 SE. Covering the one-sided 95% lower confidence
+bound (0.759 − 1.645·SE = 0.690) needs **df 3.0**, which also brings every
+pair's lower-tail shortfall inside 0.02 (BTC/ETH 0.687 vs 0.704, BTC/SOL
+0.676 vs 0.694) — the shipped 0.05 gate passes everywhere — and its symmetric
+upper-tail cost is negligible where it overstates (ETH/SOL +0.005, BTC/SOL
++0.028 = 0.7 SE) while partially closing BTC/ETH's under-modelled upper
+(0.687 vs 0.741, was 0.648).
+
+*The mechanism proposed:* `df* = min(df_ML, df_tail)`, where `df_tail` is the
+largest df whose model@q covers `empirical_lower − 1.645·SE` on every pair
+failing the gate at ≥ 2σ. Conditional exactly as finding 3 requires (pairs
+under 2σ are noise to re-test, not to fit — today that excludes BTC/ETH and
+BTC/SOL as demands), one-sided exactly as finding 4 requires (λ_U is reported,
+never constrained). Today it yields df* = 3.0 against an ML fit of 6.5.
+
+*Per-output disclosure (finding 1's requirement — the sign cannot be assumed):*
+measured at df 6.5 → 3.0 on matched two-asset cross books, 40k paths × 12
+seeds:
+
+| book | 10–13x long | 28x hedged | 36x hedged | 10–13x short |
+|---|---|---|---|---|
+| ΔP(liq) | −0.0007 (−2.1 SE) / ~0 | ~0 | −0.0021 (−3.2 SE) | ~0 |
+
+Nothing rises; two cells fall by ≤ 0.2 pp. So this change is honest about the
+measured tail rather than uniformly conservative per-output — the A1
+situation, satisfied by this disclosure, exactly as finding 1 concluded it
+must be.
+
+*The alternative lever, recorded for the owner but not proposed:* the same
+observed tail is reproduced at the CURRENT df by ρ ≈ 0.944 (vs the fitted
+0.887, at any df in 3–6.5 the needed ρ is 0.935–0.944). That reading says the
+gap may sit in the correlation estimate, not the tail shape: the EWMA matrix
+weights recent hours while the tail statistic is dominated by whatever regime
+held during the window's crashes — "correlations go to 1 in a crash" is
+precisely what the exceedances measure. Tail-matched ρ would be the sharper
+model and the larger change (per-pair adjustments threaten positive
+definiteness; it reweights the whole matrix pipeline). Deferred, not
+dismissed.
+
+*Costs and standing:* MODEL_VERSION MINOR (0.4 → 0.5), §3.3 counter reset —
+free while the counter stands at zero, which it does and stays until this
+very decision is taken. Latency: nil (same machinery, same draws). The
+decision is the owner's; the options are (A) adopt the floor as specified,
+(B) defer for more data — n doubles in ~2 weeks and SE shrinks 1.4x, so the
+2.7σ either consolidates or regresses — at the price of the window not
+starting, or (C) take the ρ-lever redesign instead. Chasing the point with
+df ≈ 1 is recorded as foreclosed, not as an option.
+
 Latency is a separate constraint on the remedy and is already tight:
 `generate_log_returns` at 20 000 × 24 × 8 measures **301 ms**, the whole of
 §2.6's budget, with 221 ms of it in the quantile maps. A skew-t marginal is
