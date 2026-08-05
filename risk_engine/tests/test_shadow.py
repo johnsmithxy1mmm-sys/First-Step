@@ -1118,6 +1118,90 @@ class TestCalibrationMetrics:
         assert report.ks_pvalue > 0.01
         journal.close()
 
+    def test_the_census_can_be_read_back_at_all(self):
+        """`record_sweep` has written this table since 2026-08-01 and nothing
+        read it, so B6's decision procedure -- stated entirely in terms of it
+        -- could not be run. A write nobody reads is not provenance, it is
+        storage."""
+        journal = CalibrationJournal()
+        try:
+            when = datetime(2026, 8, 4, 9, 0, tzinfo=timezone.utc)
+            journal.record_sweep(
+                swept_at=when, distribution_version="test",
+                attempted=515, written=216, budget_exhausted=False,
+                skipped_by_reason={"off-universe: ATOM, HYPE": 10,
+                                   "no open positions": 103},
+            )
+            rows = journal.sweeps("test")
+            assert len(rows) == 1
+            row = rows[0]
+            assert row["attempted"] == 515 and row["written"] == 216
+            assert row["budget_exhausted"] is False
+            assert row["observation_day"] == "2026-08-04"
+            # A dict on both backends: Postgres hands back JSONB, SQLite text.
+            assert row["skipped_by_reason"]["off-universe: ATOM, HYPE"] == 10
+            assert journal.sweeps("some-other-version") == []
+        finally:
+            journal.close()
+
+    def test_widening_is_counted_by_whole_sets_not_by_coin(self):
+        """The measurement defect B6 names in its own text.
+
+        A per-coin tally answers "how often is this coin the first one
+        missing", never "how many addresses would a universe containing it
+        recover". Ten addresses holding ATOM *and* HYPE are recovered by
+        neither coin alone, so a per-coin reading promises ten recoveries that
+        adding ATOM delivers none of -- and that promise is what a universe
+        decision, which costs a MODEL_VERSION bump and the whole accumulated
+        window, would be taken on.
+        """
+        from risk_engine.shadow.metrics import (
+            off_universe_demand,
+            universe_candidates,
+        )
+
+        sweeps = [{"skipped_by_reason": {
+            "off-universe: ATOM, HYPE": 10,
+            "off-universe: DOGE": 4,
+            "no open positions": 99,
+        }}]
+        demand = off_universe_demand(sweeps)
+
+        assert demand == {frozenset({"ATOM", "HYPE"}): 10,
+                          frozenset({"DOGE"}): 4}, (
+            "a flat book is not an off-universe drop and widening cannot "
+            "recover it, so it must not inflate the demand"
+        )
+
+        by_size = {c.coins_added: c for c in universe_candidates(demand)}
+        assert by_size[1].recovered == 4, "DOGE completes a set on its own"
+        assert by_size[2].recovered == 4, (
+            "adding one of ATOM/HYPE completes nothing; a per-coin tally would "
+            "claim 10 here"
+        )
+        assert by_size[3].recovered == 14 and by_size[3].still_dropped == 0
+
+    def test_a_coin_that_never_completes_a_set_alone_is_still_reachable(self):
+        """Every remaining set needs two or more additions.
+
+        The greedy step that picks "the coin completing the most sets" has no
+        candidate here, and a loop that stopped there would report the demand
+        as permanently unrecoverable when two coins clear all of it.
+        """
+        from risk_engine.shadow.metrics import (
+            off_universe_demand,
+            universe_candidates,
+        )
+
+        demand = off_universe_demand([{"skipped_by_reason": {
+            "off-universe: A, B": 5,
+            "off-universe: A, C": 3,
+        }}])
+        candidates = universe_candidates(demand)
+        assert candidates, "the search gave up while the demand was reachable"
+        assert candidates[-1].still_dropped == 0
+        assert candidates[-1].recovered == 8
+
     def test_each_cohort_keeps_the_rows_its_name_claims(self):
         """The three cohort filters, none of which had a test.
 

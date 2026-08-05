@@ -225,10 +225,18 @@ question was settled by measurement rather than by decision — see below.
 structure and marginals — a distribution change, so it must be settled
 *before* days accumulate or it throws them away. What it waits on is data
 rather than a decision in the abstract: the `calibration_sweeps` census
-records the per-coin off-universe drop rate, and a few days of full sweeps
-say whether the current universe keeps `written` above §3.3's 200/day floor.
-The measurement, the query and the decision procedure are in
-[`OPEN-QUESTIONS.md`](../docs/hl-risk/OPEN-QUESTIONS.md) under B6.
+records the off-universe drop rate, and a few days of full sweeps say whether
+the current universe keeps `written` above §3.3's 200/day floor. Run the
+procedure with
+
+    python -m risk_engine.shadow census
+
+which reports, per candidate universe, how many addresses widening actually
+recovers — counted by whole off-universe SETS, because an address holding two
+missing coins is recovered by neither of them alone. That command is new on
+2026-08-04: the census had been written daily since 2026-08-01 and read by
+nothing, so B6 was blocked on a reader as much as on days. The decision itself
+is in [`OPEN-QUESTIONS.md`](../docs/hl-risk/OPEN-QUESTIONS.md) under B6.
 
 **D7's float32 path generation — CLOSED 2026-08-04, declined.** It was on this
 list because it changes the distribution, so taking it after the first

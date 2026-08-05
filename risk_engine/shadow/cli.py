@@ -4,6 +4,7 @@
     python -m risk_engine.shadow resolve  --journal shadow.db
     python -m risk_engine.shadow progress --journal shadow.db
     python -m risk_engine.shadow icc      --journal shadow.db
+    python -m risk_engine.shadow census   --journal shadow.db
 
 Two jobs on a daily cadence: `snapshot` writes predictions, `resolve` fills
 in what actually happened a day later. Between them they accumulate the
@@ -490,6 +491,97 @@ def cmd_progress(args) -> int:
     return 0
 
 
+def cmd_census(args) -> int:
+    """B6's decision procedure, run against the census (OPEN-QUESTIONS B6).
+
+    The table has been written since 2026-08-01 and read by nothing, so the
+    question it exists to answer -- which universe clears §3.3's 200/day floor
+    -- could not be asked of it. This asks it.
+
+    The arithmetic is by SETS, not by coin. B6 records why: an address holding
+    ATOM and HYPE is recovered by neither {ATOM} nor {HYPE} alone, so summing
+    per-coin counts promises recoveries that widening does not deliver. Every
+    number below counts addresses whose WHOLE off-universe list falls inside
+    the candidate universe.
+    """
+    from risk_engine.shadow.journal import ShadowProgress
+    from risk_engine.shadow.metrics import (
+        off_universe_demand,
+        universe_candidates,
+    )
+
+    # Read off the gate rather than copied, for the reason
+    # `collect_addresses.gate_required_addresses` gives: a literal 200 here
+    # stops matching `ShadowProgress` the day the gate moves, and the
+    # disagreement only surfaces at the far end of a 21-day window.
+    floor = ShadowProgress(
+        distribution_version="", distinct_days=0,
+        distinct_addresses=0, resolved_observations=0,
+    ).required_addresses
+
+    with _open_for_reading(args.journal) as journal:
+        sweeps = journal.sweeps(DISTRIBUTION_VERSION)
+
+    if not sweeps:
+        print(f"no sweeps recorded for {DISTRIBUTION_VERSION}. The census is "
+              f"written by `snapshot`, one row per run; B6 needs a few days of "
+              f"FULL sweeps before its question can be answered.")
+        return 0
+
+    print(f"model {MODEL_VERSION}, distribution {DISTRIBUTION_VERSION}")
+    print(f"{len(sweeps)} sweep(s), {sweeps[0]['observation_day']} to "
+          f"{sweeps[-1]['observation_day']}\n")
+
+    truncated = [s for s in sweeps if s["budget_exhausted"]]
+    print(f"{'day':<12}{'attempted':>10}{'written':>9}{'floor':>8}")
+    for s in sweeps:
+        mark = "  <- budget exhausted" if s["budget_exhausted"] else ""
+        meets = "yes" if s["written"] >= floor else "NO"
+        print(f"{s['observation_day']:<12}{s['attempted']:>10}"
+              f"{s['written']:>9}{meets:>8}{mark}")
+    if truncated:
+        # A truncated sweep did not attempt every address, so its drop rates
+        # are not a sample of the list -- they are a sample of its prefix.
+        print(f"\n{len(truncated)} sweep(s) hit the §5.3 budget and did not "
+              f"attempt the whole list; their rates describe a prefix of the "
+              f"address list, not the list, and B6 step 1 asks for FULL sweeps.")
+
+    demand = off_universe_demand(sweeps)
+    total_off = sum(demand.values())
+    total_skipped = sum(
+        sum(s["skipped_by_reason"].values()) for s in sweeps
+    )
+    print(f"\nskips: {total_skipped} total, {total_off} for an off-universe "
+          f"holding ({100.0 * total_off / total_skipped:.0f}%)"
+          if total_skipped else "\nno skips recorded")
+    if not demand:
+        print("Nothing is being dropped for the universe, so widening it "
+              "recovers nothing and B6's decision is to keep it.")
+        return 0
+
+    print(f"{len(demand)} distinct off-universe coin SETS across "
+          f"{len({c for s in demand for c in s})} coins\n")
+
+    print("widening, greedily, counting whole sets:")
+    print(f"{'add':<44}{'recovered':>10}{'still lost':>12}")
+    best_written = max(s["written"] for s in sweeps)
+    for cand in universe_candidates(demand):
+        added = ", ".join(cand.added)
+        if len(added) > 42:
+            added = added[:39] + "..."
+        print(f"{added:<44}{cand.recovered:>10}{cand.still_dropped:>12}")
+
+    print(
+        f"\nB6 step 3/4: the floor is {floor} addresses with a resolved, "
+        f"non-stale observation. The best sweep here wrote {best_written}. "
+        f"Widening is a DISTRIBUTION change (MODEL_VERSION MINOR, §3.3 counter "
+        f"reset), so if it is taken it must be taken before days accumulate -- "
+        f"and the recovered counts above are addresses the sweep would ATTEMPT, "
+        f"which is an upper bound on what it writes."
+    )
+    return 0
+
+
 def cmd_icc(args) -> int:
     """Measure the intra-day correlation and size the window from it (B1)."""
     import numpy as np
@@ -661,6 +753,12 @@ def main(argv: list[str] | None = None) -> int:
     prog = sub.add_parser("progress", help="report the §3.3 window and calibration")
     _journal_arg(prog)
     prog.set_defaults(func=cmd_progress)
+
+    census = _journal_arg(sub.add_parser(
+        "census",
+        help="B6: which universe clears §3.3's address floor, from the sweep census",
+    ))
+    census.set_defaults(func=cmd_census)
 
     icc = sub.add_parser(
         "icc", help="measure the intra-day correlation and size the window (B1)"

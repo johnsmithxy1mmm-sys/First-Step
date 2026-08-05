@@ -39,6 +39,117 @@ COHORT_BOOK_UNCHANGED = "book_unchanged"
 COHORTS = (COHORT_ALL, COHORT_NO_FLOW, COHORT_BOOK_UNCHANGED)
 
 
+#: The prefix `cron.py` writes for an address dropped for holding a coin the
+#: model has no marginal for. The rest of the string is the sorted, comma-
+#: separated list of EVERY missing coin, which is what makes B6's question
+#: answerable: an address is recovered by universe U exactly when its whole
+#: list is inside U.
+OFF_UNIVERSE_PREFIX = "off-universe: "
+
+
+@dataclass(frozen=True, slots=True)
+class UniverseCandidate:
+    """What widening the universe to `coins` would recover (B6 step 2)."""
+
+    added: tuple[str, ...]
+    #: Addresses whose entire off-universe list falls inside the widened
+    #: universe, so they would be modelled rather than skipped.
+    recovered: int
+    #: Addresses still dropped for an off-universe holding afterwards.
+    still_dropped: int
+
+    @property
+    def coins_added(self) -> int:
+        return len(self.added)
+
+
+def off_universe_demand(sweeps: list[dict]) -> dict[frozenset[str], int]:
+    """Off-universe coin SETS and how many address-drops each accounts for.
+
+    Keyed on the whole set, never on individual coins, and that distinction is
+    the entire point of the function. B6 records the measurement defect it is
+    written against: summing `KeyError: '<COIN>'` counts per coin answers "how
+    often is this coin the first one missing", which is not "how many
+    addresses would a universe containing it recover". An address holding ATOM
+    and HYPE is recovered by neither {ATOM} nor {HYPE} -- only by a universe
+    containing both -- so a per-coin tally can promise recoveries that adding
+    the coin delivers none of.
+
+    Rows whose reason is not an off-universe drop (flat books, non-positive
+    equity) are ignored here: widening the universe cannot recover them, and
+    counting them would overstate what the decision buys.
+    """
+    demand: dict[frozenset[str], int] = {}
+    for sweep in sweeps:
+        for reason, count in (sweep.get("skipped_by_reason") or {}).items():
+            if not reason.startswith(OFF_UNIVERSE_PREFIX):
+                continue
+            coins = frozenset(
+                c.strip() for c in reason[len(OFF_UNIVERSE_PREFIX):].split(",")
+                if c.strip()
+            )
+            if coins:
+                demand[coins] = demand.get(coins, 0) + int(count)
+    return demand
+
+
+def universe_candidates(
+    demand: dict[frozenset[str], int], max_added: int = 25
+) -> list[UniverseCandidate]:
+    """Greedy widening: at each step add the coin recovering the most drops.
+
+    Greedy rather than exhaustive because this is a set-cover problem and the
+    census carries 40-odd distinct coins; the greedy order is the standard
+    approximation and, more to the point, it is the order an operator would
+    actually widen in -- one coin at a time, most valuable first.
+
+    Each row reports what the universe of that size ACTUALLY recovers, counted
+    by whole sets, so the numbers are what widening delivers rather than what
+    a per-coin tally would promise.
+    """
+    universe: set[str] = set()
+    remaining = dict(demand)
+    out: list[UniverseCandidate] = []
+    for _ in range(max_added):
+        if not remaining:
+            break
+        # For each candidate coin, how many drops would be recovered by adding
+        # it -- i.e. sets that become fully covered, not sets that merely
+        # contain it.
+        gain: dict[str, int] = {}
+        for coins, n in remaining.items():
+            for coin in coins:
+                if coins <= universe | {coin}:
+                    gain[coin] = gain.get(coin, 0) + n
+        if not gain:
+            # No single coin completes any remaining set. Every set left needs
+            # two or more additions, so the greedy step is to add the coin
+            # appearing in the most remaining drops and continue.
+            freq: dict[str, int] = {}
+            for coins, n in remaining.items():
+                for coin in coins - universe:
+                    freq[coin] = freq.get(coin, 0) + n
+            if not freq:
+                break
+            best = max(sorted(freq), key=lambda c: freq[c])
+        else:
+            best = max(sorted(gain), key=lambda c: gain[c])
+        universe.add(best)
+        recovered_now = {c for c in remaining if c <= universe}
+        for c in recovered_now:
+            del remaining[c]
+        out.append(
+            UniverseCandidate(
+                added=tuple(sorted(universe)),
+                recovered=sum(demand[c] for c in demand if c <= universe),
+                still_dropped=sum(remaining.values()),
+            )
+        )
+        if not remaining:
+            break
+    return out
+
+
 def in_cohort(row: dict, cohort: str) -> bool:
     """Does one scored row belong to `cohort`? The single definition of that.
 

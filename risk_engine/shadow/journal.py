@@ -368,6 +368,37 @@ class CalibrationJournal:
             row["observation_day"] = as_date(row["observation_day"]).isoformat()
         return rows
 
+    def sweeps(self, distribution_version: str) -> list[dict]:
+        """The per-sweep census rows (OPEN-QUESTIONS B6), normalised.
+
+        `record_sweep` has written this table since 2026-08-01 and until now
+        NOTHING read it. B6's decision procedure is stated in terms of it --
+        "let the census accumulate a few days of full sweeps, then for each
+        candidate universe U count the addresses whose entire off-universe
+        list is inside U" -- so the data was accumulating against a question
+        that could not be asked of it. That is the same shape as a metric
+        computed and never read: the write is not the point, the answer is.
+
+        `skipped_by_reason` is written with `json.dumps`, which Postgres
+        stores as JSONB and hands back as a dict while SQLite hands back the
+        text; `as_json` settles that here rather than in every caller.
+        """
+        rows = self._query(
+            """
+            SELECT swept_at, observation_day, attempted, written,
+                   budget_exhausted, skipped_by_reason
+            FROM calibration_sweeps
+            WHERE distribution_version = ?
+            ORDER BY swept_at
+            """,
+            (distribution_version,),
+        )
+        for row in rows:
+            row["budget_exhausted"] = as_bool(row["budget_exhausted"])
+            row["observation_day"] = as_date(row["observation_day"]).isoformat()
+            row["skipped_by_reason"] = as_json(row["skipped_by_reason"]) or {}
+        return rows
+
     def progress(self, distribution_version: str) -> ShadowProgress:
         row = self._query(
             """

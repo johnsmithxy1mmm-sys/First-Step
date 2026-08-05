@@ -1261,16 +1261,37 @@ the log, which is why the table above can separate them at all — and that
 separation is the whole value of the census, since flat accounts are not
 recoverable by widening and off-universe ones are.
 
+**The procedure is executable as of 2026-08-04:**
+
+    python -m risk_engine.shadow census
+
+Until then this table had been written since 2026-08-01 and read by **nothing**
+— `record_sweep` wrote it every day and no code path anywhere loaded it back,
+so the data accumulated against a question that could not be asked of it. B6
+was blocked on a reader as much as on days. `journal.sweeps()` and
+`shadow census` are that reader; the arithmetic below is what it runs.
+
 The decision procedure, concretely:
 1. let the census accumulate a few days of full sweeps **under the new
-   reason format** — the old rows cannot answer step 2;
+   reason format** — the old rows cannot answer step 2. `census` marks any
+   sweep that hit the §5.3 budget, because a truncated sweep's drop rates
+   describe a prefix of the address list rather than the list;
 2. for each candidate universe U, count the addresses whose entire
-   `off-universe:` list is inside U. Not a per-coin sum;
+   `off-universe:` list is inside U. Not a per-coin sum — `off_universe_demand`
+   keys on the whole SET for exactly the reason this entry gives above, and
+   `universe_candidates` widens greedily, reporting what each universe
+   actually recovers. On a census where ten addresses hold ATOM *and* HYPE, a
+   per-coin tally promises "add ATOM, recover 10" and the truth is zero;
 3. if the off-universe drop rate keeps `written` comfortably above §3.3's
    200/day floor, keep the universe and let the published score disclose the
    cohort selection this table records;
 4. if it does not, set `HL_UNIVERSE` to the smallest U that clears the floor,
    bump MODEL_VERSION, record the new frame here, and start the clock then.
+
+Note what `recovered` is and is not: it counts addresses the sweep would
+**attempt**, which is an upper bound on what it writes. Flat books and
+non-positive equity are excluded from the demand entirely, because widening
+the universe cannot recover them.
 
 ---
 
