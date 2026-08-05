@@ -36,7 +36,7 @@ from risk_engine.model.copula import (
     assert_lower_tail_not_understated,
     diagnose_tail_asymmetry,
     fit_copula_df,
-    tail_floor_df,
+    tail_remedy_dependence,
 )
 from risk_engine.model.correlation import align_on_timestamps, build_global_matrix
 from risk_engine.model.funding import FundingBounds, fit_ar1
@@ -175,28 +175,54 @@ def _fitted_copula_df(returns: dict, matrix, timestamps: dict | None = None) -> 
     return df
 
 
-def _tail_floored_copula_df(
-    returns: dict, matrix, df_ml: float, timestamps: dict | None = None
-) -> float:
-    """A11's conditional tail floor, applied between the fit and the record.
+def _with_corr(matrix, corr: np.ndarray):
+    """`matrix` with its correlation entries replaced, stub-tolerant.
 
-    Adopted 2026-08-05 (OPEN-QUESTIONS A11, option A). The ML fit sees every
-    observation; the tail statistic sees ~108 of them and, on the live window,
-    sits 2.7 sigma above what the fitted df implies for ETH/SOL. Where that
-    shortfall is SIGNIFICANT the df is floored to the largest grid value whose
-    model@q covers the demand's one-sided 95% lower bound; everywhere else the
-    ML fit stands untouched. The demands, the bound and the conditionality are
-    `tail_floor_df`'s contract — this wrapper only feeds it the same aligned
-    series and correlation submatrix the fit itself used, and makes the
-    decision loud.
+    The real matrix is a frozen dataclass; benchmarks and tests hand this
+    module minimal `SimpleNamespace` stubs, which `dataclasses.replace`
+    rejects. Both carry their state in the same attributes, so the fallback
+    is a field-for-field copy.
+    """
+    import dataclasses
+
+    if dataclasses.is_dataclass(matrix):
+        return dataclasses.replace(matrix, corr=corr)
+    from types import SimpleNamespace
+
+    fields = dict(vars(matrix))
+    fields["corr"] = corr
+    return SimpleNamespace(**fields)
+
+
+def _tail_remedied_dependence(
+    returns: dict, matrix, df_ml: float, timestamps: dict | None = None
+):
+    """A11's remedy chain, applied between the fit and the record.
+
+    Adopted 2026-08-05 (OPEN-QUESTIONS A11; option A the morning, option R+H
+    the evening, after the first live firing measured the df lever's reach).
+    The ML fit sees every observation; the tail statistic sees ~108 of them
+    and, on the live window, sits significantly above what the fitted copula
+    implies on up to three pairs. Where that shortfall is SIGNIFICANT, the
+    pair's correlation is lifted to the smallest value covering the demand's
+    one-sided 95% lower bound at the ML df, and the df floor composes on top
+    for anything the lift's cap cannot reach; everywhere else the ML fit and
+    the EWMA matrix stand untouched. The demands, the bounds, the projection
+    and the re-verification are `tail_remedy_dependence`'s contract — this
+    wrapper feeds it the same aligned series and correlation submatrix the
+    fit itself used, embeds the result back, and makes every decision loud.
+
+    Returns `(matrix, df)` — the matrix the bundle should carry (lifted
+    entries embedded, or the original object untouched when nothing lifted)
+    and the df it should serve.
 
     Runs on the fixture build too, deliberately: the fixture is symmetric by
-    construction, so the floor must decide "no demand" there — a check that
+    construction, so the chain must decide "no demand" there — a check that
     only runs on the live path is a check that rots (the A10 lesson).
     """
     assets = _estimated_assets(matrix)
     if len(assets) < 2:
-        return df_ml
+        return matrix, df_ml
     series = _aligned_series(returns, assets, timestamps)
     corr = _corr_submatrix(matrix, assets)
     prelim = diagnose_tail_asymmetry(series, tuple(assets), corr, df_ml)
@@ -218,22 +244,54 @@ def _tail_floored_copula_df(
             for d in prelim
         ),
     )
-    floor = tail_floor_df(prelim, tuple(assets), corr, df_ml)
-    if floor.floored:
-        METRICS.incr("copula_df_tail_floored")
-        pairs = ", ".join(
-            f"{d.pair[0]}/{d.pair[1]} ({d.lower_excess_sigmas:+.1f} sigma)"
-            for d in floor.demands
+    remedy = tail_remedy_dependence(
+        prelim, tuple(assets), corr, df_ml, metrics=METRICS
+    )
+    if remedy.lifted:
+        METRICS.incr("copula_rho_tail_lifted")
+        moves = ", ".join(
+            f"{lift.pair[0]}/{lift.pair[1]} {lift.rho_from:.3f} -> "
+            f"{lift.rho_to:.3f} (target {lift.target:.3f})"
+            for lift in remedy.lifts if lift.lifted
         )
         log.warning(
-            "copula df floored %.2f -> %.2f by the A11 tail floor: measured "
-            "lower-tail dependence exceeds the ML fit at >=2 sigma on %s%s",
-            floor.df_ml, floor.df, pairs,
-            "" if floor.covered else
-            " — AND the grid floor still cannot reach every demand's bound, "
-            "so the §2.3 gate stays lit and recording mode continues",
+            "copula rho lifted by the A11 remedy at ML df %.2f: %s%s%s",
+            df_ml, moves,
+            " [PD projection moved the lifted matrix; coverage re-verified "
+            "on the projected entries]" if remedy.projection_moved else "",
+            "" if remedy.covered else
+            " — AND a demand's bound stays unreachable under the rho cap "
+            "and the df grid together, so the §2.3 gate stays lit and "
+            "recording mode continues",
         )
-    return floor.df
+    if remedy.floored:
+        METRICS.incr("copula_df_tail_floored")
+        log.warning(
+            "copula df floored %.2f -> %.2f by the A11 remedy (composed on "
+            "the lifted matrix, for demands the rho cap could not reach)",
+            remedy.df_ml, remedy.df,
+        )
+    if remedy.lifted or remedy.projection_moved:
+        full = np.array(matrix.corr, dtype=np.float64, copy=True)
+        if tuple(assets) == tuple(matrix.assets):
+            full = remedy.corr
+        else:
+            # Imputed rows exist: the remedy ran on the estimated principal
+            # submatrix, and embedding a modified principal submatrix does
+            # not preserve full-matrix positive definiteness. Re-project the
+            # full matrix; the §2.3 gate downstream judges the FINAL entries,
+            # so a projection that pulls a lifted pair back below its bound
+            # re-fires the gate rather than passing silently.
+            from risk_engine.model.psd import project_to_correlation
+
+            order = list(matrix.assets)
+            idx = np.array([order.index(a) for a in assets], dtype=np.intp)
+            full[np.ix_(idx, idx)] = remedy.corr
+            full = project_to_correlation(
+                full, metrics=METRICS, label="tail_lift_embed"
+            ).corr
+        return _with_corr(matrix, full), remedy.df
+    return matrix, remedy.df
 
 
 def _checked_tail_diagnostics(returns: dict, matrix, copula_df: float | None,
@@ -612,7 +670,7 @@ def _build_fixture_bundle():
     # runs on the path nobody exercises offline is a check that rots. It also
     # means the fixture asserts the diagnostic's own plumbing on every startup.
     copula_df = _fitted_copula_df(returns, matrix)
-    copula_df = _tail_floored_copula_df(returns, matrix, copula_df)
+    matrix, copula_df = _tail_remedied_dependence(returns, matrix, copula_df)
     bundle = ModelBundle(
         matrix=matrix, marginals=marginals, funding=funding,
         funding_bounds=bounds, copula_df=copula_df,
@@ -672,20 +730,22 @@ def _build_live_bundle(*, serving: bool = True, budget=None):
     now_ms = int(time.time() * 1000)
     window_ms = 90 * 24 * 3600 * 1000
 
-    # Config, not code (OPEN-QUESTIONS B6). The 3-asset default silently
+    # Config, not code (OPEN-QUESTIONS B6). A too-narrow universe silently
     # narrows the calibration cohort: an address whose positions are all
     # off-universe is skipped as "no open positions", byte-identical to a flat
     # account, and §3.3's 200-address count comes up short for a reason no
     # output names. The `calibration_sweeps` census measures that drop rate;
-    # when it argues for widening, the widening is an env change here, one
-    # more candle+funding fetch per coin per rebuild (~40 weight each against
-    # serving's 900/min), and a B6 decision recorded in OPEN-QUESTIONS — not a
-    # code edit. BTC and ETH stay mandatory (§2.1's risk factors, enforced
-    # below); coins the venue does not list are dropped with the same
-    # visibility as before.
+    # widening is an env change here plus a B6 decision recorded in
+    # OPEN-QUESTIONS, one more candle+funding fetch per coin per rebuild
+    # (~40 weight each against serving's 900/min). HYPE entered the default
+    # by exactly that route (B6 decision, 2026-08-05): the census named it
+    # the largest single cohort recovery (~19 addresses/sweep) and a live
+    # probe showed its pairs quiet at the §2.3 gate. BTC and ETH stay
+    # mandatory (§2.1's risk factors, enforced below); coins the venue does
+    # not list are dropped with the same visibility as before.
     configured = [
         c.strip().upper()
-        for c in os.environ.get("HL_UNIVERSE", "BTC,ETH,SOL").split(",")
+        for c in os.environ.get("HL_UNIVERSE", "BTC,ETH,SOL,HYPE").split(",")
         if c.strip()
     ]
     universe = [c for c in configured if c in specs]
@@ -736,7 +796,9 @@ def _build_live_bundle(*, serving: bool = True, budget=None):
     # -- a fitted copula that cannot represent real crypto crashes is exactly
     # what §2.3 exists to catch -- not a regression to route around.
     copula_df = _fitted_copula_df(returns, matrix, candle_times)
-    copula_df = _tail_floored_copula_df(returns, matrix, copula_df, candle_times)
+    matrix, copula_df = _tail_remedied_dependence(
+        returns, matrix, copula_df, candle_times
+    )
     bundle = ModelBundle(
         matrix=matrix, marginals=marginals, funding=funding,
         funding_bounds=bounds, copula_df=copula_df,

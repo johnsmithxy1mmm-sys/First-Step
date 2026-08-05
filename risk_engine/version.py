@@ -115,7 +115,35 @@ Format: MAJOR.MINOR.PATCH-tag
 #: of 0.5.0 came back covered=False (the live ML fit is 3.5, not the fixture's
 #: 6.5, and the live rho is 0.863), so every 0.5 row is defect-stamped and no
 #: gate-day existed to lose.
-MODEL_VERSION = "0.6.0-phase1"
+#:
+#: 0.7.0 — the A11 remedy chain: a conditional rho-lift, then the df floor
+#: (OPEN-QUESTIONS A11, option R+H, adopted by the product owner 2026-08-05
+#: evening). MINOR twice over: it changes the correlation entries the bundle
+#: SERVES on demand pairs, and it changes the df a live bundle lands on
+#: (df_ML when the lift covers, where 0.6.0 always floored to the grid wall).
+#:
+#: Why the lever changed, all measured on the live readings before adoption:
+#: the df floor hit the family's grid wall short of the asymmetric pair's
+#: bound (model@q ~0.679 at df 2.5 vs a 0.6913 target -- covered=False,
+#: recording mode permanent while the reading held), and a per-output
+#: measurement showed df 5.0 -> 2.5 moves P(liq) by <= 0.1 pp at the live
+#: correlations: weak in output space, not only in reach. The rho-lever
+#: covers at the ML df with room to spare (rho* = 0.907 at df 5.0, +0.044
+#: over the EWMA 0.863; body cost +0.027 nats/obs) and is the lever that
+#: actually moves outputs (same-sign books ~+0.5 pp, hedged books -2.4 to
+#: -4.7 pp -- signs disclosed per-output in A11, every move TOWARD the
+#: measured dependence). Same demand set as the floor, one-sided (lifts
+#: only), PD-projected with coverage RE-VERIFIED on the projected entries,
+#: floor composing on anything the 0.98 cap cannot reach.
+#:
+#: Deliberately timed, again while the counter is held: every 0.6 row is
+#: defect-stamped (covered=False on both live firings), so no gate-day
+#: existed to lose. The HL_UNIVERSE default widens to include HYPE in the
+#: same reset (B6 decision, recorded there): the census named HYPE the
+#: largest single cohort recovery and a live probe showed its pairs quiet at
+#: the §2.3 gate, so the two changes share one §3.3 reset instead of costing
+#: two.
+MODEL_VERSION = "0.7.0-phase1"
 
 # Distribution-affecting prefix; the shadow counter keys on this, not on the
 # full string, so that PATCH releases keep accumulating validation days.

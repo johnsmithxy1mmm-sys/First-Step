@@ -403,6 +403,193 @@ class TestConditionalTailFloor:
         assert floor.demands == ()
 
 
+class TestConditionalRhoLift:
+    """A11 option R+H, adopted 2026-08-05 evening: lift rho, then floor df.
+
+    The first live firing measured the df lever short of the asymmetric
+    pair's bound at the grid wall; the rho-lever covers it at the ML df with
+    room to spare. The chain keeps every property the floor promised —
+    conditional, one-sided, bound-targeting, recomputed per build — and adds
+    two of its own: the lifted matrix is PD-projected, and coverage is
+    re-verified on the PROJECTED entries rather than assumed from the search.
+    Each property gets its own assertion so none can rot into prose.
+    """
+
+    RHO = 0.863          # backed out of the live 2026-08-05 banner asymptotics
+    DF_ML = 5.0          # the live ML fit with HYPE in the joint window
+    N_SIM = 100_000      # enough for these gaps; keeps the suite fast
+
+    @staticmethod
+    def _diag(lower: float, model: float, n: int = 108, upper: float = 0.685,
+              pair: tuple[str, str] = ("ETH", "SOL")):
+        from risk_engine.model.copula import TailDiagnostic
+
+        return TailDiagnostic(
+            pair=pair, threshold=0.05,
+            empirical_lower=lower, empirical_upper=upper,
+            model_at_threshold=model, model_asymptotic=0.593,
+            n_lower_exceedances=n,
+        )
+
+    def _remedy(self, diags, df_ml=None, corr=None, assets=("ETH", "SOL")):
+        from risk_engine.model.copula import tail_remedy_dependence
+
+        if corr is None:
+            corr = np.array([[1.0, self.RHO], [self.RHO, 1.0]])
+        return tail_remedy_dependence(
+            diags, tuple(assets), corr,
+            self.DF_ML if df_ml is None else df_ml, n_sim=self.N_SIM,
+        )
+
+    def test_no_demand_leaves_the_matrix_and_the_df_alone(self):
+        """Conditionality, inherited from the floor: a 1.1-sigma shortfall is
+        noise to re-test, and lifting the matrix for it would install a body
+        distortion on data indistinguishable from luck."""
+        remedy = self._remedy([self._diag(lower=0.694, model=0.645)])
+        assert not remedy.lifted and not remedy.floored
+        assert remedy.df == self.DF_ML
+        assert remedy.demands == ()
+        np.testing.assert_array_equal(
+            remedy.corr, np.array([[1.0, self.RHO], [self.RHO, 1.0]])
+        )
+
+    def test_the_live_demand_lifts_to_the_smallest_covering_rho(self):
+        """The 2026-08-05 evening reading: ETH/SOL lower 0.759 against
+        model@q 0.652 at the ML df. The lift must cover the one-sided 95%
+        bound at the ML df — where the df floor measurably could not — and
+        must not overshoot it by more than the search resolution. Asserted
+        structurally, not as a pinned 0.907, so an estimator change
+        re-derives the value instead of failing on it."""
+        from risk_engine.model.copula import model_tail_dependence_at_threshold
+
+        d = self._diag(lower=0.759, model=0.652)
+        remedy = self._remedy([d])
+        assert remedy.lifted and remedy.covered and not remedy.floored
+        assert remedy.df == self.DF_ML, "coverage at the ML df must keep it"
+
+        (lift,) = remedy.lifts
+        target = 0.759 - 1.645 * d.lower_standard_error
+        assert lift.target == pytest.approx(target, abs=1e-9)
+        rho_served = float(remedy.corr[0, 1])
+        assert rho_served > self.RHO
+        # The GATE's estimator for this pair (seed i*1000+j = 1, its default
+        # n_sim): the lift promises coverage in the gate's own terms, so the
+        # assertion must compute what the gate will compute.
+        assert model_tail_dependence_at_threshold(
+            self.DF_ML, rho_served, 0.05, n_sim=200_000, seed=1
+        ) >= target, "the served rho must cover the bound, as the gate scores it"
+        assert model_tail_dependence_at_threshold(
+            self.DF_ML, rho_served - 0.01, 0.05, n_sim=200_000, seed=1
+        ) < target, (
+            "a materially smaller rho also covers the bound; the lift dug "
+            "deeper into the body than the data demanded"
+        )
+
+    def test_the_lift_never_lowers_an_entry_and_touches_only_demand_pairs(self):
+        """One-sidedness in the rho dimension: thin readings leave the EWMA
+        estimate alone, and pairs that are not demands keep their measured
+        correlation to the last decimal."""
+        corr = np.array([
+            [1.0, 0.863, 0.884],
+            [0.863, 1.0, 0.876],
+            [0.884, 0.876, 1.0],
+        ])
+        d = self._diag(lower=0.759, model=0.652)  # ETH/SOL only
+        remedy = self._remedy([d], corr=corr, assets=("ETH", "SOL", "BTC"))
+        assert remedy.lifted
+        assert not remedy.projection_moved, (
+            "this lift keeps the matrix PD outright; the projection must be idle"
+        )
+        assert float(remedy.corr[0, 1]) > 0.863
+        assert float(remedy.corr[0, 2]) == pytest.approx(0.884, abs=1e-12)
+        assert float(remedy.corr[1, 2]) == pytest.approx(0.876, abs=1e-12)
+        assert (np.asarray(remedy.corr) >= corr - 1e-12).all(), (
+            "no entry may move DOWN: the lift raises modelled co-crash or "
+            "leaves it alone"
+        )
+
+    def test_an_unreachable_target_lifts_to_the_cap_and_composes_the_floor(self):
+        """A pathological reading (lower 0.995 on a tight SE) exceeds what
+        any rho below the cap can produce. The chain must then do everything
+        it lawfully can — lift to the cap, floor the df — and still say
+        covered=False so the §2.3 gate stays lit. And the served matrix must
+        remain strictly inside the PD cone: a comonotone pair would kill
+        every Cholesky downstream."""
+        from risk_engine.model.copula import COPULA_DF_GRID, TAIL_RHO_CAP
+
+        d = self._diag(lower=0.995, model=0.652, n=10_000)
+        remedy = self._remedy([d])
+        (lift,) = remedy.lifts
+        assert not lift.covered
+        assert lift.rho_to == pytest.approx(TAIL_RHO_CAP, abs=1e-9)
+        assert remedy.floored and remedy.df == float(COPULA_DF_GRID[0])
+        assert not remedy.covered, (
+            "an unreachable bound must keep the gate lit, not pass silently"
+        )
+        assert float(np.max(np.abs(
+            np.asarray(remedy.corr)[~np.eye(2, dtype=bool)]
+        ))) < 1.0
+        np.linalg.cholesky(remedy.corr)  # must not raise
+
+    def test_coverage_is_reverified_on_the_projected_matrix(self, monkeypatch):
+        """The PD projection may pull a lifted entry back down. Coverage must
+        be judged on the entries that will actually be SERVED — a remedy that
+        trusts its own search while the projection undid it would report a
+        covered gate over an uncovered matrix, in the §10 direction."""
+        import risk_engine.model.copula as copula_mod
+        from risk_engine.model.psd import ProjectionResult
+
+        def projection_pulls_the_lift_back(matrix, **_kwargs):
+            return ProjectionResult(
+                corr=np.array([[1.0, self.RHO], [self.RHO, 1.0]]),
+                corrected=True, min_eigenvalue_before=0.0,
+                min_eigenvalue_after=0.0, frobenius_correction=0.0,
+                shift_applied=False,
+            )
+
+        monkeypatch.setattr(
+            copula_mod, "project_to_correlation", projection_pulls_the_lift_back
+        )
+        d = self._diag(lower=0.759, model=0.652)
+        remedy = self._remedy([d])
+        assert remedy.projection_moved
+        # At the un-lifted rho the bound is unreachable on the whole df grid
+        # (the measured df-lever wall), so the honest outcome is a composed
+        # floor that still cannot cover — never a quiet covered=True.
+        assert remedy.floored
+        assert not remedy.covered
+
+    def test_gate_coherence_end_to_end_through_the_state_wrapper(self):
+        """The property the whole chain exists for: a crash-together market
+        that used to hold the §2.3 gate lit permanently is remedied into a
+        bundle the gate PASSES — recording mode ends, gate-days accrue — with
+        the lift covering at the ML df. Run through the real state wrapper so
+        the wiring (submatrix, embed, final diagnostics) is what is tested."""
+        import risk_engine.service.state as state
+
+        rng = np.random.default_rng(38)
+        n = 40_000
+        corr = np.array([[1.0, 0.6], [0.6, 1.0]])
+        z = rng.standard_normal((n, 2)) @ np.linalg.cholesky(corr).T
+        x = z / np.sqrt(rng.chisquare(6.0, size=(n, 1)) / 6.0)
+        crash = rng.random(n) < 0.05
+        x[crash, :] = -np.abs(x[crash, :]) - 3.0
+        returns = {"A": x[:, 0], "B": x[:, 1]}
+        matrix = SimpleNamespace(assets=["A", "B"], corr=corr)
+
+        # Unremedied, this market refuses (the pre-0.7.0 permanent state).
+        with pytest.raises(ValueError, match="understates lower-tail"):
+            state._checked_tail_diagnostics(returns, matrix, 6.0)
+
+        remedied, df = state._tail_remedied_dependence(returns, matrix, 6.0)
+        assert float(remedied.corr[0, 1]) > 0.6, "the pair must be lifted"
+        assert df == 6.0, "the lift covers at the ML df; no floor needed here"
+        # The remedied bundle passes the very gate that refused it (fatal
+        # path, so a regression raises rather than records).
+        diags = state._checked_tail_diagnostics(returns, remedied, df)
+        assert diags, "the diagnostics must still be produced and recorded"
+
+
 class TestCopula:
     """§2.3 — dependence fitting and the mandatory tail-asymmetry diagnostic."""
 
@@ -824,9 +1011,12 @@ class TestTheDiagnosticRunsOnTheShippedPath:
         matrix = SimpleNamespace(assets=["A", "B"], corr=corr)
 
         with caplog.at_level(logging.INFO, logger="risk_engine.service.state"):
-            df = state._tail_floored_copula_df(returns, matrix, 8.0)
+            out_matrix, df = state._tail_remedied_dependence(returns, matrix, 8.0)
 
         assert df == 8.0, "a market the model fits must not be floored"
+        assert out_matrix is matrix, (
+            "a market the model fits must not have its matrix touched"
+        )
         readings = [r for r in caplog.records if "tail readings" in r.getMessage()]
         assert readings, "the per-pair readings line must be logged"
         assert "A/B" in readings[-1].getMessage(), (

@@ -257,6 +257,16 @@ RISK_MUTANTS: list[tuple[str, str, str, str]] = [
     ("model/copula.py", "TAIL_DEMAND_SIGMAS = TAIL_ONE_SIDED_Z",
      "TAIL_DEMAND_SIGMAS = 3.0",
      "demand threshold decouples from the gate (the 0.5.0 stuck band returns)"),
+    # --- §2.3: the A11 rho-lift (0.7.0) and its two safety properties ---
+    ("model/copula.py", ") >= lift.target", ") >= -1.0",
+     "post-projection re-verification disabled (coverage assumed from the "
+     "search while the projection may have undone it)"),
+    ("model/copula.py", "TAIL_RHO_CAP = 0.98", "TAIL_RHO_CAP = 1.0",
+     "cap at comonotone: a singular matrix can be served and Cholesky dies "
+     "on the first slice downstream"),
+    ("model/copula.py", "if uncovered:", "if False:",
+     "the floor never composes: an uncovered demand serves the ML df with "
+     "covered=True and the gate goes dark over an uncovered matrix"),
     # --- §5.1 parsing: poison that evades the guards downstream ---
     ("market/parse.py", "if (closes <= 0).any():", "if (closes <= 1).any():",
      "every sub-dollar perp refused as a non-positive close"),

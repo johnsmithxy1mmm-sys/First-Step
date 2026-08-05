@@ -217,17 +217,22 @@ Changing the distribution resets the counter (§3.3, §10), so any question
 that moves it has to be settled before days start accumulating — otherwise
 they are days that get thrown away.
 
-That list has **one entry.** It had two until 2026-08-04, when D7's float32
-question was settled by measurement rather than by decision — see below.
+That list is **empty** as of 2026-08-05. It had two entries until
+2026-08-04, when D7's float32 question was settled by measurement rather
+than by decision — see below — and one until 2026-08-05, when B6 was decided
+from the census and a live probe.
 
-**B6's universe scope** (added 2026-08-02). The tracked universe is now
-`HL_UNIVERSE` (default `BTC,ETH,SOL`), and widening it adds correlation
-structure and marginals — a distribution change, so it must be settled
-*before* days accumulate or it throws them away. What it waits on is data
-rather than a decision in the abstract: the `calibration_sweeps` census
-records the off-universe drop rate, and a few days of full sweeps say whether
-the current universe keeps `written` above §3.3's 200/day floor. Run the
-procedure with
+**B6's universe scope — DECIDED 2026-08-05: HYPE in, the long tail out**
+(added 2026-08-02). The tracked universe is `HL_UNIVERSE` (default
+`BTC,ETH,SOL,HYPE` since the decision), and widening it adds correlation
+structure and marginals — a distribution change, which is why it was settled
+inside the same 0.7.0 bump as A11's rho-lift, while the §3.3 counter was
+held and the reset was free. The data it waited on arrived: the
+`calibration_sweeps` census records the off-universe drop rate, and ten full
+sweeps said `written` clears §3.3's 200/day floor either way — HYPE entered
+for cohort representativeness (largest single recovery, ≈19 addresses/sweep,
+the venue's native token) after a live probe showed its pairs quiet at the
+§2.3 gate. Run the procedure with
 
     python -m risk_engine.shadow census
 

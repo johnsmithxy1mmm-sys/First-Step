@@ -645,7 +645,9 @@ product owner, informed by the window.
 proposal below was accepted by the product owner and is live:
 `tail_floor_df` in `model/copula.py`, wired through
 `state._tail_floored_copula_df` into both bundle builders, before the §2.3
-gate. On the 2026-08-05 readings it floors the df from the ML fit of 6.5 to
+gate. (0.7.0 renamed the wrapper `_tail_remedied_dependence` when the
+rho-lift composed in front of the floor; `tail_floor_df` survives inside the
+chain.) On the 2026-08-05 readings it floors the df from the ML fit of 6.5 to
 **2.5** (the grid floor) on the single ≥2σ demand, ETH/SOL; a dress rehearsal
 of the next live build shows all three pairs passing the gate afterwards
 (residual shortfalls +0.063/+0.009/+0.011 against SE-scaled margins), so the
@@ -726,9 +728,11 @@ asymmetric pair remains the family's wall, unchanged.)
 One observability defect found by the probe, fixed the same evening: the
 banner prints FIRING pairs only, so "HYPE is quiet" had to be inferred from
 its pairs' absence — and absence cannot distinguish a passing pair from one
-that never entered the fit. `_tail_floored_copula_df` now logs every pair's
-reading (excess σ, empirical lower, model@q) at INFO on every build, quiet
-pairs included, pinned by test. The next probe reads readings, not silence.
+that never entered the fit. The remedy wrapper in `service/state.py` (then
+`_tail_floored_copula_df`, `_tail_remedied_dependence` since 0.7.0) now logs
+every pair's reading (excess σ, empirical lower, model@q) at INFO on every
+build, quiet pairs included, pinned by test. The next probe reads readings,
+not silence.
 
 **PROPOSAL (2026-08-05, second): a conditional ρ-lift on demand pairs.** The
 remaining lever, turned into numbers an owner can decide on — measured, like
@@ -813,6 +817,25 @@ adds no gate surface at the ML df, the census shows it is the largest single
 cohort recovery, and one reset is cheaper than two; or (S) stay in recording
 mode while the reading wanders — re-priced by the rolling-window correction
 above: waiting is a coin flip, not convergence.
+
+**ADOPTED and IMPLEMENTED (2026-08-05 evening, option R+H; MODEL_VERSION
+0.7.0).** The owner took R+H. `tail_remedy_dependence` in `model/copula.py`
+is the chain — the conditional rho-lift exactly as specified above (same
+demand set as the floor, one-sided, bisection to the smallest covering rho at
+the ML df, cap 0.98, PD projection, coverage RE-VERIFIED on the projected
+entries), with `tail_floor_df` composing on any demand the cap cannot reach
+and `covered=False` keeping the gate lit beyond that. Wired through
+`state._tail_remedied_dependence` (the renamed floor wrapper) into both
+bundle builders; the bundle now carries the LIFTED matrix, so the §2.3 gate,
+the simulation and the health endpoint all see the same served dependence.
+The lift is logged per pair (from → to, target) beside the all-pairs
+readings line, `copula_rho_tail_lifted` counts it, and three mutation-gate
+entries pin the safety properties (re-verification, the cap, the floor
+composition). HYPE entered the universe default in the same bump — the B6
+record has the census arithmetic and the probe is above. Expected first live
+firing: all three demand pairs lifted at the ML df ~5.0 (ETH/SOL to ~0.907,
+the BTC pairs by less), no floor, gate dark, recording mode ends, gate-days
+begin.
 
 **PROPOSAL (2026-08-05): a conditional tail floor on the copula df.** The
 remedy space above, turned into numbers an owner can decide on. Measured
@@ -1608,7 +1631,8 @@ it: the true off-universe drop rate across all 515 addresses, which the first
 (pacing-truncated) run could not measure and this table now will.
 
 **The decision is now a config change (2026-08-02).** The universe is
-`HL_UNIVERSE` (comma-separated, default `BTC,ETH,SOL`), read by
+`HL_UNIVERSE` (comma-separated; default `BTC,ETH,SOL` then, widened to
+`BTC,ETH,SOL,HYPE` by the 2026-08-05 decision below), read by
 `_build_live_bundle` and passed through the compose stack, so widening it
 does not require a code edit. BTC and ETH remain mandatory (§2.1). What
 widening costs, per added coin: one 90-day candle snapshot plus one funding
@@ -1701,6 +1725,33 @@ Note what `recovered` is and is not: it counts addresses the sweep would
 **attempt**, which is an upper bound on what it writes. Flat books and
 non-positive equity are excluded from the demand entirely, because widening
 the universe cannot recover them.
+
+**DECIDED (2026-08-05): HYPE enters the universe; the long tail does not.**
+The census the procedure asked for exists (10 full sweeps pooled across
+distribution versions — the drop pattern depends on `HL_UNIVERSE`, not the
+model version) and it answers the steps:
+
+- step 3 first, honestly: `written` ran 210–222 per sweep, already above
+  §3.3's 200/day floor, so no widening was FORCED. The floor's binding axis
+  is the 21 DAYS, not the addresses.
+- the set-based arithmetic names HYPE the largest single recovery (≈19
+  addresses/sweep — the venue's own native token, held by a quarter of the
+  off-universe cohort) at one coin's cost (~40 weight/rebuild, one more
+  marginal, three new correlation pairs). The next candidates fall off fast
+  and the tail is flat: ~166 addresses/sweep hold some coin no plausible
+  universe contains, and reaching 87% of skips takes ~20 coins at ~2 240
+  weight/rebuild — priced out, deferred, not dismissed.
+- the §2.3 surface was probed before adopting, not assumed: a live run with
+  `HL_UNIVERSE=BTC,ETH,SOL,HYPE` moved the ML df 3.5 → 5.0 (HYPE entered the
+  joint fit) and no HYPE pair fired the gate at any df (A11's probe record).
+
+Adopted as the default (`BTC,ETH,SOL,HYPE` in `_build_live_bundle` and the
+compose stack) in the SAME 0.7.0 bump as A11's rho-lift, deliberately: both
+are distribution changes, the §3.3 counter was held at zero by the 0.6.0
+`covered=False` firings, and two changes sharing one reset is the whole
+timing discipline this file keeps re-learning. The published score's frame:
+cohort = addresses whose every position is inside BTC,ETH,SOL,HYPE, with the
+census disclosing the ~166/sweep that stay outside.
 
 ---
 

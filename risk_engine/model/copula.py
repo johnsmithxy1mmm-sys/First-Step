@@ -49,6 +49,7 @@ from dataclasses import dataclass
 import numpy as np
 from scipy import special, stats
 
+from risk_engine.model.psd import project_to_correlation
 from risk_engine.sim.paths import lower_tail_dependence
 
 COPULA_DF_GRID = np.concatenate([np.arange(2.5, 12.1, 0.5), np.arange(13.0, 30.1, 1.0)])
@@ -74,6 +75,27 @@ TAIL_ONE_SIDED_Z = 1.645
 #: Conditionality (A11 finding 3) is preserved -- 1.645 one-sided IS a null,
 #: which the old flat margin never had.
 TAIL_DEMAND_SIGMAS = TAIL_ONE_SIDED_Z
+
+#: The rho-lift never raises a pair past this. At 1.0 the pair is comonotone
+#: and the matrix is singular -- Cholesky, which every serving slice relies
+#: on, fails outright. 0.98 is far above any target the tail statistic can
+#: produce at its own significance threshold (a demand's bound is capped by
+#: empirical_lower <= 1 minus 1.645 SE, and model@q at 0.98 sits above 0.9 for
+#: every df on the grid), so in practice the cap exists for pathological
+#: readings, where the correct outcome is "uncovered, gate stays lit", not a
+#: degenerate matrix.
+TAIL_RHO_CAP = 0.98
+
+#: The lifted rho is resolved to this granularity by bisection. Finer than
+#: the Monte-Carlo noise on model@q at the gate's n_sim (~0.005), so the
+#: resolution is not what limits the lift's precision. What removes the
+#: noise from the COHERENCE question is that the search scores candidate
+#: rhos with the gate's own estimator -- same seed convention, same n_sim --
+#: so "the lift covers" and "the gate passes" are the same number, not two
+#: estimates of it. Two estimators here would open a band where the remedy
+#: reports covered while the gate keeps firing: the 0.5.0 stuck band in a
+#: new coat, with no next-build self-correction to close it.
+TAIL_RHO_RESOLUTION = 0.001
 
 
 def pseudo_observations(returns: np.ndarray) -> np.ndarray:
@@ -319,7 +341,11 @@ def tail_floor_df(
     one_sided_z: float = TAIL_ONE_SIDED_Z,
     n_sim: int = 400_000,
 ) -> TailFloor:
-    """A11's adopted remedy (option A): `df* = min(df_ML, df_tail)`.
+    """The A11 df floor (option A, 0.5.0): `df* = min(df_ML, df_tail)`.
+
+    Since 0.7.0 this is the SECOND stage of the adopted chain — it composes
+    inside `tail_remedy_dependence` on the demands the rho-lift's cap cannot
+    reach, on the already-lifted matrix. The contract below is unchanged.
 
     `df_tail` is the LARGEST df on the grid whose model@q covers
     `empirical_lower - z*SE` for every pair whose shortfall is significant at
@@ -380,6 +406,224 @@ def tail_floor_df(
     return TailFloor(df_ml=df_ml, df=floor, demands=demands, covered=False)
 
 
+@dataclass(frozen=True, slots=True)
+class PairLift:
+    """One demand pair's rho adjustment, kept for logging and audit."""
+
+    pair: tuple[str, str]
+    rho_from: float
+    rho_to: float
+    #: The demand's one-sided 95% lower confidence bound the lift targets.
+    target: float
+    #: False when even TAIL_RHO_CAP cannot reach the target at df_ml; the df
+    #: floor then composes on top, and failing that the gate stays lit.
+    covered: bool
+
+    @property
+    def lifted(self) -> bool:
+        return self.rho_to > self.rho_from
+
+
+@dataclass(frozen=True, slots=True)
+class TailRemedy:
+    """What the A11 remedy chain decided: the rho-lift, then the df floor.
+
+    Adopted 2026-08-05 (OPEN-QUESTIONS A11, option R+H; 0.7.0), after the
+    first live firing of the 0.5.0/0.6.0 df floor measured the df lever's
+    reach and found it short of the asymmetric pair's bound at the grid wall
+    -- and a per-output measurement found it barely moves P(liq) at the live
+    correlations anyway. The rho-lever covers where df could not: the demand
+    targets are attainable at the ML df with room to spare.
+    """
+
+    df_ml: float
+    #: The df the bundle should serve: df_ml when the lift covers everything,
+    #: the composed floor's value when it does not.
+    df: float
+    #: The correlation matrix the bundle should serve: demand pairs lifted,
+    #: PD-projected. Identical to the input when there were no demands.
+    corr: np.ndarray
+    lifts: tuple[PairLift, ...]
+    demands: tuple[TailDiagnostic, ...]
+    #: False when even lift-then-floor leaves a demand's bound unreachable;
+    #: the §2.3 gate then keeps firing and recording mode continues.
+    covered: bool
+    #: True when the PD projection moved the lifted matrix -- coverage is
+    #: re-verified on the projected entries, never assumed from the search.
+    projection_moved: bool
+
+    @property
+    def lifted(self) -> bool:
+        return any(lift.lifted for lift in self.lifts)
+
+    @property
+    def floored(self) -> bool:
+        return self.df < self.df_ml
+
+
+def _smallest_covering_rho(
+    df: float,
+    rho_from: float,
+    target: float,
+    threshold: float,
+    cap: float,
+    resolution: float,
+    n_sim: int,
+    seed: int,
+) -> tuple[float, bool]:
+    """The smallest rho in [rho_from, cap] whose model@q reaches `target`.
+
+    model@q is monotone increasing in rho (more dependence, more joint
+    exceedances), so bisection finds the smallest covering value; `resolution`
+    bounds the interval, and the fixed seed makes the search deterministic.
+    Never returns below `rho_from`: the lift raises the modelled co-crash or
+    leaves it alone, it does not cut it.
+
+    `seed` and `n_sim` must be the GATE's for this pair (see the caller): the
+    search is answering "what will the gate compute", so it must compute the
+    same thing.
+    """
+
+    def model_at(rho: float) -> float:
+        return model_tail_dependence_at_threshold(
+            df, rho, threshold, n_sim=n_sim, seed=seed
+        )
+
+    if model_at(rho_from) >= target:
+        return rho_from, True
+    if model_at(cap) < target:
+        return cap, False
+    lo, hi = rho_from, cap
+    while hi - lo > resolution:
+        mid = 0.5 * (lo + hi)
+        if model_at(mid) >= target:
+            hi = mid
+        else:
+            lo = mid
+    return hi, True
+
+
+def tail_remedy_dependence(
+    diagnostics: list[TailDiagnostic],
+    assets: tuple[str, ...],
+    corr: np.ndarray,
+    df_ml: float,
+    grid: np.ndarray = COPULA_DF_GRID,
+    demand_sigmas: float = TAIL_DEMAND_SIGMAS,
+    one_sided_z: float = TAIL_ONE_SIDED_Z,
+    rho_cap: float = TAIL_RHO_CAP,
+    rho_resolution: float = TAIL_RHO_RESOLUTION,
+    n_sim: int = 400_000,
+    gate_n_sim: int = 200_000,
+    metrics=None,
+) -> TailRemedy:
+    """A11's adopted remedy chain (option R+H): lift rho, then floor df.
+
+    For each pair whose lower-tail shortfall is significant at
+    `demand_sigmas` -- the SAME demand set the floor uses, so nothing that
+    can hold the §2.3 gate open is invisible to the remedy -- the pair's
+    correlation entry is lifted to the smallest value whose model@q at the
+    ML df covers the demand's one-sided 95% lower bound. The lifted matrix
+    is PD-projected, coverage is RE-VERIFIED on the projected entries, and
+    `tail_floor_df` composes on top for any demand the cap could not reach.
+    Everything the floor's contract promised still holds: conditional (no
+    demand leaves the matrix and the df untouched), one-sided (lifts only,
+    never cuts; lambda_U reported, never constrained), recomputed from
+    current readings on every build.
+
+    The lift's coverage checks use the GATE's estimator, deliberately: the
+    same per-pair seed convention and `gate_n_sim` as
+    `diagnose_tail_asymmetry`, so "the lift covers the bound" and "the §2.3
+    gate passes on the served matrix" are one computation, not two estimates
+    of one quantity. With independent seeds a pair sitting within
+    Monte-Carlo noise of its bound could be reported covered by the remedy
+    while the gate keeps firing -- recording mode with no remedy left to
+    engage, the 0.5.0 stuck band re-created by the very change that closed
+    it. (`n_sim` feeds only the composed floor, whose covered=False outcomes
+    keep the gate lit regardless of estimator alignment.)
+
+    Why rho and not (only) df, measured 2026-08-05: at the live readings the
+    df lever hits the grid wall short of the asymmetric pair's bound
+    (model@q ~0.679 at the 2.5 floor vs a 0.6913 target), while rho* = 0.907
+    at the ML df 5.0 covers it with room to spare, costs +0.027 nats/obs in
+    the body against +0.10 for chasing the point estimate, and -- per the
+    per-output table in OPEN-QUESTIONS A11 -- is the lever that actually
+    moves P(liq), where the df floor moved it by <= 0.1 pp. The lift's
+    per-output signs vary by book shape (same-sign books rise, hedged books
+    fall), which is disclosed there rather than assumed away; the direction
+    of every move is TOWARD the measured dependence.
+
+    The body cost is the honest price: the EWMA estimate is the better body
+    fit, and the lift overweights body dependence on lifted pairs to buy tail
+    coverage inside a one-parameter family. The crash-regime redesign that
+    would confine the lift to where the evidence is remains recorded in A11
+    as the sharper, larger, deferred model.
+    """
+    index = {a: i for i, a in enumerate(assets)}
+    corr = np.asarray(corr, dtype=np.float64)
+    demands = tuple(
+        d for d in diagnostics
+        if d.understates_lower_tail()
+        and np.isfinite(d.lower_excess_sigmas)
+        and d.lower_excess_sigmas >= demand_sigmas
+    )
+    if not demands or len(assets) < 2:
+        return TailRemedy(
+            df_ml=df_ml, df=df_ml, corr=corr, lifts=(), demands=(),
+            covered=True, projection_moved=False,
+        )
+
+    lifted = np.array(corr, copy=True)
+    lifts = []
+    for d in demands:
+        i, j = index[d.pair[0]], index[d.pair[1]]
+        target = float(d.empirical_lower - one_sided_z * d.lower_standard_error)
+        rho_to, reached = _smallest_covering_rho(
+            df_ml, float(corr[i, j]), target, d.threshold,
+            rho_cap, rho_resolution, gate_n_sim,
+            seed=min(i, j) * 1000 + max(i, j),
+        )
+        lifts.append(PairLift(
+            pair=d.pair, rho_from=float(corr[i, j]), rho_to=rho_to,
+            target=target, covered=reached,
+        ))
+        lifted[i, j] = lifted[j, i] = rho_to
+
+    projection = project_to_correlation(lifted, metrics=metrics, label="tail_lift")
+    final = np.asarray(projection.corr, dtype=np.float64)
+
+    # Coverage is judged on the matrix that will actually be served, never on
+    # the search result: the projection may pull a lifted entry back down.
+    # Same estimator as the gate, for the same reason as in the search.
+    uncovered = []
+    for d, lift in zip(demands, lifts, strict=True):
+        i, j = index[d.pair[0]], index[d.pair[1]]
+        reached = model_tail_dependence_at_threshold(
+            df_ml, float(final[i, j]), d.threshold, n_sim=gate_n_sim,
+            seed=min(i, j) * 1000 + max(i, j),
+        ) >= lift.target
+        if not reached:
+            uncovered.append(d)
+
+    if uncovered:
+        # The floor composes on the LIFTED matrix: lowering df raises model@q
+        # for every pair at fixed rho, so pairs the lift already covers stay
+        # covered and only the residual demands drive the search.
+        floor = tail_floor_df(
+            uncovered, assets, final, df_ml,
+            grid=grid, demand_sigmas=demand_sigmas,
+            one_sided_z=one_sided_z, n_sim=n_sim,
+        )
+        df, covered = floor.df, floor.covered
+    else:
+        df, covered = df_ml, True
+
+    return TailRemedy(
+        df_ml=df_ml, df=df, corr=final, lifts=tuple(lifts), demands=demands,
+        covered=covered, projection_moved=bool(projection.corrected),
+    )
+
+
 def assert_lower_tail_not_understated(
     diagnostics: list[TailDiagnostic], margin: float = 0.05
 ) -> None:
@@ -389,11 +633,12 @@ def assert_lower_tail_not_understated(
     prescription was REFUTED by measurement (OPEN-QUESTIONS A11, all four
     findings, 2026-08-04): not per-output conservative, correlation-destroying
     below nu=4, and unable to reach the observed upper tails at any admissible
-    skew. The adopted remedy is the conditional df floor (`tail_floor_df`),
-    which runs BEFORE this gate in the bundle build -- so this firing means
-    the floor could not cover the demands within the family's grid, and the
-    honest response is still to stop and report, not to continue with a model
-    known to understate the risk the product exists to measure (§9, §10).
+    skew. The adopted remedy is the A11 chain (`tail_remedy_dependence`: the
+    conditional rho-lift, then the df floor), which runs BEFORE this gate in
+    the bundle build -- so this firing means the demands exceed what the
+    lift's cap and the family's grid can cover together, and the honest
+    response is still to stop and report, not to continue with a model known
+    to understate the risk the product exists to measure (§9, §10).
     """
     bad = [d for d in diagnostics if d.understates_lower_tail(margin)]
     if bad:
@@ -432,8 +677,9 @@ def assert_lower_tail_not_understated(
             "the t-copula understates lower-tail dependence for:\n  "
             f"{lines}\n"
             "§2.3 classifies this as a blocking defect. The adopted remedy -- the "
-            "A11 conditional df floor -- runs before this gate, so this firing "
-            "means the demands exceed what the family's grid can cover. Report "
+            "A11 chain, rho-lift then df floor -- runs before this gate, so this "
+            "firing means the demands exceed what the lift's cap and the family's "
+            "grid can cover together. Report "
             f"this rather than proceeding.{note}"
             f"{shape_note}"
         )
