@@ -16,7 +16,25 @@ FROM python:3.11-slim
 WORKDIR /app
 
 COPY risk_engine/requirements.txt risk_engine/requirements.txt
-RUN pip install --no-cache-dir -r risk_engine/requirements.txt
+# `--retries` and `--timeout` because the default pair (5 retries at 15 s) is
+# tuned for a fast link and this build has to survive a slow one. Observed
+# 2026-08-04: scipy's wheel downloaded fine while `/simple/psycopg/` timed out
+# five times in a row, and pip then reported
+#
+#     Could not find a version that satisfies the requirement psycopg<4,>=3.1
+#     (from versions: none)
+#
+# which reads as "that package does not exist" and sends whoever is deploying
+# to edit requirements.txt. "from versions: none" means the INDEX was never
+# fetched; the requirement is fine. Three shadow-stack images build in
+# parallel and share the uplink, so this is the ordinary case on a domestic
+# connection, not an unlucky one.
+#
+# Retries are cheap here and a failed build is not: it leaves the deployment
+# on the previous image with no indication that the code it is running is not
+# the code that was checked out.
+RUN pip install --no-cache-dir --retries 10 --timeout 60 \
+    -r risk_engine/requirements.txt
 
 COPY risk_engine/ risk_engine/
 
