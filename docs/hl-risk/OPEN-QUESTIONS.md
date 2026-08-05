@@ -2144,13 +2144,44 @@ measured *slower* than the per-asset loop it replaced (24.6 ms against
 the interpreted loop it removes. The finding is recorded in the code so
 nobody re-attempts it.
 
+**float32 path generation: DECIDED 2026-08-04 — declined, and not on the
+precision argument.** It was the last entry on the "before the shadow clock
+starts" list that was a decision rather than a measurement, so it was blocking
+the window from starting. It turns out not to be a trade at all: the saving
+does not exist.
+
+The claim was "roughly a 2x saving". Measured on the fixture universe at
+20 000 paths, path generation is **26-31% of a request**, so Amdahl bounds any
+generator-only change:
+
+| positions | request | generation | generator 2x faster | generator FREE |
+|---|---|---|---|---|
+| 2 | 425.7 ms | 131.6 ms (30.9%) | 1.18x | 1.45x |
+| 4 | 523.8 ms | 134.8 ms (25.7%) | 1.15x | 1.35x |
+
+A 2x request-level saving is unreachable *however* the generator is written.
+And the decisive number: 523.8 ms / 1.35 = **388 ms**, so even a generator
+that cost nothing at all still misses §2.6's 300 ms budget. The precision
+would have bought nothing.
+
+Measured directly as well, transcribing the generator with every intermediate
+in float32: **0.96x — 4% slower**, because the quantile map dominates and runs
+off a float64 table. The saving is not merely bounded, it is absent.
+
+The precision cost, measured on the same paths for completeness, is small:
+relative error in the terminal price after the 24-step cumulative sum is
+3.7e-8 median / 1.9e-7 max, the signed mean is 1.2 SE from zero (so the
+rounding has no measurable direction), and over 24 random books P(liq) and
+VaR@95 were **unchanged on every one**. So this is not a §10 refusal — §10
+would have permitted it. It is refused because it is a cost with no benefit.
+
+What this does NOT fix: §2.6 is still missed by 1.4-1.8x at the book size §0
+targets, and the binding cost is the ~74% of a request that is not path
+generation. Reported rather than worked around, per §9.
+
 Still open, none taken unilaterally because they trade against things the
 specification cares about:
 - production hardware, which this shared build container is not;
-- float32 path generation, roughly a 2x saving, but it costs precision in a
-  cumulative-sum over 24 steps and this is a risk engine. It *is*
-  distribution-affecting, so it must land before the shadow clock starts or
-  not at all;
 - a smaller default path count with the interval rule still binding, which
   in practice means accepting wider intervals on high-probability books.
 

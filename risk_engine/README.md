@@ -217,7 +217,8 @@ Changing the distribution resets the counter (§3.3, §10), so any question
 that moves it has to be settled before days start accumulating — otherwise
 they are days that get thrown away.
 
-That list has **two entries.**
+That list has **one entry.** It had two until 2026-08-04, when D7's float32
+question was settled by measurement rather than by decision — see below.
 
 **B6's universe scope** (added 2026-08-02). The tracked universe is now
 `HL_UNIVERSE` (default `BTC,ETH,SOL`), and widening it adds correlation
@@ -229,25 +230,28 @@ say whether the current universe keeps `written` above §3.3's 200/day floor.
 The measurement, the query and the decision procedure are in
 [`OPEN-QUESTIONS.md`](../docs/hl-risk/OPEN-QUESTIONS.md) under B6.
 
-**D7's float32 path generation** (added here 2026-08-03; D7 has said so since
-it was written). It is worth roughly 2x on the latency budget §2.6 misses at
-the book size §0 targets, and it costs precision in a cumulative sum over 24
-steps — so it changes the distribution and, in D7's own words, "must land
-before the shadow clock starts or not at all". This section said the list had
-one entry while D7 said that; the two files disagreed about the one question
-whose cost is measured in discarded weeks.
+**D7's float32 path generation — CLOSED 2026-08-04, declined.** It was on this
+list because it changes the distribution, so taking it after the first
+accumulated day would have thrown that day away. It was described here and in
+D7 as a decision that no amount of shadow data could make easier — a genuine
+trade of numerical precision in a risk engine against a latency budget missed
+by 2-3x for the target user.
 
-Unlike B6 this is a decision and not a measurement: no amount of shadow data
-makes it easier, because what it trades is numerical precision in a risk
-engine against a latency budget the engine currently misses by 2-3x for the
-target user. Taking it means accepting float32 accumulation error in the path
-generator; declining it means §2.6 stays missed and the over-budget counter
-(`pre_trade_budget_exceeded`) keeps being the honest report of that, per §9.
-Either answer is defensible. Deferring it is the one option that is not,
-because deferring past the first accumulated day converts a free choice into
-one that costs the window.
+It was not a trade. Measured before deciding: path generation is 26-31% of a
+request, so a 2x request-level saving is unreachable however the generator is
+written, and even a generator that cost *nothing* leaves 388 ms against
+§2.6's 300 ms budget. A float32 transcription measured 4% SLOWER than float64,
+because the quantile map dominates and runs off a float64 table. The precision
+cost is real but tiny (P(liq) unchanged on all 24 test books), which means §10
+would have permitted this — it is declined because the benefit is absent, not
+because the cost is too high. The numbers are in OPEN-QUESTIONS D7.
 
-Note the ordering trap this creates: the census that informs the decision is
+The lesson worth keeping: the entry sat on this list for days as an
+irreducible judgement call, and one afternoon of measurement dissolved it. A
+question phrased as "which do we value more" is worth re-reading as "is the
+trade real" before it is answered.
+
+Note the ordering trap B6 creates: the census that informs the decision is
 produced by sweeps, and sweeps under the *current* universe are exactly the
 days that would be thrown away by widening it. Those days are diagnostic,
 not gate-days — the same status the A10 recording window already has — and
