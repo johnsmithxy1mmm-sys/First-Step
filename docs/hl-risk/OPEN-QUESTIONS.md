@@ -523,6 +523,34 @@ BEFORE the remedy is built, not discovered inside it.
    the distortion (`ρ* = (ρ − k)/(1 − k)`), and refuse — not clamp — when
    `ρ < k`.
 
+   **Derived and measured 2026-08-04, and it is exact, not approximate.** For
+   the GH skew-t (`X = γW + √W·Z`, `W ~ IG(ν/2, ν/2)` shared — the family
+   whose ν/2-vs-ν tail indices the latency note below confirms by Hill
+   estimation): `Cov = γ²·Var(W) + ρ·E[W]`, `Var = γ²·Var(W) + E[W]`, so
+
+       ρ_eff = k + ρ·(1 − k),   k = γ²v / (γ²v + m),
+       m = E[W] = ν/(ν−2),      v = Var(W) = 2ν² / ((ν−2)²(ν−4))
+
+   — LINEAR in ρ, floor exactly `k`, inversion exactly the formula above, and
+   `ρ* ≥ −1` bounds representable targets at `ρ ≥ 2k−1`. Verified against
+   simulation over ν ∈ {6.5, 8, 12} × γ ∈ {−0.3, −0.8, −1.5} × ρ ∈
+   {0, 0.5, 0.9}: worst |closed − simulated| = 0.012 at 2M draws per cell.
+   The floor is not small at plausible parameters — `k(−0.8, 6.5) = 0.425`,
+   `k(−0.8, 5.0) = 0.681` — so an unconditioned fit would replace most of the
+   estimated dependence structure with an artefact of the skew.
+
+   **Sharper than the finding as written: below ν = 4 the question dissolves.**
+   `Var(W)` exists only for ν > 4, so with `γ ≠ 0` and ν ≤ 4 the marginal
+   variance is INFINITE — EWMA vol scaling and correlation targeting are not
+   distorted there, they are undefined. The fitted df on a young asset was
+   3.5 (this entry's own record), so that is the operating point, not a corner
+   case. Measured to show it is visible: sample correlation under
+   (ν=3.5, γ=−0.8) across 40 independent windows of 2160 observations spans
+   0.878–0.986 — an estimator of a quantity that does not exist, its spread
+   driven by single extreme draws of `W` and not shrinking with n. Any
+   skew-t design must therefore also constrain ν > 4 (with margin), which the
+   family's own fit on this venue's young assets already violates.
+
 3. **An unconditional conservatism margin has no null.** A `+1·SE` margin on
    the tail-dependence target installs a spurious `γ` on data with zero true
    skew. The margin must be conditional on first rejecting symmetry, which is
@@ -556,6 +584,62 @@ BEFORE the remedy is built, not discovered inside it.
 4. **λ_U is not monotone in γ**, so a two-sided absolute tail criterion is
    unsatisfiable by any admissible member of the family (§10 permits only
    `γ ≤ 0`). A guard no reachable model can pass is the A10 defect inverted.
+
+   **Measured 2026-08-04, at the shipped diagnostic's own threshold** (q=0.05,
+   ν=6.5, ρ=0.8, 2M draws per γ, rank pseudo-observations exactly as the
+   fitting pipeline builds them):
+
+   | γ | λ_L | λ_U |
+   |---|---|---|
+   | 0.0 | 0.540 | 0.541 |
+   | −0.2 | 0.577 | 0.517 |
+   | −0.6 | 0.660 | 0.499 |
+   | −0.9 | 0.719 | **0.498** |
+   | −1.2 | 0.762 | 0.510 |
+   | −1.5 | 0.800 | 0.522 |
+
+   λ_U falls to γ ≈ −0.9 and then RISES — non-monotone as claimed (the far
+   skew drags the common `W` so hard that big mixing draws lift both assets'
+   ranks together even against the skew). Two consequences, both now
+   concrete rather than argued:
+
+   - the whole reachable range of λ_U over admissible γ is **[0.498, 0.541]**
+     at these (ν, ρ). The live BTC/ETH pair's empirical upper tail is
+     **0.741** — far outside it. So for the one pair the 2026-08-03 mainnet
+     reading flags as under-modelled in BOTH tails, no admissible γ exists at
+     the fitted (ν, ρ), and a two-sided absolute criterion is not merely
+     hard to satisfy, it is empty. The remedy for that pair has to move ν or
+     the family, exactly as the top of this entry already concluded from the
+     shape of the reading;
+   - because λ_U is non-monotone, even a target INSIDE the range is reached
+     at two different γ values with materially different λ_L (e.g. λ_U ≈
+     0.51 at γ = −0.2 and again at γ = −1.2, where λ_L is 0.577 vs 0.762).
+     A two-sided system therefore has zero or two solutions, never reliably
+     one, and any fitting procedure built on it must state which branch it
+     takes and why — or use a one-sided lower-tail criterion with λ_U as a
+     reported diagnostic, not a constraint.
+
+**Where A11 stands after the 2026-08-04 measurements — all four findings now
+carry evidence, and together they answer the question §2.3 left open.** The
+prescription "fit a skewed-t when A10 fires" is refuted for this venue's
+measured data, on three independent grounds: (1) heavier joint tails are not
+the conservative direction per-output (zero significant rises, three
+significant falls across book shapes, worst on hedged books); (2) the family's
+common-γ construction overwrites the fitted correlation with a floor of 0.43+
+at plausible parameters, and below ν=4 — where the young-asset fit actually
+landed — its variance is infinite and correlation targeting is undefined;
+(4) for BTC/ETH, the one pair flagged in both tails, NO admissible γ reaches
+the observed upper tail (0.741 against a reachable [0.498, 0.541]), so the
+skew dimension cannot fix what the reading shows. What survives as remedy
+space: moving the copula df (or the elliptical family) to lift BOTH tails,
+gated by a one-sided, symmetry-conditional lower-tail criterion
+(finding 3's measured 2.5% null instead of the unconditional rule's 84%
+false-positive rate) — and finding 1's result stands as the requirement that
+any such change be validated per-output on the book population, which is what
+the shadow window under A10's recording mode collects. This is a design
+conclusion, not a design: the choice of df target and family is a
+model-scope decision (MODEL_VERSION MINOR, §3.3 reset) that belongs to the
+product owner, informed by the window.
 
 Latency is a separate constraint on the remedy and is already tight:
 `generate_log_returns` at 20 000 × 24 × 8 measures **301 ms**, the whole of
