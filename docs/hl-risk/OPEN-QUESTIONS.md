@@ -525,9 +525,33 @@ BEFORE the remedy is built, not discovered inside it.
 
 3. **An unconditional conservatism margin has no null.** A `+1·SE` margin on
    the tail-dependence target installs a spurious `γ` on data with zero true
-   skew in ~99% of replications. The margin must be conditional on first
-   rejecting symmetry, which is what §10's "a fit that is *uncertain* must
-   err toward a heavier lower tail" actually says.
+   skew. The margin must be conditional on first rejecting symmetry, which is
+   what §10's "a fit that is *uncertain* must err toward a heavier lower tail"
+   actually says.
+
+   **Measured 2026-08-04, and the rate stated here was wrong.** Simulated on
+   symmetric t-copula data at the live window's size (ν=6.5, ρ=0.80, n=2160
+   hourly, q=0.05, 4000 replications; the model's λ at that finite threshold
+   is 0.5435, ~106 exceedances per tail):
+
+   | rule | demands skew on ZERO-skew data |
+   |---|---|
+   | unconditional `+1·SE` | **83.9%** |
+   | conditional (margin only after symmetry is rejected) | **2.5%** |
+
+   The entry said ~99%; it is 84%. That is not a simulation artefact — it is
+   Φ(1) = 84.1% almost exactly, which is what the rule has to produce: the
+   empirical estimate is centred on the model's value under symmetry, so
+   demanding the model reach `empirical + 1·SE` fails whenever the estimate
+   lands above `model − 1·SE`. Being able to derive the number is worth more
+   than the number: it means the defect is structural in the rule and not a
+   property of this window's size.
+
+   The finding's substance is unaffected and its remedy is confirmed. 84%
+   false-positive rate against a nominal 5% is still a criterion with no null,
+   and making the margin conditional restores one exactly — 2.5% is the
+   one-sided tail of the 95% two-sided symmetry test, i.e. the rate that test
+   is supposed to have.
 
 4. **λ_U is not monotone in γ**, so a two-sided absolute tail criterion is
    unsatisfiable by any admissible member of the family (§10 permits only
@@ -542,8 +566,49 @@ tails have different polynomial indices (`ν/2` toward the skew, `ν` away —
 confirmed by Hill estimation), so a single extrapolation slope reused across
 both would understate the far lower tail by a factor of two.
 
+**Finding 1 measured, 2026-08-04 — it holds, and in the direction §10 cares
+about.** It had been an argument from the code's shape (`_any_liq` is a union,
+`Position.size` is signed) and was waiting on the window. It does not need to:
+the claim is about the model's response, so it is measurable on constructed
+books today, and only the POPULATION question needs live data.
+
+Heavier joint tail dependence applied by lowering the copula df from the
+fitted 6.5 to 3.5, on books matched at 100k equity and differing only in sign
+pattern. 40 000 paths x 16 seeds; the SE is over seeds.
+
+| book | leverage | P(liq) @6.5 | P(liq) @3.5 | delta | |
+|---|---|---|---|---|---|
+| long-only | 10x | 0.04803 | 0.04797 | −0.00006 | — |
+| long-only | 13x | 0.15274 | 0.15318 | +0.00044 | +1.4 SE |
+| hedged | 28x | 0.17277 | 0.17178 | **−0.00100** | **−2.6 SE** |
+| hedged | 36x | 0.40885 | 0.40695 | **−0.00189** | **−3.1 SE** |
+| short-only | 10x | 0.07742 | 0.07705 | −0.00038 | — |
+| short-only | 13x | 0.19213 | 0.19125 | **−0.00088** | **−2.9 SE** |
+
+**Zero significant rises; three significant falls.** So "heavier joint tails
+is the conservative direction" is not merely unproven, it is false on these
+books: the direction §2.3 prescribes can LOWER a reported P(liq), which is
+what §10 forbids. The largest fall is on the hedged book, exactly the shape
+finding 1 predicts — for a signed combination, co-movement cancels rather than
+accumulates, so binding the assets together more tightly makes the hedge work
+harder.
+
+Note what did NOT happen: long-only did not rise significantly either
+(+1.4 SE at 13x). The effect is not symmetric in magnitude — the falls are
+larger and cleaner than the rise — so a design that assumed "it helps
+long-only more than it hurts hedged" would also be unsupported.
+
+Two limits on this, stated because they bound what it licenses. It uses a
+SYMMETRIC heavying (lower df moves both tails), where the prescribed remedy is
+a skewed-t that heavies the lower tail at the upper's expense; that makes this
+a test of the easier, more obviously-safe-looking direction, and it already
+fails. And it is two-asset books on the fixture bundle, so the population mix
+of shapes on Hyperliquid — which decides how much this matters in aggregate —
+is still what the window is for.
+
 What the shadow window under A10's recording mode is for: measuring the
-magnitude and the direction of (1) on real books.
+magnitude and the direction of (1) on real books — the population question
+above, now that the mechanism itself is settled.
 
 **Recording mode is now enforced, not announced (2026-08-04).** The sweep
 printed "these observations are DIAGNOSTIC EVIDENCE, not §3.3 gate-days" and
