@@ -545,6 +545,29 @@ both would understate the far lower tail by a factor of two.
 What the shadow window under A10's recording mode is for: measuring the
 magnitude and the direction of (1) on real books.
 
+**Recording mode is now enforced, not announced (2026-08-04).** The sweep
+printed "these observations are DIAGNOSTIC EVIDENCE, not §3.3 gate-days" and
+that was the whole of it: nothing in the schema distinguished them, so
+`progress()` counted a diagnostic day toward Phase 4 exactly as it counted a
+clean one. `_print_defect_note`'s own docstring named the standard it was
+failing — a journal of observations collected under a known model defect,
+indistinguishable from a clean one, "is worse than no journal, it would be
+read as gate progress".
+
+It matters more here than the phrasing suggests, because the gate is what
+Phase 4 (real money) opens on, and the remedy for this very defect changes
+the copula, bumps MODEL_VERSION and resets the counter. Every day counted
+under the defect is a day that cannot survive the fix it is waiting for.
+
+Each prediction row now carries `recorded_under_defect`, stamped from the same
+predicate the serving path uses (`understates_lower_tail`, which had promised
+"one predicate, so the serving path and the provenance stamp cannot drift
+apart" while having no stamp to keep in step), and `progress()` excludes it
+exactly as it already excluded stale resolutions. Rows written before the
+column existed are backfilled to TRUE, not FALSE: their provenance was never
+captured, §10 resolves that uncertainty toward not counting them, and the
+deployment holding such rows logged the defect on every sweep anyway.
+
 ---
 
 ## B. Validation-methodology problems

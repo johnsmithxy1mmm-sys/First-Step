@@ -37,6 +37,24 @@ CREATE TABLE IF NOT EXISTS calibration_predictions (
     quantile_values      JSONB       NOT NULL,
     n_quantile_levels    INTEGER     NOT NULL,
     book_snapshot        JSONB       NOT NULL,
+    -- TRUE when the bundle that produced this prediction was failing §2.3's
+    -- tail gate (OPEN-QUESTIONS A10/A11): the fitted copula understates
+    -- lower-tail dependence on at least one pair.
+    --
+    -- Recorded per ROW rather than announced per run because the run's
+    -- announcement is a log line and the gate is read weeks later. The sweep
+    -- already prints "these observations are DIAGNOSTIC EVIDENCE, not §3.3
+    -- gate-days" and `_print_defect_note`'s own docstring says a journal of
+    -- observations collected under a known model defect, indistinguishable
+    -- from a clean one, "is worse than no journal -- it would be read as gate
+    -- progress". It was exactly that: nothing in this schema could tell the
+    -- two apart, so `progress()` counted diagnostic days toward Phase 4.
+    --
+    -- Here rather than on `calibration_sweeps` because `record_sweep` is
+    -- best-effort by design (a census failure is swallowed so it cannot
+    -- discard predictions), and a gate that fails OPEN when its provenance
+    -- write failed is the wrong direction for §10.
+    recorded_under_defect BOOLEAN    NOT NULL DEFAULT FALSE,
     UNIQUE (address, variant, predicted_at, distribution_version)
 );
 

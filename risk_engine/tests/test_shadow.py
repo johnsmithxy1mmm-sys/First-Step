@@ -1118,6 +1118,171 @@ class TestCalibrationMetrics:
         assert report.ks_pvalue > 0.01
         journal.close()
 
+    def test_a_day_recorded_under_the_tail_defect_is_not_a_gate_day(self):
+        """§2.3's recording mode, enforced rather than announced.
+
+        The shadow path builds with `serving=False`, so a §2.3 violation no
+        longer stops the sweep — it records instead, and prints "these
+        observations are DIAGNOSTIC EVIDENCE, not §3.3 gate-days". That print
+        was the entire defence. `_print_defect_note`'s own docstring states the
+        standard it was failing: a journal of observations collected under a
+        known model defect, indistinguishable from a clean one, "is worse than
+        no journal — it would be read as gate progress". Nothing in the schema
+        could tell them apart, so `progress()` counted them, and the print
+        lives in a container's scrollback while the gate is read weeks later
+        from the database.
+
+        What makes it serious rather than untidy: `gate_open` is what Phase 4
+        — real money — is gated on, and the remedy for the defect is a copula
+        change that bumps MODEL_VERSION and resets the counter anyway. So every
+        day counted here is a day that cannot survive the fix it is waiting
+        for.
+        """
+        journal = CalibrationJournal()
+        try:
+            dist = PredictiveDistribution.from_samples(
+                np.random.default_rng(3).normal(0, 1000, 20_000)
+            )
+            start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+            for day in range(3):
+                when = start + timedelta(days=day)
+                for i in range(2):
+                    for under_defect in (True, False):
+                        pid = journal.record_prediction(
+                            address=addr(i + (100 if under_defect else 0)),
+                            variant=VARIANT_MODEL, predicted_at=when,
+                            horizon_hours=24, model_version="v",
+                            distribution_version="test", seed=1, n_paths=100,
+                            converged=True, start_equity=100_000.0,
+                            p_liq=0.01, p_liq_ci=(0.005, 0.02),
+                            var_95=-dist.quantile(0.05), cvar_95=dist.cvar(0.95),
+                            distribution=dist, book_snapshot={"fingerprint": "x"},
+                            recorded_under_defect=under_defect,
+                        )
+                        journal.record_outcome(
+                            prediction_id=pid, resolved_at=when + timedelta(days=1),
+                            actual_equity=100_000.0, actual_equity_change=0.0,
+                            external_flow_usd=0.0, book_changed=False,
+                            liquidated=False, pit=0.5, pit_u=0.5,
+                            crps=1.0, var_95_breached=False,
+                            observation_day=when.date(),
+                            resolution_lag_s=0.0, stale_resolution=False,
+                        )
+
+            progress = journal.progress("test")
+            assert progress.resolved_observations == 6, (
+                "the clean half of the journal must still count; this test is "
+                "about telling them apart, not about discarding everything"
+            )
+            assert progress.distinct_addresses == 2, (
+                "the two defect-stamped addresses must not appear in the gate's "
+                "address count"
+            )
+        finally:
+            journal.close()
+
+    def test_a_journal_written_before_the_stamp_existed_fails_closed(self, tmp_path):
+        """`schema.sql` is all CREATE TABLE IF NOT EXISTS, so a new column
+        reaches a fresh journal and never reaches the deployed one — which,
+        with a persistent volume, is the only journal that matters.
+
+        The direction of the backfill is the substance. Rows written before
+        the column existed have UNKNOWN provenance, and this gate is what
+        Phase 4 (real money) is read off, so §10 resolves the uncertainty
+        toward not counting them. It is also the better guess on the facts:
+        the deployment carrying such rows logged "RECORDING UNDER A KNOWN §2.3
+        DEFECT" on every sweep, so marking them clean would not be neutral.
+        """
+        import re
+        import sqlite3
+
+        from risk_engine.shadow.backends import sqlite_ddl
+
+        old_ddl = re.sub(r"\s*recorded_under_defect[^,]*,", "", sqlite_ddl())
+        assert "recorded_under_defect" not in old_ddl, (
+            "the stripper missed; this test would then be exercising today's "
+            "schema and asserting nothing about migration"
+        )
+        path = tmp_path / "pre-migration.db"
+        con = sqlite3.connect(path)
+        con.executescript(old_ddl)
+        con.execute(
+            """INSERT INTO calibration_predictions
+               (address, variant, predicted_at, horizon_hours, resolves_at,
+                model_version, distribution_version, seed, n_paths, converged,
+                start_equity, p_liq, p_liq_ci_low, p_liq_ci_high, var_95,
+                cvar_95, quantile_values, n_quantile_levels, book_snapshot)
+               VALUES (?, 'model', '2026-08-01T00:00:00+00:00', 24,
+                       '2026-08-02T00:00:00+00:00', 'v', 'test', 1, 100, 1,
+                       100000.0, 0.01, 0.0, 0.1, 1.0, 2.0, '[]', 0, '{}')""",
+            (addr(1),),
+        )
+        con.commit()
+        con.close()
+
+        with CalibrationJournal(str(path)) as journal:
+            rows = journal.backend.rows(journal.backend.execute(
+                "SELECT recorded_under_defect FROM calibration_predictions"))
+            assert [bool(r["recorded_under_defect"]) for r in rows] == [True], (
+                "a row whose provenance was never captured must not be counted "
+                "as a gate-day"
+            )
+            # And the column's DEFAULT stays FALSE, so a clean write after the
+            # migration is a gate-day.
+            dist = PredictiveDistribution.from_samples(
+                np.random.default_rng(1).normal(0, 1, 500))
+            journal.record_prediction(
+                address=addr(2), variant=VARIANT_MODEL,
+                predicted_at=datetime(2026, 8, 4, tzinfo=timezone.utc),
+                horizon_hours=24, model_version="v", distribution_version="test",
+                seed=1, n_paths=100, converged=True, start_equity=1.0,
+                p_liq=0.0, p_liq_ci=(0.0, 0.0), var_95=0.0, cvar_95=0.0,
+                distribution=dist, book_snapshot={},
+            )
+            rows = journal.backend.rows(journal.backend.execute(
+                "SELECT recorded_under_defect FROM calibration_predictions "
+                "ORDER BY id"))
+            assert [bool(r["recorded_under_defect"]) for r in rows] == [True, False]
+
+        # Idempotent: the shadow jobs open the journal together every day.
+        CalibrationJournal(str(path)).close()
+
+    def test_the_defect_stamp_is_the_predicate_the_serving_path_uses(self):
+        """One predicate, which is what `understates_lower_tail` promises.
+
+        A second definition of "the copula understates the lower tail" would
+        let the served numbers and the journal's provenance disagree about
+        whether a given bundle was defective — and the disagreement would be
+        invisible, because each side looks self-consistent.
+        """
+        from risk_engine.service.state import understates_lower_tail
+        from risk_engine.shadow.cron import _bundle_understates_lower_tail
+
+        class _D:
+            def __init__(self, bad):
+                self._bad = bad
+
+            def understates_lower_tail(self):
+                return self._bad
+
+        class _Bundle:
+            def __init__(self, diagnostics):
+                self.tail_diagnostics = diagnostics
+
+        assert _bundle_understates_lower_tail(_Bundle((_D(True),))) is True
+        assert _bundle_understates_lower_tail(_Bundle((_D(False), _D(True)))) is True
+        assert _bundle_understates_lower_tail(_Bundle((_D(False),))) is False
+        assert understates_lower_tail((_D(False), _D(True))) is True
+
+        # A hand-assembled bundle carries no diagnostics, and that is not a
+        # defect: there is no fitted copula to have failed the gate.
+        assert _bundle_understates_lower_tail(_Bundle(())) is False
+
+        class _NoAttr:
+            pass
+
+        assert _bundle_understates_lower_tail(_NoAttr()) is False
+
     def test_the_census_can_be_read_back_at_all(self):
         """`record_sweep` has written this table since 2026-08-01 and nothing
         read it, so B6's decision procedure -- stated entirely in terms of it

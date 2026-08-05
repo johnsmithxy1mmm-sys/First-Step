@@ -122,7 +122,69 @@ class CalibrationJournal:
     def __init__(self, target: str | Path = ":memory:") -> None:
         self.backend: Backend = open_backend(target)
         self.backend.executescript(canonical_ddl() if self.is_postgres else sqlite_ddl())
+        self._migrate()
         self.backend.commit()
+
+    def _migrate(self) -> None:
+        """Bring an EXISTING journal up to the current schema.
+
+        `schema.sql` is all `CREATE TABLE IF NOT EXISTS`, which does nothing to
+        a table that already exists -- so a column added to the DDL reaches a
+        fresh journal and never reaches the deployed one. The shipped compose
+        stack has a persistent volume, so "the deployed one" is the only
+        journal that matters, and the failure is silent: every write that does
+        not mention the new column keeps working.
+
+        Additive and idempotent only. A migration that rewrote or dropped
+        anything would be a migration on a write-once table (A-09), which this
+        journal does not do.
+        """
+        # `backfill` is the value for rows that already exist -- rows whose
+        # provenance was never recorded because the column did not exist when
+        # they were written. It is TRUE, not FALSE, and the direction is the
+        # whole point: those rows are of UNKNOWN provenance, and the §3.3 gate
+        # is what Phase 4 (real money) is read off. §10 asks uncertainty to
+        # resolve toward caution, and here caution means "do not count it".
+        #
+        # It is also the better guess on the facts. The deployment that has
+        # rows predating this column logged "RECORDING UNDER A KNOWN §2.3
+        # DEFECT" on every single sweep, so marking them clean would not be
+        # neutral, it would be wrong in the one direction that matters.
+        for table, column, ddl, backfill in (
+            ("calibration_predictions", "recorded_under_defect",
+             "BOOLEAN NOT NULL DEFAULT FALSE", "TRUE"),
+        ):
+            if self._has_column(table, column):
+                continue
+            try:
+                self.backend.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+                # Runs exactly once, in the same transaction as the ADD, and
+                # only over rows that existed before it. Not a rewrite of a
+                # write-once row's content (A-09): it fills in provenance that
+                # was never captured, and leaves every predicted number alone.
+                # S608: `table`, `column` and `backfill` are literals from the
+                # tuple three lines up, not input. A placeholder cannot be used
+                # for an identifier anyway, which is why the ADD above is
+                # interpolated too.
+                self.backend.execute(
+                    f"UPDATE {table} SET {column} = {backfill}"  # noqa: S608
+                )
+            except Exception as exc:
+                # A concurrent journal opening at the same instant is the
+                # expected case: both shadow jobs start together. Losing the
+                # race is fine, the column is there either way.
+                log.debug("migration %s.%s: %s", table, column, exc)
+
+    def _has_column(self, table: str, column: str) -> bool:
+        if self.is_postgres:
+            rows = self._query(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_name = ? AND column_name = ?",
+                (table, column),
+            )
+            return bool(rows)
+        rows = self.backend.rows(self.backend.execute(f"PRAGMA table_info({table})"))
+        return any(r["name"] == column for r in rows)
 
     @property
     def is_postgres(self) -> bool:
@@ -164,6 +226,7 @@ class CalibrationJournal:
         cvar_95: float,
         distribution: PredictiveDistribution,
         book_snapshot: dict,
+        recorded_under_defect: bool = False,
     ) -> int:
         # One account, one identity, enforced at the only place the journal is
         # written. `address` is stored as TEXT and compared byte-for-byte by
@@ -208,8 +271,9 @@ class CalibrationJournal:
                 address, variant, predicted_at, horizon_hours, resolves_at,
                 model_version, distribution_version, seed, n_paths, converged,
                 start_equity, p_liq, p_liq_ci_low, p_liq_ci_high, var_95, cvar_95,
-                quantile_values, n_quantile_levels, book_snapshot
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                quantile_values, n_quantile_levels, book_snapshot,
+                recorded_under_defect
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             RETURNING id
             """,
             (
@@ -219,6 +283,7 @@ class CalibrationJournal:
                 start_equity, p_liq, p_liq_ci[0], p_liq_ci[1], var_95, cvar_95,
                 json.dumps([float(v) for v in distribution.values]),
                 len(distribution.levels), json.dumps(book_snapshot),
+                bool(recorded_under_defect),
             ),
         )
         self.backend.commit()
@@ -409,8 +474,9 @@ class CalibrationJournal:
             JOIN calibration_predictions p ON p.id = o.prediction_id
             WHERE p.distribution_version = ? AND p.variant = ?
               AND o.stale_resolution = ?
+              AND p.recorded_under_defect = ?
             """,
-            (distribution_version, VARIANT_MODEL, False),
+            (distribution_version, VARIANT_MODEL, False, False),
         )[0]
         return ShadowProgress(
             distribution_version=distribution_version,

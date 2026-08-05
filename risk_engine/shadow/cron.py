@@ -128,6 +128,29 @@ MAX_SWEEP_SECONDS = 90.0 * 60.0
 #: burns CPU re-asking.
 BUDGET_WAIT_SECONDS = 5.0
 
+
+def _bundle_understates_lower_tail(bundle) -> bool:
+    """Is this bundle failing §2.3's tail gate (A10/A11)?
+
+    Delegates to `service.state.understates_lower_tail`, whose docstring
+    already promised exactly this use: "one predicate, so the serving path and
+    the provenance stamp cannot drift apart in what they call a defect". There
+    was no provenance stamp until now, so the promise had one caller.
+
+    Imported inside the function: `service` builds bundles and `shadow`
+    consumes them, and a module-level import here would make the shadow jobs
+    depend on the serving package at import time for one boolean.
+
+    A bundle assembled by hand (tests, benchmarks) carries no diagnostics at
+    all, and that reads as "no defect" -- correct, because there is no fitted
+    copula to have failed the gate.
+    """
+    from risk_engine.service.state import understates_lower_tail
+
+    diagnostics = getattr(bundle, "tail_diagnostics", ())
+    return bool(diagnostics) and understates_lower_tail(diagnostics)
+
+
 #: How often the sweep says where it is.
 #:
 #: `run_once` used to log NOTHING. Between the bundle build and the final
@@ -167,6 +190,22 @@ class ShadowCron:
         self.horizon_hours = horizon_hours
         self.max_sweep_seconds = max_sweep_seconds
         self.budget_wait_seconds = budget_wait_seconds
+        # Whether the bundle this sweep predicts from is failing §2.3's tail
+        # gate (A10/A11). Stamped on every row it writes, so `progress()` can
+        # tell a diagnostic day from a gate-day weeks later.
+        #
+        # Read once here rather than per row: the bundle is fixed for the
+        # lifetime of the sweep, and re-deriving it 800 times would invite the
+        # two to disagree within one run.
+        #
+        # The sweep already ANNOUNCED this (`_print_defect_note`), and that was
+        # the whole defence: a log line, in a container's scrollback, against a
+        # gate read three weeks later from the database. Its own docstring says
+        # a journal of observations collected under a known model defect,
+        # indistinguishable from a clean one, "is worse than no journal -- it
+        # would be read as gate progress", and nothing in the schema could tell
+        # them apart.
+        self.recorded_under_defect = _bundle_understates_lower_tail(bundle)
         # No budget of its own, deliberately. §5.3's weight is owned by the
         # InfoClient inside the provider, and the sweep waits on the call that
         # spends it (see run_once). A budget object here previously looked
@@ -426,6 +465,7 @@ class ShadowCron:
             cvar_95=cvar_95,
             distribution=distribution,
             book_snapshot=snapshot,
+            recorded_under_defect=self.recorded_under_defect,
         )
 
 

@@ -306,6 +306,14 @@ def _print_defect_note(bundle) -> None:
     overlook afterwards: a journal of observations collected under a known
     model defect, indistinguishable from a clean one, is worse than no journal
     — it would be read as gate progress.
+
+    Until 2026-08-04 this print WAS that defence, and it was not enough: the
+    two were indistinguishable in the journal, so `progress()` counted these
+    days toward the gate exactly as if they were clean, while the sentence
+    below saying they are not lived in a container's scrollback. Every row now
+    carries `recorded_under_defect` and `progress()` excludes it, the same way
+    it already excluded stale resolutions. This line stays because an operator
+    watching a run should still be told; it is no longer what enforces it.
     """
     from risk_engine.service.state import understates_lower_tail
 
