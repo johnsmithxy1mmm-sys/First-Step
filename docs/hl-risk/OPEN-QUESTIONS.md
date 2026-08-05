@@ -709,6 +709,111 @@ crash-regime dependence — reaches 0.691 easily, since ρ ≈ 0.935 reproduces
 the observed tail at any df in 3–6.5), or accepting recording mode while the
 reading wanders. Chasing df past the grid floor stays foreclosed.
 
+**HYPE probe (2026-08-05 evening) — HYPE adds no gate surface at the ML df.**
+The owner ran the engine once with `HL_UNIVERSE=BTC,ETH,SOL,HYPE` (the B6
+census's candidate: largest single off-universe recovery, ≈19 addresses per
+sweep). The ML fit moved 3.5 → 5.0, which is the proof HYPE entered the joint
+fit — the common window re-profiled around its history. The floor banner read
+`floored 5.00 -> 2.50, covered=False` with demands ETH/SOL (+4.0σ), BTC/SOL
+(+2.1σ), BTC/ETH (+1.9σ) — the two BTC pairs are demands now because 0.6.0's
+shared threshold admits what 0.5.0's stuck band excluded, not because their
+readings moved. No HYPE pair fired, at the ML df or the floored one, so on
+today's window HYPE widens the calibration cohort without widening the §2.3
+gate's attack surface. (At the floored 2.5 the residual refusal named
+ETH/SOL alone — the two BTC-pair demands are covered by the floor; the
+asymmetric pair remains the family's wall, unchanged.)
+
+One observability defect found by the probe, fixed the same evening: the
+banner prints FIRING pairs only, so "HYPE is quiet" had to be inferred from
+its pairs' absence — and absence cannot distinguish a passing pair from one
+that never entered the fit. `_tail_floored_copula_df` now logs every pair's
+reading (excess σ, empirical lower, model@q) at INFO on every build, quiet
+pairs included, pinned by test. The next probe reads readings, not silence.
+
+**PROPOSAL (2026-08-05, second): a conditional ρ-lift on demand pairs.** The
+remaining lever, turned into numbers an owner can decide on — measured, like
+the df proposal before it, against the live readings (ETH/SOL empirical lower
+0.759, one-sided 95% bound 0.6913, EWMA ρ backed out at 0.863, ML df 5.0 with
+HYPE / 3.5 without).
+
+*Reach — the ρ-lever covers where the df lever could not:*
+
+| df_ML | ρ* covering the ETH/SOL bound | lift from EWMA 0.863 |
+|---|---|---|
+| 5.0 | 0.907 | +0.044 |
+| 3.5 | 0.896 | +0.033 |
+| 2.5 | 0.878 | +0.015 |
+
+The target is attainable at the ML df with room to spare — no near-Cauchy
+territory, no grid wall.
+
+*Body cost:* lifting ETH/SOL 0.863 → 0.907 at df 5.0 costs **+0.0266
+nats/obs** of copula log-likelihood on a live-shaped window (57.5 over 2160
+observations). Chasing the POINT estimate instead (ρ ≈ 0.935) costs 4× that
+(+0.1045 nats/obs, 225.8 total); the bound, not the point, stays the target
+for the same reason as in the floor design.
+
+*Positive definiteness:* on the live-shaped 4-asset matrix both lifts stay PD
+outright; the standard projection returns the matrix unchanged (entries move
+≤ 1e-4). The mechanism still projects and RE-VERIFIES coverage afterwards —
+on a future matrix the projection could pull a lifted entry back.
+
+*Per-output disclosure (finding 1's requirement):* measured at (ρ 0.863 →
+0.907, df 5.0) on matched two-asset cross books, 40k paths × 12 seeds, the
+pair's live readings substituted into the fixture bundle; third column is the
+0.6.0 floor's actual output (ρ 0.863, df 2.5) for comparison:
+
+| book | P @ML | P @floor | P @lift | lift−ML | lift−floor |
+|---|---|---|---|---|---|
+| long-only 10x | 0.175 | 0.174 | 0.180 | **+0.0052** (+35 SE) | +0.0060 |
+| long-only 13x | 0.344 | 0.344 | 0.350 | **+0.0057** (+42 SE) | +0.0057 |
+| hedged 28x | 0.514 | 0.514 | 0.467 | **−0.0474** (−131 SE) | −0.0470 |
+| hedged 36x | 0.792 | 0.791 | 0.766 | **−0.0256** (−114 SE) | −0.0245 |
+| short-only 10x | 0.228 | 0.227 | 0.233 | **+0.0052** (+23 SE) | +0.0056 |
+| short-only 13x | 0.389 | 0.388 | 0.395 | **+0.0056** (+41 SE) | +0.0064 |
+
+Three readings, all load-bearing:
+
+1. **The sign varies by shape**, exactly as finding 1 requires disclosing:
+   same-sign books rise ~+0.5 pp, hedged books FALL 2.4–4.7 pp — an order of
+   magnitude larger. The §10 case is that the tail statistic says the market's
+   dependence EXCEEDS the model's, so the current model overstates a hedged
+   book's P(liq) and understates a same-sign book's; the lift moves every
+   shape TOWARD the measurement. The honest counterpoint, stated rather than
+   buried: the lift applies a tail-motivated ρ to the WHOLE distribution,
+   including the body, where the EWMA 0.863 is the better estimate — part of
+   the hedged fall is body distortion, not measured truth. The crash-regime
+   redesign (ρ high only in the crash state) would confine the lift to where
+   the evidence is; it remains the sharper, larger, deferred design.
+2. **The df floor barely moves outputs at all** (ML vs floor columns differ by
+   ≤ 0.1 pp everywhere): at ρ 0.863 the pair is near-comonotone and df has
+   almost no room to act on a two-asset book at a 24h horizon. The df lever is
+   weak in OUTPUT space, not only in tail-statistic reach — on this venue's
+   readings, ρ is the operative lever, df is not.
+3. **lift−floor ≈ lift−ML**: the comparison the owner actually faces (what
+   recording mode records today vs the proposal) is the same table.
+
+*Mechanism, if adopted (option R):* after the ML fit, with the SAME demand set
+the floor uses (pairs ≥ 1.645σ significant shortfall): lift each demand
+pair's correlation entry upward to the smallest grid value whose model@q at
+df_ML covers that pair's one-sided 95% lower bound, cap 0.98; project to PD;
+re-verify every demand post-projection; where a demand stays uncovered under
+the cap, the df floor composes on top, and failing that `covered=False` keeps
+the gate lit exactly as today. Conditional (no demand → matrix untouched),
+one-sided (lifts only, never cuts), recomputed each rebuild from current
+readings. The serving matrix then diverges from the EWMA on lifted pairs;
+both numbers are in the log — the new readings line prints every pair.
+
+*Costs and standing:* MODEL_VERSION MINOR (0.6 → 0.7), §3.3 reset — free
+while the clock is held by `covered=False`, which it is. Latency nil (same
+machinery, one matrix entry differs). The decision is the owner's; the
+options are (R) adopt the ρ-lift mechanism; (R+H) adopt it together with
+adding HYPE to `HL_UNIVERSE` in the same bump — the probe above shows HYPE
+adds no gate surface at the ML df, the census shows it is the largest single
+cohort recovery, and one reset is cheaper than two; or (S) stay in recording
+mode while the reading wanders — re-priced by the rolling-window correction
+above: waiting is a coin flip, not convergence.
+
 **PROPOSAL (2026-08-05): a conditional tail floor on the copula df.** The
 remedy space above, turned into numbers an owner can decide on. Measured
 against the live 2026-08-05 sweep banner (ETH/SOL lower 0.759 at +2.7σ,

@@ -801,6 +801,38 @@ class TestTheDiagnosticRunsOnTheShippedPath:
         returns, matrix = self._crash_together_market(36)
         assert state._checked_tail_diagnostics(returns, matrix, None) == ()
 
+    def test_every_pairs_tail_reading_is_logged_quiet_ones_included(self, caplog):
+        """The 2026-08-05 HYPE probe had to infer "no demand on the new pairs"
+        from their ABSENCE in the gate banner — and absence cannot distinguish
+        a passing pair from one that never entered the fit, because the banner
+        prints firing pairs only. The readings themselves are a probe's
+        evidence, so the floor wrapper must log every pair on every build,
+        including the ones with nothing to complain about."""
+        import logging
+
+        import risk_engine.service.state as state
+
+        # A market the fitted copula genuinely represents: t-copula draws fed
+        # back with their own correlation and df, so no pair fires and the
+        # quiet-pair half of the claim is the one under test.
+        rng = np.random.default_rng(41)
+        n = 20_000
+        corr = np.array([[1.0, 0.6], [0.6, 1.0]])
+        z = rng.standard_normal((n, 2)) @ np.linalg.cholesky(corr).T
+        x = z / np.sqrt(rng.chisquare(8.0, size=(n, 1)) / 8.0)
+        returns = {"A": x[:, 0], "B": x[:, 1]}
+        matrix = SimpleNamespace(assets=["A", "B"], corr=corr)
+
+        with caplog.at_level(logging.INFO, logger="risk_engine.service.state"):
+            df = state._tail_floored_copula_df(returns, matrix, 8.0)
+
+        assert df == 8.0, "a market the model fits must not be floored"
+        readings = [r for r in caplog.records if "tail readings" in r.getMessage()]
+        assert readings, "the per-pair readings line must be logged"
+        assert "A/B" in readings[-1].getMessage(), (
+            "the quiet pair must appear in the readings line by name"
+        )
+
 
 class TestShrinkageIntensityMagnitude:
     """Audit A-05. The previous suite checked only the *direction* of

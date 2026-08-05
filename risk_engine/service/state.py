@@ -200,6 +200,24 @@ def _tail_floored_copula_df(
     series = _aligned_series(returns, assets, timestamps)
     corr = _corr_submatrix(matrix, assets)
     prelim = diagnose_tail_asymmetry(series, tuple(assets), corr, df_ml)
+    # Every pair's reading, quiet ones included. The 2026-08-05 HYPE probe had
+    # to infer "no demand on the new pairs" from their ABSENCE in the gate
+    # banner, and absence cannot distinguish a passing pair from one that
+    # never entered the fit -- the banner prints firing pairs only. A probe
+    # (B6 widening, a rho recalibration) needs the readings themselves.
+    log.info(
+        "§2.3 tail readings at ML df %.2f (q=%.2f): %s",
+        df_ml, prelim[0].threshold,
+        "; ".join(
+            "{}/{} {} (lower={:.3f} model@q={:.3f})".format(
+                d.pair[0], d.pair[1],
+                f"{d.lower_excess_sigmas:+.1f} sigma"
+                if np.isfinite(d.lower_excess_sigmas) else "unmeasurable",
+                d.empirical_lower, d.model_at_threshold,
+            )
+            for d in prelim
+        ),
+    )
     floor = tail_floor_df(prelim, tuple(assets), corr, df_ml)
     if floor.floored:
         METRICS.incr("copula_df_tail_floored")
