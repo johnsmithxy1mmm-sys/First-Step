@@ -36,6 +36,7 @@ from risk_engine.model.copula import (
     assert_lower_tail_not_understated,
     diagnose_tail_asymmetry,
     fit_copula_df,
+    tail_floor_df,
 )
 from risk_engine.model.correlation import align_on_timestamps, build_global_matrix
 from risk_engine.model.funding import FundingBounds, fit_ar1
@@ -169,9 +170,52 @@ def _fitted_copula_df(returns: dict, matrix, timestamps: dict | None = None) -> 
         log.warning(
             "copula df fitted to the edge of its grid (%.2f, grid %.2f-%.2f): %s",
             df, lo, hi,
-            "tails heavier than representable" if df <= lo else "≈ Gaussian dependence",
+            "tails heavier than representable" if df <= lo else "~ Gaussian dependence",
         )
     return df
+
+
+def _tail_floored_copula_df(
+    returns: dict, matrix, df_ml: float, timestamps: dict | None = None
+) -> float:
+    """A11's conditional tail floor, applied between the fit and the record.
+
+    Adopted 2026-08-05 (OPEN-QUESTIONS A11, option A). The ML fit sees every
+    observation; the tail statistic sees ~108 of them and, on the live window,
+    sits 2.7 sigma above what the fitted df implies for ETH/SOL. Where that
+    shortfall is SIGNIFICANT the df is floored to the largest grid value whose
+    model@q covers the demand's one-sided 95% lower bound; everywhere else the
+    ML fit stands untouched. The demands, the bound and the conditionality are
+    `tail_floor_df`'s contract — this wrapper only feeds it the same aligned
+    series and correlation submatrix the fit itself used, and makes the
+    decision loud.
+
+    Runs on the fixture build too, deliberately: the fixture is symmetric by
+    construction, so the floor must decide "no demand" there — a check that
+    only runs on the live path is a check that rots (the A10 lesson).
+    """
+    assets = _estimated_assets(matrix)
+    if len(assets) < 2:
+        return df_ml
+    series = _aligned_series(returns, assets, timestamps)
+    corr = _corr_submatrix(matrix, assets)
+    prelim = diagnose_tail_asymmetry(series, tuple(assets), corr, df_ml)
+    floor = tail_floor_df(prelim, tuple(assets), corr, df_ml)
+    if floor.floored:
+        METRICS.incr("copula_df_tail_floored")
+        pairs = ", ".join(
+            f"{d.pair[0]}/{d.pair[1]} ({d.lower_excess_sigmas:+.1f} sigma)"
+            for d in floor.demands
+        )
+        log.warning(
+            "copula df floored %.2f -> %.2f by the A11 tail floor: measured "
+            "lower-tail dependence exceeds the ML fit at >=2 sigma on %s%s",
+            floor.df_ml, floor.df, pairs,
+            "" if floor.covered else
+            " — AND the grid floor still cannot reach every demand's bound, "
+            "so the §2.3 gate stays lit and recording mode continues",
+        )
+    return floor.df
 
 
 def _checked_tail_diagnostics(returns: dict, matrix, copula_df: float | None,
@@ -550,6 +594,7 @@ def _build_fixture_bundle():
     # runs on the path nobody exercises offline is a check that rots. It also
     # means the fixture asserts the diagnostic's own plumbing on every startup.
     copula_df = _fitted_copula_df(returns, matrix)
+    copula_df = _tail_floored_copula_df(returns, matrix, copula_df)
     bundle = ModelBundle(
         matrix=matrix, marginals=marginals, funding=funding,
         funding_bounds=bounds, copula_df=copula_df,
@@ -673,6 +718,7 @@ def _build_live_bundle(*, serving: bool = True, budget=None):
     # -- a fitted copula that cannot represent real crypto crashes is exactly
     # what §2.3 exists to catch -- not a regression to route around.
     copula_df = _fitted_copula_df(returns, matrix, candle_times)
+    copula_df = _tail_floored_copula_df(returns, matrix, copula_df, candle_times)
     bundle = ModelBundle(
         matrix=matrix, marginals=marginals, funding=funding,
         funding_bounds=bounds, copula_df=copula_df,

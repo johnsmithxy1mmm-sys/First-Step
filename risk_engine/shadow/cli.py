@@ -326,12 +326,14 @@ def _print_defect_note(bundle) -> None:
         f"lower-tail dependence (worst pair {worst.pair[0]}/{worst.pair[1]}, "
         f"empirical {worst.empirical_lower:.3f} against model "
         f"{worst.model_at_threshold:.3f}).\n"
-        f"  These observations are DIAGNOSTIC EVIDENCE, not §3.3 gate-days: the "
-        f"remedy is a skewed-t, which changes the predicted distribution, bumps "
-        f"MODEL_VERSION and resets the counter. They exist to measure how much "
-        f"the asymmetry moves P(liq) on real books, and in which direction — an "
-        f"adversarial review established the sign depends on book shape, so it "
-        f"is not known. No number from this bundle is served to anyone."
+        f"  These observations are DIAGNOSTIC EVIDENCE, not §3.3 gate-days. As "
+        f"of 0.5.0 the A11 conditional df floor runs before this gate, so this "
+        f"firing means the measured demands exceed what the t-copula grid can "
+        f"cover — any remedy deep enough is a family change, which bumps "
+        f"MODEL_VERSION and resets the counter. The skewed-t §2.3 named was "
+        f"refuted by measurement (OPEN-QUESTIONS A11). These days measure how "
+        f"the shortfall moves P(liq) on real books; the sign depends on book "
+        f"shape. No number from this bundle is served to anyone."
     )
 
 

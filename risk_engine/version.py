@@ -73,7 +73,39 @@ Format: MAJOR.MINOR.PATCH-tag
 #: the paired pre-trade walk therefore disagreed with itself about which
 #: column belonged to which pocket. Same law, different draw -- the 0.2.1
 #: reasoning applies, and it rides along with the MINOR bump anyway.
-MODEL_VERSION = "0.4.0-phase1"
+#: 0.5.0 — the A11 conditional tail floor (OPEN-QUESTIONS A11, option A,
+#: adopted by the product owner 2026-08-05). MINOR: it changes the copula df
+#: the live bundle serves, and therefore the joint tail of every predicted
+#: distribution. Two coupled changes, coherent by construction:
+#:
+#:   - `df* = min(df_ML, df_tail)`: where a pair's measured lower-tail
+#:     dependence exceeds the fitted model at >=2 sigma (today: ETH/SOL at +2.7 sigma),
+#:     the df is floored to the largest grid value whose model@q covers that
+#:     pair's one-sided 95% lower confidence bound. Conditional per finding 3
+#:     (sub-2-sigma pairs are noise, not demands), one-sided per finding 4 (lambda_U is
+#:     reported, never constrained — it is non-monotone and the observed
+#:     BTC/ETH upper tail is unreachable at any admissible skew). On the
+#:     2026-08-05 live readings this yields df* = 2.5 against an ML fit of
+#:     6.5.
+#:   - the §2.3 gate's margin gains a null: `max(0.05, 1.645*SE)` instead of
+#:     a flat 0.05, which at the live n=108 was 1.13*SE — the no-null
+#:     criterion finding 3 measured at ~84% false positives on zero-signal
+#:     data. The floor targets exactly the bound the gate now tests, so a
+#:     floored bundle passes the gate by construction and recording mode
+#:     (A10) ends when, and only when, the floor actually covers the demands.
+#:
+#: The skewed-t §2.3 prescribes was REFUTED for this venue's data before this
+#: was adopted (all four A11 findings measured; see OPEN-QUESTIONS A11): not
+#: per-output conservative, correlation-destroying below nu=4, and unable to
+#: reach the observed BTC/ETH upper tail at any admissible skew. The df floor
+#: is the surviving remedy; the rho-lever redesign (crash-regime dependence,
+#: rho_tail ~ 0.944 vs EWMA 0.887) is recorded in A11 as the sharper future
+#: model, deferred.
+#:
+#: Taken while the counter stood at zero — every observation recorded under
+#: 0.4 carried `recorded_under_defect` and was never a gate-day, so this
+#: reset discards nothing.
+MODEL_VERSION = "0.5.0-phase1"
 
 # Distribution-affecting prefix; the shadow counter keys on this, not on the
 # full string, so that PATCH releases keep accumulating validation days.

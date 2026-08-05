@@ -259,6 +259,130 @@ class TestGlobalMatrix:
             build_global_matrix(series)
 
 
+class TestConditionalTailFloor:
+    """A11 option A, adopted 2026-08-05: `df* = min(df_ML, df_tail)`.
+
+    The floor is conditional (only >= 2 sigma shortfalls are demands),
+    one-sided (lambda_U is never a constraint), targets the demand's one-sided
+    95% lower bound rather than its point estimate, and cannot raise the df.
+    Each of those properties is a measured A11 finding; each gets its own
+    assertion here so none can rot into prose.
+    """
+
+    RHO = 0.887          # backed out of the live 2026-08-05 ETH/SOL reading
+    N_SIM = 100_000      # enough for these gaps; keeps the suite fast
+
+    @staticmethod
+    def _diag(lower: float, model: float, n: int = 108, upper: float = 0.685):
+        from risk_engine.model.copula import TailDiagnostic
+
+        return TailDiagnostic(
+            pair=("ETH", "SOL"), threshold=0.05,
+            empirical_lower=lower, empirical_upper=upper,
+            model_at_threshold=model, model_asymptotic=0.593,
+            n_lower_exceedances=n,
+        )
+
+    def _floor(self, diags, df_ml=6.5):
+        from risk_engine.model.copula import tail_floor_df
+
+        corr = np.array([[1.0, self.RHO], [self.RHO, 1.0]])
+        return tail_floor_df(diags, ("ETH", "SOL"), corr, df_ml,
+                             n_sim=self.N_SIM)
+
+    def test_a_sub_two_sigma_pair_is_not_a_demand(self):
+        """Finding 3's conditionality. A shortfall the old gate would have
+        fired on (1.4 sigma) leaves the ML fit untouched: fitting to it would
+        install a remedy on data indistinguishable from noise."""
+        floor = self._floor([self._diag(lower=0.694, model=0.645)])
+        assert not floor.floored
+        assert floor.df == 6.5
+        assert floor.demands == ()
+
+    def test_a_significant_demand_floors_to_the_largest_covering_df(self):
+        """The live 2026-08-05 ETH/SOL reading: +2.7 sigma. The floor must
+        land on the LARGEST grid df covering `empirical - 1.645*SE` -- not
+        deeper (over-fitting the point) and not shallower (missing the bound).
+        Asserted structurally rather than as a pinned constant, so a grid or
+        estimator change re-derives the value instead of failing on it."""
+        from risk_engine.model.copula import (
+            COPULA_DF_GRID,
+            model_tail_dependence_at_threshold,
+        )
+
+        d = self._diag(lower=0.759, model=0.648)
+        floor = self._floor([d])
+        assert floor.floored and floor.covered
+        assert floor.demands == (d,)
+
+        target = 0.759 - 1.645 * d.lower_standard_error
+        assert model_tail_dependence_at_threshold(
+            floor.df, self.RHO, 0.05, n_sim=self.N_SIM, seed=7
+        ) >= target, "the chosen df must cover the one-sided bound"
+        above = [float(g) for g in COPULA_DF_GRID
+                 if floor.df < g <= floor.df_ml]
+        if above:
+            nxt = min(above)
+            assert model_tail_dependence_at_threshold(
+                nxt, self.RHO, 0.05, n_sim=self.N_SIM, seed=7
+            ) < target, (
+                "a larger grid df also covers the bound; the floor dug deeper "
+                "than the data demanded"
+            )
+
+    def test_the_floored_bundle_passes_the_gate_it_was_floored_for(self):
+        """The coherence property, which is the whole point of coupling the
+        floor and the margin: after flooring, the residual shortfall is at
+        most 1.645*SE, and the gate's margin is at least that -- so recording
+        mode ends exactly when the floor covers the demands."""
+        from risk_engine.model.copula import (
+            model_tail_dependence_at_threshold,
+        )
+
+        d = self._diag(lower=0.759, model=0.648)
+        floor = self._floor([d])
+        model_at_floor = model_tail_dependence_at_threshold(
+            floor.df, self.RHO, 0.05, n_sim=self.N_SIM, seed=7
+        )
+        refit = self._diag(lower=0.759, model=model_at_floor)
+        assert not refit.understates_lower_tail(), (
+            f"floored to df={floor.df} (model@q={model_at_floor:.3f}) yet the "
+            f"gate still fires; the floor and the margin have decohered"
+        )
+
+    def test_the_floor_never_raises_the_df(self):
+        """Thin-tailed data leave the ML fit alone: a demand whose bound the
+        current fit already covers is not a demand at all, and an ML fit
+        already below every covering df must stand."""
+        floor = self._floor([self._diag(lower=0.660, model=0.648)])
+        assert floor.df == 6.5
+
+        deep = self._floor([self._diag(lower=0.759, model=0.648)], df_ml=2.5)
+        assert deep.df == 2.5, "df_ml at the grid floor cannot be raised"
+
+    def test_an_unreachable_demand_floors_to_the_grid_edge_and_says_so(self):
+        """When even the heaviest grid df cannot reach the bound, the floor
+        still applies (heavier is nearer the data) and reports covered=False,
+        so the §2.3 gate stays lit and recording mode continues. Chasing
+        coverage off the grid is foreclosed -- the family's measured reach
+        says the point needs a near-Cauchy df."""
+        from risk_engine.model.copula import COPULA_DF_GRID
+
+        floor = self._floor([self._diag(lower=0.95, model=0.648)])
+        assert floor.floored and not floor.covered
+        assert floor.df == float(COPULA_DF_GRID[0])
+
+    def test_lambda_U_is_never_a_constraint(self):
+        """Finding 4's one-sidedness. A pair whose UPPER tail towers over the
+        model must contribute nothing to the demand set: lambda_U is not
+        monotone in the family's parameters and the observed BTC/ETH upper is
+        unreachable at any admissible skew, so a two-sided demand would be
+        unsatisfiable by construction."""
+        floor = self._floor([self._diag(lower=0.650, model=0.648, upper=0.95)])
+        assert not floor.floored
+        assert floor.demands == ()
+
+
 class TestCopula:
     """§2.3 — dependence fitting and the mandatory tail-asymmetry diagnostic."""
 
@@ -325,12 +449,30 @@ class TestCopula:
             model_at_threshold=0.633, model_asymptotic=0.571,
             n_lower_exceedances=108,
         )
-        assert live_btc_eth.understates_lower_tail(), "it must still fail the gate"
+        # Under the 0.5.0 margin (max(0.05, 1.645*SE)) this reading no longer
+        # fires at all: its shortfall is 1.4 sigma, and A11 finding 3 measured
+        # what a margin without a null does (a remedy installed on zero-signal
+        # data ~84% of the time). The gate not firing HERE is the designed
+        # change, asserted rather than worked around.
+        assert not live_btc_eth.understates_lower_tail(), (
+            "a 1.4-sigma shortfall is noise under the null-calibrated margin"
+        )
         assert live_btc_eth.asymmetry < 0, "the upper tail is the heavier one"
         assert live_btc_eth.upper_also_understated
 
+        # The same shape with two more weeks of window: identical point
+        # estimates at n=432 halve the SE twice over, the shortfall becomes
+        # 2.8 sigma, and the gate fires -- now on signal. The NOT-AN-ASYMMETRY
+        # note must name this case, or a reader reaches for the wrong remedy.
+        matured = TailDiagnostic(
+            pair=("BTC", "ETH"), threshold=0.05,
+            empirical_lower=0.694, empirical_upper=0.731,
+            model_at_threshold=0.633, model_asymptotic=0.571,
+            n_lower_exceedances=432,
+        )
+        assert matured.understates_lower_tail()
         with pytest.raises(ValueError, match="NOT AN ASYMMETRY"):
-            assert_lower_tail_not_understated([live_btc_eth])
+            assert_lower_tail_not_understated([matured])
 
         # A genuinely asymmetric pair must NOT collect that note.
         live_eth_sol = TailDiagnostic(

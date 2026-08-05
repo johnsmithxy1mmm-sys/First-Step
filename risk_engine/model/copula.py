@@ -53,6 +53,22 @@ from risk_engine.sim.paths import lower_tail_dependence
 
 COPULA_DF_GRID = np.concatenate([np.arange(2.5, 12.1, 0.5), np.arange(13.0, 30.1, 1.0)])
 
+#: A pair becomes a DEMAND on the tail floor only when its lower-tail
+#: shortfall is at least this many standard errors (A11 finding 3, measured:
+#: an unconditional criterion at these sample sizes has no null and installs
+#: a remedy on zero-signal data ~84% of the time; conditioning restores the
+#: nominal rate). Pairs below this are noise to re-test, not to fit.
+TAIL_DEMAND_SIGMAS = 2.0
+
+#: The floor targets the demand's one-sided 95% lower confidence bound,
+#: `empirical_lower - 1.645*SE`, not its point estimate. Measured (A11
+#: proposal, 2026-08-05): chasing the point on the live ETH/SOL reading needs
+#: df ~ 1.05 -- a near-Cauchy copula that would wreck the body fit and every
+#: other pair to chase one number carrying a 0.04 SE. The bound is what the
+#: data insists on at 95%; §10's heavier-tail preference is served by the
+#: DEMAND threshold being conditional, not by over-fitting the point.
+TAIL_ONE_SIDED_Z = 1.645
+
 
 def pseudo_observations(returns: np.ndarray) -> np.ndarray:
     """Rank-transform each column to (0, 1), the standard copula input."""
@@ -157,9 +173,21 @@ class TailDiagnostic:
     def understates_lower_tail(self, margin: float = 0.05) -> bool:
         """True when the symmetric copula sits below the observed lower tail.
 
-        `margin` keeps sampling noise from tripping the flag; with a 5%
-        threshold on a few thousand hourly observations the standard error on
-        the empirical estimate is a few percentage points.
+        The effective margin is `max(margin, TAIL_ONE_SIDED_Z * SE)`: the
+        absolute `margin` binds at large n, the SE-scaled term at small n.
+
+        The fixed 0.05 alone was 1.13 SE at the live window's n=108 — a
+        criterion with essentially no null, firing readily on noise (the same
+        defect A11 finding 3 measured for the skew margin: ~84% false-positive
+        rate on zero-signal data). The SE term gives the gate a nominal
+        one-sided 5% level where the data are thin, and hands back to the
+        absolute floor as n grows and 0.05 becomes a real signal. This is
+        also what makes the A11 tail floor coherent with the gate: the floor
+        raises the model to the demand's one-sided 95% lower bound, so a
+        floored bundle's residual shortfall is at most `z*SE` — inside this
+        margin by construction (up to Monte-Carlo noise between two estimates
+        of model@q; a borderline flip re-fires the gate and the next build
+        floors deeper, which is self-correcting rather than silent).
         """
         if not np.isfinite(self.empirical_lower):
             # NaN means the window held no lower-tail exceedances at all, so
@@ -169,7 +197,9 @@ class TailDiagnostic:
             # unmeasurable tail is not a safe tail; say so, and let
             # `assert_lower_tail_not_understated` refuse.
             return True
-        return self.empirical_lower - self.model_at_threshold > margin
+        se = self.lower_standard_error
+        effective = max(margin, TAIL_ONE_SIDED_Z * se) if np.isfinite(se) else margin
+        return self.empirical_lower - self.model_at_threshold > effective
 
     @property
     def lower_standard_error(self) -> float:
@@ -255,15 +285,109 @@ def diagnose_tail_asymmetry(
     return sorted(out, key=lambda d: d.model_at_threshold - d.empirical_lower)
 
 
+@dataclass(frozen=True, slots=True)
+class TailFloor:
+    """What the conditional tail floor decided, kept for logging and audit."""
+
+    df_ml: float
+    df: float
+    #: The pairs that were demands (>= TAIL_DEMAND_SIGMAS over the model).
+    demands: tuple[TailDiagnostic, ...]
+    #: False when even the grid's heaviest df cannot reach every demand's
+    #: bound; the §2.3 gate then keeps firing and recording mode continues,
+    #: which is the correct escalation rather than a silent best-effort.
+    covered: bool
+
+    @property
+    def floored(self) -> bool:
+        return self.df < self.df_ml
+
+
+def tail_floor_df(
+    diagnostics: list[TailDiagnostic],
+    assets: tuple[str, ...],
+    corr: np.ndarray,
+    df_ml: float,
+    grid: np.ndarray = COPULA_DF_GRID,
+    demand_sigmas: float = TAIL_DEMAND_SIGMAS,
+    one_sided_z: float = TAIL_ONE_SIDED_Z,
+    n_sim: int = 400_000,
+) -> TailFloor:
+    """A11's adopted remedy (option A): `df* = min(df_ML, df_tail)`.
+
+    `df_tail` is the LARGEST df on the grid whose model@q covers
+    `empirical_lower - z*SE` for every pair whose shortfall is significant at
+    `demand_sigmas`. Conditional exactly as finding 3 requires — sub-2-sigma pairs
+    are noise to re-test, never demands — and one-sided exactly as finding 4
+    requires: lambda_U is reported by the diagnostic, never constrained, because it
+    is not monotone in the family's parameters and a two-sided criterion is
+    unsatisfiable (measured: the live BTC/ETH upper tail is unreachable at any
+    admissible skew, and for the df lever the whole grid moves lambda_U with λ_L).
+
+    Why a floor under the ML fit rather than a tail-matched estimator
+    outright: the likelihood sees every observation and the tail statistic
+    sees ~n*q of them, so the ML fit is the better estimate everywhere the
+    tail does not contradict it at 2 sigma. The floor binds only on measured,
+    significant shortfall — which also means it cannot RAISE df: thin-tailed
+    data leave the ML fit alone.
+
+    model@q is monotone decreasing in df, so the first covering df walking
+    the grid downward from `df_ml` is the largest one. Each check simulates
+    (`n_sim` per pair per step, fixed seed) — an offline cost in a build that
+    already simulates the diagnostic itself.
+
+    When even the grid floor cannot cover every demand, the floor is applied
+    anyway (`covered=False`): heavier is still nearer the data, and the §2.3
+    gate stays lit, which keeps recording mode on. Chasing coverage OFF the
+    grid is foreclosed — the measured reach of the family says the point
+    estimate needs df ~ 1, a near-Cauchy copula (OPEN-QUESTIONS A11).
+    """
+    index = {a: i for i, a in enumerate(assets)}
+    demands = tuple(
+        d for d in diagnostics
+        if d.understates_lower_tail()
+        and np.isfinite(d.lower_excess_sigmas)
+        and d.lower_excess_sigmas >= demand_sigmas
+    )
+    if not demands or len(assets) < 2:
+        return TailFloor(df_ml=df_ml, df=df_ml, demands=(), covered=True)
+
+    targets = []
+    for d in demands:
+        se = d.lower_standard_error
+        i, j = index[d.pair[0]], index[d.pair[1]]
+        targets.append((float(corr[i, j]), d.empirical_lower - one_sided_z * se))
+
+    def covers(df: float) -> bool:
+        return all(
+            model_tail_dependence_at_threshold(
+                df, rho, demands[0].threshold, n_sim=n_sim, seed=7
+            ) >= target
+            for rho, target in targets
+        )
+
+    candidates = sorted({float(g) for g in grid if g <= df_ml}, reverse=True)
+    for df in candidates:
+        if covers(df):
+            return TailFloor(df_ml=df_ml, df=df, demands=demands, covered=True)
+    floor = candidates[-1] if candidates else df_ml
+    return TailFloor(df_ml=df_ml, df=floor, demands=demands, covered=False)
+
+
 def assert_lower_tail_not_understated(
     diagnostics: list[TailDiagnostic], margin: float = 0.05
 ) -> None:
     """§2.3: understating the lower tail is a blocking defect.
 
-    Raises rather than warns. The remedy §2.3 names is a skewed-t, which
-    Phase 1 does not implement -- so the honest response to this firing is to
-    stop and report it, not to continue with a model known to understate the
-    risk the product exists to measure (§9, §10).
+    Raises rather than warns. §2.3 names a skewed-t as the remedy, and that
+    prescription was REFUTED by measurement (OPEN-QUESTIONS A11, all four
+    findings, 2026-08-04): not per-output conservative, correlation-destroying
+    below nu=4, and unable to reach the observed upper tails at any admissible
+    skew. The adopted remedy is the conditional df floor (`tail_floor_df`),
+    which runs BEFORE this gate in the bundle build -- so this firing means
+    the floor could not cover the demands within the family's grid, and the
+    honest response is still to stop and report, not to continue with a model
+    known to understate the risk the product exists to measure (§9, §10).
     """
     bad = [d for d in diagnostics if d.understates_lower_tail(margin)]
     if bad:
@@ -301,7 +425,9 @@ def assert_lower_tail_not_understated(
         raise ValueError(
             "the t-copula understates lower-tail dependence for:\n  "
             f"{lines}\n"
-            "§2.3 classifies this as a blocking defect and prescribes a skewed-t, "
-            f"which is not implemented. Report this rather than proceeding.{note}"
+            "§2.3 classifies this as a blocking defect. The adopted remedy -- the "
+            "A11 conditional df floor -- runs before this gate, so this firing "
+            "means the demands exceed what the family's grid can cover. Report "
+            f"this rather than proceeding.{note}"
             f"{shape_note}"
         )

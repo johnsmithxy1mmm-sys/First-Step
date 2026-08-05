@@ -641,6 +641,33 @@ conclusion, not a design: the choice of df target and family is a
 model-scope decision (MODEL_VERSION MINOR, §3.3 reset) that belongs to the
 product owner, informed by the window.
 
+**ADOPTED and IMPLEMENTED (2026-08-05, option A; MODEL_VERSION 0.5.0).** The
+proposal below was accepted by the product owner and is live:
+`tail_floor_df` in `model/copula.py`, wired through
+`state._tail_floored_copula_df` into both bundle builders, before the §2.3
+gate. On the 2026-08-05 readings it floors the df from the ML fit of 6.5 to
+**2.5** (the grid floor) on the single ≥2σ demand, ETH/SOL; a dress rehearsal
+of the next live build shows all three pairs passing the gate afterwards
+(residual shortfalls +0.063/+0.009/+0.011 against SE-scaled margins), so the
+recording-mode banner goes dark and gate-days can accumulate.
+
+**One correction to the proposal as first committed, owned rather than
+papered over:** it claimed df 3.0 "brings every pair's lower-tail shortfall
+inside 0.02" and "the shipped 0.05 gate passes everywhere". False for the
+signal pair: ETH/SOL's shortfall at df 3.0 is 0.068 > 0.05, so under the old
+flat margin the gate would have kept firing and the clock would never have
+started. The adopted design therefore couples the floor with the second half
+of finding 3: the gate margin is now `max(0.05, 1.645·SE)` — the flat 0.05
+was 1.13·SE at the live n=108, a criterion with no null — and the floor
+targets exactly the bound the new margin tests, which is what makes "floored
+⟹ gate passes" true by construction rather than by luck. A borderline
+Monte-Carlo flip between the two estimates re-fires the gate and the next
+build floors deeper: self-correcting, not silent.
+
+Per-output at the actually-adopted df (6.5 → 2.5, 40k paths × 12 seeds):
+nothing rises; long-only 13x −0.0010 (−2.8 SE), hedged 36x −0.0026 (−4.2 SE),
+the rest ~0. Same shape as the 3.0 table below, slightly larger.
+
 **PROPOSAL (2026-08-05): a conditional tail floor on the copula df.** The
 remedy space above, turned into numbers an owner can decide on. Measured
 against the live 2026-08-05 sweep banner (ETH/SOL lower 0.759 at +2.7σ,
