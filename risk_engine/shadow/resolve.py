@@ -112,12 +112,26 @@ class OutcomeProvider(Protocol):
 DEFAULT_STALE_AFTER_S = 2 * 3600.0
 
 #: Ceiling on one resolve run's wall clock, and how long to wait when the §5.3
-#: weight window is spent. Each ADDRESS costs ~40 weight (one book + one
-#: external_flow, both shared across its three variants) against 300/min, so
-#: §3.3's floor of 200 addresses -- 600 rows -- needs ~27 minutes of
-#: mostly-waiting; 50 minutes leaves headroom while staying inside the hourly
-#: cadence so runs do not overlap. Per ROW rather than per address it was 80
-#: weight and the arithmetic did not hold; see `flow_cache` in `resolve_due`.
+#: weight window is spent. Each ADDRESS costs 22 weight -- one `clearinghouseState`
+#: at 2 (INFO_REQUEST_WEIGHTS) plus one `userNonFundingLedgerUpdates` at the
+#: default 20, both shared across its three variants -- against 300/min, so
+#: §3.3's floor of 200 addresses (600 rows) is ~15 minutes of mostly-waiting
+#: and the deployed ~270-address list is ~20. Per ROW rather than per address
+#: the flow fetch made it 62; see `flow_cache` in `resolve_due`.
+#:
+#: These figures said ~40 and ~80 until 2026-08-04. They predated the §5.3
+#: weight-table correction of 2026-08-03, which moved `clearinghouseState`
+#: from a presumed flat 20 to its published 2 -- so the capacity arithmetic
+#: written here, and repeated in three test docstrings, overstated the real
+#: cost by 1.8x. Nothing computed from them: they are prose, which is exactly
+#: why they drifted. They are load-bearing anyway, because they are what an
+#: operator sizes a deployment from, and an audit of this file on 2026-08-04
+#: reached the wrong conclusion about throughput by trusting them.
+#:
+#: The binding constraint is NOT this ceiling. It is the sum of the resolver's
+#: cadence, its start delay and this ceiling against `DEFAULT_STALE_AFTER_S`;
+#: see the schedule block in deploy/docker-compose.yml and
+#: `test_a_due_row_cannot_go_stale_before_a_resolve_run_can_reach_it`.
 DEFAULT_MAX_RESOLVE_SECONDS = 50 * 60.0
 DEFAULT_BUDGET_WAIT_SECONDS = 5.0
 
@@ -249,7 +263,7 @@ def resolve_due(
     permanent: list[tuple[int, str]] = []
 
     # WAIT on the §5.3 weight, do not burst-and-drop. Each resolution spends
-    # ~40 weight (book + external_flow) against 300/min, and this loop used to
+    # 22 weight (book + external_flow) against 300/min, and this loop used to
     # process rows as fast as it could until `RateLimitExceeded`, then file
     # the rest as failed. Combined with a fresh hourly process (empty window
     # each run) that resolved ~8 rows before refusing, against ~200 coming due
@@ -319,12 +333,16 @@ def resolve_due(
     cache: dict[str, tuple[float, str, datetime]] = {}
     # External flow is a function of (address, window) only -- it is
     # byte-identical across an address's three variants, and fetching it once
-    # per ROW tripled the cost of a resolution: 80 weight per address against
-    # the ~40 the capacity arithmetic below budgets with. At the deployed
-    # ~500-address list that is 2.7 ceiling-runs to clear a day's queue, so
-    # the third hourly run starts past the 2h staleness bound and ~25% of each
-    # day's observations are flagged stale and dropped from §3.3 -- the same
-    # gate-unreachable failure the pacing rework fixed on the snapshot side.
+    # per ROW nearly tripled the cost of a resolution: 62 weight per address
+    # (2 for the book, then 20 for the flow on each of the three variants)
+    # against the 22 the capacity arithmetic above budgets with. At the
+    # deployed address list that is multiple ceiling-runs to clear a day's
+    # queue, so a later run starts past the 2h staleness bound and a share of
+    # each day's observations is flagged stale and dropped from §3.3 -- the
+    # same gate-unreachable failure the pacing rework fixed on the snapshot
+    # side. (These read 80 and ~40 until 2026-08-04, from before the §5.3
+    # weight table was corrected; the ratio was right, the absolute numbers
+    # were 1.8x high.)
     flow_cache: dict[tuple[str, datetime, datetime], float] = {}
 
     # Paced like everything else -- the old top-of-function fetch ran before

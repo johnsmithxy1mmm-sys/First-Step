@@ -259,8 +259,8 @@ services:
         condition: service_healthy
     environment:
       SHADOW_DSN: postgresql://${POSTGRES_USER:-risk}:${POSTGRES_PASSWORD}@journal:5432/${POSTGRES_DB:-shadow}
-      SHADOW_INTERVAL_S: ${RESOLVE_INTERVAL_S:-3600}
-      RESOLVE_START_DELAY_S: ${RESOLVE_START_DELAY_S:-1800}
+      SHADOW_INTERVAL_S: ${RESOLVE_INTERVAL_S:-1800}
+      RESOLVE_START_DELAY_S: ${RESOLVE_START_DELAY_S:-900}
       SHADOW_ARGS: ${SHADOW_ARGS:---fixture}
       HL_UNIVERSE: ${HL_UNIVERSE:-BTC,ETH,SOL}
     volumes:
@@ -288,9 +288,34 @@ services:
     #
     # Half an hour, and the direction of the offset is the load-bearing part:
     # the RESOLVER yields, not the snapshot. A missed resolve is retried the
-    # next hour and the row is still pending; a missed snapshot is a day of
+    # next period and the row is still pending; a missed snapshot is a day of
     # the 21 that cannot be recovered, because the prediction it would have
     # written had to be made against that day's book.
+    #
+    # THE PERIOD AND THE OFFSET ARE BOUNDED BY THE STALENESS RULE, not chosen
+    # for tidiness. Three delays stack between a row coming due and its
+    # outcome being read, and their SUM must fit inside `stale_after_s` (2 h)
+    # or rows are dropped from §3.3 by the schedule alone -- no outage and no
+    # backlog required:
+    #
+    #     cadence      `due()` is snapshotted once at run start, so a row that
+    #                  comes due a second later waits a full period
+    #   + start delay  re-paid on EVERY container start, on top of the phase
+    #                  the loop already had
+    #   + ceiling      staleness is measured when the row is actually FETCHED,
+    #                  up to `max_resolve_seconds` into the run
+    #
+    # At 3600 + 1800 + 3000 that was 8400 s against a 7200 s bound. Measured
+    # on the live deployment 2026-08-04: 513 resolved observations, ZERO
+    # usable, the §3.3 window still at day 0 after days of running. Now
+    # 1800 + 900 + 3000 = 5700 s, inside the bound with 25 minutes to spare.
+    # `test_a_due_row_cannot_go_stale_before_a_resolve_run_can_reach_it`
+    # recomputes this from these literals, so moving either one re-checks the
+    # sum rather than quietly reopening the hole.
+    #
+    # Halving the period costs nothing that matters: a run with an empty queue
+    # spends one cached `spot` refresh and a database query, and the shadow
+    # pool is 300 weight/minute against roughly 22 per address.
     #
     # Same drift correction and failure escalation as the snapshot job, with a
     # higher threshold: this runs 24x more often, so three consecutive misses

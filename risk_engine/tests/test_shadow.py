@@ -853,7 +853,7 @@ class TestTheLiveCliSpendsNoWeightItNeedNot:
 class TestResolverPacesRatherThanDroppingToStale:
     """The resolver had the snapshot's bug, made worse by staleness.
 
-    Each resolution spends ~40 weight (book + external_flow); a fresh hourly
+    Each resolution spends 22 weight (book + external_flow); a fresh hourly
     process resolves ~8 before the §5.3 window refuses, then filed the rest as
     failed. Against ~200 due per day inside a 2-hour staleness window, ~15
     landed and ~185 aged out and were dropped from the gate (A-04). §3.3 was
@@ -1786,7 +1786,7 @@ class TestTheFlowWindowCoversWhatTheEquityIncludes:
         """The fix must not cost what the cache saves. `observed_at` comes off
         the per-address cache, so the three variants of one address still
         share a key — if it were read per row, each address would cost three
-        fetches and the resolver's capacity arithmetic (~40 weight/address)
+        fetches and the resolver's capacity arithmetic (22 weight/address)
         would be wrong by 3x."""
         resolves_at = now + timedelta(hours=24)
         observed = resolves_at + timedelta(minutes=5)

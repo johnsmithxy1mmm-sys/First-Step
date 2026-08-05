@@ -298,6 +298,53 @@ def test_the_two_shadow_jobs_cannot_start_in_the_same_second_every_day():
     assert "RESOLVE_START_DELAY_S" not in snap
 
 
+def test_a_due_row_cannot_go_stale_before_a_resolve_run_can_reach_it():
+    """The scheduling arithmetic, against the bound it has to fit inside.
+
+    Three delays stack between a row becoming due and its outcome being read,
+    and every one of them is a literal somebody can change independently:
+
+      cadence      `due()` is snapshotted once at run start (resolve.py:341),
+                   so a row that comes due a second later is invisible to that
+                   run and waits a full period.
+      start delay  RESOLVE_START_DELAY_S is re-paid on EVERY container start,
+                   added on top of whatever phase the loop already had.
+      ceiling      staleness is measured when the row is actually fetched
+                   (`observed_at = now + elapsed`, resolve.py:281-291), so a
+                   row reached at the end of a long run is judged there, not
+                   at run start.
+
+    Their sum is the worst case, and it must not exceed DEFAULT_STALE_AFTER_S
+    -- otherwise rows are flagged stale and dropped from §3.3 by the
+    configuration alone, with no outage and no backlog needed. Measured on the
+    deployment 2026-08-04: 3600 + 1800 + 3000 = 8400s against a 7200s bound,
+    with 513 resolved observations and ZERO usable.
+
+    A stale row is unrecoverable. The journal is written once (A-09), and the
+    §3.3 gate counts only non-stale rows (journal.py:380), so every hour spent
+    over this bound is a day of the 21-day window that cannot be earned back.
+    """
+    from risk_engine.shadow.resolve import (
+        DEFAULT_MAX_RESOLVE_SECONDS,
+        DEFAULT_STALE_AFTER_S,
+    )
+
+    res = _compose_defaults().get("shadow-resolve", {})
+    cadence = res.get("SHADOW_INTERVAL_S")
+    start_delay = res.get("RESOLVE_START_DELAY_S")
+    assert cadence and start_delay, f"parsed no resolver schedule: {res}"
+
+    worst_case = cadence + start_delay + DEFAULT_MAX_RESOLVE_SECONDS
+    assert worst_case <= DEFAULT_STALE_AFTER_S, (
+        f"a row can be reached {worst_case}s after coming due, against a "
+        f"{DEFAULT_STALE_AFTER_S:.0f}s staleness bound: "
+        f"cadence {cadence} + start delay {start_delay} + ceiling "
+        f"{DEFAULT_MAX_RESOLVE_SECONDS:.0f}. Rows past the bound are flagged "
+        f"stale and dropped from the §3.3 gate, and the journal is write-once, "
+        f"so they cannot be recovered by resolving again."
+    )
+
+
 def test_the_bundle_may_wait_longer_than_it_takes_to_lose_the_day():
     """The ceiling on STARTING must not be tighter than the one on working.
 
