@@ -53,13 +53,6 @@ from risk_engine.sim.paths import lower_tail_dependence
 
 COPULA_DF_GRID = np.concatenate([np.arange(2.5, 12.1, 0.5), np.arange(13.0, 30.1, 1.0)])
 
-#: A pair becomes a DEMAND on the tail floor only when its lower-tail
-#: shortfall is at least this many standard errors (A11 finding 3, measured:
-#: an unconditional criterion at these sample sizes has no null and installs
-#: a remedy on zero-signal data ~84% of the time; conditioning restores the
-#: nominal rate). Pairs below this are noise to re-test, not to fit.
-TAIL_DEMAND_SIGMAS = 2.0
-
 #: The floor targets the demand's one-sided 95% lower confidence bound,
 #: `empirical_lower - 1.645*SE`, not its point estimate. Measured (A11
 #: proposal, 2026-08-05): chasing the point on the live ETH/SOL reading needs
@@ -68,6 +61,19 @@ TAIL_DEMAND_SIGMAS = 2.0
 #: data insists on at 95%; §10's heavier-tail preference is served by the
 #: DEMAND threshold being conditional, not by over-fitting the point.
 TAIL_ONE_SIDED_Z = 1.645
+
+#: A pair becomes a DEMAND on the tail floor when its lower-tail shortfall is
+#: significant at this many standard errors -- THE SAME threshold the gate's
+#: margin tests, and the sameness is load-bearing. As shipped in 0.5.0 this
+#: was 2.0 against the gate's 1.645, which left a stuck band: a pair at, say,
+#: 1.8 sigma kept the §2.3 gate lit (so recording mode continued and no
+#: gate-day accrued) while never becoming a demand (so the floor never even
+#: attempted a remedy). A gate that can fire on a pair the remedy is not
+#: allowed to see is the A10 defect in a new coat. One threshold, shared:
+#: every pair that can hold the gate open is a pair the floor tries to cover.
+#: Conditionality (A11 finding 3) is preserved -- 1.645 one-sided IS a null,
+#: which the old flat margin never had.
+TAIL_DEMAND_SIGMAS = TAIL_ONE_SIDED_Z
 
 
 def pseudo_observations(returns: np.ndarray) -> np.ndarray:

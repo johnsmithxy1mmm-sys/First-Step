@@ -290,14 +290,34 @@ class TestConditionalTailFloor:
         return tail_floor_df(diags, ("ETH", "SOL"), corr, df_ml,
                              n_sim=self.N_SIM)
 
-    def test_a_sub_two_sigma_pair_is_not_a_demand(self):
-        """Finding 3's conditionality. A shortfall the old gate would have
-        fired on (1.4 sigma) leaves the ML fit untouched: fitting to it would
-        install a remedy on data indistinguishable from noise."""
+    def test_a_sub_threshold_pair_is_not_a_demand(self):
+        """Finding 3's conditionality. A 1.1-sigma shortfall (one the OLD flat
+        margin would have fired on) leaves the ML fit untouched: fitting to it
+        would install a remedy on data indistinguishable from noise."""
         floor = self._floor([self._diag(lower=0.694, model=0.645)])
         assert not floor.floored
         assert floor.df == 6.5
         assert floor.demands == ()
+
+    def test_every_pair_that_fires_the_gate_is_a_demand(self):
+        """The stuck band 0.5.0 shipped with, closed and pinned.
+
+        The gate's margin fires at 1.645*SE; the demand threshold was 2.0
+        sigma. A pair between them held the gate lit -- recording mode, no
+        gate-days -- while the floor never attempted a remedy, indefinitely.
+        The two thresholds are now the same constant, and this asserts the
+        implication that matters: understates => demand, so there is no
+        reading that can keep the gate open without the floor at least
+        trying to close it.
+        """
+        # 1.8 sigma: gap = 0.0797 over SE 0.0443 -- fires the 1.645*SE margin,
+        # sat in the dead band under the old 2.0 demand threshold.
+        d = self._diag(lower=0.694, model=0.694 - 1.8 * 0.0443)
+        assert d.understates_lower_tail(), "the fixture must sit past the gate"
+        floor = self._floor([d])
+        assert d in floor.demands, (
+            "a pair keeping the gate lit was not a demand; the stuck band is back"
+        )
 
     def test_a_significant_demand_floors_to_the_largest_covering_df(self):
         """The live 2026-08-05 ETH/SOL reading: +2.7 sigma. The floor must

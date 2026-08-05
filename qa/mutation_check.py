@@ -254,8 +254,9 @@ RISK_MUTANTS: list[tuple[str, str, str, str]] = [
     ("model/copula.py", "effective = max(margin, TAIL_ONE_SIDED_Z * se)",
      "effective = min(margin, TAIL_ONE_SIDED_Z * se)",
      "gate margin loses its null (fires on 1.4-sigma noise again)"),
-    ("model/copula.py", "TAIL_DEMAND_SIGMAS = 2.0", "TAIL_DEMAND_SIGMAS = 3.0",
-     "the 2.7-sigma live demand stops being a demand (floor never engages)"),
+    ("model/copula.py", "TAIL_DEMAND_SIGMAS = TAIL_ONE_SIDED_Z",
+     "TAIL_DEMAND_SIGMAS = 3.0",
+     "demand threshold decouples from the gate (the 0.5.0 stuck band returns)"),
     # --- §5.1 parsing: poison that evades the guards downstream ---
     ("market/parse.py", "if (closes <= 0).any():", "if (closes <= 1).any():",
      "every sub-dollar perp refused as a non-positive close"),

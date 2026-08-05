@@ -105,7 +105,17 @@ Format: MAJOR.MINOR.PATCH-tag
 #: Taken while the counter stood at zero — every observation recorded under
 #: 0.4 carried `recorded_under_defect` and was never a gate-day, so this
 #: reset discards nothing.
-MODEL_VERSION = "0.5.0-phase1"
+#: 0.6.0 — the demand threshold is the gate threshold (the 0.5.0 stuck band).
+#: MINOR because it changes WHEN the floor engages and therefore what df a
+#: live bundle can serve. 0.5.0 shipped the gate firing at 1.645*SE but a pair
+#: becoming a floor demand only at 2.0 sigma, so a reading in [1.645, 2.0)
+#: sigma held the gate lit -- recording mode, no gate-days -- while the floor
+#: never attempted a remedy: a gate that can fire on a pair the remedy is not
+#: allowed to see. One shared constant now. Free again: the first live firing
+#: of 0.5.0 came back covered=False (the live ML fit is 3.5, not the fixture's
+#: 6.5, and the live rho is 0.863), so every 0.5 row is defect-stamped and no
+#: gate-day existed to lose.
+MODEL_VERSION = "0.6.0-phase1"
 
 # Distribution-affecting prefix; the shadow counter keys on this, not on the
 # full string, so that PATCH releases keep accumulating validation days.

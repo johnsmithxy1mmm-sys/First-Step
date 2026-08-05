@@ -668,6 +668,47 @@ Per-output at the actually-adopted df (6.5 → 2.5, 40k paths × 12 seeds):
 nothing rises; long-only 13x −0.0010 (−2.8 SE), hedged 36x −0.0026 (−4.2 SE),
 the rest ~0. Same shape as the 3.0 table below, slightly larger.
 
+**FIRST LIVE FIRING (2026-08-05 12:15) — the floor engaged and hit the
+family's wall; two of this entry's own premises corrected by it.** The live
+build floored `3.50 -> 2.50, covered=False`: the ML fit on the live window is
+**3.5, not 6.5** (6.5 was the FIXTURE value; the rehearsal above inherited
+that error, which is why it predicted the gate would clear), and the pair
+correlations back out at **ρ ≈ 0.863**, not 0.887 (both of this morning's
+banner asymptotics agree: 0.593@3.5 and 0.642@2.5 both invert to 0.863). At
+the real (ρ, df): the grid floor 2.5 reaches model@q ≈ 0.679, ETH/SOL's
+bound needs 0.691, **df 2.0 measures 0.688 — still short — and only 1.5
+covers**, which is the foreclosed near-Cauchy territory against an ML of 3.5.
+
+So the shortfall that remains is not a tuning problem. ETH/SOL is the
+ASYMMETRIC pair (+0.074 lower over upper), and a symmetric family covering
+its lower tail must overstate its upper by the same distance; the floor
+closed what symmetry allows (shortfall 0.111 → 0.080, 2.7σ → 2.0σ) and the
+rest is the family boundary A11's opening paragraphs predicted for exactly
+this shape of reading.
+
+**A second premise of this entry was also wrong and matters for the owner's
+option B:** "n doubles in ~2 weeks, SE shrinks 1.4x" is false. The window is
+a ROLLING 90 days — n stays ≈ 108 forever. Waiting does not shrink the SE;
+the reading wanders (0.759 today) and the gate outcome with it. Option B is
+a coin flip on that wander, not convergence, and is re-priced accordingly.
+
+**Also fixed on this firing (0.6.0): the stuck band.** As shipped in 0.5.0
+the gate fired at 1.645·SE while a pair became a floor DEMAND only at 2.0σ,
+so a reading in [1.645σ, 2.0σ) held the gate lit — recording mode, no
+gate-days — while the floor never attempted a remedy. The demand threshold
+is now the same constant as the gate's (`TAIL_DEMAND_SIGMAS =
+TAIL_ONE_SIDED_Z`): every pair that can keep the gate open is a pair the
+floor tries to cover. Conditionality survives — 1.645 one-sided is a real
+null, which is all finding 3 asked for.
+
+**Standing after the firing:** recording mode continues, correctly — the
+demands exceed what the symmetric family can express on the asymmetric pair.
+The §3.3 clock is held by that fact, not by a defect. The levers that remain
+are the ones this entry already names: the ρ-lever redesign (tail-matched /
+crash-regime dependence — reaches 0.691 easily, since ρ ≈ 0.935 reproduces
+the observed tail at any df in 3–6.5), or accepting recording mode while the
+reading wanders. Chasing df past the grid floor stays foreclosed.
+
 **PROPOSAL (2026-08-05): a conditional tail floor on the copula df.** The
 remedy space above, turned into numbers an owner can decide on. Measured
 against the live 2026-08-05 sweep banner (ETH/SOL lower 0.759 at +2.7σ,
