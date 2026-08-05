@@ -357,10 +357,41 @@ def resolve_due(
     extra_mids: dict[str, float] | None = None
 
     due = list(journal.due(now))
+
+    # SALVAGEABLE FIRST. `due()` orders by `resolves_at` ascending, and the
+    # loop below walks it in order, so the oldest rows are served first. That
+    # is the right instinct and the wrong result once a backlog exists.
+    #
+    # A row already past `stale_after_s` cannot be rescued: whatever this run
+    # writes for it will be flagged stale and excluded from §3.3 by
+    # `progress()`. It still costs a book fetch, a flow fetch, and its turn in
+    # the queue. So with a backlog larger than one run can clear, every run
+    # spends its whole ceiling on rows that cannot count, the rows that COULD
+    # have counted age out behind them, and they join the backlog. The queue
+    # never drains and the gate never fills.
+    #
+    # Observed on the deployment 2026-08-05: 376 rows resolved in a single run,
+    # 376 of them stale, while that day's own predictions waited behind
+    # yesterday's. 1919 predictions, zero usable observations.
+    #
+    # Ordering only -- no row is skipped, and a hopeless row is still resolved
+    # if the ceiling allows, because its outcome is real history even though
+    # the gate cannot count it. Within each group the oldest still goes first,
+    # so the salvageable rows nearest their deadline are served first.
+    def _priority(p):
+        lag = (now - p.resolves_at).total_seconds()
+        return (lag >= stale_after_s, p.resolves_at)
+
+    due.sort(key=_priority)
+    salvageable = sum(
+        1 for p in due if (now - p.resolves_at).total_seconds() < stale_after_s
+    )
     log.info(
-        "resolving %d pending rows; ceiling %.0f min, anything collected more "
-        "than %.0f min late is flagged stale and dropped from the gate",
-        len(due), max_resolve_seconds / 60.0, stale_after_s / 60.0,
+        "resolving %d pending rows (%d still inside the %.0f min staleness "
+        "bound, served first; %d already past it and countable only as "
+        "history); ceiling %.0f min",
+        len(due), salvageable, stale_after_s / 60.0, len(due) - salvageable,
+        max_resolve_seconds / 60.0,
     )
     for pending in due:
         if budget_exhausted:

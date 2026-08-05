@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -895,6 +896,80 @@ class TestResolverPacesRatherThanDroppingToStale:
         # failed, not stale, just deferred.
         assert not any("RateLimit" in reason for _, reason in report.failed)
         assert journal.due(later)  # still pending
+        journal.close()
+
+    def test_salvageable_rows_are_served_before_a_hopeless_backlog(
+        self, bundle, specs, spot, books, naive, now
+    ):
+        """A row past the staleness bound cannot be rescued; it must not queue
+        ahead of rows that still can be.
+
+        `due()` orders oldest-first, which is right until a backlog exists and
+        then inverts into a trap: rows already past `stale_after_s` are
+        resolved first (each costing a book fetch, a flow fetch, and its turn),
+        every one of them lands stale, and the rows still INSIDE the bound age
+        out while they wait. Observed live 2026-08-05: one run resolved 376
+        rows, all 376 stale, while that day's own predictions queued behind
+        yesterday's corpses. 1919 predictions, zero usable observations — a
+        backlog the drain order itself regenerates every day.
+
+        Two sweeps a day apart, resolved when day 1's rows are far past the
+        bound and day 2's are fresh, under a ceiling that stops the run after
+        the salvageable half. Under the old order the ceiling is spent on the
+        corpses and the salvageable rows get NOTHING; under the new one they
+        are all scored non-stale and the corpses defer to the next run.
+        """
+        journal = CalibrationJournal()
+        provider = FakeProvider(books, spot, specs)
+        cron = ShadowCron(provider, bundle, journal, naive, n_paths=1_000)
+        cron.run_once(now)                                # day 1
+        cron.run_once(now + timedelta(hours=24))          # day 2
+
+        # Day 1 resolves at now+24h: 25h late at the observation instant --
+        # hopeless. Day 2 resolves at now+48h: 1h late -- salvageable.
+        observe_at = now + timedelta(hours=49)
+        assert len(journal.due(observe_at)) == 12, "both sweeps' rows must be due"
+
+        # The ceiling must cut the run partway so the ORDER decides who gets
+        # served. Against an instant fake a wall-clock ceiling cannot, so the
+        # provider burns real time on the two fetches a day's rows genuinely
+        # need. The book cache is keyed on ADDRESS alone and both days share
+        # the two fixture addresses, so `book()` fires twice; the flow cache is
+        # keyed on (address, window), so `external_flow` fires once per
+        # address per day -- four times. At 0.2s each that is 2*0.2 + 4*0.2 =
+        # 1.2s of forced work against a 0.7s ceiling: one day's rows fit
+        # (0.2*2 books + 0.2*2 flows = 0.8s, whose last fetch passes the
+        # deadline check at 0.6s), the other day's first uncached fetch meets
+        # the deadline and defers. Which day got served is then purely the
+        # order under test.
+        class SlowProvider(FakeProvider):
+            def book(self, address):
+                time.sleep(0.2)
+                return super().book(address)
+
+            def external_flow(self, address, since, until):
+                time.sleep(0.2)
+                return super().external_flow(address, since, until)
+
+        slow = SlowProvider(books, spot, specs)
+        report = resolve_due(journal, slow, observe_at,
+                             max_resolve_seconds=0.7)
+        assert 0 < report.resolved < 12, (
+            f"resolved {report.resolved}; the ceiling was meant to cut the run "
+            f"partway so the order decides who gets served -- retune the pause"
+        )
+
+        model_rows = journal.scored(DISTRIBUTION_VERSION, VARIANT_MODEL)
+        fresh = [r for r in model_rows if not r["stale_resolution"]]
+        day2 = (now + timedelta(hours=24)).date().isoformat()
+        assert fresh, (
+            "the run had budget for several rows and every salvageable row was "
+            "due; under the fixed order at least some of them must be scored "
+            "non-stale before any ceiling is spent on the hopeless backlog"
+        )
+        assert all(r["observation_day"] == day2 for r in fresh)
+        # And nothing is lost: whatever the ceiling deferred is still due.
+        assert len(journal.due(observe_at)) == 12 - report.resolved
         journal.close()
 
 
