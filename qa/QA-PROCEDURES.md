@@ -12,11 +12,35 @@ Every layer below was added because something got through the ones above it.
 | 3 | Executable specs (Gherkin) | included in gate 1 | yes |
 | 4 | Audit reproducers | `AUDIT_REPRO=1 pytest polymarket_bot/tests/audit -q` | yes |
 | 5 | Mutation check | `python qa/mutation_check.py` | yes |
+| 5b | Mutation check, risk engine | `python qa/mutation_check.py --project risk` | yes |
 | 6 | Chaos drills | `python -m polymarket_bot.main --mode chaos` | yes |
 | 7 | Lint (bug rules only) | `ruff check polymarket_bot` | review, not a hard block |
 | 8 | Dependency audit | `pip-audit` | review |
 
-Run all of them: `bash qa/run_all.sh`.
+Install the tooling first, then run all of them:
+
+```bash
+pip install -r qa/requirements-dev.txt
+bash qa/run_all.sh
+```
+
+**The install line is not boilerplate.** Until 2026-07-31 this table listed
+`pytest --cov` as a blocking gate while `pytest-cov` was installed nowhere and
+declared in no manifest, so gates 1, 2 and 5 could not run — and, worse, none
+of the three said why. Gate 1 died with argparse's `unrecognized arguments:
+--cov`, which reads as a typo in `run_all.sh`. Gate 5 passes `--no-cov`, so it
+failed identically and printed `baseline (unmutated suite must be green):
+FAILED` — a claim about the test suite, which was green, and which sends
+whoever ran it to debug tests that were fine. Three of eight documented gates
+unrunnable and misdiagnosed, in a file whose subject is how this codebase is
+verified.
+
+Both are now fixed at the cause rather than the symptom: `run_all.sh` checks
+for the plugin up front and refuses with the install command instead of
+producing three false failures, and `mutation_check.py` only passes `--no-cov`
+when the plugin that defines it is present (it is a speed measure, so dropping
+it changes nothing about what the check measures). With the plugin absent,
+gate 5 now runs clean: **33/33 mutants killed**.
 
 ## Why each layer exists
 
@@ -52,9 +76,32 @@ at the modules that guard capital rather than run repo-wide — a single
 whole-repo score is the least actionable number in testing, and a full `mutmut`
 run takes hours. A survivor is a **test gap**, not a code bug.
 
-Current: **13/13 killed** across `risk.py`, `fees.py`, `rewards.py`, `clob.py`,
-`ledger.py`, `models.py`. This layer found F-009 (four survivors in the
-safety module, including "pause no longer stops trading").
+Two mutant sets, run against their own suites: **49** for `polymarket_bot`
+(`risk.py`, `fees.py`, `rewards.py`, `clob.py`, `ledger.py`, `models.py`,
+`fade.py`, `portfolio.py`, `marketmaker.py`, `telegram_control.py`) and **16**
+for `risk_engine`. `--project bot` or `--project risk` runs one half. This
+layer found F-009 in the bot (four survivors in the safety module, including
+"pause no longer stops trading").
+
+The `risk_engine` half came out of a **systematic** AST sweep rather than a
+hand-written list — every comparison, arithmetic operator and numeric constant
+in a module, one at a time — which is a different instrument from the pointed
+mutants above and finds different things. What it found was rarely a wrong
+line; it was a fixture that made a wrong line invisible:
+
+| The sweep asked | The fixture answered |
+|---|---|
+| is `elapsed = now - started` right? | `FakeClock` started at 0.0, where `-` and `+` agree. `time.monotonic()` counts from boot, so the mutant aborts every real run in its first iteration. |
+| is `size - mmr * \|size\|` right? | every test book had `\|size\| = 1`, where `*` and `/` agree. |
+| does `_tier_consistent` iterate? | the fixture's tier boundary was $150M and every book was $100k–$500k, so the loop exited on its first pass. |
+| does the `no_external_flow` cohort filter? | no test ever selected that cohort, so inverting it changed nothing. |
+
+The mutants that survived and **cannot** be killed are listed in the source
+with the measurement that proved them equivalent, rather than left in the score
+as gaps that do not exist.
+
+Re-run the sweep (not part of any gate — it takes tens of minutes per module)
+with `scripts/`-free ad-hoc tooling; what is committed is the distilled result.
 
 **6. Chaos drills.** Failure injection against the live object graph: WS
 outage, corrupt feed, desync, loss breach, losing streak. Verifies the system

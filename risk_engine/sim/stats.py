@@ -1,0 +1,402 @@
+"""Interval estimation and scoring rules.
+
+§2.5 forbids ever returning a point estimate without an interval, and §4
+makes that unconstructible in the type system. This module supplies the
+intervals.
+
+Wilson intervals are used for probabilities rather than the Wald
+(`p +- z sqrt(p(1-p)/n)`) interval, because the quantity most often reported
+here is a small liquidation probability, and Wald intervals around small p
+famously extend below zero and undercover.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+from scipy import stats
+
+Z95 = 1.959963984540054
+
+
+def wilson_interval(successes: int, n: int, z: float = Z95) -> tuple[float, float]:
+    """Two-sided Wilson score interval for a binomial proportion."""
+    if n <= 0:
+        raise ValueError("n must be positive")
+    p = successes / n
+    denom = 1.0 + z * z / n
+    centre = (p + z * z / (2 * n)) / denom
+    half = z * np.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
+    return float(max(0.0, centre - half)), float(min(1.0, centre + half))
+
+
+def wilson_half_width(successes: int, n: int, z: float = Z95) -> float:
+    lo, hi = wilson_interval(successes, n, z)
+    return 0.5 * (hi - lo)
+
+
+def paths_needed_for_half_width(p: float, half_width: float, z: float = Z95) -> int:
+    """A path count whose interval half-width at probability `p` meets the target.
+
+    Sufficient, not provably minimal: the width depends on the integer
+    success count, so rounding `p * n` makes it very slightly non-monotone in
+    `n` and a handful of smaller counts may also fit. Sufficiency is the
+    property that matters -- it is what stops the engine returning a number
+    that violates §2.5.
+
+    §2.5 requires the half-width on P(liq) to stay under 2 pp. §2.6 says to
+    cut paths when the latency budget is missed. Those conflict, and this
+    function is where the conflict is resolved in favour of §2.5: it returns
+    the floor below which paths must not be cut, whatever the clock says
+    (OPEN-QUESTIONS D1).
+    """
+    if not 0.0 <= p <= 1.0:
+        raise ValueError("p must be a probability")
+    if half_width <= 0:
+        raise ValueError("half_width must be positive")
+    p = min(max(p, 1e-4), 1 - 1e-4)
+
+    # The normal approximation is a starting guess, not the answer: at small p
+    # it understates n, and returning a count whose actual Wilson width still
+    # exceeds the target would break the one rule §2.5 is unambiguous about.
+    # The Wilson half-width is monotone decreasing in n, so double until it
+    # fits and then bisect for the smallest n that does.
+    def fits(n: int) -> bool:
+        return wilson_half_width(round(p * n), n, z) <= half_width
+
+    n = max(2, int(np.ceil(z * z * p * (1 - p) / (half_width * half_width))))
+    if not fits(n):
+        lo = n
+        hi = n * 2
+        while not fits(hi):
+            lo, hi = hi, hi * 2
+            if hi > 1 << 34:  # pragma: no cover - unreachable for sane targets
+                raise ValueError(f"half_width {half_width} unreachable at p={p}")
+        while lo + 1 < hi:
+            mid = (lo + hi) // 2
+            if fits(mid):
+                hi = mid
+            else:
+                lo = mid
+        n = hi
+    return n
+
+
+def bootstrap_ci(
+    samples: np.ndarray,
+    statistic,
+    rng: np.random.Generator,
+    n_boot: int = 400,
+    alpha: float = 0.05,
+) -> tuple[float, float]:
+    """Percentile bootstrap interval for an arbitrary statistic."""
+    x = np.asarray(samples, dtype=np.float64)
+    n = x.size
+    if n == 0:
+        raise ValueError("cannot bootstrap an empty sample")
+    idx = rng.integers(0, n, size=(n_boot, n))
+    vals = np.array([statistic(x[i]) for i in idx])
+    lo, hi = np.quantile(vals, [alpha / 2, 1 - alpha / 2])
+    return float(lo), float(hi)
+
+
+def value_at_risk(losses_or_pnl: np.ndarray, level: float = 0.95) -> float:
+    """VaR as a positive loss number at `level` (0.95 -> the 5% worst tail)."""
+    pnl = np.asarray(losses_or_pnl, dtype=np.float64)
+    return float(-np.quantile(pnl, 1.0 - level))
+
+
+def conditional_value_at_risk(pnl: np.ndarray, level: float = 0.95) -> float:
+    """Mean loss conditional on being in the worst (1 - level) tail, positive."""
+    x = np.asarray(pnl, dtype=np.float64)
+    cutoff = np.quantile(x, 1.0 - level)
+    tail = x[x <= cutoff]
+    if tail.size == 0:  # pragma: no cover - only with a degenerate sample
+        return float(-cutoff)
+    return float(-tail.mean())
+
+
+def tail_size(n: int, level: float = 0.95) -> int:
+    """How many of `n` samples make up the worst (1 - level) tail."""
+    return max(1, round((1.0 - level) * n))
+
+
+def conditional_value_at_risk_rows(pnl: np.ndarray, level: float = 0.95) -> np.ndarray:
+    """CVaR of every row of a 2-D sample, as positive losses.
+
+    Exists for the bootstrap in `pre_trade_delta`, where the scalar version
+    called in a Python loop dominated the §2.6 latency budget: 200
+    replicates x 2 books was 166 ms of a 300 ms allowance, because each call
+    fully sorted 20 000 numbers. `np.partition` finds the tail in linear time
+    and does every replicate in one pass.
+
+    Selects exactly the `tail_size(n)` smallest values, so it can differ
+    marginally from the quantile-and-mask scalar version when the sample has
+    ties on the cutoff. `test_pre_trade_delta.py` pins the two together.
+    """
+    x = np.asarray(pnl)
+    if x.ndim != 2:
+        raise ValueError(f"expected a 2-D sample, got {x.shape}")
+    k = tail_size(x.shape[1], level)
+    part = np.partition(x, k - 1, axis=1)[:, :k]
+    # Accumulate in float64 even when the input is float32: the caller may
+    # narrow the sample to make the partition cheaper, but the tail mean
+    # itself should not lose digits.
+    return -part.mean(axis=1, dtype=np.float64)
+
+
+@dataclass(frozen=True, slots=True)
+class PredictiveDistribution:
+    """A predicted distribution stored as a quantile function.
+
+    Quantiles rather than raw samples because this is what goes into the
+    calibration journal (§3.4): 1001 numbers per prediction is a row a
+    database can hold for years, 20 000 is not, and every metric §3.3 asks
+    for -- PIT, CRPS, VaR breach -- is computable from the quantile function.
+    """
+
+    levels: np.ndarray
+    values: np.ndarray
+
+    def __post_init__(self) -> None:
+        if self.levels.shape != self.values.shape:
+            raise ValueError("levels and values must have the same shape")
+        # Finiteness before monotonicity (audit A-07): NaN makes every
+        # comparison False, so a NaN quantile function would otherwise pass
+        # the non-decreasing check and poison the calibration journal.
+        if not np.isfinite(self.values).all():
+            raise ValueError("quantile values must be finite")
+        if np.any(np.diff(self.values) < 0):
+            raise ValueError("quantile function must be non-decreasing")
+
+    @classmethod
+    def from_samples(cls, samples: np.ndarray, n_levels: int = 1001) -> PredictiveDistribution:
+        levels = np.linspace(0.0, 1.0, n_levels)
+        return cls(levels=levels, values=np.quantile(np.asarray(samples, float), levels))
+
+    def quantile(self, q: float | np.ndarray) -> float | np.ndarray:
+        return np.interp(q, self.levels, self.values)
+
+    def cdf_interval(self, x: float) -> tuple[float, float]:
+        """(P(X < x), P(X <= x)) -- distinct exactly where the law has an atom.
+
+        The liquidation model writes a wiped account to exactly zero equity
+        (§1.6), so the predicted equity-change distribution carries a mass
+        point at total loss. A single-valued CDF cannot represent that
+        honestly; both one-sided limits can.
+        """
+        v, lv = self.values, self.levels
+        il = int(np.searchsorted(v, x, side="left"))
+        ir = int(np.searchsorted(v, x, side="right"))
+        if il < ir:
+            # x sits on a flat run of the quantile function: an atom.
+            return float(lv[il]), float(lv[ir - 1])
+        if il == 0:
+            return 0.0, 0.0
+        if il == len(v):
+            return 1.0, 1.0
+        t = (x - v[il - 1]) / (v[il] - v[il - 1])
+        c = float(lv[il - 1] + t * (lv[il] - lv[il - 1]))
+        return c, c
+
+    def cdf(self, x: float) -> float:
+        """Midpoint CDF; for atom-aware work use `cdf_interval` or `pit`."""
+        lo, hi = self.cdf_interval(x)
+        return 0.5 * (lo + hi)
+
+    def pit(self, actual: float, u: float) -> float:
+        """§3.3: randomized probability integral transform.
+
+        Uniform on [0, 1] under a correctly calibrated model *including*
+        models whose predicted distribution carries atoms. The naive
+        `cdf(actual)` is not: every realised liquidation maps to the same
+        deterministic value, and the KS test then rejects a perfectly
+        calibrated model with certainty (audit A-02, reproduced at
+        p = 1e-104). `u` must be an independent U(0,1) draw; the resolver
+        derives it deterministically from the prediction id so every journal
+        row stays reproducible.
+        """
+        if not 0.0 <= u <= 1.0:
+            raise ValueError(f"u must be in [0, 1], got {u}")
+        lo, hi = self.cdf_interval(actual)
+        return lo + u * (hi - lo)
+
+    def crps(self, actual: float) -> float:
+        """Continuous ranked probability score, lower is better.
+
+        The pinball identity `CRPS = 2 * integral_0^1 QL_tau dtau`, integrated
+        EXACTLY for this representation — which the previous trapezoid was
+        not, though its docstring said so.
+
+        The integrand is `(1{x < q(tau)} - tau) * (q(tau) - x)`. On a segment
+        where `q` is linear that is a product of two affine functions of
+        `tau`, i.e. a QUADRATIC, and the trapezoid rule is exact only for
+        linear integrands. Measured on a forecast whose quantile function is
+        exactly representable (uniform, `q(tau) = tau`, so no representation
+        error at all): the error against the closed form was 3.33e-3 at 11
+        levels, 3.33e-5 at 101, 3.33e-7 at the shipped 1001 and 3.33e-9 at
+        10001 — exactly 100x per 10x refinement, the signature of a
+        second-order method, and the residual is the integrator's alone.
+        4e-6 relative at the shipped grid.
+
+        Small, and not obviously harmless: `crps_beats_baseline_a/b` is a bare
+        `<` between two means with no tolerance, the value is written once to
+        an immutable journal row, and the bias does not cancel between model
+        and baseline because it depends on the shape of each distribution.
+        Exactness costs a few lines on a cold path (once per resolution, not
+        per path), so there is no reason to carry an approximation here.
+
+        Simpson is exact for quadratics, so each segment integrates exactly
+        provided the indicator does not flip inside it. Where `q` crosses
+        `actual` the segment is split at the crossing and each half done
+        separately, which is the only place the integrand is not smooth.
+        """
+        tau, q = self.levels, self.values
+        if tau.size < 2:
+            return 0.0
+        a, b, qa, qb = tau[:-1], tau[1:], q[:-1], q[1:]
+
+        def _simpson(lo, hi, q_lo, q_hi):
+            """Exact for the quadratic pinball integrand on one sub-interval.
+
+            The indicator is read at the MIDPOINT, which is constant across
+            any sub-interval the caller has already split at the crossing —
+            and avoids the boundary case where `q == actual` exactly, where
+            `<` would have to pick a side.
+            """
+            mid_q = 0.5 * (q_lo + q_hi)
+            mid_t = 0.5 * (lo + hi)
+            c = np.where(actual < mid_q, 1.0, 0.0)
+            g_lo = (c - lo) * (q_lo - actual)
+            g_mid = (c - mid_t) * (mid_q - actual)
+            g_hi = (c - hi) * (q_hi - actual)
+            return (hi - lo) / 6.0 * (g_lo + 4.0 * g_mid + g_hi)
+
+        total = _simpson(a, b, qa, qb)
+
+        # Segments where `q` passes through `actual`: the indicator flips
+        # inside them, so one Simpson over the whole segment integrates the
+        # wrong function on one side of the crossing.
+        span = qb - qa
+        crossing = np.nonzero((qa - actual) * (qb - actual) < 0.0)[0]
+        for i in crossing:
+            t_star = a[i] + (actual - qa[i]) * (b[i] - a[i]) / span[i]
+            total[i] = (
+                _simpson(a[i], t_star, qa[i], actual)
+                + _simpson(t_star, b[i], actual, qb[i])
+            )
+        return float(2.0 * total.sum())
+
+    def var(self, level: float = 0.95) -> float:
+        return float(-self.quantile(1.0 - level))
+
+    def cvar(self, level: float = 0.95) -> float:
+        mask = self.levels <= (1.0 - level)
+        if mask.sum() < 2:  # pragma: no cover - only for absurdly coarse grids
+            return float(-self.quantile(1.0 - level))
+        return float(-np.trapezoid(self.values[mask], self.levels[mask]) / (1.0 - level))
+
+
+def ks_uniformity(pit_values: np.ndarray) -> tuple[float, float]:
+    """Kolmogorov-Smirnov statistic and p-value against U(0, 1).
+
+    The p-value assumes independent observations. Shadow observations on the
+    same calendar day share one market and are strongly dependent, so this
+    p-value is anti-conservative and must be read alongside the day-clustered
+    version (OPEN-QUESTIONS B1).
+    """
+    x = np.asarray(pit_values, dtype=np.float64)
+    res = stats.kstest(x, "uniform")
+    return float(res.statistic), float(res.pvalue)
+
+
+def _pooled_mean_and_cluster_se(groups: list[np.ndarray]) -> tuple[float, float]:
+    """Pooled mean and its cluster-robust (sandwich) standard error.
+
+    Pooled rather than the unweighted average of per-cluster means, because
+    §0.3 asks about THE breach rate over the observations, and the two differ
+    whenever days carry different numbers of addresses.
+    """
+    n = sum(g.size for g in groups)
+    m = len(groups)
+    if n == 0 or m < 2:
+        return float("nan"), float("nan")
+    theta = sum(float(g.sum()) for g in groups) / n
+    resid = np.array([float(g.sum()) - g.size * theta for g in groups])
+    var = (m / (m - 1.0)) * float((resid**2).sum()) / (n**2)
+    return theta, float(np.sqrt(max(var, 0.0)))
+
+
+def clustered_mean_ci(
+    values: np.ndarray,
+    cluster_ids: np.ndarray,
+    rng: np.random.Generator,
+    n_boot: int = 2000,
+    alpha: float = 0.05,
+) -> tuple[float, float]:
+    """Cluster-robust interval on a mean, STUDENTISED.
+
+    §0.3 and §3.3 ask for an interval around the VaR breach rate. The binomial
+    one assumes independent observations, and 300 addresses observed on the
+    same day are not independent -- one market move drives all of them -- so
+    days are resampled whole (OPEN-QUESTIONS B1).
+
+    Resampling days is necessary and was not sufficient. This was a PERCENTILE
+    bootstrap over days, and a percentile bootstrap undercovers badly when the
+    clusters are few, which 21 days is. Measured against a beta-binomial
+    generator whose day-level correlation is controlled, at 200 addresses/day,
+    nominal 95%:
+
+    | ICC  | percentile (was) | studentised (now) |
+    |------|------------------|-------------------|
+    | 0.00 |  94.8% ±0.63pp   |  95.2% ±0.69pp    |
+    | 0.05 |  92.0% ±2.06pp   |  94.8% ±2.55pp    |
+    | 0.10 |  89.0% ±2.74pp   |  94.0% ±3.92pp    |
+    | 0.20 |  82.8% ±3.58pp   |  94.5% ±7.31pp    |
+    | 0.40 |  79.2% ±4.94pp   |  91.2% ±27.83pp   |
+
+    The harness is calibrated by the row this repository already published:
+    the naive Wilson interval covers 23.5% at ICC 0.20 here, against B1's
+    recorded 77.7% rejection rate for a correct model.
+
+    Two consequences, and the second is the worse one. A gate criterion read
+    off an interval covering 83% rejects a correctly calibrated model about
+    17% of the time instead of 5%. And B1's window arithmetic reads this
+    interval's WIDTH: at ICC 0.20 the honest half-width is 7.31pp, not the
+    3.58pp the percentile version reported, so a window sized off the old
+    number looks informative and is not -- §10's forbidden direction, reached
+    by arithmetic.
+
+    B1 records exactly this lesson, learned on the OTHER interval: "the
+    day-clustered percentile bootstrap covers 43% at 14 days ... Both were
+    discarded. The shipped intervals invert the test." That fix went into
+    `clustering.py`'s ICC estimator and never reached this one.
+
+    The width at ICC 0.40 is not a defect of the interval. 27pp says a
+    21-day window cannot resolve the breach rate at that clustering, which is
+    what B1's power table independently concludes (~180 days).
+    """
+    v = np.asarray(values, dtype=np.float64)
+    ids = np.asarray(cluster_ids)
+    uniq = np.unique(ids)
+    if uniq.size < 2:
+        raise ValueError("need at least two clusters to bootstrap over them")
+    groups = [v[ids == u] for u in uniq]
+    theta, se = _pooled_mean_and_cluster_se(groups)
+    if not np.isfinite(se) or se <= 0.0:
+        # Every cluster identical -- no variation to studentise against, and
+        # a bootstrap over identical clusters says the same. A degenerate
+        # point interval is the honest answer, not a fabricated width.
+        return float(theta), float(theta)
+    m = len(groups)
+    ts = np.empty(n_boot)
+    for b in range(n_boot):
+        pick = rng.integers(0, m, size=m)
+        tb, sb = _pooled_mean_and_cluster_se([groups[i] for i in pick])
+        ts[b] = (tb - theta) / sb if sb > 0 else 0.0
+    # Note the crossing: the UPPER quantile of the t distribution gives the
+    # LOWER endpoint. Getting this backwards inverts the interval and is
+    # silent, because a symmetric-looking result stays symmetric-looking.
+    hi_t, lo_t = np.quantile(ts, [1.0 - alpha / 2, alpha / 2])
+    return float(theta - hi_t * se), float(theta - lo_t * se)

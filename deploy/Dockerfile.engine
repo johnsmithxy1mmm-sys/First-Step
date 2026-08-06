@@ -1,0 +1,81 @@
+# Risk engine (§8) — the Python service and the shadow harness.
+#
+# One image serves both, because they are the same code with different entry
+# points and the shadow jobs must run the *exact* model the service serves.
+# Two images drift, and a drift here is silent: the journal would accumulate
+# predictions attributed to a version that never produced them, which is the
+# one thing §3.3's counter cannot survive.
+#
+# Build from the repository root:
+#   docker build -f deploy/Dockerfile.engine -t hl-risk/engine .
+FROM python:3.11-slim
+
+# scipy wheels cover manylinux, so no toolchain is needed. Not installing one
+# keeps the image free of a compiler, which is a smaller attack surface than
+# it sounds for a service that parses untrusted JSON.
+WORKDIR /app
+
+COPY risk_engine/requirements.txt risk_engine/requirements.txt
+# `--retries` and `--timeout` because the default pair (5 retries at 15 s) is
+# tuned for a fast link and this build has to survive a slow one. Observed
+# 2026-08-04: scipy's wheel downloaded fine while `/simple/psycopg/` timed out
+# five times in a row, and pip then reported
+#
+#     Could not find a version that satisfies the requirement psycopg<4,>=3.1
+#     (from versions: none)
+#
+# which reads as "that package does not exist" and sends whoever is deploying
+# to edit requirements.txt. "from versions: none" means the INDEX was never
+# fetched; the requirement is fine. Three shadow-stack images build in
+# parallel and share the uplink, so this is the ordinary case on a domestic
+# connection, not an unlucky one.
+#
+# Retries are cheap here and a failed build is not: it leaves the deployment
+# on the previous image with no indication that the code it is running is not
+# the code that was checked out.
+RUN pip install --no-cache-dir --retries 10 --timeout 60 \
+    -r risk_engine/requirements.txt
+
+COPY risk_engine/ risk_engine/
+
+# The recorded out-of-band findings (C2's 12-hour basis series, C5's testnet
+# funding tick). Not documentation despite where it lives: `market/verify.py`
+# READS this file, and `DEFAULT_FINDINGS_PATH` resolves it relative to the
+# package's own parent — i.e. /app/docs/hl-risk/VERIFIED.json.
+#
+# Missing until 2026-08-04, and the failure was silent by design: a missing
+# findings file is the normal case for a fresh checkout, so `load_findings`
+# returns an empty dict rather than raising. Every containerised verification
+# run therefore reported C2 and C5 as unconfirmed while the measurements that
+# closed them sat in the repository, unreadable from inside. The mechanism was
+# built, tested, and inert on the one path an operator actually uses.
+COPY docs/hl-risk/VERIFIED.json docs/hl-risk/VERIFIED.json
+
+# Non-root. The engine writes nothing except logs; the journal lives in
+# Postgres or on a mounted volume owned by the same uid.
+RUN useradd --create-home --uid 10001 risk && chown -R risk:risk /app
+USER risk
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    RISK_ENGINE_WORKERS=2
+
+EXPOSE 8787
+
+# 0.0.0.0 is required inside a container, and `serve` refuses that bind
+# without RISK_SERVICE_TOKEN. That refusal is the point: an image that
+# silently served an unauthenticated engine to the compose network would be
+# the same defect as exposing it on a host interface.
+# Probes the container's own HOSTNAME, not 127.0.0.1 -- the same fix the
+# backend image already carries. A loopback-only bind answers a 127.0.0.1
+# probe perfectly well from inside the container while every peer on the
+# compose network gets ECONNREFUSED, so the check reported `healthy` for a
+# container nothing could reach. `serve` permits a loopback bind (it refuses
+# only a non-loopback one without a token), so an overridden `command` can
+# still produce exactly that, and the healthcheck has to be able to see it.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
+    CMD python3 -c "import socket,urllib.request,sys; \
+sys.exit(0 if urllib.request.urlopen('http://'+socket.gethostname()+':8787/health', timeout=4).status==200 else 1)"
+
+ENTRYPOINT ["python3", "-m", "risk_engine.service"]
+CMD ["--host", "0.0.0.0", "--port", "8787"]

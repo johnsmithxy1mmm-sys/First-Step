@@ -1,0 +1,352 @@
+# The read-only stack (Phases 1-3, 5) plus the shadow harness.
+#
+#   docker compose -f deploy/docker-compose.yml up -d --build
+#
+# Nothing here can move funds. There is no execution path in this codebase:
+# that is Phase 4, and Phase 4 is gated on shadow validation (§3.3).
+#
+# Run from the repository root -- the build contexts are the repo, because
+# the engine image needs risk_engine/ and the schema it ships with.
+#
+# Required in deploy/.env (see .env.example):
+#   RISK_SERVICE_TOKEN   shared secret between backend and engine
+#   POSTGRES_PASSWORD    journal database
+name: hl-risk
+
+x-engine-image: &engine-image
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile.engine
+  image: hl-risk/engine:latest
+
+services:
+  engine:
+    <<: *engine-image
+    restart: unless-stopped
+    environment:
+      # The engine refuses to bind 0.0.0.0 without this, which is what stops
+      # a compose network from quietly getting an unauthenticated engine.
+      RISK_SERVICE_TOKEN: ${RISK_SERVICE_TOKEN:?set RISK_SERVICE_TOKEN in deploy/.env}
+      RISK_ENGINE_WORKERS: ${RISK_ENGINE_WORKERS:-2}
+      # Present so the documented one-off commands actually run:
+      #
+      #   docker compose run --rm --entrypoint python3 engine \
+      #     -m risk_engine.shadow progress
+      #
+      # NO `--journal`, and that is the whole point of this variable. It is
+      # read by `cli.py::_journal_arg` INSIDE the container, where it is in
+      # scope. Writing it on the command line cannot work and does not fail
+      # honestly: the operator's shell expands it first, so bash turns
+      # `"$$SHADOW_DSN"` into `<pid>SHADOW_DSN` and PowerShell turns
+      # `"$env:SHADOW_DSN"` into an empty string. PowerShell is the lucky
+      # case -- argparse refuses a flag with no value. bash is not: any
+      # string that does not start with `postgres://` is taken as a SQLite
+      # PATH (backends.py:184), so the command silently creates an empty
+      # database and prints `0 days, 0 addresses, 0 observations` -- a
+      # well-formed, confident, entirely wrong answer that reads as "the §3.3
+      # gate has not advanced" when it means "you queried a file that did not
+      # exist a moment ago". This comment printed that form until now, while
+      # deploy/README.md beside it already documented the fix.
+      #
+      # `--entrypoint python3` is not optional. This image's ENTRYPOINT is
+      # `python3 -m risk_engine.service`, so trailing arguments are APPENDED
+      # to it: without the override the line above runs the serving process
+      # with `-m risk_engine.shadow progress` as unrecognised arguments and
+      # exits 2 on an argparse usage message. This comment documented the
+      # broken form while fixing the missing variable beside it -- one
+      # command, two independent reasons it could not run, and correcting
+      # either alone leaves it just as unrunnable.
+      #
+      # deploy/README.md printed exactly that and it could not work. The DSN
+      # was defined only on the two shadow services, so `$SHADOW_DSN` expanded
+      # to empty in the operator's own shell and the command failed on a
+      # missing journal argument -- after the compose file had already refused
+      # for an unrelated missing token, which is the kind of stacked failure
+      # that reads as "the deployment is broken" rather than "one variable is
+      # unset". The serving path does not use it; the report commands do.
+      SHADOW_DSN: postgresql://${POSTGRES_USER:-risk}:${POSTGRES_PASSWORD:-}@journal:5432/${POSTGRES_DB:-shadow}
+      # B6: the tracked universe, comma-separated. Widening it is a sampling
+      # decision (record it in OPEN-QUESTIONS B6) that the calibration_sweeps
+      # census informs; making it config means the decision does not need a
+      # code change. BTC and ETH are mandatory (§2.1).
+      HL_UNIVERSE: ${HL_UNIVERSE:-BTC,ETH,SOL,HYPE}
+    command: ["--host", "0.0.0.0", "--port", "8787", "${ENGINE_MODE:---fixture}"]
+    # No `ports:`. The engine is reachable only from this network; the
+    # backend is the sole consumer and owns rate limiting (§5.3). Publishing
+    # 8787 would put an engine with no rate limit of its own on a host
+    # interface, which the token protects but does not justify.
+    expose:
+      - "8787"
+    mem_limit: 2g
+
+  backend:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+    image: hl-risk/backend:latest
+    restart: unless-stopped
+    environment:
+      PORT: 8080
+      # Without this the backend binds 127.0.0.1 (its default, which is the
+      # right one for a laptop) and is then reachable only from inside its own
+      # container: `web` gets ECONNREFUSED on every request and renders §6's
+      # "risk engine unavailable" for a backend that is running perfectly.
+      #
+      # Nothing surfaced it. The healthcheck passed because it runs INSIDE the
+      # container against loopback, so compose reported `healthy` for a
+      # service no client could reach; the engine's own logs showed only
+      # /health, and the backend's showed only remoteAddress 127.0.0.1. Three
+      # green signals and one dead path.
+      #
+      # The engine avoids this by taking `--host 0.0.0.0` explicitly in its
+      # `command:` below, and refuses that bind without a token. The backend
+      # is not published to the host either (`expose`, not `ports`), so the
+      # compose network is the boundary here.
+      HOST: 0.0.0.0
+      RISK_SERVICE_URL: http://engine:8787
+      RISK_SERVICE_TOKEN: ${RISK_SERVICE_TOKEN:?set RISK_SERVICE_TOKEN in deploy/.env}
+    depends_on:
+      engine:
+        condition: service_started
+    # Deliberately `service_started`, not `service_healthy`. §6 says an
+    # unreachable engine is a state the backend reports, not a reason for it
+    # to be absent -- a user opening the page during an engine outage must
+    # get "no value available", and they cannot get that from a backend that
+    # refused to start.
+    expose:
+      - "8080"
+    mem_limit: 512m
+
+  web:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.web
+      args:
+        BACKEND_URL: http://backend:8080
+    image: hl-risk/web:latest
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+    mem_limit: 512m
+
+  journal:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-risk}
+      POSTGRES_DB: ${POSTGRES_DB:-shadow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}
+    volumes:
+      - journal-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-risk} -d ${POSTGRES_DB:-shadow}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    expose:
+      - "5432"
+    mem_limit: 1g
+
+  # The two shadow jobs (§3.3). Under the `shadow` profile so the read-only
+  # stack comes up without them: starting the clock is a decision, not a
+  # side effect of `up`. Moving the distribution resets the window to zero, so
+  # every question that moves it has to be settled before days accumulate; the
+  # list of those questions lives in risk_engine/README.md under "Before the
+  # shadow clock starts" and nowhere else. This comment used to enumerate it
+  # (A1, A8, C1, C2, C5) and by 2026-07-30 it enumerated a list that README
+  # records as empty -- so an operator who followed the pointer got the
+  # opposite answer from the file it pointed at, and the safe-looking reading
+  # ("still blocked, do not start") is the one that quietly costs weeks.
+  shadow-snapshot:
+    <<: *engine-image
+    profiles: ["shadow"]
+    restart: unless-stopped
+    # The image's HEALTHCHECK polls http://<self>:8787/health, which is the
+    # SERVICE's endpoint. These jobs are cron loops that serve no HTTP, so the
+    # inherited check can never pass: both containers report `unhealthy` from
+    # the moment they start and for as long as they run correctly.
+    #
+    # Worse than cosmetic. `docker compose ps` is where an operator looks
+    # first, and a column that says `unhealthy` for a healthy container
+    # teaches them to ignore the column — so the one time it means something,
+    # it reads the same. Observed 2026-08-04: both shadow jobs `unhealthy`
+    # while the snapshot had just written 1481 predictions.
+    #
+    # Disabled rather than replaced. A cron loop that sleeps 23 of every 24
+    # hours has no cheap liveness signal worth the name, and inventing one
+    # that passes while asleep would be the same lie in the other direction.
+    # Absence of a signal is honest; a permanently false one is not. The
+    # failure escalation these jobs DO have is the consecutive-failure counter
+    # in `command:` above, which exits non-zero and shows up as a restart.
+    healthcheck:
+      disable: true
+    depends_on:
+      journal:
+        condition: service_healthy
+    environment:
+      SHADOW_DSN: postgresql://${POSTGRES_USER:-risk}:${POSTGRES_PASSWORD}@journal:5432/${POSTGRES_DB:-shadow}
+      SHADOW_INTERVAL_S: ${SHADOW_INTERVAL_S:-86400}
+      SHADOW_ARGS: ${SHADOW_ARGS:---fixture}
+      HL_UNIVERSE: ${HL_UNIVERSE:-BTC,ETH,SOL,HYPE}
+    volumes:
+      - ./addresses.json:/app/addresses.json:ro
+    entrypoint: ["/bin/sh", "-c"]
+    # `sleep` for the REMAINDER of the interval, not the whole of it. The naive
+    # form -- run, then sleep 86400 -- makes the period `run + 86400`, and a
+    # 500-address sweep is ~33 minutes at §5.3's 25% share (20 weight each,
+    # 1200/min budget). That drifts the snapshot 33 minutes later every day, so
+    # 21 snapshots need 21.5 calendar days, and the drift compounds silently
+    # against a gate measured in days.
+    #
+    # Consecutive failures are COUNTED and escalate to a non-zero exit. The
+    # previous `|| echo` swallowed every failure into a log line while the
+    # container stayed healthy and `restart: unless-stopped` never fired: a
+    # cron failing every day for three weeks looked exactly like one that
+    # worked. That is the same shape as the TRANSIENT-retried-forever defect
+    # B2 exists to prevent, one layer up. Three in a row is the threshold
+    # because a single failed sweep is genuinely worth retrying -- the venue
+    # rate-limits, containers restart -- and three days of them is not.
+    command:
+      - |
+        fails=0
+        while true; do
+          started=$$(date +%s)
+          if python3 -m risk_engine.shadow snapshot \
+               --journal "$$SHADOW_DSN" $$SHADOW_ARGS; then
+            fails=0
+          else
+            fails=$$((fails + 1))
+            echo "snapshot failed ($$fails consecutive)" >&2
+            if [ "$$fails" -ge 3 ]; then
+              echo "FATAL: $$fails consecutive snapshot failures; the shadow window is not advancing. Exiting so this is visible as a crash-looping container rather than a quiet log line." >&2
+              exit 1
+            fi
+          fi
+          elapsed=$$(( $$(date +%s) - started ))
+          remaining=$$(( SHADOW_INTERVAL_S - elapsed ))
+          [ "$$remaining" -lt 60 ] && remaining=60
+          sleep "$$remaining"
+        done
+    mem_limit: 2g
+
+  shadow-resolve:
+    <<: *engine-image
+    profiles: ["shadow"]
+    restart: unless-stopped
+    # The image's HEALTHCHECK polls http://<self>:8787/health, which is the
+    # SERVICE's endpoint. These jobs are cron loops that serve no HTTP, so the
+    # inherited check can never pass: both containers report `unhealthy` from
+    # the moment they start and for as long as they run correctly.
+    #
+    # Worse than cosmetic. `docker compose ps` is where an operator looks
+    # first, and a column that says `unhealthy` for a healthy container
+    # teaches them to ignore the column — so the one time it means something,
+    # it reads the same. Observed 2026-08-04: both shadow jobs `unhealthy`
+    # while the snapshot had just written 1481 predictions.
+    #
+    # Disabled rather than replaced. A cron loop that sleeps 23 of every 24
+    # hours has no cheap liveness signal worth the name, and inventing one
+    # that passes while asleep would be the same lie in the other direction.
+    # Absence of a signal is honest; a permanently false one is not. The
+    # failure escalation these jobs DO have is the consecutive-failure counter
+    # in `command:` above, which exits non-zero and shows up as a restart.
+    healthcheck:
+      disable: true
+    depends_on:
+      journal:
+        condition: service_healthy
+    environment:
+      SHADOW_DSN: postgresql://${POSTGRES_USER:-risk}:${POSTGRES_PASSWORD}@journal:5432/${POSTGRES_DB:-shadow}
+      SHADOW_INTERVAL_S: ${RESOLVE_INTERVAL_S:-1800}
+      RESOLVE_START_DELAY_S: ${RESOLVE_START_DELAY_S:-900}
+      SHADOW_ARGS: ${SHADOW_ARGS:---fixture}
+      HL_UNIVERSE: ${HL_UNIVERSE:-BTC,ETH,SOL,HYPE}
+    volumes:
+      - ./addresses.json:/app/addresses.json:ro
+    entrypoint: ["/bin/sh", "-c"]
+    # Hourly rather than daily, and that is not a duplicate of the snapshot
+    # cadence. A prediction resolves 24 h after it was made; checking once a
+    # day means a resolution can sit up to a day late, and the journal marks
+    # a late resolution stale and drops it from the gate (audit A-04). The
+    # window is the scarce thing here, not the API calls.
+    #
+    # RESOLVE_START_DELAY_S exists because 86400 is an exact multiple of 3600.
+    # Both containers start together and both sleep the REMAINDER of their
+    # interval, so they hold phase forever: without an offset the daily
+    # snapshot begins in the same second as one of these hourly runs, every
+    # single day, for the life of the deployment.
+    #
+    # Observed 2026-08-03, first restart after the shared pool landed. Both
+    # jobs wanted a bundle at once (~356 weight each under the corrected §5.3
+    # accounting) from one 300/min pool; the snapshot waited out its ceiling
+    # and exited, logging "another shadow job is holding the pool". That is
+    # §3.3's gate unreachable BY CONSTRUCTION -- the third time this project
+    # has produced that failure and the first time from scheduling rather
+    # than from rate-limit handling.
+    #
+    # Half an hour, and the direction of the offset is the load-bearing part:
+    # the RESOLVER yields, not the snapshot. A missed resolve is retried the
+    # next period and the row is still pending; a missed snapshot is a day of
+    # the 21 that cannot be recovered, because the prediction it would have
+    # written had to be made against that day's book.
+    #
+    # THE PERIOD AND THE OFFSET ARE BOUNDED BY THE STALENESS RULE, not chosen
+    # for tidiness. Three delays stack between a row coming due and its
+    # outcome being read, and their SUM must fit inside `stale_after_s` (2 h)
+    # or rows are dropped from §3.3 by the schedule alone -- no outage and no
+    # backlog required:
+    #
+    #     cadence      `due()` is snapshotted once at run start, so a row that
+    #                  comes due a second later waits a full period
+    #   + start delay  re-paid on EVERY container start, on top of the phase
+    #                  the loop already had
+    #   + ceiling      staleness is measured when the row is actually FETCHED,
+    #                  up to `max_resolve_seconds` into the run
+    #
+    # At 3600 + 1800 + 3000 that was 8400 s against a 7200 s bound. Measured
+    # on the live deployment 2026-08-04: 513 resolved observations, ZERO
+    # usable, the §3.3 window still at day 0 after days of running. Now
+    # 1800 + 900 + 3000 = 5700 s, inside the bound with 25 minutes to spare.
+    # `test_a_due_row_cannot_go_stale_before_a_resolve_run_can_reach_it`
+    # recomputes this from these literals, so moving either one re-checks the
+    # sum rather than quietly reopening the hole.
+    #
+    # Halving the period costs nothing that matters: a run with an empty queue
+    # spends one cached `spot` refresh and a database query, and the shadow
+    # pool is 300 weight/minute against roughly 22 per address.
+    #
+    # Same drift correction and failure escalation as the snapshot job, with a
+    # higher threshold: this runs 24x more often, so three consecutive misses
+    # is three hours rather than three days, and a rate-limited hour is not a
+    # reason to crash-loop. Twelve in a row is half a day of resolutions going
+    # nowhere -- past the point where a stale-resolution drop starts costing
+    # observations (audit A-04).
+    command:
+      - |
+        fails=0
+        echo "deferring the first resolve by $${RESOLVE_START_DELAY_S}s so the hourly cadence stays out of phase with the daily snapshot" >&2
+        sleep "$$RESOLVE_START_DELAY_S"
+        while true; do
+          started=$$(date +%s)
+          if python3 -m risk_engine.shadow resolve \
+               --journal "$$SHADOW_DSN" $$SHADOW_ARGS; then
+            fails=0
+          else
+            fails=$$((fails + 1))
+            echo "resolve failed ($$fails consecutive)" >&2
+            if [ "$$fails" -ge 12 ]; then
+              echo "FATAL: $$fails consecutive resolve failures (~12h). Predictions are being written and never resolved; resolutions collected late are marked stale and dropped from the gate (audit A-04)." >&2
+              exit 1
+            fi
+          fi
+          elapsed=$$(( $$(date +%s) - started ))
+          remaining=$$(( SHADOW_INTERVAL_S - elapsed ))
+          [ "$$remaining" -lt 30 ] && remaining=30
+          sleep "$$remaining"
+        done
+    mem_limit: 1g
+
+volumes:
+  journal-data:

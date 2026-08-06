@@ -1,12 +1,22 @@
 # Tooling config only — the package itself is run as `python -m polymarket_bot.main`.
 
 [tool.pytest.ini_options]
-testpaths = ["polymarket_bot/tests"]
+testpaths = ["polymarket_bot/tests", "risk_engine/tests"]
 # Audit reproducers are gated behind AUDIT_REPRO=1 (see tests/audit/conftest.py)
 # so a normal run stays fast; CI runs them explicitly.
 addopts = "-q"
 markers = [
     "slow: excluded from the fast pre-commit run",
+    # Wall-clock assertions. They measure the box as much as the code, so a
+    # contended runner turns them red with nothing changed -- measured: the
+    # §2.6 budget test passes on an idle four-core box and misses by 2x with
+    # all four cores busy. CI runs them in a non-blocking step so the branch
+    # does not fail on unrelated load; a plain `pytest risk_engine/tests`
+    # still runs them, because on a developer's machine they are meaningful.
+    # This is a quarantine, not a licence to soften one: the budget stays
+    # §2.6's 300 ms and OPEN-QUESTIONS D7 stays the honest record of it being
+    # missed at the book size §0 targets.
+    "load_sensitive: timing assertion; non-blocking in CI, still run locally",
 ]
 
 [tool.coverage.run]
@@ -57,3 +67,4 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "polymarket_bot/tests/*" = ["S105", "S106", "S107", "SLF001", "B017"]
+"risk_engine/tests/*" = ["S105", "S106", "S107", "SLF001", "B017"]

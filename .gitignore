@@ -14,3 +14,13 @@ polymarket_bot/config.yaml
 # Состояние бота: журнал сделок, снапшоты стаканов, кэш LLM, логи, локальный конфиг
 polymarket_bot/data/
 polymarket_bot/config.json
+
+# Node services (Phase 3)
+node_modules/
+services/backend/dist/
+apps/web/.next/
+apps/web/next-env.d.ts
+*.tsbuildinfo
+
+# Deployment secrets (template: deploy/.env.example)
+deploy/.env

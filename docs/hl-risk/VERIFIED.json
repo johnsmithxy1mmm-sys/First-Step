@@ -1,0 +1,69 @@
+{
+  "_comment": [
+    "Verifications made OUTSIDE a `verify` run, with the provenance needed to",
+    "distrust them. `risk_engine.market.verify` reads this file and reports",
+    "each entry as 'PASS (recorded)' -- never as a live result -- with its",
+    "date, network and originating command shown every time.",
+    "",
+    "Only add an entry for a question that genuinely cannot be answered inside",
+    "one run. C2 needs a basis series spanning hours; C5 needs a funded",
+    "account observed across an hourly funding tick. Anything a CLI run can",
+    "settle belongs in a check, not here: this file is a place where claims",
+    "can outlive their evidence, and every entry is a small bet that the",
+    "venue has not changed.",
+    "",
+    "Required on every entry: status, observed_utc, command, network, detail.",
+    "The loader refuses an entry missing any of them. `command` is how the",
+    "next person reproduces it, `observed_utc` is how it expires (90 days,",
+    "then it degrades to INCONCLUSIVE on its own), and `network` is what the",
+    "claim is actually about -- a testnet observation is evidence about",
+    "testnet, however good it is.",
+    "",
+    "A live check always outranks an entry here. If this run reaches a verdict",
+    "and it disagrees with a recording, the live verdict wins and the",
+    "disagreement is reported."
+  ],
+  "C2": {
+    "status": "PASS",
+    "observed_utc": "2026-07-30T00:00:00+00:00",
+    "network": "mainnet",
+    "command": "python -m risk_engine.market.verify --samples 8640 --interval-s 5",
+    "detail": "mark tracks mid within §1.4's threshold over a 12-hour series: median |basis| 2.61e-05 against a 9.07e-04 threshold, a 35x margin. The margin is what makes this a PASS rather than a close call -- §1.4's simplification is that mark and mid are interchangeable for liquidation purposes, and being wrong by 1/35th of the tolerance does not move a liquidation price by a tick.",
+    "evidence": {
+      "median_abs_basis": 2.61e-05,
+      "threshold": 0.000907,
+      "margin_ratio": 35,
+      "window_hours": 12,
+      "why_not_in_a_run": "the in-run check samples for about a minute, which is not the window §1.4 intends; a minute of quiet says nothing about the basis under stress."
+    }
+  },
+  "C5": {
+    "status": "PASS",
+    "observed_utc": "2026-07-31T00:00:00+00:00",
+    "network": "testnet",
+    "command": "python -m risk_engine.market.probe_isolated_funding --testnet --address 0x<funded-account>",
+    "detail": "funding on an isolated position was debited from the isolated pocket, not the cross pool: across one hourly funding tick the pocket absorbed 100% of the charge and the cross balance moved $0.00. §1.1's independence claim holds, so the simulator needs no coupling term. OBSERVED ON TESTNET -- this is evidence about testnet, and it is the best available because the probe requires a funded account and a real funding tick. Margining is protocol logic and is not expected to differ between networks, but that expectation is reasoning, not measurement. Re-run on mainnet before Phase 4 if the cost of being wrong there is judged higher than the cost of the probe.",
+    "evidence": {
+      "isolated_pocket_share": 1.0,
+      "cross_balance_delta_usd": 0.0,
+      "ticks_observed": 1,
+      "why_not_in_a_run": "no read-only endpoint distinguishes the two accounts; it needs a funded position observed across a funding tick, which is out-of-band by construction.",
+      "caveat": "testnet; one tick; one position."
+    }
+  },
+  "C4": {
+    "status": "PASS",
+    "observed_utc": "2026-08-03T00:00:00+00:00",
+    "network": "mainnet",
+    "command": "python scripts/probe_webdata.py 0x<any-real-account>",
+    "detail": "`webData3` EXISTS and `webData2` does NOT, which inverts §5.2. Four probes in one session: with a well-formed `user`, webData3 was accepted with an explicit subscriptionResponse echoing the subscription back, while webData2 was REJECTED in the identical payload shape a moment later -- so the shape is not in question. Without a `user` both are rejected with the same parse error, which is why a bare probe settles nothing and why an earlier reading of one wrongly refuted webData3. Nothing in this tree consumes either subscription: the \"shard planner\" those comments deferred to has no implementation here. The finding is for whoever builds it -- §5.2 names the one the venue refuses.",
+    "evidence": {
+      "webData3_with_user": "accepted (subscriptionResponse)",
+      "webData2_with_user": "rejected (Error parsing JSON into valid websocket request)",
+      "webData3_no_user": "rejected (same parse error)",
+      "webData2_no_user": "rejected (same parse error)",
+      "why_not_in_a_run": "a WebSocket probe needs `websockets`, which the engine deliberately does not depend on; `verify --probe-ws` runs the same comparison when it is installed.",
+      "caveat": "one session, one address, mainnet. The venue moved once already -- this subscription pair is exactly the thing that changed."
+    }
+  }
+}

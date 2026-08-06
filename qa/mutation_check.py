@@ -23,12 +23,58 @@ Exit code 1 if any mutant survives, so it can gate a release.
 from __future__ import annotations
 
 import argparse
+import atexit
+import contextlib
+import importlib.util
 import pathlib
+import signal
 import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 PKG = ROOT / "polymarket_bot"
+
+#: The one file currently holding a mutant, and what it said before.
+#:
+#: A `try/finally` around the pytest call is not enough, and this is not
+#: theoretical -- it happened while this list was being written. `finally` does
+#: not run when the process takes SIGTERM, so a `pkill`, a CI cancellation or a
+#: timeout leaves the mutated source sitting in the working tree. What it
+#: leaves is by construction the worst possible thing to leave: a plausible
+#: one-token edit that the test suite is known not to catch, in a file the next
+#: `git commit -a` will happily pick up. A tool whose whole job is to ask
+#: whether the tests would notice a wrong line must not be the thing that
+#: quietly writes one.
+#: A list holding at most one entry rather than a rebindable `path | None`, so
+#: the handlers below mutate it in place instead of needing `global`.
+_IN_FLIGHT: list[tuple[pathlib.Path, str]] = []
+
+
+def _restore_in_flight() -> None:
+    while _IN_FLIGHT:
+        path, original = _IN_FLIGHT.pop()
+        with contextlib.suppress(OSError):
+            path.write_text(original, encoding="utf-8")
+
+
+def _install_restore_handlers() -> None:
+    """Restore on the ways a process ends without unwinding.
+
+    `atexit` covers a normal exit and an unhandled exception; the signal
+    handlers cover SIGTERM and SIGINT, which bypass it. Each handler restores
+    and then re-raises the default disposition, so the exit status still says
+    the process was signalled rather than pretending it finished.
+    """
+    atexit.register(_restore_in_flight)
+
+    def _on_signal(signum, _frame):
+        _restore_in_flight()
+        signal.signal(signum, signal.SIG_DFL)
+        signal.raise_signal(signum)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        with contextlib.suppress(ValueError, OSError):
+            signal.signal(sig, _on_signal)
 
 # (file, original, mutated, description). Ordered by blast radius.
 MUTANTS: list[tuple[str, str, str, str]] = [
@@ -140,54 +186,218 @@ MUTANTS: list[tuple[str, str, str, str]] = [
 
 TEST_PATHS = ["polymarket_bot/tests"]
 
+#: The risk engine's mutants, on the same terms and in a separate list only
+#: because they run against a different suite.
+#:
+#: This half exists because a systematic AST sweep over the engine found blind
+#: spots the hand-written list above could not have predicted, and a one-off
+#: sweep that is not re-run is a finding with a shelf life. Each entry below is
+#: a mutant that SURVIVED that sweep, was diagnosed, and is now killed by a
+#: named test; keeping them here is what stops the gap reopening.
+#:
+#: Deliberately NOT in this list, having been checked and found equivalent:
+#:
+#:   - `cross_alive &= cross_gap_prev > 0` and its isolated twin, changed to
+#:     `>= 0`. Every observable is bit-identical, because the per-step rule
+#:     (`dead = alive & (gap <= 0)`) kills the same path at s=1 whatever the
+#:     t=0 guard did. Measured on `cross_liquidated`, `isolated_liquidated`,
+#:     `terminal_equity` and `funding_paid`.
+#:   - `mmr * side` -> `mmr / side` in `_liq_from_margin_available`: `side` is
+#:     exactly +/-1, so the two agree identically.
+#:   - `max_iter: int = 12` -> 13 in `_tier_consistent`: the loop converges in
+#:     about two passes on every tier table in `meta`.
+#:
+#: Listing a survivor that cannot be killed would report a test gap that does
+#: not exist, so those are named here rather than counted there.
+RISK_ROOT = "risk_engine"
+RISK_MUTANTS: list[tuple[str, str, str, str]] = [
+    # --- §3.1's gate: the checks that decide whether the model ships ---
+    ("shadow/metrics.py", 'return row["external_flow_usd"] == 0.0',
+     'return row["external_flow_usd"] != 0.0',
+     "no-flow cohort inverted (scores exactly the rows it excludes)"),
+    ("shadow/metrics.py", 'return not row["book_changed"]',
+     'return row["book_changed"]',
+     "book-unchanged cohort inverted (§3.3's own gate population)"),
+    ("shadow/metrics.py", "crps_beats_baseline_a=bool(m_p.n and means[VARIANT_MODEL] <",
+     "crps_beats_baseline_a=bool(m_p.n and means[VARIANT_MODEL] <=",
+     "a tie counts as beating baseline A (§0.2 asks for an improvement)"),
+    ("shadow/metrics.py", "crps_beats_baseline_b=bool(m_p.n and means[VARIANT_MODEL] <",
+     "crps_beats_baseline_b=bool(m_p.n and means[VARIANT_MODEL] <=",
+     "a tie counts as beating baseline B"),
+    ("shadow/metrics.py", '("PIT uniform (KS p>0.05)", self.ks_pvalue > 0.05)',
+     '("PIT uniform (KS p>0.05)", self.ks_pvalue >= 0.05)',
+     "KS row passes at exactly the p it names"),
+    ("shadow/metrics.py", "if cohort.n_days >= 2:", "if cohort.n_days > 2:",
+     "clustered interval withheld on the first day it could be computed"),
+    ("shadow/metrics.py", "return self.clustered_ci[0] <= self.target",
+     "return self.clustered_ci[1] <= self.target",
+     "VaR@95 row read off the wrong end of the clustered interval"),
+    # --- §2: the within-step correction, which had no test at all ---
+    ("liquidation/simulator.py", "d = self._cross_size[None, :] - mmr * np.abs",
+     "d = self._cross_size[None, :] - mmr / np.abs",
+     "bridge gap-variance drift term (invisible at |size| == 1)"),
+    ("liquidation/simulator.py", "d = self._iso_size[None, :] - mmr * np.abs",
+     "d = self._iso_size[None, :] - mmr / np.abs",
+     "same, on the isolated branch"),
+    ("liquidation/simulator.py", "return np.where(var > 0", "return np.where(var >= 0",
+     "0/0 leaks NaN into a hit probability (reads as 'survived')"),
+    ("liquidation/simulator.py", "p = np.exp(-2.0 * g0 * g1 / var)",
+     "p = np.exp(-3.0 * g0 * g1 / var)",
+     "first-passage exponent (P(liq) understated, the §10 direction)"),
+    # --- §1.3: the tier the answer lands in, not the tier it started in ---
+    ("liquidation/margin.py", "if nxt == mmr:", "if nxt != mmr:",
+     "tier-consistency convergence test inverted"),
+    ("liquidation/margin.py", "return min(candidates, key=lambda p: abs(p - reference))",
+     "return max(candidates, key=lambda p: abs(p - reference))",
+     "two-cycle tie-break takes the LATER warning (anti-conservative)"),
+    # --- §2.3: the A11 tail floor and the gate margin it coheres with ---
+    ("model/copula.py", "effective = max(margin, TAIL_ONE_SIDED_Z * se)",
+     "effective = min(margin, TAIL_ONE_SIDED_Z * se)",
+     "gate margin loses its null (fires on 1.4-sigma noise again)"),
+    ("model/copula.py", "TAIL_DEMAND_SIGMAS = TAIL_ONE_SIDED_Z",
+     "TAIL_DEMAND_SIGMAS = 3.0",
+     "demand threshold decouples from the gate (the 0.5.0 stuck band returns)"),
+    # --- §2.3: the A11 rho-lift (0.7.0) and its two safety properties ---
+    ("model/copula.py", ") >= lift.target", ") >= -1.0",
+     "post-projection re-verification disabled (coverage assumed from the "
+     "search while the projection may have undone it)"),
+    ("model/copula.py", "TAIL_RHO_CAP = 0.98", "TAIL_RHO_CAP = 1.0",
+     "cap at comonotone: a singular matrix can be served and Cholesky dies "
+     "on the first slice downstream"),
+    ("model/copula.py", "if uncovered:", "if False:",
+     "the floor never composes: an uncovered demand serves the ML df with "
+     "covered=True and the gate goes dark over an uncovered matrix"),
+    ("model/copula.py", "cap = max(cap, rho_from)", "cap = min(cap, rho_from)",
+     "a measured rho past the cap is CUT down to it: the served entry drops "
+     "below the EWMA measurement, understating co-crash dependence (§10)"),
+    ("model/copula.py",
+     "firing = uncovered_at_gate(diagnostics, assets, final, df, gate_n_sim)",
+     "firing = ()",
+     "the final all-pairs verdict is disabled: a bystander pair degraded by "
+     "the PD projection fires the gate while the remedy reports covered"),
+    ("service/state.py", "if remedy.lifted or remedy.projection_moved:",
+     "if False:",
+     "the wrapper discards the lifted matrix: the bundle serves the raw "
+     "EWMA correlations while the log says a lift was applied"),
+    # --- §5.1 parsing: poison that evades the guards downstream ---
+    ("market/parse.py", "if (closes <= 0).any():", "if (closes <= 1).any():",
+     "every sub-dollar perp refused as a non-positive close"),
+    # --- B4's collector: the exit code IS the operator's diagnosis ---
+    ("market/collect_addresses.py", "elapsed = now - started",
+     "elapsed = now + started",
+     "elapsed read off the absolute clock (aborts every real run instantly)"),
+    ("market/collect_addresses.py", "if n < required and not allow_short:",
+     "if n <= required and not allow_short:",
+     "a harvest that meets §3.3 exactly is refused as short"),
+]
 
-def run_tests() -> bool:
-    proc = subprocess.run(
-        [sys.executable, "-m", "pytest", *TEST_PATHS, "-x", "-q", "--no-header",
-         "-p", "no:cacheprovider", "--no-cov"],
-        cwd=ROOT, capture_output=True, text=True)
+RISK_TEST_PATHS = ["risk_engine/tests"]
+
+
+def _have_pytest_cov() -> bool:
+    """Whether `--no-cov` is a flag pytest will accept.
+
+    It is only defined by the pytest-cov plugin. Passing it unconditionally
+    made this script fail with argparse's "unrecognized arguments: --no-cov"
+    whenever the plugin was absent -- which `main` then reported as
+    "baseline (unmutated suite must be green): FAILED", a statement about the
+    suite rather than about the environment. The suite was green. A mutation
+    check that misdiagnoses a missing plugin as a broken test suite sends
+    whoever ran it to debug the wrong thing entirely.
+    """
+    return importlib.util.find_spec("pytest_cov") is not None
+
+
+def run_tests(test_paths: list[str] | None = None) -> bool:
+    # `--no-cov` is a speed measure, not a correctness one: coverage
+    # instrumentation across dozens of mutant runs is the bulk of the wall
+    # clock. Dropping it when the plugin is absent changes nothing about what
+    # is measured.
+    cmd = [sys.executable, "-m", "pytest", *(test_paths or TEST_PATHS), "-x", "-q",
+           "--no-header", "-p", "no:cacheprovider"]
+    if _have_pytest_cov():
+        cmd.append("--no-cov")
+    # S603: every element of `cmd` is a literal or `sys.executable`; nothing
+    # here comes from a caller. check=False is the point -- a non-zero exit is
+    # the signal this function exists to report, not an error to raise on.
+    proc = subprocess.run(  # noqa: S603
+        cmd, cwd=ROOT, capture_output=True, text=True, check=False
+    )
     return proc.returncode == 0
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--module", help="only mutants in this file")
-    args = ap.parse_args()
-
-    mutants = [m for m in MUTANTS if not args.module or m[0] == args.module]
-    if not mutants:
-        print(f"no mutants defined for {args.module}")
-        return 0
-
+def _run_set(name: str, root: pathlib.Path, mutants, test_paths: list[str],
+             width: int) -> list[str] | None:
+    """One project's mutants against its own suite. None means the baseline
+    was already red, which makes every result below it meaningless."""
+    print(f"=== {name} ===")
     print("baseline (unmutated suite must be green):", end=" ", flush=True)
-    if not run_tests():
+    if not run_tests(test_paths):
         print("FAILED — fix the suite before trusting mutation results")
-        return 1
+        return None
     print("green\n")
 
     survived: list[str] = []
+    checked = 0
     for fname, old, new, label in mutants:
-        path = PKG / fname
+        path = root / fname
         original = path.read_text(encoding="utf-8")
         if old not in original:
-            print(f"  SKIP      {fname:<12} {label} (pattern not found — "
+            print(f"  SKIP      {fname:<{width}} {label} (pattern not found — "
                   f"code moved, update this mutant)")
             continue
+        checked += 1
+        _IN_FLIGHT.append((path, original))
         path.write_text(original.replace(old, new, 1), encoding="utf-8")
         try:
-            still_green = run_tests()
+            still_green = run_tests(test_paths)
         finally:
-            path.write_text(original, encoding="utf-8")   # always restore
+            # `finally` for the ordinary paths; `_IN_FLIGHT` and the handlers
+            # installed in `main` for the ones that never unwind.
+            _restore_in_flight()
         if still_green:
             survived.append(f"{fname}: {label}")
-            print(f"  SURVIVED  {fname:<12} {label}")
+            print(f"  SURVIVED  {fname:<{width}} {label}")
         else:
-            print(f"  killed    {fname:<12} {label}")
+            print(f"  killed    {fname:<{width}} {label}")
 
-    total = len([m for m in mutants if (PKG / m[0]).read_text(encoding="utf-8").count(m[1])])
-    print(f"\nscore: {total - len(survived)}/{total} mutants killed")
+    print(f"\n{name} score: {checked - len(survived)}/{checked} mutants killed\n")
+    return survived
+
+
+def main() -> int:
+    _install_restore_handlers()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--module", help="only mutants in this file")
+    ap.add_argument("--project", choices=("bot", "risk"),
+                    help="only one project's mutants (default: both)")
+    args = ap.parse_args()
+
+    sets = []
+    if args.project in (None, "bot"):
+        sets.append(("polymarket_bot", PKG,
+                     [m for m in MUTANTS if not args.module or m[0] == args.module],
+                     TEST_PATHS, 12))
+    if args.project in (None, "risk"):
+        sets.append(("risk_engine", ROOT / RISK_ROOT,
+                     [m for m in RISK_MUTANTS if not args.module or m[0] == args.module],
+                     RISK_TEST_PATHS, 28))
+
+    if not any(mutants for _, _, mutants, _, _ in sets):
+        print(f"no mutants defined for {args.module}")
+        return 0
+
+    survived: list[str] = []
+    for name, root, mutants, test_paths, width in sets:
+        if not mutants:
+            continue
+        out = _run_set(name, root, mutants, test_paths, width)
+        if out is None:
+            return 1
+        survived.extend(f"{name}/{s}" for s in out)
+
     if survived:
-        print("\nSURVIVORS — these behaviours are not actually verified:")
+        print("SURVIVORS — these behaviours are not actually verified:")
         for s in survived:
             print(f"  - {s}")
         return 1

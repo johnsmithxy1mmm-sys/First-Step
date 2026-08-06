@@ -1,0 +1,25 @@
+# Tools the quality gates in qa/QA-PROCEDURES.md need, and nothing else.
+#
+#   pip install -r qa/requirements-dev.txt
+#
+# This file exists because gates 1, 2 and 5 could not run without it and said
+# so in a way nobody could act on. `qa/run_all.sh` invoked `pytest --cov`,
+# pytest-cov was not installed and was declared in no manifest, and the gate
+# died with:
+#
+#     error: unrecognized arguments: --cov
+#
+# which names the flag and not the cause, reads like a typo in the script,
+# and took gate 5 down with it (`mutation_check.py` passes `--no-cov`, so it
+# failed identically and reported "baseline suite must be green" about a
+# suite that was in fact green). Three of eight documented gates unrunnable,
+# diagnosed as a broken test suite.
+#
+# Runtime dependencies are deliberately NOT here. The engine imports numpy and
+# scipy and the collector imports websockets lazily; those belong with the
+# thing that needs them, not with the test tooling.
+
+pytest>=8.0
+pytest-cov>=5.0      # gates 1, 2 — the branch-coverage floor (`fail_under` in pyproject.toml)
+ruff>=0.5            # gate 7 — bug rules only, see [tool.ruff.lint] in pyproject.toml
+pip-audit>=2.7       # gate 8 — advisory
