@@ -144,32 +144,42 @@ def _paced_bundle(budget, max_wait_s: float = BUNDLE_MAX_WAIT_S,
                   wait_s: float = BUNDLE_BUDGET_WAIT_S):
     """Build the live bundle, WAITING on the §5.3 window rather than dying on it.
 
-    The bundle costs ~160 weight (meta, plus a candle snapshot and a funding
-    history per coin) and it is spent before the sweep proper starts. While
-    each process had a private budget that was always affordable at startup,
-    because a fresh process began with a full window. Sharing the pool (C6)
-    removed that guarantee: a snapshot starting while the resolver holds the
-    window now meets a spent one, and an unpaced build turns that into a dead
-    run -- `RateLimitExceeded` propagating out of `meta()` and killing the
-    process before a single prediction is written.
+    The wait lives at the CHARGE (`PacedBudget`), not around the whole build,
+    and the difference is what makes a 4-coin universe possible at all. The
+    build costs ~470 weight nominal — meta 20 plus ~112 per coin (candle
+    20+36 response surcharge, funding 20+36; C6's corrected table) — against
+    the shadow pool's 300/minute usable, so NO single pass fits inside one
+    window. The first version of this function retried the WHOLE build on
+    `RateLimitExceeded`: every retry re-spent the head of the build (meta and
+    the first coins), pinned the pool at its cap, and starved the tail
+    forever — both shadow jobs sat in "window is spent" for the full
+    30-minute ceiling while holding the pool themselves. Observed on the
+    first 4-coin start (2026-08-06, the B6 widening); at 3 coins the build
+    was 56 weight over and squeaked through on retry timing, which is why
+    the defect stayed invisible. Waiting at the charge stretches the build
+    over ~2 minutes of window and completes it.
 
-    That is the same burst-and-drop failure the sweep and the resolver were
-    both fixed for (a rate limit is a PACE, not an error), reintroduced one
-    layer up by the change that made the pool shared. Waiting is what §5.3
-    asks for; the ceiling only exists so a genuinely oversubscribed pool
-    surfaces as a loud failure instead of a container asleep forever.
+    The outer retry stays as the backstop for a pool a DIFFERENT process is
+    genuinely holding: `PacedBudget.charge` gives up after its own per-charge
+    ceiling, and the loop here turns that into one loud message with the
+    operator's next move in it.
     """
     import time as _t
 
+    from risk_engine.market.info import PacedBudget
     from risk_engine.service.state import _build_live_bundle
 
+    paced = PacedBudget(budget, wait_s=wait_s)
     deadline = _t.monotonic() + max_wait_s
     waited = False
     while True:
         try:
-            bundle = _build_live_bundle(serving=False, budget=budget)
-            if waited:
-                log.info("§5.3 window refilled; bundle built")
+            bundle = _build_live_bundle(serving=False, budget=paced)
+            if waited or paced.waited_s > 0:
+                log.info(
+                    "§5.3 window refilled; bundle built (%.0fs of waiting)",
+                    paced.waited_s,
+                )
             return bundle
         except RateLimitExceeded:
             if _t.monotonic() >= deadline:

@@ -1662,8 +1662,9 @@ it: the true off-universe drop rate across all 515 addresses, which the first
 `_build_live_bundle` and passed through the compose stack, so widening it
 does not require a code edit. BTC and ETH remain mandatory (§2.1). What
 widening costs, per added coin: one 90-day candle snapshot plus one funding
-history per rebuild (~40 weight against serving's 900/min — ten coins is
-~80/min of the rebuild's budget), a row and column of correlation structure,
+history per rebuild (~112 weight with response surcharges, C6's corrected
+table; this line said ~40 until 2026-08-06 — base weights only, the same
+drift resolve.py documents), a row and column of correlation structure,
 one more marginal fit, and a bigger draw per path-step. What it is NOT: a
 free fix. It is a sampling-frame change AND a distribution change
 (MODEL_VERSION MINOR, §3.3 counter reset), so it must happen BEFORE the
@@ -1762,8 +1763,12 @@ model version) and it answers the steps:
   is the 21 DAYS, not the addresses.
 - the set-based arithmetic names HYPE the largest single recovery (≈19
   addresses/sweep — the venue's own native token, held by a quarter of the
-  off-universe cohort) at one coin's cost (~40 weight/rebuild, one more
-  marginal, three new correlation pairs). The next candidates fall off fast
+  off-universe cohort) at one coin's cost (~112 weight/rebuild with response
+  surcharges — this record first said ~40, repeating exactly the stale-figure
+  drift resolve.py documents; the corrected number is what starved the shadow
+  bundle build on the first 4-coin start and forced the per-charge pacing fix
+  in `_paced_bundle` — one more marginal, three new correlation pairs). The
+  next candidates fall off fast
   and the tail is flat: ~166 addresses/sweep hold some coin no plausible
   universe contains, and reaching 87% of skips takes ~20 coins at ~2 240
   weight/rebuild — priced out, deferred, not dismissed.

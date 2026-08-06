@@ -778,7 +778,8 @@ def _build_live_bundle(*, serving: bool = True, budget=None):
     # `calibration_sweeps` census measures that drop rate;
     # widening is an env change here plus a B6 decision recorded in
     # OPEN-QUESTIONS, one more candle+funding fetch per coin per rebuild
-    # (~40 weight each against serving's 900/min). HYPE entered the default
+    # (~112 weight each with response surcharges -- C6's corrected table,
+    # against serving's 900/min). HYPE entered the default
     # by exactly that route (B6 decision, 2026-08-05): the census named it
     # the largest single cohort recovery (~19 addresses/sweep) and a live
     # probe showed its pairs quiet at the §2.3 gate. BTC and ETH stay

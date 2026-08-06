@@ -2408,3 +2408,84 @@ class TestTheCrpsComparisonIsPaired:
         report = calibration_report(journal, self.VERSION, cohort=COHORT_ALL)
         journal.close()
         assert report.tail.n == 21
+
+
+class TestTheBundleBuildPacesAtTheCharge:
+    """The 4-coin bundle build costs ~470 weight against the shadow pool's
+    300/minute usable, so NO single pass fits inside one sliding window. The
+    first `_paced_bundle` retried the WHOLE build on `RateLimitExceeded`:
+    every retry re-spent the head of the build, pinned the pool at its cap
+    and starved the tail — both shadow jobs sat in "window is spent" for the
+    full 30-minute ceiling while holding the pool themselves (observed on
+    the first 4-coin start, 2026-08-06). The wait must therefore live at the
+    CHARGE, where a build stretches over minutes and completes.
+    """
+
+    def test_the_build_is_handed_a_per_charge_pacing_budget(self, monkeypatch):
+        import risk_engine.service.state as state
+        import risk_engine.shadow.cli as shadow_cli
+        from risk_engine.market.info import PacedBudget, WeightBudget
+
+        captured = {}
+
+        def fake_build(*, serving, budget):
+            captured["serving"] = serving
+            captured["budget"] = budget
+            return "bundle", {}, {}
+
+        monkeypatch.setattr(state, "_build_live_bundle", fake_build)
+        inner = WeightBudget(reserved_fraction=0.75)
+        out = shadow_cli._paced_bundle(inner)
+
+        assert out == ("bundle", {}, {})
+        assert isinstance(captured["budget"], PacedBudget), (
+            "an unpaced budget re-creates the whole-build retry livelock: "
+            "no 4-coin build can fit a 300/minute window in one pass"
+        )
+        assert captured["budget"].inner is inner, (
+            "the pacing must wrap the SHARED ledger, not a private window"
+        )
+        assert captured["serving"] is False
+
+    def test_a_build_wider_than_one_window_completes_by_waiting(self, monkeypatch):
+        """The livelock scenario in miniature: a build whose total cost
+        exceeds the usable window succeeds only if charges WAIT for expiry
+        rather than abort the pass. Time is virtualised through the budget's
+        `now` hooks in `spent`/`charge`... which `PacedBudget.charge` refuses
+        to pace (a frozen clock never refills), so this drives the real
+        pacing loop with a real-but-fast clock: wait_s=0 and an inner budget
+        whose window drains as refusals accumulate."""
+        from risk_engine.market.info import (
+            PacedBudget,
+            RateLimitExceeded,
+        )
+
+        class DrainingBudget:
+            """Refuses twice per charge, then admits: a window that frees
+            only while the caller waits, in miniature."""
+
+            def __init__(self):
+                self.refusals_left = 0
+                self.charged = []
+
+            def charge(self, weight, now=None):
+                if self.refusals_left > 0:
+                    self.refusals_left -= 1
+                    raise RateLimitExceeded("window full")
+                self.refusals_left = 2
+                self.charged.append(weight)
+
+            def charge_incurred(self, weight, now=None):
+                self.charged.append(weight)
+
+        inner = DrainingBudget()
+        inner.refusals_left = 2
+        paced = PacedBudget(inner, max_wait_s=5.0, wait_s=0.0)
+        # Seven charges, as the 4-coin build makes (meta + candle/funding per
+        # two coins here); every one must land despite the refusals.
+        for weight in (20, 20, 36, 20, 36, 20, 20):
+            if weight == 36:
+                paced.charge_incurred(weight)
+            else:
+                paced.charge(weight)
+        assert sum(inner.charged) == 172, "every charge must eventually land"
