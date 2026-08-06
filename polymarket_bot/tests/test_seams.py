@@ -319,3 +319,98 @@ def test_the_money_call_scan_actually_finds_the_call_sites():
     calls = _money_calls()
     assert len(calls) >= 8, f"only {len(calls)} money paths found — scan is broken"
     assert {attr for _, _, attr, _ in calls} >= {"record_trade", "execute_sell"}
+
+
+# =====================================================================
+# Seam 5 — an assumption that holds at the centre and breaks at the edge
+# =====================================================================
+#
+# Found in a live paper report: a single position of 7,500 shares at 0.982 =
+# $7,365, on a $5,000 bankroll. 147% of the account in one leg, past a per-market
+# cap of $250, with every portfolio limit intact and every test green.
+#
+# `compute_quote` sized in SHARES as `quote_usd / yes_bid` and posted that same
+# share count on BOTH legs. That silently assumes the two legs cost about the
+# same per share — true near a 0.5 midpoint, false by a factor of 60 on a 1.8c
+# longshot. And the per-market cap measured `size * yes_bid`, the CHEAP leg, so
+# it reported $120 of a $250 cap while committing $7,365.
+#
+# The same shape as F-020: correct arithmetic over a domain nobody checked. Every
+# unit test for the quote sizer used a midpoint near 0.5, which is precisely
+# where the bug is invisible.
+
+def _mm_at(cfg, ledger, yes_price: float, tick: float = 0.001):
+    """A quote on a market whose YES trades at `yes_price`."""
+    from .test_marketmaker import make_mm, mm_market, top
+    m = mm_market(id="ext", clob_token_ids=["ext-yes", "ext-no"],
+                  outcome_prices=[yes_price, 1.0 - yes_price], tick_size=tick)
+    spread = max(tick * 3, yes_price * 0.15)
+    tops = {"ext-yes": top(bid=max(tick, yes_price - spread),
+                           ask=min(1 - tick, yes_price + spread)),
+            "ext-no": top(bid=max(tick, 1 - yes_price - spread),
+                          ask=min(1 - tick, 1 - yes_price + spread))}
+    mm = make_mm(cfg, ledger, mode="paper", tops=tops)
+    return mm, m, mm.compute_quote(m, tops["ext-yes"])
+
+
+def test_a_penny_priced_market_does_not_commit_the_whole_bankroll(cfg, ledger):
+    """The observed defect, pinned with its own numbers.
+
+    YES at 1.8c means NO at 98.2c. Sizing off the YES price buys a share count
+    that costs ~60x the budget on the NO side.
+    """
+    _, _, quote = _mm_at(cfg, ledger, 0.018)
+    assert quote is not None, "fixture produced no quote — cannot test the sizing"
+    cap = cfg.risk.max_position_per_market_usd * 2
+    no_leg = quote.size * quote.no_bid
+    assert no_leg <= cap, (
+        f"the No leg commits ${no_leg:,.2f} against a per-market cap of "
+        f"${cap:,.2f} — the cap measured the cheap leg and could not refuse it")
+    assert no_leg <= cfg.portfolio.bankroll_usd * 0.05, (
+        f"${no_leg:,.2f} of a ${cfg.portfolio.bankroll_usd:,.0f} bankroll in one "
+        "market maker leg")
+
+
+def test_neither_leg_exceeds_the_cap_anywhere_in_the_price_range(cfg, ledger):
+    """INVARIANT over the whole domain, not one convenient midpoint.
+
+    A quote sizer is only correct if it is correct at 0.02 and 0.98, not merely
+    at 0.5 — and the rewards band REQUIRES two-sided quoting below 0.10 and above
+    0.90, so the extremes are not a corner case the MM can avoid.
+    """
+    cap = cfg.risk.max_position_per_market_usd * 2
+    produced = 0
+    for yes_price in (0.01, 0.02, 0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95, 0.98):
+        _, _, quote = _mm_at(cfg, ledger, yes_price)
+        if quote is None:
+            continue
+        produced += 1
+        for leg, price in (("Yes", quote.yes_bid), ("No", quote.no_bid)):
+            notional = quote.size * price
+            assert notional <= cap + 1e-9, (
+                f"at YES={yes_price}: the {leg} leg commits ${notional:,.2f} "
+                f"against a ${cap:,.2f} cap")
+    assert produced >= 5, f"only {produced} quotes produced — grid is not exercising"
+
+
+def test_the_cap_refuses_a_market_whose_expensive_leg_would_breach_it(cfg, ledger):
+    """The cap must see what is actually committed, not the cheaper half."""
+    cfg.risk.max_position_per_market_usd = 1.0        # cap = $2 after the x2
+    _, _, quote = _mm_at(cfg, ledger, 0.02)
+    if quote is not None:
+        assert quote.size * quote.no_bid <= 2.0 + 1e-9, (
+            "a quote was produced whose No leg breaches the per-market cap")
+
+
+def test_a_balanced_market_is_sized_as_before(cfg, ledger):
+    """Regression guard: the fix must not change behaviour near a 0.5 midpoint.
+
+    yes_bid ~ no_bid there, so dividing by the max is dividing by the same number
+    — anything that moves here means the fix changed more than the extremes.
+    """
+    _, _, quote = _mm_at(cfg, ledger, 0.50)
+    assert quote is not None
+    budget = cfg.market_maker.quote_size_usd
+    for price in (quote.yes_bid, quote.no_bid):
+        assert quote.size * price <= max(budget, 20 * price) * 1.2, (
+            "sizing at a balanced midpoint moved unexpectedly")

@@ -226,13 +226,32 @@ class MarketMaker:
         if not tick <= yes_bid < yes_ask <= 1 - tick:
             return None
 
+        no_bid = round_to_tick(1.0 - yes_ask, tick)
+
         quote_usd = self._size_map.get(market.id, c.quote_size_usd) * self.size_factor
-        size = float(math.floor(quote_usd / max(yes_bid, tick)))
+        # ONE share count is posted on BOTH legs (see `_place`), so the budget
+        # must be divided by the price of the EXPENSIVE leg, not the Yes leg.
+        #
+        # Dividing by yes_bid alone silently assumes the two legs cost about the
+        # same per share. That holds near a 0.5 midpoint and collapses at the
+        # extremes: on a 1.8c longshot, yes_bid ~ 0.016 and no_bid ~ 0.982, so
+        # `quote_usd / yes_bid` shares cost 60x `quote_usd` on the No side. A $120
+        # budget bought a $7,365 No leg on a $5,000 bankroll — 147% of the account
+        # in one position — and every extreme market is quoted TWO-SIDED by
+        # construction, because the rewards band demands it below 0.10 and above
+        # 0.90. So the arithmetic broke hardest exactly where it always applies.
+        worst_price = max(yes_bid, no_bid, tick)
+        size = float(math.floor(quote_usd / worst_price))
         size = max(size, market.rewards_min_size)  # otherwise it will not count for rewards
         if size < market.min_order_size:
             return None
-        # Per-market position cap.
-        if abs(self._inventory_usd(market)) + size * yes_bid \
+        # Per-market position cap, measured on the EXPENSIVE leg for the same
+        # reason. `size * yes_bid` reported $120 of a $250 cap while committing
+        # $7,365, so the cap could not have refused anything it needed to.
+        # Keeping it here also bounds the `rewards_min_size` floor above: a venue
+        # minimum that would breach the cap now refuses the market instead of
+        # quietly overriding the budget.
+        if abs(self._inventory_usd(market)) + size * worst_price \
                 > self._risk.max_position_per_market_usd * 2:
             return None
         # Predicted fill probability at placement — checked later against what
@@ -240,8 +259,7 @@ class MarketMaker:
         queue_ahead = top.bid * top.bid_size if yes_bid <= top.bid else 0.0
         flow = market.volume_24h_usd * (max(c.requote_timer_sec, 1.0) / 86_400.0)
         p_pred = fill_probability(queue_ahead, size * yes_bid, flow)
-        return Quote(market=market, fair=fair, yes_bid=yes_bid,
-                     no_bid=round_to_tick(1.0 - yes_ask, tick),
+        return Quote(market=market, fair=fair, yes_bid=yes_bid, no_bid=no_bid,
                      size=size, ts=time.time(), p_fill_pred=p_pred)
 
     def needs_requote(self, market: Market, top: TopOfBook) -> bool:

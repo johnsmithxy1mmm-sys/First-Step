@@ -39,6 +39,7 @@ Sorted by (probability in prod) × (irreversibility).
 | F-028 | Medium | high | measurement validity | the shadow gap is constant by construction when the book's shape is stable, so it could not distinguish a dead market from one we track | `test_measurement.py` | FIXED |
 | F-029 | High | high | measurement / economics | with zero fills the rewards score is the MM's entire return, and no quote ever recorded what it earned; the score is quadratic, so widening silently zeroes it | `test_measurement.py` | FIXED |
 | F-030 | High | high | measurement validity | `ALTER TABLE ... DEFAULT 0.0` back-filled unmeasured rows with zeros, and the report condemned four markets as unpaid on numbers nobody took | `test_measurement.py` | FIXED |
+| F-031 | **Critical** | high | sizing / risk | quote sized in shares off `yes_bid` but posted on BOTH legs, and the per-market cap measured the cheap leg: one leg held 147% of the bankroll | `test_seams.py` (Seam 5) | FIXED |
 
 ---
 
@@ -840,3 +841,66 @@ found by reading output rather than by testing. F-030 is the sharpest instance:
 the flawed output was produced by the fix for the previous instance. Whatever
 review this project applies to a measurement change, it has to include reading the
 first report the change produces, on a database that predates it.
+
+## F-031 — A market-maker leg committed 147% of the bankroll, past every cap
+
+```
+Severity: CRITICAL | Confidence: high | Class: sizing / risk
+Found by: reading `--mode report` open positions
+Location: polymarket_bot/marketmaker.py `compute_quote`
+```
+From a live paper report, on a $5,000 bankroll:
+
+```
+[No] Will Khvicha Kvaratskhelia win the 2026 Ballon d'Or?   7,500 sh   0.9820   $7,365.00
+Risk: gross $7,800 | true worst-case $7,794 | largest event $7,365
+```
+
+One leg holding **147% of the account**, past a per-market cap of $250, with every
+portfolio limit intact and the whole suite green.
+
+`compute_quote` sized in SHARES as `quote_usd / yes_bid`, and `_place` posts that
+same share count on **both** legs. That silently assumes the two legs cost about
+the same per share. Near a 0.5 midpoint they do. On a 1.8c longshot
+`yes_bid ~ 0.016` and `no_bid ~ 0.982`, so the share count bought for the Yes
+budget costs **60x** that budget on the No side:
+
+```
+size      = 120 / 0.016   = 7,500 shares
+Yes leg   = 7,500 * 0.016 = $120     <- the intended budget
+No leg    = 7,500 * 0.982 = $7,365   <- what was actually committed
+```
+
+The second defect is why nothing stopped it. The per-market cap read
+
+```python
+if abs(self._inventory_usd(market)) + size * yes_bid > cap:
+```
+
+— the **cheap** leg. It compared $120 against a $250 cap and passed, while the
+order it approved committed $7,365. A cap that measures the wrong quantity is not
+a weak cap, it is an absent one.
+
+And the two compound *by design*: below 0.10 and above 0.90 the rewards band
+**requires** a two-sided quote (`compute_quote` refuses one-sided there), so the
+extremes are not a corner the MM can avoid — they are where it is obliged to post
+both legs, and precisely where the arithmetic is worst.
+
+Fixed by sizing off the expensive leg, `worst_price = max(yes_bid, no_bid, tick)`,
+and measuring the cap on the same quantity. At a 0.5 midpoint nothing changes
+(the two prices are equal); at 1.8c the No leg drops from $1,215 to $19.44 on the
+default $10 budget — the residue being `rewards_min_size`, which the cap now
+bounds instead of letting it override the budget silently.
+
+The honest cost: at extreme prices a balanced-notional quote posts ~60x fewer
+shares, and the rewards score is linear in size, so far fewer reward points are
+earned there. That is the correct trade. Committing $7,365 of a $5,000 account to
+farm rewards is not a strategy, and an operator who wants more score at the
+extremes should raise `quote_size_usd` deliberately.
+
+**This is the same shape as F-020**: correct arithmetic over a domain nobody
+checked. Every existing test of the quote sizer used a midpoint near 0.5 — exactly
+where the defect is invisible. Added to `test_seams.py` as Seam 5, with the
+invariant stated over the whole price range (0.01 to 0.98) rather than at one
+convenient point, plus a regression guard that the balanced case is unchanged.
+Two mutants, both killed.
