@@ -267,6 +267,18 @@ RISK_MUTANTS: list[tuple[str, str, str, str]] = [
     ("model/copula.py", "if uncovered:", "if False:",
      "the floor never composes: an uncovered demand serves the ML df with "
      "covered=True and the gate goes dark over an uncovered matrix"),
+    ("model/copula.py", "cap = max(cap, rho_from)", "cap = min(cap, rho_from)",
+     "a measured rho past the cap is CUT down to it: the served entry drops "
+     "below the EWMA measurement, understating co-crash dependence (§10)"),
+    ("model/copula.py",
+     "firing = uncovered_at_gate(diagnostics, assets, final, df, gate_n_sim)",
+     "firing = ()",
+     "the final all-pairs verdict is disabled: a bystander pair degraded by "
+     "the PD projection fires the gate while the remedy reports covered"),
+    ("service/state.py", "if remedy.lifted or remedy.projection_moved:",
+     "if False:",
+     "the wrapper discards the lifted matrix: the bundle serves the raw "
+     "EWMA correlations while the log says a lift was applied"),
     # --- §5.1 parsing: poison that evades the guards downstream ---
     ("market/parse.py", "if (closes <= 0).any():", "if (closes <= 1).any():",
      "every sub-dollar perp refused as a non-positive close"),

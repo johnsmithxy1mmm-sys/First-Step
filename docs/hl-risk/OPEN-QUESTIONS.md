@@ -826,16 +826,42 @@ the ML df, cap 0.98, PD projection, coverage RE-VERIFIED on the projected
 entries), with `tail_floor_df` composing on any demand the cap cannot reach
 and `covered=False` keeping the gate lit beyond that. Wired through
 `state._tail_remedied_dependence` (the renamed floor wrapper) into both
-bundle builders; the bundle now carries the LIFTED matrix, so the §2.3 gate,
-the simulation and the health endpoint all see the same served dependence.
-The lift is logged per pair (from → to, target) beside the all-pairs
-readings line, `copula_rho_tail_lifted` counts it, and three mutation-gate
-entries pin the safety properties (re-verification, the cap, the floor
-composition). HYPE entered the universe default in the same bump — the B6
+bundle builders; the bundle carries the LIFTED matrix, so the §2.3 gate and
+the simulation judge the same served dependence. (`/health` is NOT in that
+list: its diagnostics block reports the ESTIMATION pipeline — shrinkage,
+eigenvalues, imputation — computed before the lift; the lift's operator
+record is the per-pair WARNING log and the `copula_rho_tail_lifted`
+counter.) The lift is logged per pair (from → to, target) beside the
+all-pairs readings line, and mutation-gate entries pin the safety
+properties. HYPE entered the universe default in the same bump — the B6
 record has the census arithmetic and the probe is above. Expected first live
 firing: all three demand pairs lifted at the ML df ~5.0 (ETH/SOL to ~0.907,
 the BTC pairs by less), no floor, gate dark, recording mode ends, gate-days
 begin.
+
+**Hardened the same night: an adversarial review of the diff found two real
+holes in the first implementation**, both of the covered-while-firing class
+the chain exists to close. (1) Coverage was re-verified only on the DEMAND
+pairs, so the PD projection could redistribute a lift's distortion onto a
+bystander pair — pushing it past its own margin (the gate fires on a pair
+the remedy never looked at, while the log says covered) or below its
+measured correlation (served co-crash understated, the §10 direction,
+silently). (2) The composed floor still scored coverage with the historical
+seed-7 estimator while the gate scores with per-pair seeds — the
+two-estimator band, re-opened on the floor branch at a zero-slack boundary.
+Fixed by making the chain's verdict `uncovered_at_gate`: the final served
+(matrix, df) is re-scored on EVERY pair with the gate's own estimator, so
+`covered` IS the gate's verdict computed ahead of time, `uncovered_pairs`
+names what will fire, and the floor's walk takes the gate's seeds. Closed in
+the same pass: a demand pair whose measured ρ already exceeds the 0.98 cap
+is no longer cut down to it (the search domain is [ρ_from, max(cap,
+ρ_from)]; the lift's only direction is up); an unmeasurable pair (NaN lower
+tail, zero-SE reading) now yields covered=False instead of a vacuous
+covered=True over a firing gate; any projection move that leaves a served
+entry below its EWMA measurement is logged per pair; and the census header
+no longer claims cross-version pooling is universe-clean — 0.7 moved the
+universe, so pre-0.7 and post-0.7 census rows describe different cohort
+frames.
 
 **PROPOSAL (2026-08-05): a conditional tail floor on the copula df.** The
 remedy space above, turned into numbers an owner can decide on. Measured

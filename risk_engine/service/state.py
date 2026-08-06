@@ -255,14 +255,11 @@ def _tail_remedied_dependence(
             for lift in remedy.lifts if lift.lifted
         )
         log.warning(
-            "copula rho lifted by the A11 remedy at ML df %.2f: %s%s%s",
+            "copula rho lifted by the A11 remedy at ML df %.2f: %s%s",
             df_ml, moves,
-            " [PD projection moved the lifted matrix; coverage re-verified "
-            "on the projected entries]" if remedy.projection_moved else "",
-            "" if remedy.covered else
-            " — AND a demand's bound stays unreachable under the rho cap "
-            "and the df grid together, so the §2.3 gate stays lit and "
-            "recording mode continues",
+            " [PD projection moved the lifted matrix; the verdict below is "
+            "re-verified on the projected entries]"
+            if remedy.projection_moved else "",
         )
     if remedy.floored:
         METRICS.incr("copula_df_tail_floored")
@@ -271,6 +268,32 @@ def _tail_remedied_dependence(
             "the lifted matrix, for demands the rho cap could not reach)",
             remedy.df_ml, remedy.df,
         )
+    if not remedy.covered:
+        METRICS.incr("copula_remedy_uncovered")
+        log.warning(
+            "the A11 remedy cannot produce a §2.3-passing matrix: the gate "
+            "will fire on %s — recording mode continues and no gate-day "
+            "accrues (unreachable bound, unmeasurable pair, or "
+            "PD-projection redistribution; see the readings line above)",
+            ", ".join("/".join(p) for p in remedy.uncovered_pairs),
+        )
+    if remedy.projection_moved:
+        # §10 disclosure: the projection can pay for a lift by pulling OTHER
+        # entries down. The all-pairs verdict above decides serving; this
+        # names the entries that now sit below their EWMA measurement.
+        pulled = [
+            (a, b, float(corr[i, j]), float(remedy.corr[i, j]))
+            for i, a in enumerate(assets)
+            for j, b in enumerate(assets)
+            if i < j and remedy.corr[i, j] < corr[i, j] - 1e-9
+        ]
+        if pulled:
+            log.warning(
+                "PD projection moved served correlations BELOW their "
+                "measured values: %s",
+                ", ".join(f"{a}/{b} {was:.3f} -> {now:.3f}"
+                          for a, b, was, now in pulled),
+            )
     if remedy.lifted or remedy.projection_moved:
         full = np.array(matrix.corr, dtype=np.float64, copy=True)
         if tuple(assets) == tuple(matrix.assets):
@@ -279,17 +302,34 @@ def _tail_remedied_dependence(
             # Imputed rows exist: the remedy ran on the estimated principal
             # submatrix, and embedding a modified principal submatrix does
             # not preserve full-matrix positive definiteness. Re-project the
-            # full matrix; the §2.3 gate downstream judges the FINAL entries,
-            # so a projection that pulls a lifted pair back below its bound
-            # re-fires the gate rather than passing silently.
+            # full matrix, then re-verify the estimated pairs on the entries
+            # that will ACTUALLY be served — the embed projection runs after
+            # the remedy's own verdict and can move them again. The §2.3
+            # gate downstream judges the same final entries with the same
+            # estimator, so a pair named here is a pair the gate will name.
+            from risk_engine.model.copula import uncovered_at_gate
             from risk_engine.model.psd import project_to_correlation
 
             order = list(matrix.assets)
             idx = np.array([order.index(a) for a in assets], dtype=np.intp)
             full[np.ix_(idx, idx)] = remedy.corr
-            full = project_to_correlation(
+            embed = project_to_correlation(
                 full, metrics=METRICS, label="tail_lift_embed"
-            ).corr
+            )
+            full = embed.corr
+            if embed.corrected:
+                refire = uncovered_at_gate(
+                    prelim, tuple(assets),
+                    np.asarray(full)[np.ix_(idx, idx)], remedy.df,
+                )
+                if refire:
+                    METRICS.incr("copula_remedy_uncovered")
+                    log.warning(
+                        "embedding the lifted submatrix re-projected the "
+                        "full matrix and the §2.3 gate will fire on %s "
+                        "despite the remedy — recording mode continues",
+                        ", ".join("/".join(p) for p in refire),
+                    )
         return _with_corr(matrix, full), remedy.df
     return matrix, remedy.df
 
@@ -731,10 +771,11 @@ def _build_live_bundle(*, serving: bool = True, budget=None):
     window_ms = 90 * 24 * 3600 * 1000
 
     # Config, not code (OPEN-QUESTIONS B6). A too-narrow universe silently
-    # narrows the calibration cohort: an address whose positions are all
-    # off-universe is skipped as "no open positions", byte-identical to a flat
-    # account, and §3.3's 200-address count comes up short for a reason no
-    # output names. The `calibration_sweeps` census measures that drop rate;
+    # narrows the calibration cohort: an address holding any coin outside it
+    # is dropped from the sweep with an `off-universe:` reason — distinct
+    # from a flat account in the log (B6's 2026-08-04 correction), but a
+    # drop all the same, and §3.3's 200-address count feels it. The
+    # `calibration_sweeps` census measures that drop rate;
     # widening is an env change here plus a B6 decision recorded in
     # OPEN-QUESTIONS, one more candle+funding fetch per coin per rebuild
     # (~40 weight each against serving's 900/min). HYPE entered the default

@@ -417,7 +417,6 @@ class TestConditionalRhoLift:
 
     RHO = 0.863          # backed out of the live 2026-08-05 banner asymptotics
     DF_ML = 5.0          # the live ML fit with HYPE in the joint window
-    N_SIM = 100_000      # enough for these gaps; keeps the suite fast
 
     @staticmethod
     def _diag(lower: float, model: float, n: int = 108, upper: float = 0.685,
@@ -438,7 +437,7 @@ class TestConditionalRhoLift:
             corr = np.array([[1.0, self.RHO], [self.RHO, 1.0]])
         return tail_remedy_dependence(
             diags, tuple(assets), corr,
-            self.DF_ML if df_ml is None else df_ml, n_sim=self.N_SIM,
+            self.DF_ML if df_ml is None else df_ml,
         )
 
     def test_no_demand_leaves_the_matrix_and_the_df_alone(self):
@@ -449,6 +448,7 @@ class TestConditionalRhoLift:
         assert not remedy.lifted and not remedy.floored
         assert remedy.df == self.DF_ML
         assert remedy.demands == ()
+        assert remedy.covered and remedy.uncovered_pairs == ()
         np.testing.assert_array_equal(
             remedy.corr, np.array([[1.0, self.RHO], [self.RHO, 1.0]])
         )
@@ -526,6 +526,7 @@ class TestConditionalRhoLift:
         assert not remedy.covered, (
             "an unreachable bound must keep the gate lit, not pass silently"
         )
+        assert ("ETH", "SOL") in remedy.uncovered_pairs
         assert float(np.max(np.abs(
             np.asarray(remedy.corr)[~np.eye(2, dtype=bool)]
         ))) < 1.0
@@ -559,13 +560,177 @@ class TestConditionalRhoLift:
         assert remedy.floored
         assert not remedy.covered
 
-    def test_gate_coherence_end_to_end_through_the_state_wrapper(self):
+    def test_a_measured_rho_past_the_cap_is_never_cut_down_to_it(self):
+        """A pair can be MEASURED above TAIL_RHO_CAP (crash-regime BTC/ETH is
+        the live candidate). The lift's only permitted direction is up:
+        writing the cap over a higher measurement would serve an entry below
+        the EWMA estimate — understating measured co-crash dependence, the
+        §10 direction — to chase a bound the pair cannot meet anyway."""
+        rho_measured = 0.985  # above the 0.98 cap
+        corr = np.array([[1.0, rho_measured], [rho_measured, 1.0]])
+        d = self._diag(lower=0.995, model=0.87, n=10_000)
+        remedy = self._remedy([d], corr=corr)
+        (lift,) = remedy.lifts
+        assert lift.rho_to == pytest.approx(rho_measured, abs=1e-12), (
+            "the entry was cut toward the cap; the lift may never lower"
+        )
+        assert float(remedy.corr[0, 1]) == pytest.approx(rho_measured, abs=1e-9)
+        assert not remedy.covered, "the bound is unreachable; the gate stays lit"
+        assert ("ETH", "SOL") in remedy.uncovered_pairs
+
+    def test_an_unmeasurable_pair_is_uncovered_never_vacuously_covered(self):
+        """A NaN lower tail (no joint exceedances) and a zero-SE reading
+        (every exceedance joint, sigmas not finite) both fire the §2.3 gate
+        while carrying no bound the remedy could target. They are excluded
+        from the demand set — correctly, there is nothing to lift toward —
+        but the remedy must then say covered=False: covered=True over a
+        firing gate is the exact lie `covered` exists not to tell."""
+        nan_pair = self._diag(lower=float("nan"), model=0.4)
+        remedy = self._remedy([nan_pair])
+        assert remedy.demands == ()
+        assert not remedy.covered
+        assert ("ETH", "SOL") in remedy.uncovered_pairs
+
+        exact = self._diag(lower=1.0, model=0.652)  # SE = 0, sigmas NaN
+        remedy = self._remedy([exact])
+        assert remedy.demands == ()
+        assert not remedy.covered
+        assert ("ETH", "SOL") in remedy.uncovered_pairs
+
+    def test_a_bystander_pair_degraded_by_the_projection_is_in_the_verdict(self):
+        """The projection can pay for a lift by pulling down entries the
+        search never touched. A bystander pair pushed past its own margin
+        must appear in the verdict — the alternative is a bundle logged
+        covered while the §2.3 gate fires on a pair the remedy never looked
+        at, which is the 0.5.0 stuck band with extra steps."""
+        corr = np.array([
+            [1.0, 0.60, 0.95],
+            [0.60, 1.0, 0.35],
+            [0.95, 0.35, 1.0],
+        ])  # PD, but tight: lifting (A,B) forces redistribution
+        demand = self._diag(lower=0.62, model=0.3775, pair=("A", "B"))
+        bystander = self._diag(lower=0.829, model=0.773, pair=("A", "C"))
+        quiet = self._diag(lower=0.30, model=0.28, pair=("B", "C"))
+        assert not bystander.understates_lower_tail(), (
+            "the bystander must PASS the gate before the remedy runs"
+        )
+        remedy = self._remedy(
+            [demand, bystander, quiet], corr=corr, assets=("A", "B", "C")
+        )
+        assert remedy.projection_moved, "this scenario exists to move it"
+        assert float(remedy.corr[0, 2]) < 0.95, (
+            "the projection should have pulled the bystander entry down"
+        )
+        assert not remedy.covered
+        assert ("A", "C") in remedy.uncovered_pairs, (
+            "the degraded bystander must be named, not just the demands"
+        )
+
+    def test_two_demands_are_both_lifted_and_both_covered(self):
+        """The live banner reported up to three demand pairs; nothing about
+        the chain may quietly assume one. Two demands on a loose matrix must
+        both lift, both cover, and leave the third pair byte-identical."""
+        corr = np.array([
+            [1.0, 0.60, 0.55],
+            [0.60, 1.0, 0.58],
+            [0.55, 0.58, 1.0],
+        ])
+        d1 = self._diag(lower=0.55, model=0.45, pair=("A", "B"))
+        d2 = self._diag(lower=0.55, model=0.45, pair=("B", "C"))
+        remedy = self._remedy([d1, d2], corr=corr, assets=("A", "B", "C"))
+        assert len(remedy.demands) == 2
+        assert all(lift.lifted for lift in remedy.lifts), (
+            "both demands must be lifted, not just the first"
+        )
+        assert remedy.covered and remedy.df == self.DF_ML
+        assert float(remedy.corr[0, 1]) > 0.60
+        assert float(remedy.corr[1, 2]) > 0.58
+        assert float(remedy.corr[0, 2]) == pytest.approx(0.55, abs=1e-9), (
+            "the pair with no demand must keep its measured value"
+        )
+
+    def test_the_embed_branch_serves_a_pd_matrix_with_imputed_rows(self):
+        """When imputed young-asset rows exist, the lifted submatrix is
+        embedded into the full matrix and the whole thing re-projected —
+        served matrices are Cholesky-factorised per slice, so full-matrix
+        PD is a hard invariant, and no test exercised this branch."""
+        import risk_engine.service.state as state
+
+        rng = np.random.default_rng(38)
+        n = 40_000
+        sub = np.array([[1.0, 0.6], [0.6, 1.0]])
+        z = rng.standard_normal((n, 2)) @ np.linalg.cholesky(sub).T
+        x = z / np.sqrt(rng.chisquare(6.0, size=(n, 1)) / 6.0)
+        crash = rng.random(n) < 0.05
+        x[crash, :] = -np.abs(x[crash, :]) - 3.0
+        returns = {"A": x[:, 0], "B": x[:, 1], "C": rng.standard_normal(n)}
+        full = np.array([
+            [1.0, 0.6, 0.40],
+            [0.6, 1.0, 0.35],
+            [0.40, 0.35, 1.0],
+        ])
+        matrix = SimpleNamespace(
+            assets=["A", "B", "C"], corr=full,
+            diagnostics=SimpleNamespace(imputed_assets=("C",)),
+        )
+
+        remedied, _df = state._tail_remedied_dependence(returns, matrix, 6.0)
+        served = np.asarray(remedied.corr)
+        assert served.shape == (3, 3)
+        assert float(served[0, 1]) > 0.6, "the estimated pair must be lifted"
+        np.linalg.cholesky(served)  # the §2.1 invariant: PD or bust
+        # The imputed row was §2.1's construction, not a measurement; the
+        # remedy has no business rewriting it beyond what PD requires.
+        assert float(served[0, 2]) == pytest.approx(0.40, abs=0.02)
+
+    def test_the_builders_hand_the_gate_the_matrix_and_df_they_bundle(self, monkeypatch):
+        """The wiring finding: nothing tested that the REMEDIED matrix and
+        df are what reaches both the ModelBundle and the §2.3 gate. A slip
+        that bundles the remedied pair while the gate judges the raw one
+        (or vice versa) would serve an unguarded model with the gate dark."""
+        import risk_engine.service.state as state
+
+        marker = {}
+
+        real_remedy = state._tail_remedied_dependence
+
+        def spy_remedy(returns, matrix, df_ml, timestamps=None):
+            out_matrix, out_df = real_remedy(returns, matrix, df_ml, timestamps)
+            marker["matrix"], marker["df"] = out_matrix, out_df
+            return out_matrix, out_df
+
+        seen = {}
+        real_checked = state._checked_tail_diagnostics
+
+        def spy_checked(returns, matrix, copula_df, fatal=True, timestamps=None):
+            seen["matrix"], seen["df"] = matrix, copula_df
+            return real_checked(returns, matrix, copula_df,
+                                fatal=fatal, timestamps=timestamps)
+
+        monkeypatch.setattr(state, "_tail_remedied_dependence", spy_remedy)
+        monkeypatch.setattr(state, "_checked_tail_diagnostics", spy_checked)
+        bundle, _specs, _spot = state._build_fixture_bundle()
+
+        assert bundle.matrix is marker["matrix"], (
+            "the bundle must carry the remedy's matrix"
+        )
+        assert bundle.copula_df == marker["df"]
+        assert seen["matrix"] is marker["matrix"], (
+            "the gate must judge the same matrix the bundle serves"
+        )
+        assert seen["df"] == marker["df"]
+
+    def test_gate_coherence_end_to_end_through_the_state_wrapper(self, caplog):
         """The property the whole chain exists for: a crash-together market
         that used to hold the §2.3 gate lit permanently is remedied into a
         bundle the gate PASSES — recording mode ends, gate-days accrue — with
         the lift covering at the ML df. Run through the real state wrapper so
-        the wiring (submatrix, embed, final diagnostics) is what is tested."""
+        the wiring (submatrix, embed, final diagnostics) is what is tested,
+        and the operator-visible trace (lift WARNING, counter) with it."""
+        import logging
+
         import risk_engine.service.state as state
+        from risk_engine.observability.metrics import METRICS
 
         rng = np.random.default_rng(38)
         n = 40_000
@@ -581,9 +746,17 @@ class TestConditionalRhoLift:
         with pytest.raises(ValueError, match="understates lower-tail"):
             state._checked_tail_diagnostics(returns, matrix, 6.0)
 
-        remedied, df = state._tail_remedied_dependence(returns, matrix, 6.0)
+        METRICS.reset()
+        with caplog.at_level(logging.WARNING, logger="risk_engine.service.state"):
+            remedied, df = state._tail_remedied_dependence(returns, matrix, 6.0)
         assert float(remedied.corr[0, 1]) > 0.6, "the pair must be lifted"
         assert df == 6.0, "the lift covers at the ML df; no floor needed here"
+        assert METRICS.counters.get("copula_rho_tail_lifted", 0) == 1
+        lifted_warnings = [
+            r for r in caplog.records if "copula rho lifted" in r.getMessage()
+        ]
+        assert lifted_warnings, "a served lift with no WARNING is invisible"
+        assert "A/B" in lifted_warnings[-1].getMessage()
         # The remedied bundle passes the very gate that refused it (fatal
         # path, so a regression raises rather than records).
         diags = state._checked_tail_diagnostics(returns, remedied, df)

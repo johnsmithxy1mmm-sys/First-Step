@@ -531,10 +531,12 @@ def cmd_census(args) -> int:
 
     with _open_for_reading(args.journal) as journal:
         # ALL versions, deliberately: the drop pattern depends on the address
-        # list and HL_UNIVERSE, not on the model version, and the version
-        # bumped twice in two days without the universe moving. The first
-        # version of this command filtered on the current version and reported
-        # "no sweeps" over a table holding exactly the data B6 asked for.
+        # list and HL_UNIVERSE, not on the model version. The first version
+        # of this command filtered on the current version and reported "no
+        # sweeps" over a table holding exactly the data B6 asked for. The
+        # table does not record HL_UNIVERSE per sweep, so the version column
+        # is the era proxy: 0.7 widened the universe (B6 decision), so rows
+        # up to 0.6 describe the BTC,ETH,SOL frame and 0.7+ the +HYPE one.
         sweeps = journal.sweeps()
 
     if not sweeps:
@@ -545,8 +547,10 @@ def cmd_census(args) -> int:
 
     versions = sorted({s["distribution_version"] for s in sweeps})
     print(f"current model {MODEL_VERSION}; census pooled across "
-          f"distribution version(s) {', '.join(versions)} -- valid while "
-          f"HL_UNIVERSE is unchanged, which no bump so far has touched")
+          f"distribution version(s) {', '.join(versions)} -- NOTE: "
+          f"HL_UNIVERSE widened at 0.7 (BTC,ETH,SOL -> +HYPE, the B6 "
+          f"decision), so drop rates before and after describe different "
+          f"cohort frames; read each era on its own rows")
     print(f"{len(sweeps)} sweep(s), {sweeps[0]['observation_day']} to "
           f"{sweeps[-1]['observation_day']}\n")
 
